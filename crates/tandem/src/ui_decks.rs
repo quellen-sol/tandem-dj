@@ -202,7 +202,7 @@ impl TandemApp {
                 ui.separator();
                 match dv.meta.as_ref().and_then(|m| m.bpm) {
                     Some(b) => ui.monospace(
-                        RichText::new(format!("{:.2} BPM", b as f64 * st.rate())).size(15.0),
+                        RichText::new(format!("{:.2} BPM", b as f64 * st.tempo)).size(15.0),
                     ),
                     None => ui.monospace(RichText::new("--- BPM").weak()),
                 };
@@ -559,7 +559,9 @@ fn scrolling_waveform(ui: &mut egui::Ui, d: usize, dv: &DeckView, now: i64, heig
     let pos = st.position_at(now);
     if let Some(a) = &dv.audio {
         let sr = a.sample_rate as f64;
-        let span = 8.0 * st.rate().max(0.05);
+        // Zoom follows the tempo fader only. A jog nudge (temporary bend)
+        // slides the waveform instead of stretching it, like Serato.
+        let span = 8.0 * st.tempo.max(0.05);
         let cols = rect.width().max(1.0) as usize;
         let per_col = span / cols as f64;
         for x in 0..cols {
