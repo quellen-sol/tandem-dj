@@ -199,12 +199,17 @@ fn yes() -> bool {
 pub struct Mapping {
     pub device: String,
     pub bindings: Vec<Binding>,
-    /// Nudge strength when turning the jog without touching the platter.
+    /// Pitch-bend strength when turning the jog ring while playing.
     #[serde(default = "one")]
     pub jog_sensitivity: f32,
-    /// Scratch distance per jog tick, relative to 720 ticks per 33⅓ rpm turn.
+    /// Scratch distance multiplier (1.0 = one platter turn moves 1.8 s,
+    /// like a 33⅓ rpm record).
     #[serde(default = "one")]
     pub scratch_sensitivity: f32,
+    /// Jog ticks in one full turn of the platter (measured with the
+    /// calibration tool). `None` = unknown, use 720.
+    #[serde(default)]
+    pub jog_ticks_per_rev: Option<f32>,
     /// Touching the jog platter holds the record (vinyl mode).
     #[serde(default = "yes")]
     pub vinyl: bool,
@@ -220,9 +225,14 @@ impl Mapping {
             bindings: Vec::new(),
             jog_sensitivity: 1.0,
             scratch_sensitivity: 1.0,
+            jog_ticks_per_rev: None,
             vinyl: true,
             preset: None,
         }
+    }
+
+    pub fn ticks_per_rev(&self) -> f64 {
+        self.jog_ticks_per_rev.unwrap_or(720.0).max(16.0) as f64
     }
 
     pub fn binding_for(&self, target: Target) -> Option<&Binding> {
@@ -315,13 +325,23 @@ pub struct MidiEngine {
     lsb: HashMap<(u8, u8), u8>,
     /// (channel, coarse CC) pairs seen sending a fine half on CC+32.
     hires: HashSet<(u8, u8)>,
+    /// Scratch / search movement (seconds) not yet sent, per deck.
+    jog_pos: [f64; DECKS],
+    /// Jog ring ticks since the last pitch-bend update, per deck.
+    ring_ticks: [i32; DECKS],
+    /// Pitch bend currently applied from the jog ring, per deck.
+    ring_bend: [f64; DECKS],
+    /// While calibrating: net jog ticks counted so far.
+    pub calibration: Option<i64>,
 }
 
 const BEND: f64 = 0.04;
-/// Nudge per jog tick when not scratching (seconds of audio).
-const JOG_SECONDS_PER_TICK: f64 = 0.0008;
-/// Scratch per tick: one 33⅓ rpm turn (1.8 s) over 720 ticks.
-const SCRATCH_SECONDS_PER_TICK: f64 = 60.0 / (100.0 / 3.0) / 720.0;
+/// One platter turn at 33⅓ rpm: 1.8 s of audio.
+const SECONDS_PER_TURN: f64 = 60.0 / (100.0 / 3.0);
+/// Jog-ring pitch bend: turning the ring at one turn per second speeds the
+/// track up by this fraction (10%). A gentle quarter-turn nudge over a
+/// second shifts the track by about 25 ms.
+const BEND_PER_TURN_PER_SEC: f64 = 0.10;
 
 impl MidiEngine {
     pub fn new(mapping: Mapping, tempo_range: f64) -> Self {
@@ -334,7 +354,55 @@ impl MidiEngine {
             msb: HashMap::new(),
             lsb: HashMap::new(),
             hires: HashSet::new(),
+            jog_pos: [0.0; DECKS],
+            ring_ticks: [0; DECKS],
+            ring_bend: [0.0; DECKS],
+            calibration: None,
         }
+    }
+
+    /// Called every few milliseconds by the controller thread. Turns the
+    /// jog movement gathered since last time into actions: scratch and
+    /// search movement as one playhead shift (batched so a 1 kHz jog doesn't
+    /// flood the room), and, when `bend_window` (seconds) is given, the jog
+    /// ring's speed as a pitch bend that stops when the ring stops.
+    pub fn flush(&mut self, bend_window: Option<f64>) -> Vec<Action> {
+        let mut out = Vec::new();
+        let per_rev = self.mapping.ticks_per_rev();
+        for d in 0..DECKS {
+            let deck = d as u8;
+            if self.jog_pos[d] != 0.0 {
+                out.push(Action::Nudge {
+                    deck,
+                    delta: self.jog_pos[d],
+                });
+                self.jog_pos[d] = 0.0;
+            }
+            if let Some(dt) = bend_window {
+                let ticks = std::mem::take(&mut self.ring_ticks[d]);
+                let prev = self.ring_bend[d];
+                let next = if ticks == 0 {
+                    let decayed = prev * 0.3;
+                    if decayed.abs() < 0.002 {
+                        0.0
+                    } else {
+                        decayed
+                    }
+                } else {
+                    let turns_per_sec = ticks as f64 / per_rev / dt.max(0.001);
+                    let target = (turns_per_sec
+                        * BEND_PER_TURN_PER_SEC
+                        * self.mapping.jog_sensitivity as f64)
+                        .clamp(-0.5, 0.5);
+                    prev * 0.4 + target * 0.6
+                };
+                if (next - prev).abs() > 0.001 || (next == 0.0 && prev != 0.0) {
+                    self.ring_bend[d] = next;
+                    out.push(Action::Bend { deck, bend: next });
+                }
+            }
+        }
+        out
     }
 
     /// Targets whose hardware control hasn't "picked up" the room value yet.
@@ -543,16 +611,24 @@ impl MidiEngine {
                     }
                     match b.target {
                         Target::Jog { deck } => {
-                            let delta = if room.decks[deck as usize].scratching {
-                                ticks as f64
-                                    * SCRATCH_SECONDS_PER_TICK
-                                    * self.mapping.scratch_sensitivity as f64
+                            if let Some(c) = self.calibration.as_mut() {
+                                *c += ticks as i64;
+                            }
+                            let d = deck as usize;
+                            let st = &room.decks[d];
+                            let turns = ticks as f64 / self.mapping.ticks_per_rev();
+                            if st.scratching {
+                                // Hand on the record: it moves exactly with the platter.
+                                self.jog_pos[d] += turns
+                                    * SECONDS_PER_TURN
+                                    * self.mapping.scratch_sensitivity as f64;
+                            } else if !st.playing {
+                                // Paused: turning searches through the track.
+                                self.jog_pos[d] += turns * SECONDS_PER_TURN;
                             } else {
-                                ticks as f64
-                                    * JOG_SECONDS_PER_TICK
-                                    * self.mapping.jog_sensitivity as f64
-                            };
-                            out.push(MidiOut::Action(Action::Nudge { deck, delta }));
+                                // Playing: the ring bends the speed while it turns.
+                                self.ring_ticks[d] += ticks;
+                            }
                         }
                         Target::Browse => out.push(MidiOut::Browse(ticks)),
                         _ => {}
@@ -703,9 +779,15 @@ pub fn mapping_key(port_name: &str) -> String {
 pub fn builtin_preset(port_name: &str) -> Option<Mapping> {
     let n = port_name.to_uppercase();
     if n.contains("DDJ-FLX6") {
-        Some(pioneer_ddj(port_name, "Pioneer DDJ-FLX6", 4))
+        // Large jogs: same resolution as the DDJ-SX family until calibrated.
+        Some(pioneer_ddj(port_name, "Pioneer DDJ-FLX6", 4, 2048.0))
     } else if n.contains("DDJ-FLX4") || n.contains("DDJ-400") {
-        Some(pioneer_ddj(port_name, "Pioneer DDJ-FLX4 / DDJ-400", 2))
+        Some(pioneer_ddj(
+            port_name,
+            "Pioneer DDJ-FLX4 / DDJ-400",
+            2,
+            720.0,
+        ))
     } else {
         None
     }
@@ -716,27 +798,32 @@ pub fn builtin_preset(port_name: &str) -> Option<Mapping> {
 /// channel 8 (deck 1), 10 (deck 2), 12 (deck 3), 14 (deck 4), with SHIFT on
 /// the next channel up. On 4-deck controllers decks 1 and 3 drive Tandem's
 /// deck A and decks 2 and 4 drive deck B, whichever the DECK button selects.
-fn pioneer_ddj(device: &str, name: &str, hw_decks: u8) -> Mapping {
+fn pioneer_ddj(device: &str, name: &str, hw_decks: u8, ticks_per_rev: f32) -> Mapping {
     let mut m = Mapping::empty(device);
     m.preset = Some(name.to_string());
+    m.jog_ticks_per_rev = Some(ticks_per_rev);
     for hw in 0..hw_decks {
         let ch = hw;
         let deck = hw % 2;
         m.bind(Trigger::note(ch, 0x0B), Target::Play { deck });
         m.bind(Trigger::note(ch, 0x0C), Target::Cue { deck });
-        m.bind(Trigger::note(ch, 0x54), Target::Pfl { deck });
         m.bind(Trigger::note(ch, 0x36), Target::JogTouch { deck });
         for cc in [0x21, 0x22, 0x23] {
             m.bind(Trigger::cc(ch, cc), Target::Jog { deck });
         }
         m.bind(Trigger::cc(ch, 0x00), Target::Tempo { deck });
-        m.bind(Trigger::cc(ch, 0x13), Target::Volume { deck });
-        m.bind(Trigger::cc(ch, 0x04), Target::Trim { deck });
-        m.bind(Trigger::cc(ch, 0x07), Target::Eq { deck, band: 2 });
-        m.bind(Trigger::cc(ch, 0x0B), Target::Eq { deck, band: 1 });
-        m.bind(Trigger::cc(ch, 0x0F), Target::Eq { deck, band: 0 });
-        m.bind(Trigger::cc(6, 0x17 + hw), Target::Filter { deck });
         m.bind(Trigger::note(6, 0x46 + hw), Target::Load { deck });
+        // The mixer has its own strip per channel: only channels 1 and 2
+        // are Tandem's two decks. Channels 3/4 are left alone.
+        if hw < 2 {
+            m.bind(Trigger::note(ch, 0x54), Target::Pfl { deck });
+            m.bind(Trigger::cc(ch, 0x13), Target::Volume { deck });
+            m.bind(Trigger::cc(ch, 0x04), Target::Trim { deck });
+            m.bind(Trigger::cc(ch, 0x07), Target::Eq { deck, band: 2 });
+            m.bind(Trigger::cc(ch, 0x0B), Target::Eq { deck, band: 1 });
+            m.bind(Trigger::cc(ch, 0x0F), Target::Eq { deck, band: 0 });
+            m.bind(Trigger::cc(6, 0x17 + hw), Target::Filter { deck });
+        }
         let pads = 7 + 2 * hw;
         for slot in 0..8u8 {
             m.bind(Trigger::note(pads, slot), Target::HotCue { deck, slot });
@@ -846,13 +933,14 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        let out = e.handle(&[0xb0, 0x21, 66], &room, &local);
-        assert!(matches!(out[..], [MidiOut::Action(Action::Nudge { .. })]));
+        // Paused deck: the jog searches through the track.
+        assert!(e.handle(&[0xb0, 0x21, 66], &room, &local).is_empty());
+        assert!(matches!(e.flush(None)[..], [Action::Nudge { .. }]));
     }
 
     #[test]
     fn jog_scratches_while_touched() {
-        let mut e = MidiEngine::new(pioneer_ddj("DDJ-FLX6", "test", 4), 0.08);
+        let mut e = MidiEngine::new(pioneer_ddj("DDJ-FLX6", "test", 4, 2048.0), 0.08);
         let local = LocalParams::default();
         let mut room = RoomState::default();
         room.decks[0].track = Some(crate::model::TrackId([1; 32]));
@@ -865,13 +953,16 @@ mod tests {
             })]
         );
         room.decks[0].scratching = true;
-        let out = e.handle(&[0xb0, 0x22, 64 + 10], &room, &local);
-        match &out[..] {
-            [MidiOut::Action(Action::Nudge { delta, .. })] => {
-                assert!((delta - 10.0 * SCRATCH_SECONDS_PER_TICK).abs() < 1e-12)
+        // Jog messages are gathered and sent as one movement per flush.
+        assert!(e.handle(&[0xb0, 0x22, 64 + 10], &room, &local).is_empty());
+        assert!(e.handle(&[0xb0, 0x22, 64 + 6], &room, &local).is_empty());
+        match &e.flush(None)[..] {
+            [Action::Nudge { delta, .. }] => {
+                assert!((delta - 16.0 / 2048.0 * SECONDS_PER_TURN).abs() < 1e-12)
             }
             other => panic!("{other:?}"),
         }
+        assert!(e.flush(None).is_empty());
         // Deck 3 on the FLX6 drives deck A too.
         let out = e.handle(&[0x82, 0x36, 0], &room, &local);
         assert_eq!(
@@ -884,8 +975,58 @@ mod tests {
     }
 
     #[test]
+    fn jog_ring_bends_speed_only_while_turning() {
+        let mut e = MidiEngine::new(pioneer_ddj("DDJ-FLX6", "test", 4, 2048.0), 0.08);
+        let local = LocalParams::default();
+        let mut room = RoomState::default();
+        room.decks[0].track = Some(crate::model::TrackId([1; 32]));
+        room.decks[0].playing = true;
+        // A gentle nudge: ~0.25 turns per second for 25 ms (13 ticks).
+        for _ in 0..13 {
+            e.handle(&[0xb0, 0x21, 65], &room, &local);
+        }
+        let bend = match &e.flush(Some(0.025))[..] {
+            [Action::Bend { bend, .. }] => *bend,
+            other => panic!("{other:?}"),
+        };
+        assert!(
+            bend > 0.005 && bend < 0.03,
+            "gentle nudge bent speed by {bend}"
+        );
+        // Ring stops: the bend falls back to exactly zero within a few updates.
+        let mut last = bend;
+        for _ in 0..6 {
+            for a in e.flush(Some(0.025)) {
+                if let Action::Bend { bend, .. } = a {
+                    last = bend;
+                }
+            }
+        }
+        assert_eq!(last, 0.0);
+    }
+
+    #[test]
+    fn flx6_mixer_channels_3_and_4_are_not_decks() {
+        let m = pioneer_ddj("DDJ-FLX6", "test", 4, 2048.0);
+        let bound = |t: Trigger| m.bindings.iter().any(|b| b.trigger == t);
+        assert!(bound(Trigger::note(0, 0x54)));
+        assert!(
+            !bound(Trigger::note(2, 0x54)),
+            "channel 3 headphone cue must not drive deck A"
+        );
+        assert!(
+            !bound(Trigger::cc(2, 0x13)),
+            "channel 3 fader must not drive deck A"
+        );
+        assert!(
+            bound(Trigger::note(2, 0x0B)),
+            "deck 3 play still drives deck A"
+        );
+    }
+
+    #[test]
     fn leds_follow_the_room() {
-        let e = MidiEngine::new(pioneer_ddj("DDJ-FLX6", "test", 4), 0.08);
+        let e = MidiEngine::new(pioneer_ddj("DDJ-FLX6", "test", 4, 2048.0), 0.08);
         let mut room = RoomState::default();
         room.decks[1].playing = true;
         room.decks[0].hot_cues[2] = Some(1.0);

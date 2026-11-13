@@ -92,7 +92,14 @@ impl Midi {
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok());
         let mapping = match saved {
-            Some(m) => m,
+            Some(mut m) => {
+                // Older saved mappings don't know the jog resolution yet.
+                if m.jog_ticks_per_rev.is_none() {
+                    m.jog_ticks_per_rev =
+                        builtin_preset(port_name).and_then(|p| p.jog_ticks_per_rev);
+                }
+                m
+            }
             None => match builtin_preset(port_name) {
                 Some(p) => {
                     log::info!(
@@ -151,19 +158,18 @@ impl Midi {
         self.port = Some(port_name.to_string());
         log::info!("MIDI: connected to {port_name}");
 
-        match open_output(port_name) {
-            Some(out) => {
-                self.has_output = true;
-                let stop = Arc::new(AtomicBool::new(false));
-                self.feedback_stop = Some(stop.clone());
-                let pioneer = port_name.to_uppercase().contains("DDJ");
-                let engine = self.engine.clone();
-                std::thread::Builder::new()
-                    .name("tandem-midi-out".into())
-                    .spawn(move || feedback_loop(out, session, engine, stop, pioneer))?;
-            }
-            None => log::info!("MIDI: no output port for {port_name}; lights won't follow Tandem"),
+        let out = open_output(port_name);
+        self.has_output = out.is_some();
+        if out.is_none() {
+            log::info!("MIDI: no output port for {port_name}; lights won't follow Tandem");
         }
+        let stop = Arc::new(AtomicBool::new(false));
+        self.feedback_stop = Some(stop.clone());
+        let pioneer = port_name.to_uppercase().contains("DDJ");
+        let engine = self.engine.clone();
+        std::thread::Builder::new()
+            .name("tandem-controller".into())
+            .spawn(move || controller_loop(out, session, engine, stop, pioneer))?;
         Ok(())
     }
 
@@ -178,10 +184,11 @@ impl Midi {
     }
 }
 
-/// Keep the controller's lights in step with the room, and keep Pioneer
-/// controllers out of demo mode.
-fn feedback_loop(
-    mut out: MidiOutputConnection,
+/// The controller's clock: every 5 ms send gathered jog movement (scratch /
+/// search); every 25 ms update the jog-ring pitch bend and the lights; every
+/// 200 ms keep Pioneer controllers out of demo mode.
+fn controller_loop(
+    mut out: Option<MidiOutputConnection>,
     session: SessionHandle,
     engine: Arc<Mutex<MidiEngine>>,
     stop: Arc<AtomicBool>,
@@ -189,32 +196,51 @@ fn feedback_loop(
 ) {
     let mut sent: HashMap<(u8, u8), bool> = HashMap::new();
     let mut last_keepalive = Instant::now() - Duration::from_secs(1);
+    let mut last_slow = Instant::now();
+    let clock = session.lock().clock();
     while !stop.load(Ordering::Relaxed) {
-        if pioneer && last_keepalive.elapsed() >= Duration::from_millis(200) {
-            let _ = out.send(&PIONEER_KEEPALIVE);
-            last_keepalive = Instant::now();
-        }
-        let (room, local) = {
-            let s = session.lock();
-            (s.latest(), s.local)
+        let slow = last_slow.elapsed() >= Duration::from_millis(25);
+        let window = if slow {
+            let w = last_slow.elapsed().as_secs_f64();
+            last_slow = Instant::now();
+            Some(w)
+        } else {
+            None
         };
-        let leds = engine.lock().leds(&room, &local);
-        for (key, on) in leds {
-            if sent.get(&key) != Some(&on) {
-                if out
-                    .send(&[key.0, key.1, if on { 0x7F } else { 0x00 }])
-                    .is_err()
-                {
-                    return;
-                }
-                sent.insert(key, on);
+        let actions = engine.lock().flush(window);
+        if !actions.is_empty() {
+            let t = clock.now();
+            let mut s = session.lock();
+            for a in actions {
+                s.act_at(a, t);
             }
         }
-        std::thread::sleep(Duration::from_millis(25));
+        if let Some(o) = out.as_mut() {
+            if pioneer && last_keepalive.elapsed() >= Duration::from_millis(200) {
+                let _ = o.send(&PIONEER_KEEPALIVE);
+                last_keepalive = Instant::now();
+            }
+            if slow {
+                let (room, local) = {
+                    let s = session.lock();
+                    (s.latest(), s.local)
+                };
+                let leds = engine.lock().leds(&room, &local);
+                for (key, on) in leds {
+                    if sent.get(&key) != Some(&on) {
+                        let _ = o.send(&[key.0, key.1, if on { 0x7F } else { 0x00 }]);
+                        sent.insert(key, on);
+                    }
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
     }
-    for (key, on) in sent {
-        if on {
-            let _ = out.send(&[key.0, key.1, 0x00]);
+    if let Some(o) = out.as_mut() {
+        for (key, on) in sent {
+            if on {
+                let _ = o.send(&[key.0, key.1, 0x00]);
+            }
         }
     }
 }

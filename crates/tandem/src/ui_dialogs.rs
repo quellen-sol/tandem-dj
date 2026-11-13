@@ -509,11 +509,11 @@ impl TandemApp {
                 .checkbox(&mut engine.mapping.vinyl, "Vinyl mode")
                 .on_hover_text("Touching the top of the jog wheel holds the record, so you can scratch. Off: the jog only nudges.")
                 .changed();
-            ui.label("Scratch");
+            ui.label("Scratch speed");
             changed |= ui
                 .add(egui::Slider::new(&mut engine.mapping.scratch_sensitivity, 0.25..=4.0).logarithmic(true))
                 .changed();
-            ui.label("Nudge");
+            ui.label("Ring pitch-bend");
             changed |= ui
                 .add(egui::Slider::new(&mut engine.mapping.jog_sensitivity, 0.1..=5.0).logarithmic(true))
                 .changed();
@@ -541,6 +541,37 @@ impl TandemApp {
                 .small()
                 .weak(),
             );
+        });
+        ui.horizontal(|ui| {
+            ui.label(format!("Jog: {:.0} ticks per turn", engine.mapping.ticks_per_rev()));
+            match engine.calibration {
+                None => {
+                    if ui
+                        .small_button("Calibrate…")
+                        .on_hover_text("Measure your jog wheel so one turn of the platter moves the record exactly one turn.")
+                        .clicked()
+                    {
+                        engine.calibration = Some(0);
+                    }
+                }
+                Some(count) => {
+                    ui.label(
+                        RichText::new(format!(
+                            "Line up a mark on the platter, then turn it exactly one full turn (either way). Counted: {}",
+                            count.abs()
+                        ))
+                        .color(AMBER),
+                    );
+                    if ui.add_enabled(count.abs() >= 100, egui::Button::new("Use this")).clicked() {
+                        engine.mapping.jog_ticks_per_rev = Some(count.unsigned_abs() as f32);
+                        engine.calibration = None;
+                        changed = true;
+                    }
+                    if ui.small_button("Cancel").clicked() {
+                        engine.calibration = None;
+                    }
+                }
+            }
         });
         let waiting = engine.waiting_for_pickup();
         if !waiting.is_empty() {
