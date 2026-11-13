@@ -410,7 +410,7 @@ impl Session {
                 let (title, artist) = library::display_names(&lib, &path);
                 let audio = decode_file(&path, id)?;
                 let size = std::fs::metadata(&path)?.len();
-                let grid = library::grid_for(&lib, &path, &audio, bpm);
+                let (grid, key) = library::analysis_for(&lib, &path, &audio, bpm);
                 let info = TrackInfo {
                     id,
                     title,
@@ -420,6 +420,7 @@ impl Session {
                     size,
                     file_name: name.clone(),
                     grid,
+                    key,
                 };
                 Ok((info, audio))
             })();
@@ -778,6 +779,7 @@ impl Session {
                     size: meta.len(),
                     file_name,
                     grid: library::cached_grid(&lib, &p),
+                    key: library::cached_key(&lib, &p),
                 });
                 files.push((id, p));
             }
@@ -1359,6 +1361,7 @@ fn load_action(deck: usize, info: &TrackInfo) -> Action {
         cue: 0.0,
         bpm: info.grid.map(|g| g.bpm).unwrap_or(0.0),
         first_beat: info.grid.map(|g| g.first_beat).unwrap_or(0.0),
+        key: info.key.unwrap_or(-1),
     }
 }
 

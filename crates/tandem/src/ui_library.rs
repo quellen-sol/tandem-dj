@@ -10,6 +10,7 @@ struct Row {
     title: String,
     artist: String,
     bpm: Option<f64>,
+    key: Option<i8>,
     duration: f64,
 }
 
@@ -267,10 +268,10 @@ impl TandemApp {
 
         let row_h = 22.0;
         let width = ui.available_width();
-        let cols = [0.0, width * 0.45, width * 0.80, width * 0.90];
+        let cols = [0.0, width * 0.42, width * 0.74, width * 0.83, width * 0.91];
         let header = ui.allocate_exact_size(vec2(width, 18.0), Sense::hover()).0;
         let hp = ui.painter_at(header);
-        for (x, label) in cols.iter().zip(["TITLE", "ARTIST", "BPM", "TIME"]) {
+        for (x, label) in cols.iter().zip(["TITLE", "ARTIST", "BPM", "KEY", "TIME"]) {
             hp.text(
                 pos2(header.left() + x + 6.0, header.center().y),
                 Align2::LEFT_CENTER,
@@ -317,12 +318,14 @@ impl TandemApp {
                         title: t.title.clone(),
                         artist: t.artist.clone(),
                         bpm: t.grid.map(|g| g.bpm).or(t.bpm.map(|b| b as f64)),
+                        key: t.key,
                         duration: t.duration,
                     }),
                     _ => list.and_then(|l| l.tracks.get(idx)).map(|t| Row {
                         title: t.title.clone(),
                         artist: t.artist.clone(),
                         bpm: t.grid_bpm.or(t.bpm.map(|b| b as f64)),
+                        key: t.key,
                         duration: t.duration,
                     }),
                 };
@@ -341,6 +344,7 @@ impl TandemApp {
                     row.title,
                     row.artist,
                     row.bpm.map(|b| format!("{b:.1}")).unwrap_or_default(),
+                    row.key.map(tandem_core::keys::camelot).unwrap_or_default(),
                     if row.duration > 0.0 {
                         fmt_time(row.duration)
                             .split('.')
@@ -397,7 +401,7 @@ impl TandemApp {
             self.ui.sel_index = i;
             match (self.free_deck(view), self.item_at(i, view)) {
                 (Some(d), Some(item)) => self.load(d, item, view),
-                (None, _) => self.toast("Both decks are playing."),
+                (None, _) => {}
                 _ => {}
             }
         }

@@ -13,6 +13,7 @@
 
 use crate::audio::TrackAudio;
 use crate::model::{DeckState, RoomState, Timeline, TrackId, DECKS};
+use crate::stretch::Stretcher;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -114,27 +115,166 @@ const SCRATCH_MAX_SPEED: f64 = 8.0;
 const CLICK_PERIOD_US: i64 = 500_000;
 const CLICK_LEN_US: i64 = 15_000;
 
-#[derive(Default)]
+/// Frames of audio fed to the stretcher before playback starts.
+const SEEK_FRAMES: usize = 8192;
+const HEAD_BUF_FRAMES: usize = 32_768;
+
+/// Copy track frames `[start, start + n)` as interleaved f32 (silence outside the track).
+fn fill(audio: &TrackAudio, start: i64, buf: &mut [f32]) {
+    for (i, c) in buf.chunks_exact_mut(2).enumerate() {
+        let idx = start + i as i64;
+        let f = if idx >= 0 && (idx as usize) < audio.frames.len() {
+            audio.frames[idx as usize]
+        } else {
+            [0, 0]
+        };
+        c[0] = f[0] as f32 * (1.0 / 32768.0);
+        c[1] = f[1] as f32 * (1.0 / 32768.0);
+    }
+}
+
+/// One read head: vinyl-style (interpolated; pitch follows speed) or
+/// through the time-stretcher (key lock / key shift).
+struct Head {
+    track: Option<TrackId>,
+    playing: bool,
+    stretched: bool,
+    /// Vinyl: read position. Stretched: next input frame to feed.
+    pos: f64,
+    /// Source frames consumed per output frame.
+    step: f64,
+    carry: f64,
+    stretch: Stretcher,
+    inbuf: Vec<f32>,
+    outbuf: Vec<f32>,
+}
+
+impl Head {
+    fn new(sr: f64) -> Self {
+        Self {
+            track: None,
+            playing: false,
+            stretched: false,
+            pos: 0.0,
+            step: 0.0,
+            carry: 0.0,
+            stretch: Stretcher::new(sr as f32),
+            inbuf: vec![0.0; HEAD_BUF_FRAMES * 2],
+            outbuf: vec![0.0; HEAD_BUF_FRAMES * 2],
+        }
+    }
+
+    /// Track position (source frames) of the audio coming out right now.
+    fn heard(&self) -> f64 {
+        if self.stretched {
+            self.pos
+                - self.stretch.input_latency() as f64
+                - self.step * self.stretch.output_latency() as f64
+        } else {
+            self.pos
+        }
+    }
+
+    /// Start (or restart) at `target` source frames.
+    #[allow(clippy::too_many_arguments)]
+    fn start(
+        &mut self,
+        track: Option<TrackId>,
+        target: f64,
+        playing: bool,
+        stretched: bool,
+        step: f64,
+        transpose: f32,
+        audio: Option<&TrackAudio>,
+    ) {
+        self.track = track;
+        self.playing = playing;
+        self.stretched = stretched;
+        self.step = step;
+        self.carry = 0.0;
+        self.pos = target;
+        let (true, Some(a)) = (stretched && playing, audio) else {
+            return;
+        };
+        // Prime the stretcher with the audio leading up to the target, then
+        // run it for one output-latency and discard that, so the very first
+        // sample heard is the target itself (a cue point's kick isn't lost).
+        self.stretch.reset();
+        self.stretch.set_transpose(transpose);
+        let feed = (target + self.stretch.input_latency() as f64).round();
+        fill(
+            a,
+            feed as i64 - SEEK_FRAMES as i64,
+            &mut self.inbuf[..SEEK_FRAMES * 2],
+        );
+        self.stretch.seek(&mut self.inbuf[..SEEK_FRAMES * 2], step);
+        let out_lat = self.stretch.output_latency().min(HEAD_BUF_FRAMES / 2);
+        let pre_in = ((out_lat as f64 * step).round() as usize).min(HEAD_BUF_FRAMES);
+        fill(a, feed as i64, &mut self.inbuf[..pre_in * 2]);
+        self.stretch.process(
+            &mut self.inbuf[..pre_in * 2],
+            &mut self.outbuf[..out_lat * 2],
+        );
+        self.pos = feed + pre_in as f64;
+    }
+
+    fn render(&mut self, audio: Option<&TrackAudio>, out: &mut [[f32; 2]]) {
+        let (true, Some(a)) = (self.playing, audio) else {
+            out.fill([0.0; 2]);
+            return;
+        };
+        if !self.stretched {
+            for o in out.iter_mut() {
+                *o = a.sample(self.pos);
+                self.pos += self.step;
+            }
+            return;
+        }
+        let n = out.len();
+        let want = self.carry + n as f64 * self.step.max(0.0);
+        let in_frames = (want.floor() as usize).min(HEAD_BUF_FRAMES);
+        self.carry = want - in_frames as f64;
+        fill(a, self.pos as i64, &mut self.inbuf[..in_frames * 2]);
+        self.stretch
+            .process(&mut self.inbuf[..in_frames * 2], &mut self.outbuf[..n * 2]);
+        self.pos += in_frames as f64;
+        for (i, o) in out.iter_mut().enumerate() {
+            *o = [self.outbuf[i * 2], self.outbuf[i * 2 + 1]];
+        }
+    }
+}
+
 struct Player {
     track: Option<TrackId>,
     has_audio: bool,
     gen: u64,
-    pos: f64,
-    step: f64,
-    playing: bool,
-    corr: f64,
-    // Crossfade from the previous head after a jump.
+    cur: Head,
+    /// The previous head, faded out after a jump.
+    old: Head,
     xfade: u32,
-    old_track: Option<TrackId>,
-    old_pos: f64,
-    old_step: f64,
-    old_playing: bool,
+    old_buf: [[f32; 2]; SUB],
+    corr: f64,
     scratching: bool,
-    /// Current velocity (source frames per output frame), eased while scratching.
+    /// Velocity (source frames per output frame), eased while scratching.
     vel: f64,
 }
 
 impl Player {
+    fn new(sr: f64) -> Self {
+        Self {
+            track: None,
+            has_audio: false,
+            gen: 0,
+            cur: Head::new(sr),
+            old: Head::new(sr),
+            xfade: 0,
+            old_buf: [[0.0; 2]; SUB],
+            corr: 0.0,
+            scratching: false,
+            vel: 0.0,
+        }
+    }
+
     fn prepare(&mut self, st: &DeckState, ts: i64, out_sr: f64, audio: Option<&TrackAudio>) {
         let track_sr = audio.map(|a| a.sample_rate as f64).unwrap_or(out_sr);
         let model_pos = st.position_at(ts);
@@ -143,27 +283,43 @@ impl Player {
         let scratching = st.scratching && has_audio;
         let want_playing =
             scratching || (st.playing && has_audio && model_pos < st.duration - 1e-3);
-        let changed = st.track != self.track || st.gen != self.gen || has_audio != self.has_audio;
+        // Key lock / key shift go through the stretcher; scratching is always vinyl.
+        let stretched = !scratching && (st.key_lock || st.key_shift != 0);
+        let transpose = (st.pitch_ratio() * track_sr / out_sr) as f32;
+        let base_step = track_sr / out_sr * st.rate();
+        let changed = st.track != self.track
+            || st.gen != self.gen
+            || has_audio != self.has_audio
+            || (want_playing && self.cur.playing && stretched != self.cur.stretched);
         if changed {
-            self.hard_sync(st, target, want_playing, has_audio);
+            self.hard_sync(
+                st,
+                target,
+                want_playing,
+                has_audio,
+                stretched,
+                base_step,
+                transpose,
+                audio,
+            );
         }
 
         if scratching {
             // Vinyl: the read head follows the hand, forwards or backwards,
             // with eased velocity so grabbing and releasing sound natural.
-            let err = target - self.pos;
+            let err = target - self.cur.pos;
             if err.abs() > 2.0 * track_sr {
-                self.hard_sync(st, target, true, has_audio);
+                self.hard_sync(st, target, true, has_audio, false, 0.0, 1.0, audio);
             }
-            if !self.playing {
-                self.old_playing = false;
+            if !self.cur.playing {
+                self.old.playing = false;
                 self.xfade = XFADE;
-                self.playing = true;
+                self.cur.playing = true;
             }
             let max = SCRATCH_MAX_SPEED * track_sr / out_sr;
-            let want = ((target - self.pos) / (SCRATCH_TAU_S * out_sr)).clamp(-max, max);
+            let want = ((target - self.cur.pos) / (SCRATCH_TAU_S * out_sr)).clamp(-max, max);
             self.vel += (want - self.vel) * 0.35;
-            self.step = self.vel;
+            self.cur.step = self.vel;
             self.scratching = true;
             self.corr = 0.0;
             return;
@@ -172,62 +328,83 @@ impl Player {
 
         if !changed {
             if want_playing {
-                let err = target - self.pos;
-                if !self.playing || err.abs() > HARD_SYNC_S * track_sr {
-                    self.hard_sync(st, target, want_playing, has_audio);
+                let err = target - self.cur.heard();
+                if !self.cur.playing || err.abs() > HARD_SYNC_S * track_sr {
+                    self.hard_sync(
+                        st,
+                        target,
+                        want_playing,
+                        has_audio,
+                        stretched,
+                        base_step,
+                        transpose,
+                        audio,
+                    );
                 } else {
                     self.corr = (err / track_sr / CHASE_TAU_S).clamp(-CHASE_MAX, CHASE_MAX);
                 }
             } else {
-                if self.playing {
-                    self.hard_sync(st, target, false, has_audio);
+                if self.cur.playing {
+                    self.hard_sync(
+                        st, target, false, has_audio, stretched, base_step, transpose, audio,
+                    );
                 }
-                self.pos = target; // paused: follow scrubs/nudges directly
+                self.cur.pos = target; // paused: follow scrubs/nudges directly
                 self.corr = 0.0;
             }
         }
-        self.step = if self.playing {
-            track_sr / out_sr * st.rate() * (1.0 + self.corr)
+        self.cur.step = if self.cur.playing {
+            base_step * (1.0 + self.corr)
         } else {
             0.0
         };
-        self.vel = self.step;
+        if self.cur.stretched {
+            self.cur.stretch.set_transpose(transpose);
+        }
+        self.vel = self.cur.step;
     }
 
-    fn hard_sync(&mut self, st: &DeckState, target: f64, playing: bool, has_audio: bool) {
-        self.old_track = self.track;
-        self.old_pos = self.pos;
-        self.old_step = self.step;
-        self.old_playing = self.playing;
-        self.xfade = if self.playing || playing { XFADE } else { 0 };
+    #[allow(clippy::too_many_arguments)]
+    fn hard_sync(
+        &mut self,
+        st: &DeckState,
+        target: f64,
+        playing: bool,
+        has_audio: bool,
+        stretched: bool,
+        step: f64,
+        transpose: f32,
+        audio: Option<&TrackAudio>,
+    ) {
+        std::mem::swap(&mut self.cur, &mut self.old);
+        self.xfade = if self.old.playing || playing {
+            XFADE
+        } else {
+            0
+        };
+        self.cur
+            .start(st.track, target, playing, stretched, step, transpose, audio);
         self.track = st.track;
         self.gen = st.gen;
         self.has_audio = has_audio;
-        self.pos = target;
-        self.playing = playing;
         self.corr = 0.0;
     }
 
     fn render(&mut self, cur: Option<&TrackAudio>, old: Option<&TrackAudio>, out: &mut [[f32; 2]]) {
-        for o in out.iter_mut() {
-            let mut s = match (self.playing, cur) {
-                (true, Some(a)) => a.sample(self.pos),
-                _ => [0.0; 2],
-            };
-            if self.playing {
-                self.pos += self.step;
+        self.cur.render(cur, out);
+        if self.xfade == 0 {
+            return;
+        }
+        let n = out.len();
+        self.old.render(old, &mut self.old_buf[..n]);
+        for (i, o) in out.iter_mut().enumerate() {
+            if self.xfade == 0 {
+                break;
             }
-            if self.xfade > 0 {
-                let w = self.xfade as f32 / XFADE as f32;
-                let so = match (self.old_playing, old) {
-                    (true, Some(a)) => a.sample(self.old_pos),
-                    _ => [0.0; 2],
-                };
-                self.old_pos += self.old_step;
-                s = [s[0] * (1.0 - w) + so[0] * w, s[1] * (1.0 - w) + so[1] * w];
-                self.xfade -= 1;
-            }
-            *o = s;
+            let w = self.xfade as f32 / XFADE as f32;
+            let so = self.old_buf[i];
+            *o = [o[0] * (1.0 - w) + so[0] * w, o[1] * (1.0 - w) + so[1] * w];
+            self.xfade -= 1;
         }
     }
 }
@@ -441,7 +618,7 @@ impl Lane {
             kind,
             delay_us,
             sr: sample_rate,
-            players: Default::default(),
+            players: std::array::from_fn(|_| Player::new(sample_rate)),
             iso: std::array::from_fn(|_| Isolator::new(sample_rate)),
             filt: std::array::from_fn(|_| DjFilter::new(sample_rate)),
             deck_buf: [[[0.0; 2]; SUB]; DECKS],
@@ -524,9 +701,9 @@ impl Lane {
             let st = &state.decks[d];
             let p = &mut self.players[d];
             p.prepare(st, ts, self.sr, snap.track(st.track));
-            let cur = snap.track(p.track);
+            let cur = snap.track(p.cur.track);
             let old = if p.xfade > 0 {
-                snap.track(p.old_track)
+                snap.track(p.old.track)
             } else {
                 None
             };
@@ -606,6 +783,7 @@ mod tests {
                 cue: 0.0,
                 bpm: 0.0,
                 first_beat: 0.0,
+                key: -1,
             },
         });
         tl.insert(Event {
@@ -647,6 +825,7 @@ mod tests {
                 cue: 0.0,
                 bpm: 0.0,
                 first_beat: 0.0,
+                key: -1,
             },
         });
         tl.insert(Event {
@@ -681,7 +860,7 @@ mod tests {
         }
         assert_eq!(lane.players[0].gen, gen);
         let model = snap.timeline.state_at(t).decks[0].position_at(t) * 44_100.0;
-        let err_ms = (model - lane.players[0].pos).abs() / 44.1;
+        let err_ms = (model - lane.players[0].cur.heard()).abs() / 44.1;
         assert!(err_ms < 1.0, "still {err_ms} ms off after 1 s");
     }
 
@@ -709,6 +888,7 @@ mod tests {
                 cue: 0.0,
                 bpm: 0.0,
                 first_beat: 0.0,
+                key: -1,
             },
         );
         push(&mut tl, 0, Action::Seek { deck: 0, pos: 5.0 });
@@ -739,18 +919,143 @@ mod tests {
         let mut min_step = f64::MAX;
         while t < 1_300_000 {
             lane.render(&snap, t, &mut m, &mut c);
-            min_step = min_step.min(lane.players[0].step);
+            min_step = min_step.min(lane.players[0].cur.step);
             t += 10_000;
         }
         assert!(
             min_step < -0.5,
             "never played backwards (min step {min_step})"
         );
-        let pos_s = lane.players[0].pos / 44_100.0;
+        let pos_s = lane.players[0].cur.pos / 44_100.0;
         assert!(
             (pos_s - 5.7).abs() < 0.01,
             "ended at {pos_s} s, expected 5.7"
         );
+    }
+
+    /// Render deck A alone (crossfader hard left) for `secs` from shared time 0.
+    fn render_deck(a: &Arc<TrackAudio>, key_lock: bool, tempo: f64, secs: f64) -> Vec<f32> {
+        let mut tl = Timeline::new(-1_000_000);
+        let mut seq = 0;
+        let mut go = |tl: &mut Timeline, t: i64, action: Action| {
+            seq += 1;
+            tl.insert(Event {
+                time: t,
+                origin: 1,
+                seq,
+                action,
+            });
+        };
+        go(
+            &mut tl,
+            -1_000_000,
+            Action::Load {
+                deck: 0,
+                track: a.id,
+                duration: a.duration(),
+                cue: 0.0,
+                bpm: 0.0,
+                first_beat: 0.0,
+                key: -1,
+            },
+        );
+        go(&mut tl, -1_000_000, Action::Crossfader { v: 0.0 });
+        go(
+            &mut tl,
+            -1_000_000,
+            Action::KeyLock {
+                deck: 0,
+                on: key_lock,
+            },
+        );
+        go(&mut tl, -1_000_000, Action::Tempo { deck: 0, tempo });
+        go(&mut tl, 0, Action::Play { deck: 0 });
+        let snap = snap_with(tl, a.clone());
+        let mut lane = Lane::new(44_100.0, 0, LaneKind::Live);
+        let block = 441;
+        let mut out = Vec::new();
+        let (mut m, mut c) = (vec![0.0; block * 2], vec![0.0; block * 2]);
+        let mut t = 0i64;
+        while (out.len() / 2) < (secs * 44_100.0) as usize {
+            lane.render(&snap, t, &mut m, &mut c);
+            out.extend(m.iter().step_by(2));
+            out.extend(std::iter::repeat(0.0).take(0));
+            t += 10_000;
+        }
+        out
+    }
+
+    /// Times (s) where the signal first jumps above `thresh` after quiet.
+    fn onsets(x: &[f32], thresh: f32) -> Vec<f64> {
+        let mut v = Vec::new();
+        let mut quiet = usize::MAX / 2;
+        for (i, s) in x.iter().enumerate() {
+            if s.abs() > thresh {
+                if quiet > 2000 {
+                    v.push(i as f64 / 44_100.0);
+                }
+                quiet = 0;
+            } else {
+                quiet += 1;
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn key_lock_keeps_kicks_on_time() {
+        // Short clicks every 0.5 s.
+        let frames: Vec<[i16; 2]> = (0..44_100 * 8)
+            .map(|i| {
+                let ph = i % 22_050;
+                let v = if ph < 220 {
+                    ((ph as f64 * 0.3).sin() * 20_000.0) as i16
+                } else {
+                    0
+                };
+                [v, v]
+            })
+            .collect();
+        let a = Arc::new(TrackAudio::new(TrackId([5; 32]), 44_100, frames));
+        for tempo in [1.0, 1.06] {
+            let vinyl = onsets(&render_deck(&a, false, tempo, 4.0), 0.05);
+            let locked = onsets(&render_deck(&a, true, tempo, 4.0), 0.05);
+            assert!(vinyl.len() >= 6, "vinyl onsets {vinyl:?}");
+            // The very first click (the cue point) must not be swallowed.
+            assert!(
+                locked[0] < 0.005,
+                "first click came out at {:.1} ms",
+                locked[0] * 1000.0
+            );
+            for (v, l) in vinyl.iter().zip(&locked) {
+                let err_ms = (v - l).abs() * 1000.0;
+                assert!(
+                    err_ms < 4.0,
+                    "tempo {tempo}: click at {v:.4}s vinyl vs {l:.4}s locked ({err_ms:.1} ms)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn key_lock_keeps_pitch() {
+        let frames: Vec<[i16; 2]> = (0..44_100 * 4)
+            .map(|i| {
+                let v = ((2.0 * std::f64::consts::PI * 440.0 * i as f64 / 44_100.0).sin()
+                    * 12_000.0) as i16;
+                [v, v]
+            })
+            .collect();
+        let a = Arc::new(TrackAudio::new(TrackId([6; 32]), 44_100, frames));
+        let zero_crossings_hz = |x: &[f32]| {
+            let seg = &x[22_050..66_150];
+            let z = seg.windows(2).filter(|w| w[0] <= 0.0 && w[1] > 0.0).count();
+            z as f64 / (seg.len() as f64 / 44_100.0)
+        };
+        let locked = zero_crossings_hz(&render_deck(&a, true, 1.08, 2.0));
+        let vinyl = zero_crossings_hz(&render_deck(&a, false, 1.08, 2.0));
+        assert!((locked - 440.0).abs() < 5.0, "key-locked pitch {locked} Hz");
+        assert!((vinyl - 475.2).abs() < 5.0, "vinyl pitch {vinyl} Hz");
     }
 
     #[test]

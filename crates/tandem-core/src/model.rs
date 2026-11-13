@@ -101,6 +101,12 @@ pub struct DeckState {
     pub first_beat: f64,
     /// Tempo-locked to the other deck (SYNC on).
     pub synced: bool,
+    /// Detected key: 0-11 major (C = 0), 12-23 minor; -1 unknown.
+    pub key: i8,
+    /// Key shift in semitones (pitch only, tempo unchanged).
+    pub key_shift: i8,
+    /// Key lock: tempo changes don't change pitch.
+    pub key_lock: bool,
     /// Bumped on every discontinuity (load, play, pause, jump). The renderer
     /// hard-syncs when it changes and smoothly chases otherwise.
     pub gen: u64,
@@ -129,6 +135,9 @@ impl Default for DeckState {
             bpm: 0.0,
             first_beat: 0.0,
             synced: false,
+            key: -1,
+            key_shift: 0,
+            key_lock: true,
             gen: 0,
             last_touch: 0,
         }
@@ -151,6 +160,28 @@ impl DeckState {
             self.anchor_pos
         };
         p.clamp(0.0, self.duration.max(0.0))
+    }
+
+    /// How much higher (as a frequency ratio) the deck sounds than the
+    /// original recording.
+    pub fn pitch_ratio(&self) -> f64 {
+        let shift = 2f64.powf(self.key_shift as f64 / 12.0);
+        if self.key_lock {
+            shift
+        } else {
+            shift * self.rate()
+        }
+    }
+
+    /// The key the deck is sounding in right now (after key shift and, with
+    /// key lock off, tempo), rounded to the nearest semitone.
+    pub fn sounding_key(&self) -> Option<i8> {
+        if self.key < 0 {
+            return None;
+        }
+        let semis = (12.0 * self.pitch_ratio().log2()).round() as i32;
+        let pc = (self.key as i32 % 12 + semis).rem_euclid(12);
+        Some((pc + if self.key >= 12 { 12 } else { 0 }) as i8)
     }
 
     /// The deck's current BPM, as the tempo fader sets it (ignores nudges).
@@ -203,6 +234,19 @@ pub enum Action {
         bpm: f64,
         #[serde(default)]
         first_beat: f64,
+        /// Detected key (see [`DeckState::key`]), -1 unknown.
+        #[serde(default = "no_key")]
+        key: i8,
+    },
+    /// Key lock on/off.
+    KeyLock {
+        deck: u8,
+        on: bool,
+    },
+    /// Shift the key by this many semitones from the original.
+    KeyShift {
+        deck: u8,
+        semitones: i8,
     },
     /// SYNC on/off: match the other deck's tempo and beat phase, and keep
     /// both decks' tempos locked together while on.
@@ -300,7 +344,9 @@ impl Action {
             | Trim { deck, .. }
             | Filter { deck, .. }
             | JogTouch { deck, .. }
-            | Sync { deck, .. } => Some(deck as usize),
+            | Sync { deck, .. }
+            | KeyLock { deck, .. }
+            | KeyShift { deck, .. } => Some(deck as usize),
             Crossfader { .. } => None,
         }
     }
@@ -341,15 +387,65 @@ impl RoomState {
             self.decks[deck].synced = on && self.sync_deck(deck, t, true);
             return;
         }
-        let was_playing = self.decks[deck].playing;
+        let before = self.decks[deck];
+        let was_playing = before.playing;
         self.apply_deck(deck, ev);
         match ev.action {
+            Action::Load { .. } if was_playing => self.start_on_beat(deck, t, before),
             Action::Tempo { .. } => self.follow_tempo(deck, t),
             Action::Play { .. } if !was_playing && self.decks[deck].synced => {
                 // Starting a synced deck: start it on the beat.
                 self.sync_deck(deck, t, false);
             }
             _ => {}
+        }
+    }
+
+    /// A track loaded onto a deck that was playing starts playing at once,
+    /// placed so its beats land on the beat of what's playing: the other
+    /// deck if it's playing, otherwise the track it replaced. It starts on
+    /// its first beat (or the first one it can reach without going before
+    /// 0:00). A synced deck stays synced.
+    fn start_on_beat(&mut self, x: usize, t: i64, prev: DeckState) {
+        let other = self.decks[(x + 1) % DECKS];
+        let d = &mut self.decks[x];
+        if d.track.is_none() {
+            return;
+        }
+        d.playing = true;
+        d.anchor_time = t;
+        if d.bpm <= 0.0 {
+            d.anchor_pos = 0.0;
+            return;
+        }
+        let reference = if other.playing && other.bpm > 0.0 && other.track.is_some() {
+            Some(other)
+        } else if prev.bpm > 0.0 && prev.track.is_some() {
+            Some(prev)
+        } else {
+            None
+        };
+        let beat_len = 60.0 / d.bpm;
+        d.anchor_pos = match reference {
+            None => d.first_beat,
+            Some(r) => {
+                // Seconds until the reference's next beat.
+                let phase = r.beat_phase(r.bpm, t);
+                let wait = if phase < 1e-9 {
+                    0.0
+                } else {
+                    (1.0 - phase) * 60.0 / (r.bpm * r.rate())
+                };
+                let lead = wait * d.rate();
+                let mut k = 0.0;
+                while d.first_beat + k * beat_len - lead < 0.0 {
+                    k += 1.0;
+                }
+                d.first_beat + k * beat_len - lead
+            }
+        };
+        if prev.synced && other.bpm > 0.0 && other.track.is_some() {
+            self.decks[x].synced = self.sync_deck(x, t, true);
         }
     }
 
@@ -427,8 +523,11 @@ impl RoomState {
                 cue,
                 bpm,
                 first_beat,
+                key,
                 ..
             } => {
+                d.key = if (0..24).contains(&key) { key } else { -1 };
+                d.key_shift = 0;
                 d.track = Some(track);
                 d.bpm = if bpm.is_finite() && bpm > 0.0 {
                     bpm
@@ -572,6 +671,11 @@ impl RoomState {
                     *e = v.clamp(0.0, 1.0);
                 }
             }
+            Action::KeyLock { on, .. } => {
+                d.reanchor(t);
+                d.key_lock = on;
+            }
+            Action::KeyShift { semitones, .. } => d.key_shift = semitones.clamp(-12, 12),
             Action::Crossfader { .. } | Action::Sync { .. } => {}
         }
     }
@@ -605,6 +709,9 @@ impl RoomState {
             h.f64(d.bpm);
             h.f64(d.first_beat);
             h.u64(d.synced as u64);
+            h.u64(d.key as u64);
+            h.u64(d.key_shift as u64);
+            h.u64(d.key_lock as u64);
             h.u64(d.gen);
         }
         h.u64(self.crossfader.to_bits() as u64);
@@ -630,6 +737,10 @@ impl Fnv {
     fn f64(&mut self, v: f64) {
         self.u64(v.to_bits())
     }
+}
+
+fn no_key() -> i8 {
+    -1
 }
 
 /// A base state plus the recent events after it, kept sorted.
@@ -760,6 +871,7 @@ mod tests {
                 cue: 0.0,
                 bpm: 0.0,
                 first_beat: 0.0,
+                key: -1,
             },
         ));
         tl.insert(ev(2_000_000, 1, 2, Action::Play { deck: 0 }));
@@ -791,6 +903,7 @@ mod tests {
                     cue: 0.0,
                     bpm: 0.0,
                     first_beat: 0.0,
+                    key: -1,
                 },
             ),
             ev(
@@ -804,6 +917,7 @@ mod tests {
                     cue: 5.0,
                     bpm: 0.0,
                     first_beat: 0.0,
+                    key: -1,
                 },
             ),
             ev(500_000, 1, 2, Action::Play { deck: 0 }),
@@ -872,6 +986,7 @@ mod tests {
                 cue: 0.0,
                 bpm: 0.0,
                 first_beat: 0.0,
+                key: -1,
             },
         );
         go(&mut s, 1_000_000, Action::Play { deck: 0 });
@@ -906,6 +1021,7 @@ mod tests {
                 cue: 0.0,
                 bpm: 0.0,
                 first_beat: 0.0,
+                key: -1,
             },
         ));
         s.apply(&ev(0, 1, 2, Action::Play { deck: 0 }));
@@ -951,6 +1067,7 @@ mod tests {
             cue: 0.0,
             bpm,
             first_beat,
+            key: -1,
         }
     }
 
@@ -1061,6 +1178,99 @@ mod tests {
     }
 
     #[test]
+    fn loading_onto_a_playing_deck_starts_on_the_beat() {
+        let mut s = RoomState::default();
+        // Deck B plays at 124; deck A is playing something else.
+        s.apply(&ev(0, 1, 1, grid_load(1, 2, 124.0, 0.31)));
+        s.apply(&ev(0, 1, 2, Action::Play { deck: 1 }));
+        s.apply(&ev(0, 1, 3, grid_load(0, 1, 124.0, 0.05)));
+        s.apply(&ev(0, 1, 4, Action::Play { deck: 0 }));
+        // Load a new 124 BPM track onto A mid-play.
+        s.apply(&ev(9_876_543, 1, 5, grid_load(0, 3, 124.0, 1.2)));
+        let a = s.decks[0];
+        assert!(a.playing, "keeps playing");
+        assert_eq!(a.track, Some(tid(3)));
+        // Its beats line up with deck B's.
+        assert!(beat_offset(&s, 12_000_000, 1.0).abs() < 1e-6);
+        // It starts just before its first beat (no earlier than one beat before).
+        let p = a.position_at(9_876_543);
+        assert!(p <= 1.2 && p > 1.2 - 60.0 / 124.0, "started at {p}");
+    }
+
+    #[test]
+    fn loading_onto_a_playing_deck_follows_the_replaced_track() {
+        let mut s = RoomState::default();
+        s.apply(&ev(0, 1, 1, grid_load(0, 1, 120.0, 0.0)));
+        s.apply(&ev(0, 1, 2, Action::Play { deck: 0 }));
+        // Other deck idle: the new track lands on the old track's beat.
+        let t = 3_210_000;
+        let old_phase = ((s.decks[0].position_at(t) - 0.0) * 2.0).rem_euclid(1.0);
+        s.apply(&ev(t, 1, 3, grid_load(0, 2, 120.0, 0.7)));
+        let d = s.decks[0];
+        let wait = (1.0 - old_phase) * 0.5;
+        assert!(
+            (d.position_at(t) + wait - 0.7).abs() < 1e-9
+                || (d.position_at(t) + wait - 1.2).abs() < 1e-9
+        );
+    }
+
+    #[test]
+    fn key_shift_and_lock() {
+        let mut s = RoomState::default();
+        s.apply(&ev(
+            0,
+            1,
+            1,
+            Action::Load {
+                deck: 0,
+                track: tid(1),
+                duration: 100.0,
+                cue: 0.0,
+                bpm: 120.0,
+                first_beat: 0.0,
+                key: 9 + 12,
+            },
+        ));
+        assert!(s.decks[0].key_lock, "key lock is on by default");
+        s.apply(&ev(
+            0,
+            1,
+            2,
+            Action::Tempo {
+                deck: 0,
+                tempo: 1.06,
+            },
+        ));
+        assert_eq!(
+            s.decks[0].sounding_key(),
+            Some(9 + 12),
+            "tempo doesn't move the key"
+        );
+        s.apply(&ev(
+            0,
+            1,
+            3,
+            Action::KeyShift {
+                deck: 0,
+                semitones: -2,
+            },
+        ));
+        assert_eq!(s.decks[0].sounding_key(), Some(7 + 12));
+        s.apply(&ev(
+            0,
+            1,
+            4,
+            Action::KeyShift {
+                deck: 0,
+                semitones: 0,
+            },
+        ));
+        s.apply(&ev(0, 1, 5, Action::KeyLock { deck: 0, on: false }));
+        // +6% ≈ +1 semitone.
+        assert_eq!(s.decks[0].sounding_key(), Some(10 + 12));
+    }
+
+    #[test]
     fn hot_cue_sets_then_jumps() {
         let mut s = RoomState::default();
         s.apply(&ev(
@@ -1074,6 +1284,7 @@ mod tests {
                 cue: 0.0,
                 bpm: 0.0,
                 first_beat: 0.0,
+                key: -1,
             },
         ));
         s.apply(&ev(0, 1, 2, Action::Play { deck: 1 }));

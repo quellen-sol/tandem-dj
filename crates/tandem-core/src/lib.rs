@@ -18,6 +18,7 @@ pub mod audio;
 pub mod clock;
 pub mod config;
 pub mod files;
+pub mod keys;
 pub mod library;
 pub mod logging;
 pub mod mapping;
@@ -28,6 +29,7 @@ pub mod render;
 pub mod selftest;
 pub mod serato;
 pub mod session;
+pub mod stretch;
 pub mod terms;
 pub mod time;
 

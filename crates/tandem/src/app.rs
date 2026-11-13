@@ -14,7 +14,7 @@ use tandem_core::mapping::MidiOut;
 use tandem_core::model::{Action, TrackId, DECKS};
 use tandem_core::render::LocalParams;
 use tandem_core::serato::SeratoCrate;
-use tandem_core::session::{deck_letter, Session, SessionHandle, SessionView};
+use tandem_core::session::{Session, SessionHandle, SessionView};
 use tandem_core::time::SharedClock;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -307,7 +307,11 @@ impl TandemApp {
         }
         let matches = |t: &str, a: &str| {
             let (t, a) = (t.to_lowercase(), a.to_lowercase());
-            q.split_whitespace().all(|w| t.contains(w) || a.contains(w))
+            // Words must all match; "|" separates alternatives ("house | garage").
+            q.split('|').any(|alt| {
+                alt.split_whitespace()
+                    .all(|w| t.contains(w) || a.contains(w))
+            })
         };
         self.ui.filtered = match &self.ui.source {
             Source::Room => view
@@ -353,14 +357,8 @@ impl TandemApp {
         }
     }
 
-    pub(crate) fn load(&mut self, deck: usize, item: Item, view: &SessionView) {
-        if view.decks[deck].state.playing {
-            self.toast(format!(
-                "Deck {} is playing. Pause it before loading.",
-                deck_letter(deck)
-            ));
-            return;
-        }
+    pub(crate) fn load(&mut self, deck: usize, item: Item, _view: &SessionView) {
+        // Loading onto a playing deck is fine: the new track starts on the beat.
         let mut s = self.session.lock();
         match item {
             Item::File(p) => s.load_path(deck, p),
@@ -369,8 +367,18 @@ impl TandemApp {
     }
 
     /// First deck that isn't playing.
+    /// The deck to load into on double-click: a stopped one, otherwise the
+    /// one that's quieter in the mix.
     pub(crate) fn free_deck(&self, view: &SessionView) -> Option<usize> {
-        (0..DECKS).find(|d| !view.decks[*d].state.playing)
+        (0..DECKS)
+            .find(|d| !view.decks[*d].state.playing)
+            .or_else(|| {
+                let gain = |d: usize| {
+                    tandem_core::render::fader_gain(view.room.decks[d].volume)
+                        * tandem_core::render::xfader_gain(d, view.room.crossfader)
+                };
+                (0..DECKS).min_by(|a, b| gain(*a).partial_cmp(&gain(*b)).unwrap())
+            })
     }
 
     fn handle_midi_queue(&mut self, view: &SessionView) {
@@ -485,9 +493,18 @@ impl TandemApp {
                 });
                 s.act(Action::Sync { deck: 1, on: true });
                 s.act(Action::Play { deck: 1 });
+                let room = s.latest();
+                if let (k, Some(t)) = (room.decks[1].key, room.decks[0].sounding_key()) {
+                    if k >= 0 {
+                        s.act(Action::KeyShift {
+                            deck: 1,
+                            semitones: tandem_core::keys::match_shift(k, t),
+                        });
+                    }
+                }
                 s.act(Action::Crossfader { v: 0.25 });
                 drop(s);
-                self.dev.frame = self.dev.shot_frame.saturating_sub(90);
+                self.dev.frame = self.dev.shot_frame.saturating_sub(600);
             }
         }
         if let (Some(port), 30) = (self.dev.host_port, f) {
@@ -520,6 +537,11 @@ impl TandemApp {
             self.session
                 .lock()
                 .offer_share("Friday warm-up".into(), paths);
+        }
+        if self.dev.demo && self.dev.demo_started && f == self.dev.shot_frame.saturating_sub(40) {
+            if let Some(item) = self.item_at(2, view) {
+                self.load(0, item, view);
+            }
         }
         if self.dev.screenshot.is_some() {
             if f == self.dev.shot_frame {

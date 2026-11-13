@@ -24,6 +24,20 @@ const GREEN: Color32 = Color32::from_rgb(90, 220, 120);
 const RED: Color32 = Color32::from_rgb(240, 90, 90);
 const AMBER: Color32 = Color32::from_rgb(250, 190, 60);
 
+/// Camelot-compatible: same key, relative major/minor, or one step round the wheel.
+fn keys_fit(a: i8, b: i8) -> bool {
+    let (ca, cb) = (tandem_core::keys::camelot(a), tandem_core::keys::camelot(b));
+    let split = |c: &str| {
+        (
+            c[..c.len() - 1].parse::<i32>().unwrap_or(0),
+            c.ends_with('A'),
+        )
+    };
+    let ((na, ma), (nb, mb)) = (split(&ca), split(&cb));
+    let dist = (na - nb).rem_euclid(12).min((nb - na).rem_euclid(12));
+    (ma == mb && dist <= 1) || (na == nb)
+}
+
 pub fn fmt_time(s: f64) -> String {
     let s = s.max(0.0);
     let m = (s / 60.0).floor();
@@ -209,6 +223,20 @@ impl TandemApp {
                     None => ui.monospace(RichText::new("--- BPM").weak()),
                 };
                 ui.monospace(format!("{:+.2}%", (st.tempo - 1.0) * 100.0));
+                ui.separator();
+                let other = &view.room.decks[(d + 1) % 2];
+                match st.sounding_key() {
+                    Some(k) => {
+                        let fits = other.sounding_key().map(|o| keys_fit(k, o)).unwrap_or(false);
+                        let text = RichText::new(format!("{} {}", tandem_core::keys::camelot(k), tandem_core::keys::name(k))).size(15.0).strong();
+                        ui.label(if fits { text.color(GREEN) } else { text })
+                            .on_hover_text(if fits { "Harmonically compatible with the other deck" } else { "Key (Camelot)" });
+                    }
+                    None if st.track.is_some() => {
+                        ui.monospace(RichText::new("key ?").weak());
+                    }
+                    None => {}
+                }
             });
 
             if let Some(seek) = overview(ui, dv, pos, col) {
@@ -299,7 +327,53 @@ impl TandemApp {
                 });
             });
 
-            ui.add_space(4.0);
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                let other = view.room.decks[(d + 1) % 2];
+                let lock_fill = if st.key_lock { Color32::from_rgb(110, 70, 170) } else { Color32::from_gray(50) };
+                if ui
+                    .add(egui::Button::new(RichText::new("KEY LOCK").strong()).fill(lock_fill).min_size(vec2(72.0, 20.0)))
+                    .on_hover_text("On: changing tempo keeps the original pitch. Off: pitch follows tempo, like vinyl.")
+                    .clicked()
+                {
+                    self.pending.push(Action::KeyLock { deck, on: !st.key_lock });
+                }
+                ui.label(RichText::new("key").weak());
+                if ui.small_button("−").on_hover_text("Down a semitone").clicked() {
+                    self.pending.push(Action::KeyShift { deck, semitones: (st.key_shift - 1).max(-12) });
+                }
+                ui.monospace(format!("{:+}", st.key_shift));
+                if ui.small_button("+").on_hover_text("Up a semitone").clicked() {
+                    self.pending.push(Action::KeyShift { deck, semitones: (st.key_shift + 1).min(12) });
+                }
+                if st.key_shift != 0 && ui.small_button("reset").clicked() {
+                    self.pending.push(Action::KeyShift { deck, semitones: 0 });
+                }
+                let target = other.sounding_key();
+                let shift = match (st.key >= 0, target) {
+                    (true, Some(t)) => Some(tandem_core::keys::match_shift(st.key, t)),
+                    _ => None,
+                };
+                let r = ui
+                    .add_enabled(shift.is_some(), egui::Button::new("MATCH KEY"))
+                    .on_hover_text(match (shift, target) {
+                        (Some(s), Some(t)) => format!(
+                            "Shift this deck {s:+} semitones to sound in {} (or its relative key), matching the other deck",
+                            tandem_core::keys::camelot(t)
+                        ),
+                        _ => String::new(),
+                    })
+                    .on_disabled_hover_text("Both decks need a track with a detected key.");
+                if r.clicked() {
+                    if let Some(s) = shift {
+                        if !st.key_lock {
+                            self.pending.push(Action::KeyLock { deck, on: true });
+                        }
+                        self.pending.push(Action::KeyShift { deck, semitones: s });
+                    }
+                }
+            });
+            ui.add_space(2.0);
             ui.horizontal(|ui| {
                 let other = &view.room.decks[(d + 1) % 2];
                 let can_sync = st.bpm > 0.0 && other.bpm > 0.0 && other.track.is_some();
@@ -315,10 +389,17 @@ impl TandemApp {
                             .min_size(vec2(52.0, 20.0))
                             .fill(sync_fill),
                     )
-                    .on_hover_text("Match this deck's tempo and beats to the other deck, and keep their tempos locked together.")
+                    .on_hover_text("Match this deck's tempo and beats to the other deck, and keep their tempos locked together. Right-click (or SHIFT + SYNC): sync off, back to the deck's own BPM.")
                     .on_disabled_hover_text("Both decks need a track with a detected beat.");
                 if r.clicked() {
                     self.pending.push(Action::Sync { deck, on: !st.synced });
+                }
+                if r.secondary_clicked() {
+                    // Like SHIFT + SYNC: sync off, back to the deck's own BPM
+                    // (plus wherever the controller's tempo fader sits).
+                    self.pending.push(Action::Sync { deck, on: false });
+                    let tempo = self.midi.engine.lock().hardware_tempo(deck).unwrap_or(1.0);
+                    self.pending.push(Action::Tempo { deck, tempo });
                 }
                 let range = (self.settings.tempo_range * 100.0) as f32;
                 let mut pct = ((st.tempo - 1.0) * 100.0) as f32;

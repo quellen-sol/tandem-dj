@@ -43,6 +43,14 @@ Each deck in each lane has a *read head* that chases the model's playhead:
 
 `StreamClock` maps each sound-card callback to room time and smooths out callback jitter.
 
+### Key lock and key shift
+
+With key lock on, or with a key shift, a read head feeds the track through Signalsmith Stretch, which changes speed without changing pitch (and pitch without changing speed). The stretcher's latency is part of the read head's maths: the audio heard now is `fed position − input latency − speed × output latency`. Chasing and sync therefore work exactly as in vinyl mode. When starting at a cue point, the stretcher is primed and pre-rolled, so the first sample out is the cue point itself. A test checks that key-locked kicks land within 4 ms of vinyl ones. The stretcher uses a fixed random seed, so both booths still render identical audio. Scratching always uses vinyl mode.
+
+### BPM, beatgrid and key detection
+
+`analysis.rs` builds a kick-weighted onset envelope and sweeps every tempo from 68 to 190 BPM over the whole track. Each tempo is scored together with its double and half, with a mild preference for dance tempos, so dotted 2-step rhythms and half-time grooves don't win. The beat phase comes from the same comb. `keys.rs` folds sustained note energy into pitch classes and matches them against Temperley's major/minor key profiles. Results are cached per file (and versioned, so better detection re-runs). They travel with the `Load` event, so both booths use the same grid and key.
+
 ### Local vs shared
 
 | Shared (in the timeline) | Local (this booth only) |

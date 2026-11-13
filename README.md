@@ -4,7 +4,7 @@ Back-to-back DJing with a friend, from anywhere. Two DJs in different places sha
 
 **Personal, non-commercial use only.** See [TERMS.md](TERMS.md).
 
-> **Status: v0.1, first round.** Windows only. The sync core is proven by tests; the rest is a playable first version for two people to try. See [docs/ROADMAP.md](docs/ROADMAP.md) for what's next and a test plan.
+> **Status: v0.2.** Windows only. Rooms, BPM and key detection, sync, key lock and a ready-made DDJ-FLX6 mapping all work; this is still an early version for two people to try. See [docs/ROADMAP.md](docs/ROADMAP.md) for what's next and a test plan.
 
 ## How it works
 
@@ -37,11 +37,24 @@ The self-test lists your audio and MIDI devices, opens your default output for h
    - **Speakers (master):** your controller's sound card, channels 1/2.
    - **Headphones (cue):** the same device, channels 3/4. Most controllers expose four channels.
    - Use the **🎧 CUE** buttons on the mixer to send a deck to your headphones, and **phones: cue ↔ master** to blend.
-3. **Controller.** Close Serato, rekordbox and any other DJ app, because only one app can use the controller at a time. Then open **Settings → Controller**, pick your controller, click **Learn** next to each function and move or press the matching control.
-   - **Faders and knobs use soft takeover.** A hardware fader only takes over once it reaches the value the room already has, so you never jump over your partner's mix.
+3. **Controller.** Close Serato, rekordbox and any other DJ app, because only one app can use the controller at a time. Then open **Settings → Controller** and pick your controller.
+   - **Pioneer DDJ-FLX6, DDJ-FLX4 and DDJ-400 map themselves.** Everything on the deck and mixer sections works straight away, including the pads, jog wheels, SYNC and the button lights. On a four-deck FLX6, decks 1 and 3 control Tandem's deck A, and 2 and 4 control deck B.
+   - **Other controllers:** click **Learn** next to each function, then move or press the matching control.
+   - **Calibrate the jog wheel** once (Settings → Controller → **Calibrate…**: turn the platter exactly one full turn). Then scratching moves the record exactly as far as your hand, like a 33⅓ record.
+   - **Faders and knobs use soft takeover.** A control nobody has moved yet takes your hardware position straight away. Once the room value has changed, your fader takes over only when it reaches that value, so you never jump over your partner's mix.
    - **Jog wheel moves the wrong way or jumps?** Tick **1/127 style** or **invert** next to it.
 
-Mappings are saved per controller, so you only do this once.
+Mappings are saved per controller, so you only do this once. When Tandem's built-in mapping gains new controls, your saved mapping picks them up automatically. Your calibration and changes are kept.
+
+## BPM, sync and keys
+
+- **Analyze BPM** (library toolbar) works out the tempo, beatgrid and musical key of every track in the list, in the background. Each track is only analysed once, and tracks are also analysed when you load them. A key already in the file's tags is used as-is.
+- **Beat markers** run along the top of each scrolling waveform.
+- **SYNC** matches a deck's tempo and beats to the other deck, using half or double time when that's closer. While SYNC is on, moving either deck's tempo fader moves both, and pressing play on a synced deck starts it on the beat.
+- **SHIFT + SYNC** on the controller, or right-clicking SYNC, turns sync off. The deck goes back to its own BPM, offset only by where your tempo fader sits.
+- **KEY LOCK** is on by default, so changing tempo doesn't change pitch. Turn it off for vinyl-style pitch. Scratching always sounds like vinyl.
+- **Keys** show in Camelot notation (8A, 11B…), in green when the two decks are harmonically compatible. Use **−/+** to shift a deck by semitones. **MATCH KEY** shifts it the smallest amount needed to sit in the other deck's key, or its relative major/minor.
+- **Loading onto a playing deck** swaps the track instantly. The new track starts on the beat of what's playing: the other deck if it's playing, otherwise the track you replaced. A synced deck stays synced.
 
 ## Play together
 
@@ -79,13 +92,14 @@ tandem.exe --data-dir C:\temp\tandem-bob
 
 Host in one window and join `127.0.0.1` from the other.
 
-## Known limits in v0.1
+## Known limits in v0.2
 
 - **Decks and DJs:** 2 decks, 2 DJs per room.
-- **No key lock:** tempo changes pitch, like vinyl.
-- **No beat sync yet:** no beatgrids, sync button or quantize. BPM comes from file tags (Serato writes these).
-- **Mixer:** no effects or loops. EQ is a 3-band isolator.
-- **Controllers:** MIDI only, with no LED feedback yet. Controllers that only speak HID aren't supported.
+- **Beatgrids:** a steady tempo is assumed, and bars (the "1") aren't detected yet. Hot cues and play aren't snapped to the beat, except on a synced deck.
+- **Keys:** detection is good but not perfect. It can mix up a key with its relative major/minor (same Camelot number), and very drum-heavy tracks are harder.
+- **Mixer:** no effects or loops. EQ is a 3-band isolator, plus a filter and trim per channel.
+- **Controllers:** MIDI only. Controllers that only speak HID aren't supported.
+- **CPU:** the screen redraws use more CPU than the audio does. Key lock costs under 2% of one core per deck.
 - **Audio driver:** WASAPI shared mode, roughly 10–20 ms of output latency. No ASIO yet.
 - **Serato data:** crates are read, but Serato cue points and beatgrids aren't imported yet.
 - **Security:** traffic isn't encrypted by Tandem itself. Use Tailscale, which is encrypted. The room code is a simple gate, not a password.
@@ -102,7 +116,7 @@ Host in one window and join `127.0.0.1` from the other.
 
 ## Build from source
 
-You need Rust (stable) and the Visual Studio Build Tools (C++ workload).
+You need Rust (stable) and the Visual Studio Build Tools (C++ workload). The C++ compiler builds the vendored time-stretcher.
 
 ```
 cargo build --release -p tandem      # target\release\tandem.exe
@@ -114,3 +128,5 @@ cargo test -p tandem-core            # core tests, including a two-booth TCP tes
 ## License
 
 [PolyForm Noncommercial 1.0.0](LICENSE). The source is available for any non-commercial use. This is intentionally *not* an OSI open-source license, because those can't forbid commercial use.
+
+Tandem includes [Signalsmith Stretch](https://github.com/Signalsmith-Audio/signalsmith-stretch) for key lock and key shift (MIT). See [THIRD_PARTY.md](THIRD_PARTY.md).

@@ -62,22 +62,61 @@ pub enum TargetKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "t")]
 pub enum Target {
-    Play { deck: u8 },
-    Cue { deck: u8 },
-    Sync { deck: u8 },
-    HotCue { deck: u8, slot: u8 },
-    HotCueClear { deck: u8, slot: u8 },
-    Tempo { deck: u8 },
-    Volume { deck: u8 },
-    Eq { deck: u8, band: u8 },
-    Trim { deck: u8 },
-    Filter { deck: u8 },
-    Pfl { deck: u8 },
-    Jog { deck: u8 },
-    JogTouch { deck: u8 },
-    BendDown { deck: u8 },
-    BendUp { deck: u8 },
-    Load { deck: u8 },
+    Play {
+        deck: u8,
+    },
+    Cue {
+        deck: u8,
+    },
+    Sync {
+        deck: u8,
+    },
+    /// SHIFT + SYNC: sync off, tempo back to where the tempo fader sits.
+    SyncOff {
+        deck: u8,
+    },
+    HotCue {
+        deck: u8,
+        slot: u8,
+    },
+    HotCueClear {
+        deck: u8,
+        slot: u8,
+    },
+    Tempo {
+        deck: u8,
+    },
+    Volume {
+        deck: u8,
+    },
+    Eq {
+        deck: u8,
+        band: u8,
+    },
+    Trim {
+        deck: u8,
+    },
+    Filter {
+        deck: u8,
+    },
+    Pfl {
+        deck: u8,
+    },
+    Jog {
+        deck: u8,
+    },
+    JogTouch {
+        deck: u8,
+    },
+    BendDown {
+        deck: u8,
+    },
+    BendUp {
+        deck: u8,
+    },
+    Load {
+        deck: u8,
+    },
     Crossfader,
     CueMix,
     Browse,
@@ -90,6 +129,9 @@ impl Target {
             Target::Play { deck: d } => format!("Deck {} · Play/Pause", deck(d)),
             Target::Cue { deck: d } => format!("Deck {} · Cue", deck(d)),
             Target::Sync { deck: d } => format!("Deck {} · Sync", deck(d)),
+            Target::SyncOff { deck: d } => {
+                format!("Deck {} · Sync off (back to tempo fader)", deck(d))
+            }
             Target::HotCue { deck: d, slot } => format!("Deck {} · Hot cue {}", deck(d), slot + 1),
             Target::HotCueClear { deck: d, slot } => {
                 format!("Deck {} · Clear hot cue {}", deck(d), slot + 1)
@@ -146,6 +188,7 @@ impl Target {
             v.push(Target::Play { deck: d });
             v.push(Target::Cue { deck: d });
             v.push(Target::Sync { deck: d });
+            v.push(Target::SyncOff { deck: d });
             for slot in 0..8 {
                 v.push(Target::HotCue { deck: d, slot });
             }
@@ -225,7 +268,7 @@ pub struct Mapping {
 }
 
 /// Bump when built-in presets gain controls; saved mappings pick them up.
-pub const PRESET_VERSION: u32 = 2;
+pub const PRESET_VERSION: u32 = 3;
 
 impl Mapping {
     pub fn empty(device: &str) -> Self {
@@ -435,6 +478,12 @@ impl MidiEngine {
         out
     }
 
+    /// Tempo the hardware tempo fader is physically set to, if we've seen it.
+    pub fn hardware_tempo(&self, deck: u8) -> Option<f64> {
+        let v = self.takeover.get(&Target::Tempo { deck })?.last_hw?;
+        Some(1.0 + (v as f64 - 0.5) * 2.0 * self.tempo_range)
+    }
+
     /// Targets whose hardware control hasn't "picked up" the room value yet.
     pub fn waiting_for_pickup(&self) -> Vec<Target> {
         self.takeover
@@ -581,6 +630,16 @@ impl MidiEngine {
                 Target::Sync { deck } if down => {
                     let on = !room.decks[deck as usize].synced;
                     out.push(MidiOut::Action(Action::Sync { deck, on }));
+                }
+                Target::SyncOff { deck } if down => {
+                    out.push(MidiOut::Action(Action::Sync { deck, on: false }));
+                    let tempo = self.hardware_tempo(deck).unwrap_or(1.0);
+                    out.push(MidiOut::Action(Action::Tempo { deck, tempo }));
+                    // The fader is in control again straight away, no pickup.
+                    if let Some(t) = self.takeover.get_mut(&Target::Tempo { deck }) {
+                        t.engaged = true;
+                        t.last_sent = t.last_hw;
+                    }
                 }
                 Target::HotCue { deck, slot } if down => {
                     out.push(MidiOut::Action(Action::HotCue { deck, slot }))
@@ -844,6 +903,7 @@ fn pioneer_ddj(device: &str, name: &str, hw_decks: u8, ticks_per_rev: f32) -> Ma
         m.bind(Trigger::note(ch, 0x0B), Target::Play { deck });
         m.bind(Trigger::note(ch, 0x0C), Target::Cue { deck });
         m.bind(Trigger::note(ch, 0x58), Target::Sync { deck });
+        m.bind(Trigger::note(ch, 0x60), Target::SyncOff { deck });
         m.bind(Trigger::note(ch, 0x36), Target::JogTouch { deck });
         for cc in [0x21, 0x22, 0x23] {
             m.bind(Trigger::cc(ch, cc), Target::Jog { deck });
@@ -1071,11 +1131,11 @@ mod tests {
         saved.jog_ticks_per_rev = Some(6387.0);
         saved
             .bindings
-            .retain(|b| !matches!(b.target, Target::Sync { .. }));
+            .retain(|b| !matches!(b.target, Target::Sync { .. } | Target::SyncOff { .. }));
         saved.bindings.retain(|b| b.trigger != Trigger::note(7, 0));
         saved.bind(Trigger::note(7, 0), Target::Play { deck: 0 });
         let added = saved.upgrade_from(&preset);
-        assert_eq!(added, 4, "SYNC on decks 1-4");
+        assert_eq!(added, 8, "SYNC and SHIFT+SYNC on decks 1-4");
         assert!(saved
             .bindings
             .iter()
@@ -1088,6 +1148,26 @@ mod tests {
             .collect();
         assert_eq!(pad1.len(), 1, "custom binding kept, not doubled");
         assert_eq!(saved.upgrade_from(&preset), 0, "only once");
+    }
+
+    #[test]
+    fn shift_sync_turns_sync_off_and_returns_to_the_fader() {
+        let mut e = MidiEngine::new(pioneer_ddj("DDJ-FLX6", "test", 4, 2048.0), 0.08);
+        let local = LocalParams::default();
+        let mut room = RoomState::default();
+        // Tempo fader physically at +4% (fader 0.75 with an 8% range).
+        let _ = e.handle(&[0xb0, 0x00, 96], &room, &local);
+        let _ = e.handle(&[0xb0, 0x20, 0], &room, &local);
+        room.decks[0].synced = true;
+        room.decks[0].tempo = 0.93; // sync pulled it elsewhere
+        let out = e.handle(&[0x90, 0x60, 127], &room, &local);
+        assert_eq!(out[0], MidiOut::Action(Action::Sync { deck: 0, on: false }));
+        match out[1] {
+            MidiOut::Action(Action::Tempo { tempo, .. }) => {
+                assert!((tempo - 1.04).abs() < 0.001, "{tempo}")
+            }
+            ref other => panic!("{other:?}"),
+        }
     }
 
     #[test]

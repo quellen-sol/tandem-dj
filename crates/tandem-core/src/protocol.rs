@@ -30,6 +30,9 @@ pub struct TrackInfo {
     /// Detected tempo and beat positions, if analysed.
     #[serde(default)]
     pub grid: Option<crate::analysis::BeatGrid>,
+    /// Detected key (see [`crate::keys`]), if analysed.
+    #[serde(default)]
+    pub key: Option<i8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

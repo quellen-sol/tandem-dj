@@ -42,17 +42,25 @@ Work through these in order and note anything that fails. `tandem.log` (Settings
     - Do both booths keep playing?
     - Can you rejoin?
 
-## Round 2 candidates
+## Round 2 (v0.2): done
+
+- **DDJ-FLX6 support:** built-in mapping (FLX4 and DDJ-400 too), vinyl scratching with jog calibration, ring pitch-bend nudging, filter and trim, button and pad lights, keep-alive, and saved mappings that pick up new controls.
+- **BPM and beatgrid detection,** with beat markers, plus key detection in Camelot notation. Both are cached per file and run in the background with Analyze BPM.
+- **SYNC:** tempo and beat match with half/double time, locked tempos, synced decks starting on the beat, and SHIFT + SYNC (or right-click) to return to the deck's own BPM.
+- **Key lock** (on by default), semitone key shift and MATCH KEY, using Signalsmith Stretch.
+- **Loading onto a playing deck** starts the new track on the beat.
+- **Library:** analysed BPM and key columns; "Title - Artist" file names detected; `|` in search means "or".
+
+## Next candidates
 
 Rough priority order:
 
-1. **Beatgrids and sync:** import Serato's BeatGrid tag, analyse otherwise, add a sync button and quantize. Beat-snapped actions get scheduled on the next beat, which hides network latency completely for cues, as long as the delay is under one beat.
-2. **Key lock** (time-stretch, e.g. Signalsmith Stretch).
-3. **Serato cue points and loops** from the Markers2 tag.
-4. **Controller LED feedback** (MIDI out) and per-controller presets for common Pioneer, Numark and Hercules models.
+1. **Downbeats (bars)** in the beatgrid, plus quantize for hot cues, play and loops.
+2. **Loops:** auto-loop, loop in/out and reloop on the FLX6 controls.
+3. **Lower UI CPU:** redraw waveforms only when they change, and cap the frame rate.
+4. **Serato cue points and loops** from the Markers2 tag.
 5. **Lower-latency audio:** WASAPI exclusive mode or ASIO.
-6. **Loops and a filter knob** per channel.
-7. **Recording** the broadcast lane to WAV.
-8. **Deck ownership indicators and optional locks.**
-9. **Encrypted transport** (QUIC/TLS) and an optional relay server, so neither DJ needs Tailscale or port forwarding.
-10. **Four decks.**
+6. **Recording** the broadcast lane to WAV.
+7. **Effects:** beat FX (echo, reverb) on the FLX6's FX section.
+8. **Encrypted transport** (QUIC/TLS) and an optional relay server, so neither DJ needs Tailscale or port forwarding.
+9. **Four decks.**

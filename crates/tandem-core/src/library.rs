@@ -37,6 +37,9 @@ pub struct LibTrack {
     /// BPM from Tandem's own analysis, once analysed.
     #[serde(default)]
     pub grid_bpm: Option<f64>,
+    /// Detected (or tagged) key, see [`crate::keys`].
+    #[serde(default)]
+    pub key: Option<i8>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -53,7 +56,17 @@ struct CacheEntry {
     grid: Option<BeatGrid>,
     #[serde(default)]
     analyzed: bool,
+    #[serde(default)]
+    key: Option<i8>,
+    #[serde(default)]
+    key_done: bool,
+    /// Which version of key detection produced `key`.
+    #[serde(default)]
+    key_version: u32,
 }
+
+/// Bump when key detection improves: cached keys from older versions are redone.
+const KEY_VERSION: u32 = 2;
 
 /// "Left - Right" parts of a file name, if it has that shape.
 fn name_split(path: &Path) -> Option<(String, String)> {
@@ -278,6 +291,9 @@ impl Library {
                         id: Some(id),
                         grid: None,
                         analyzed: false,
+                        key: None,
+                        key_done: false,
+                        key_version: 0,
                     },
                 );
             }
@@ -290,6 +306,7 @@ impl Library {
             bpm: None,
             duration: 0.0,
             grid_bpm: None,
+            key: None,
         }]);
         self.cache_dirty = true;
     }
@@ -344,6 +361,9 @@ pub fn scan(lib: &Arc<Mutex<Library>>, key: String, kind: SourceKind) {
                         id: None,
                         grid: None,
                         analyzed: false,
+                        key: None,
+                        key_done: false,
+                        key_version: 0,
                     };
                     let mut l = lib.lock();
                     l.cache
@@ -360,6 +380,7 @@ pub fn scan(lib: &Arc<Mutex<Library>>, key: String, kind: SourceKind) {
                 bpm: e.bpm,
                 duration: e.duration,
                 grid_bpm: e.grid.map(|g| g.bpm),
+                key: e.key,
             });
             if i % 500 == 499 {
                 let mut l = lib.lock();
@@ -468,19 +489,75 @@ pub fn record_grid(lib: &Arc<Mutex<Library>>, path: &Path, grid: Option<BeatGrid
     }
 }
 
-/// Beatgrid for a decoded track: from the cache, or analysed now and cached.
-pub fn grid_for(
+/// A key from the file's tags (TKEY etc.), if it has one.
+pub fn read_key_tag(path: &Path) -> Option<i8> {
+    use lofty::prelude::*;
+    let tf = lofty::read_from_path(path).ok()?;
+    let tag = tf.primary_tag().or_else(|| tf.first_tag())?;
+    tag.get_string(&ItemKey::InitialKey)
+        .and_then(crate::keys::parse)
+}
+
+fn key_known(lib: &Arc<Mutex<Library>>, path: &Path) -> Option<Option<i8>> {
+    let (size, mtime) = stat(path)?;
+    lib.lock()
+        .cached(path, size, mtime)
+        .filter(|e| e.key_done && e.key_version == KEY_VERSION)
+        .map(|e| e.key)
+}
+
+fn record_key(lib: &Arc<Mutex<Library>>, path: &Path, key: Option<i8>) {
+    let Some((size, mtime)) = stat(path) else {
+        return;
+    };
+    let mut l = lib.lock();
+    let k = path.to_string_lossy().to_string();
+    if let Some(e) = l
+        .cache
+        .get_mut(&k)
+        .filter(|e| e.size == size && e.mtime == mtime)
+    {
+        e.key = key;
+        e.key_done = true;
+        e.key_version = KEY_VERSION;
+        l.cache_dirty = true;
+    }
+    for list in l.lists.values_mut() {
+        for t in list.tracks.iter_mut().filter(|t| t.path == path) {
+            t.key = key;
+        }
+    }
+}
+
+/// Beatgrid and key for a decoded track: from the cache, or worked out now
+/// (and cached). A key tag in the file wins over detection.
+pub fn analysis_for(
     lib: &Arc<Mutex<Library>>,
     path: &Path,
     audio: &TrackAudio,
     tag_bpm: Option<f32>,
-) -> Option<BeatGrid> {
-    if is_analyzed(lib, path) {
-        return cached_grid(lib, path);
-    }
-    let grid = analysis::analyze(audio, tag_bpm.map(|b| b as f64));
-    record_grid(lib, path, grid);
-    grid
+) -> (Option<BeatGrid>, Option<i8>) {
+    let grid = if is_analyzed(lib, path) {
+        cached_grid(lib, path)
+    } else {
+        let g = analysis::analyze(audio, tag_bpm.map(|b| b as f64));
+        record_grid(lib, path, g);
+        g
+    };
+    let key = match key_known(lib, path) {
+        Some(k) => k,
+        None => {
+            let k = read_key_tag(path).or_else(|| crate::keys::detect(audio));
+            record_key(lib, path, k);
+            k
+        }
+    };
+    (grid, key)
+}
+
+/// Cached key for a file, if known.
+pub fn cached_key(lib: &Arc<Mutex<Library>>, path: &Path) -> Option<i8> {
+    key_known(lib, path).flatten()
 }
 
 /// Analyse every not-yet-analysed track in a list, in the background.
@@ -495,7 +572,10 @@ pub fn analyze_list(lib: &Arc<Mutex<Library>>, key: &str) {
             .map(|li| li.tracks.iter().map(|t| t.path.clone()).collect())
             .unwrap_or_default()
     };
-    let todo: Vec<PathBuf> = paths.into_iter().filter(|p| !is_analyzed(lib, p)).collect();
+    let todo: Vec<PathBuf> = paths
+        .into_iter()
+        .filter(|p| !is_analyzed(lib, p) || key_known(lib, p).is_none())
+        .collect();
     if todo.is_empty() {
         return;
     }
@@ -511,15 +591,20 @@ pub fn analyze_list(lib: &Arc<Mutex<Library>>, key: &str) {
                 let Some(path) = queue.lock().pop() else {
                     break;
                 };
-                if !is_analyzed(&lib, &path) {
+                if !is_analyzed(&lib, &path) || key_known(&lib, &path).is_none() {
                     // Make sure the file has a cache entry to hold the result.
                     let _ = hash_path(&lib, &path);
                     let hint = stat(&path)
                         .and_then(|(s, m)| lib.lock().cached(&path, s, m).and_then(|e| e.bpm));
-                    let grid = crate::audio::decode_file(&path, TrackId([0; 32]))
-                        .ok()
-                        .and_then(|a| analysis::analyze(&a, hint.map(|b| b as f64)));
-                    record_grid(&lib, &path, grid);
+                    match crate::audio::decode_file(&path, TrackId([0; 32])) {
+                        Ok(a) => {
+                            let _ = analysis_for(&lib, &path, &a, hint);
+                        }
+                        Err(_) => {
+                            record_grid(&lib, &path, None);
+                            record_key(&lib, &path, None);
+                        }
+                    }
                 }
                 if let Some(a) = lib.lock().analyzing.as_mut() {
                     a.1 += 1;
@@ -598,6 +683,7 @@ mod tests {
                     bpm: None,
                     duration: 0.0,
                     grid_bpm: None,
+                    key: None,
                 }
             })
             .collect();

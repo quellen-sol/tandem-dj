@@ -2,7 +2,7 @@
 //! Usage: cargo run --release --example analyze -- <file-or-folder> [max files]
 use std::path::PathBuf;
 use std::time::Instant;
-use tandem_core::{analysis, audio, library, TrackId};
+use tandem_core::{analysis, audio, keys, library, TrackId};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -33,12 +33,15 @@ fn main() {
         };
         let decoded = t.elapsed();
         let g = analysis::analyze(&a, None);
+        let key = keys::detect(&a)
+            .map(|k| format!("{:>3} {:<4}", keys::camelot(k), keys::name(k)))
+            .unwrap_or_else(|| "  ?     ".into());
         let txt = match g {
             Some(g) => format!("{:7.2} BPM  first beat {:6.3}s", g.bpm, g.first_beat),
             None => "   no steady beat".to_string(),
         };
         println!(
-            "{:<60} {txt}  (decode {:.2}s, analyze {:.2}s)",
+            "{:<60} {key} {txt}  (decode {:.2}s, analyze {:.2}s)",
             name(&p),
             decoded.as_secs_f64(),
             (t.elapsed() - decoded).as_secs_f64()
