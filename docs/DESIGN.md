@@ -43,6 +43,19 @@ Each deck in each lane has a *read head* that chases the model's playhead:
 
 `StreamClock` maps each sound-card callback to room time and smooths out callback jitter.
 
+### Loops
+
+A loop is part of the deck's state: an in point, an out point and whether it's looping. While looping, `position_at` wraps the analytic playhead, so it's still a pure function of the events: past the out point it carries on from the in point, at `in + (p − in) mod length`.
+
+- **Anchor.** Anything that moves the anchor to or past the out point (a nudge, a sync phase shift, halving) wraps it. A jump (seek, CUE, hot cue) that lands outside the loop ends it.
+- **Beat loops** start on the grid: on the beat the playhead is in, or for loops under a beat, on that fraction of the beat (`BeatGrid::beat_loop`). The playhead is always inside the loop, and wrapping keeps the beat phase, so a synced deck stays locked.
+- **Leaving a loop** shorter than a beat can leave a synced deck between beats, so the deck re-matches its phase. Whole-beat loops don't move.
+- **Relocks** for tempo changes only look at markers inside the loop, plus the jump back to the in point.
+
+Read heads go round loops by themselves. They read the track through the loop: frames past the out point come from the in point, and the last 96 frames (about 2 ms) before the out point fade into the frames just before the in point. Going round is therefore seamless and click-free, through the stretcher too, with no jump and no re-priming. The chase measures its error the short way round the loop.
+
+A loop that appears or changes under audio the head has already read makes the head hard-sync with the usual 2 ms crossfade. That happens with LOOP OUT pressed at the playhead, a partner's loop arriving a little late, and always with a stretched head, because the stretcher reads ahead.
+
 ### Key lock and key shift
 
 With key lock on, or with a key shift, a read head feeds the track through Signalsmith Stretch, which changes speed without changing pitch (and pitch without changing speed). The stretcher's latency is part of the read head's maths: the audio heard now is `fed position − input latency − speed × output latency`. Chasing and sync therefore work exactly as in vinyl mode. When starting at a cue point, the stretcher is primed and pre-rolled, so the first sample out is the cue point itself. A test checks that key-locked kicks land within 4 ms of vinyl ones. The stretcher uses a fixed random seed, so both booths still render identical audio. Scratching always uses vinyl mode.
@@ -65,7 +78,7 @@ Grids are boxed inside `Action` (which is therefore `Clone`, not `Copy`) so the 
 
 | Shared (in the timeline) | Local (this booth only) |
 |---|---|
-| decks: load, play, cue, hot cues, tempo, bend, nudge, beatgrids | headphone cue (PFL) per deck |
+| decks: load, play, cue, hot cues, loops, tempo, bend, nudge, beatgrids | headphone cue (PFL) per deck |
 | channel faders, EQ, crossfader | headphone mix and level |
 | | master and broadcast levels, sync click |
 

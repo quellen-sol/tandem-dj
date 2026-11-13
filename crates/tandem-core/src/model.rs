@@ -13,6 +13,15 @@ use std::fmt;
 
 pub const DECKS: usize = 2;
 pub const HOT_CUES: usize = 8;
+/// Beat loop sizes (in beats) on the pads and buttons: ¼ to 32.
+pub const BEAT_LOOPS: [f64; 8] = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0];
+/// Shortest loop (seconds): LOOP OUT closer than this to LOOP IN does
+/// nothing, and halving stops here.
+pub const MIN_LOOP: f64 = 0.01;
+/// Longest beat loop, in beats.
+const MAX_LOOP_BEATS: f64 = 512.0;
+/// Beat length (seconds) for beat loops on a track with no beatgrid (120 BPM).
+const NO_GRID_BEAT: f64 = 0.5;
 
 /// Content hash (BLAKE3) of a track file. Two peers with the same file have
 /// the same id, whatever they named it.
@@ -111,6 +120,20 @@ pub struct DeckState {
     pub key_shift: i8,
     /// Key lock: tempo changes don't change pitch.
     pub key_lock: bool,
+    /// Loop in point (seconds), set by LOOP IN or a beat loop.
+    #[serde(default)]
+    pub loop_in: Option<f64>,
+    /// Loop out point. None while a LOOP IN waits for LOOP OUT.
+    #[serde(default)]
+    pub loop_out: Option<f64>,
+    /// Looping: on reaching `loop_out`, playback carries on from `loop_in`.
+    /// While looping, the anchor is always before `loop_out`.
+    #[serde(default)]
+    pub looping: bool,
+    /// The loop's length in beats, for loops made from the grid (beat loops,
+    /// and halving or doubling them). None for loops set by hand.
+    #[serde(default)]
+    pub loop_beats: Option<f64>,
     /// Bumped on every discontinuity (load, play, pause, jump). The renderer
     /// hard-syncs when it changes and smoothly chases otherwise.
     pub gen: u64,
@@ -142,6 +165,10 @@ impl Default for DeckState {
             key: -1,
             key_shift: 0,
             key_lock: true,
+            loop_in: None,
+            loop_out: None,
+            looping: false,
+            loop_beats: None,
             gen: 0,
             last_touch: 0,
         }
@@ -153,7 +180,8 @@ impl DeckState {
         self.tempo * (1.0 + self.bend)
     }
 
-    /// Track position (seconds) at shared time `t`.
+    /// Track position (seconds) at shared time `t`. While looping, the
+    /// playhead goes round the loop: it's still analytic, just wrapped.
     pub fn position_at(&self, t: i64) -> f64 {
         if self.track.is_none() {
             return 0.0;
@@ -163,7 +191,37 @@ impl DeckState {
         } else {
             self.anchor_pos
         };
-        p.clamp(0.0, self.duration.max(0.0))
+        self.wrap(p).clamp(0.0, self.duration.max(0.0))
+    }
+
+    /// The loop that's set, `(in, out)`, whether or not it's playing.
+    pub fn loop_span(&self) -> Option<(f64, f64)> {
+        match (self.loop_in, self.loop_out) {
+            (Some(a), Some(b)) if b > a => Some((a, b)),
+            _ => None,
+        }
+    }
+
+    /// The loop the playhead is going round, `(in, out)`.
+    pub fn active_loop(&self) -> Option<(f64, f64)> {
+        self.loop_span().filter(|_| self.looping)
+    }
+
+    /// A position as heard while looping: at or past the loop out point, it
+    /// has gone round the loop. Positions before the loop are left alone (a
+    /// playhead there walks into the loop and gets caught).
+    fn wrap(&self, p: f64) -> f64 {
+        match self.active_loop() {
+            Some((a, b)) if p >= b => a + (p - a).rem_euclid(b - a),
+            _ => p,
+        }
+    }
+
+    /// Length of one beat (seconds) at `pos`, from the grid.
+    fn beat_len_at(&self, pos: f64) -> f64 {
+        self.grid
+            .map(|g| 60.0 / g.bpm_at(pos))
+            .unwrap_or(NO_GRID_BEAT)
     }
 
     /// How much higher (as a frequency ratio) the deck sounds than the
@@ -218,14 +276,47 @@ impl DeckState {
         let pos = self.position_at(now);
         let m = g.markers();
         let here = m[g.section(pos)].bpm;
-        let next = m.iter().find(|x| x.pos > pos && x.bpm != here)?;
-        let dt = ((next.pos - pos) / rate * 1e6).ceil() as i64;
+        // Going round a loop, the deck only reaches markers inside it, and
+        // the tempo can also change where it jumps back to the loop in point.
+        let (limit, back_to) = match self.active_loop() {
+            Some((a, b)) if pos < b => (b, Some(a)),
+            _ => (f64::INFINITY, None),
+        };
+        let at = match m
+            .iter()
+            .find(|x| x.pos > pos && x.pos < limit && x.bpm != here)
+        {
+            Some(next) => next.pos,
+            None if back_to.is_some_and(|a| g.bpm_at(a) != here) => limit,
+            None => return None,
+        };
+        let dt = ((at - pos) / rate * 1e6).ceil() as i64;
         (dt <= horizon).then_some(now + dt)
     }
 
     fn reanchor(&mut self, t: i64) {
         self.anchor_pos = self.position_at(t);
         self.anchor_time = t;
+    }
+
+    fn clear_loop(&mut self) {
+        self.loop_in = None;
+        self.loop_out = None;
+        self.looping = false;
+        self.loop_beats = None;
+    }
+
+    /// Keep a looping deck's anchor inside its loop (anything that moved it
+    /// to or past the out point has gone round the loop).
+    fn settle_loop(&mut self) {
+        if self.looping && self.loop_span().is_none() {
+            self.looping = false;
+        }
+        if let Some((a, b)) = self.active_loop() {
+            if self.anchor_pos >= b {
+                self.anchor_pos = a + (self.anchor_pos - a).rem_euclid(b - a);
+            }
+        }
     }
 }
 
@@ -326,6 +417,36 @@ pub enum Action {
         deck: u8,
         slot: u8,
     },
+    /// LOOP IN: a loop starts at the playhead, and LOOP OUT ends it. While
+    /// looping, it moves the start of the loop to the playhead instead.
+    LoopIn {
+        deck: u8,
+    },
+    /// LOOP OUT: the loop ends at the playhead, and playback goes back to
+    /// the loop in point and loops. While looping, it moves the end here.
+    LoopOut {
+        deck: u8,
+    },
+    /// RELOOP/EXIT: while looping, leave the loop (playback carries on
+    /// through it). Otherwise jump back to the loop in point and loop again.
+    Reloop {
+        deck: u8,
+    },
+    /// A loop `beats` long, on the grid around the playhead. While a loop
+    /// of the same size plays, it leaves the loop instead. A different size
+    /// resizes the playing loop from its in point.
+    BeatLoop {
+        deck: u8,
+        beats: f64,
+    },
+    /// Halve the loop, keeping its in point.
+    LoopHalve {
+        deck: u8,
+    },
+    /// Double the loop, keeping its in point.
+    LoopDouble {
+        deck: u8,
+    },
     Seek {
         deck: u8,
         pos: f64,
@@ -386,6 +507,12 @@ impl Action {
             | HotCue { deck, .. }
             | HotCueUp { deck, .. }
             | ClearHotCue { deck, .. }
+            | LoopIn { deck }
+            | LoopOut { deck }
+            | Reloop { deck }
+            | BeatLoop { deck, .. }
+            | LoopHalve { deck }
+            | LoopDouble { deck }
             | Seek { deck, .. }
             | Tempo { deck, .. }
             | Bend { deck, .. }
@@ -423,6 +550,13 @@ impl Event {
 
 impl RoomState {
     pub fn apply(&mut self, ev: &Event) {
+        self.apply_event(ev);
+        for d in &mut self.decks {
+            d.settle_loop();
+        }
+    }
+
+    fn apply_event(&mut self, ev: &Event) {
         let t = ev.time;
         if let Action::Crossfader { v } = ev.action {
             self.crossfader = v.clamp(0.0, 1.0);
@@ -444,24 +578,45 @@ impl RoomState {
             return;
         }
         let was_playing = self.decks[deck].playing;
+        let was_looping = self.decks[deck].looping;
         // Only a load needs the whole previous deck (and DeckState is big).
         let before = matches!(ev.action, Action::Load { .. }).then(|| self.decks[deck]);
-        let jumps = matches!(
+        // Moves the playhead to somewhere chosen (a cue, a seek): if that's
+        // outside a playing loop, the loop ends.
+        let lands = matches!(
             ev.action,
             Action::Seek { .. }
                 | Action::HotCue { .. }
                 | Action::HotCueUp { .. }
                 | Action::CueDown { .. }
                 | Action::CueUp { .. }
-                | Action::Nudge { .. }
-                | Action::JogTouch { .. }
         );
+        let jumps = lands
+            || matches!(
+                ev.action,
+                Action::Nudge { .. }
+                    | Action::JogTouch { .. }
+                    | Action::LoopOut { .. }
+                    | Action::Reloop { .. }
+                    | Action::BeatLoop { .. }
+                    | Action::LoopHalve { .. }
+            );
         let bpm_before = if jumps {
             self.decks[deck].bpm_at(t)
         } else {
             None
         };
         self.apply_deck(deck, ev);
+        if lands {
+            let d = &mut self.decks[deck];
+            if let Some((a, b)) = d.active_loop() {
+                if d.anchor_pos < a || d.anchor_pos >= b {
+                    d.looping = false;
+                }
+            }
+        }
+        // Settle the loop now, so the BPM check below sees where it lands.
+        self.decks[deck].settle_loop();
         match ev.action {
             Action::Load { .. } if was_playing => {
                 if let Some(before) = before {
@@ -471,6 +626,16 @@ impl RoomState {
             Action::Tempo { .. } => self.follow_tempo(deck, t),
             Action::Play { .. } if !was_playing && self.decks[deck].synced => {
                 // Starting a synced deck: start it on the beat.
+                self.sync_deck(deck, t, false);
+            }
+            // Leaving a loop shorter than a beat (or not on the beat) can
+            // leave a synced deck between beats: put it back on the beat.
+            Action::Reloop { .. } | Action::BeatLoop { .. }
+                if was_looping
+                    && !self.decks[deck].looping
+                    && self.decks[deck].synced
+                    && self.decks[deck].playing =>
+            {
                 self.sync_deck(deck, t, false);
             }
             // The deck's own BPM may have changed under a sync lock.
@@ -633,6 +798,7 @@ impl RoomState {
                 d.anchor_pos = cue.clamp(0.0, d.duration);
                 d.cue_point = d.anchor_pos;
                 d.hot_cues = [None; HOT_CUES];
+                d.clear_loop();
                 d.bend = 0.0;
                 d.scratching = false;
                 d.gen += 1;
@@ -647,6 +813,7 @@ impl RoomState {
                 d.anchor_pos = 0.0;
                 d.cue_point = 0.0;
                 d.hot_cues = [None; HOT_CUES];
+                d.clear_loop();
                 d.grid = None;
                 d.synced = false;
                 d.gen += 1;
@@ -752,6 +919,114 @@ impl RoomState {
                     *h = None;
                 }
             }
+            Action::LoopIn { .. } => {
+                if d.track.is_none() {
+                    return;
+                }
+                let p = d.position_at(t);
+                match d.active_loop() {
+                    Some((_, b)) => {
+                        if p < b - MIN_LOOP {
+                            d.reanchor(t);
+                            d.loop_in = Some(p);
+                            d.loop_beats = None;
+                        }
+                    }
+                    None => {
+                        d.loop_in = Some(p);
+                        d.loop_out = None;
+                        d.looping = false;
+                        d.loop_beats = None;
+                    }
+                }
+            }
+            Action::LoopOut { .. } => {
+                let (Some(a), Some(_)) = (d.loop_in, d.track) else {
+                    return;
+                };
+                let p = d.position_at(t);
+                if p < a + MIN_LOOP {
+                    return;
+                }
+                // The playhead is on the new out point, so settling the loop
+                // takes it straight back to the in point. No `gen` bump: the
+                // renderer follows loops itself and wraps seamlessly.
+                d.reanchor(t);
+                d.loop_out = Some(p);
+                d.looping = true;
+                d.loop_beats = None;
+            }
+            Action::Reloop { .. } => {
+                if d.track.is_none() {
+                    return;
+                }
+                if d.looping {
+                    d.reanchor(t);
+                    d.looping = false;
+                } else if let Some((a, _)) = d.loop_span() {
+                    d.anchor_pos = a;
+                    d.anchor_time = t;
+                    d.looping = true;
+                    d.gen += 1;
+                }
+            }
+            Action::BeatLoop { beats, .. } => {
+                if d.track.is_none() || !(beats > 0.0 && beats <= MAX_LOOP_BEATS) {
+                    return;
+                }
+                let same = d.loop_beats.is_some_and(|b| (b - beats).abs() < 1e-9);
+                match d.active_loop() {
+                    Some(_) if same => {
+                        d.reanchor(t);
+                        d.looping = false;
+                    }
+                    Some((a, _)) => {
+                        let want = a + beats * d.beat_len_at(a);
+                        let end = want.min(d.duration);
+                        if end - a >= MIN_LOOP {
+                            d.reanchor(t);
+                            d.loop_out = Some(end);
+                            d.loop_beats = (end == want).then_some(beats);
+                        }
+                    }
+                    None => {
+                        let p = d.position_at(t);
+                        let (mut a, mut b) = match d.grid {
+                            Some(g) => g.beat_loop(p, beats),
+                            None => (p, p + beats * NO_GRID_BEAT),
+                        };
+                        if a < 0.0 {
+                            // Starts before the track: move it up to the
+                            // first slice that starts inside it.
+                            let step = (b - a) * beats.min(1.0) / beats;
+                            let shift = (-a / step).ceil() * step;
+                            a += shift;
+                            b += shift;
+                        }
+                        let end = b.min(d.duration);
+                        if end - a >= MIN_LOOP {
+                            d.reanchor(t);
+                            d.loop_in = Some(a);
+                            d.loop_out = Some(end);
+                            d.looping = true;
+                            d.loop_beats = (end == b).then_some(beats);
+                        }
+                    }
+                }
+            }
+            Action::LoopHalve { .. } | Action::LoopDouble { .. } => {
+                let Some((a, b)) = d.loop_span() else { return };
+                let double = matches!(ev.action, Action::LoopDouble { .. });
+                let factor = if double { 2.0 } else { 0.5 };
+                let want = a + (b - a) * factor;
+                let end = want.min(d.duration);
+                if end - a < MIN_LOOP || end == b {
+                    return;
+                }
+                d.reanchor(t);
+                d.loop_out = Some(end);
+                d.loop_beats = d.loop_beats.map(|x| x * factor).filter(|_| end == want);
+            }
             Action::Seek { pos, .. } => {
                 if d.track.is_some() {
                     d.anchor_pos = pos.clamp(0.0, d.duration);
@@ -839,6 +1114,10 @@ impl RoomState {
             h.u64(d.key as u64);
             h.u64(d.key_shift as u64);
             h.u64(d.key_lock as u64);
+            h.f64(d.loop_in.unwrap_or(-1.0));
+            h.f64(d.loop_out.unwrap_or(-1.0));
+            h.u64(d.looping as u64);
+            h.f64(d.loop_beats.unwrap_or(-1.0));
             h.u64(d.gen);
         }
         h.u64(self.crossfader.to_bits() as u64);
@@ -1516,6 +1795,355 @@ mod tests {
             "{}",
             std::mem::size_of::<Event>()
         );
+    }
+
+    fn at(s: &RoomState, deck: usize, t: i64) -> f64 {
+        s.decks[deck].position_at(t)
+    }
+
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-6
+    }
+
+    #[test]
+    fn loop_in_and_out_go_round_and_reloop_exits_and_returns() {
+        let mut s = RoomState::default();
+        let mut seq = 0;
+        let mut go = |s: &mut RoomState, t: i64, a: Action| {
+            seq += 1;
+            s.apply(&ev(t, 1, seq, a));
+        };
+        go(&mut s, 0, grid_load(0, 1, 120.0, 0.0));
+        // LOOP OUT with no LOOP IN does nothing.
+        go(&mut s, 0, Action::LoopOut { deck: 0 });
+        assert!(!s.decks[0].looping);
+        go(&mut s, 0, Action::Play { deck: 0 });
+        go(&mut s, 10_000_000, Action::LoopIn { deck: 0 });
+        assert!(!s.decks[0].looping, "waits for LOOP OUT");
+        go(&mut s, 12_000_000, Action::LoopOut { deck: 0 });
+        let d = s.decks[0];
+        assert_eq!(d.active_loop(), Some((10.0, 12.0)));
+        assert_eq!(d.gen, s.decks[0].gen);
+        // Straight back to the in point, then round and round.
+        assert!(close(at(&s, 0, 12_000_000), 10.0));
+        assert!(close(at(&s, 0, 13_000_000), 11.0));
+        assert!(close(at(&s, 0, 14_500_000), 10.5));
+        assert!(close(at(&s, 0, 101_250_000), 11.25));
+        // EXIT: carries on from where it is, through the out point.
+        go(&mut s, 15_000_000, Action::Reloop { deck: 0 });
+        assert!(!s.decks[0].looping);
+        assert!(close(at(&s, 0, 17_000_000), 13.0));
+        // RELOOP: back to the in point, looping again.
+        go(&mut s, 20_000_000, Action::Reloop { deck: 0 });
+        assert!(s.decks[0].looping);
+        assert!(close(at(&s, 0, 21_000_000), 11.0));
+        assert!(close(at(&s, 0, 22_500_000), 10.5));
+        // LOOP IN while looping moves the start to the playhead.
+        go(&mut s, 23_000_000, Action::LoopIn { deck: 0 });
+        assert_eq!(s.decks[0].active_loop(), Some((11.0, 12.0)));
+        assert!(close(at(&s, 0, 24_500_000), 11.5));
+        // LOOP OUT while looping moves the end to the playhead.
+        go(&mut s, 25_750_000, Action::LoopOut { deck: 0 });
+        assert_eq!(s.decks[0].active_loop(), Some((11.0, 11.75)));
+        assert!(close(at(&s, 0, 26_000_000), 11.25));
+        // Loading another track forgets the loop.
+        go(&mut s, 27_000_000, grid_load(0, 2, 120.0, 0.0));
+        assert_eq!(s.decks[0].loop_span(), None);
+        assert!(!s.decks[0].looping);
+    }
+
+    #[test]
+    fn beat_loops_toggle_resize_halve_and_double() {
+        let mut s = RoomState::default();
+        let mut seq = 0;
+        let mut go = |s: &mut RoomState, t: i64, a: Action| {
+            seq += 1;
+            s.apply(&ev(t, 1, seq, a));
+        };
+        // 120 BPM, beats every 0.5 s from 0.
+        go(&mut s, 0, grid_load(0, 1, 120.0, 0.0));
+        go(&mut s, 0, Action::Play { deck: 0 });
+        go(
+            &mut s,
+            5_300_000,
+            Action::BeatLoop {
+                deck: 0,
+                beats: 4.0,
+            },
+        );
+        let d = s.decks[0];
+        assert_eq!(d.active_loop(), Some((5.0, 7.0)), "from the beat before");
+        assert_eq!(d.loop_beats, Some(4.0));
+        assert!(close(at(&s, 0, 6_900_000), 6.9));
+        assert!(close(at(&s, 0, 8_000_000), 6.0));
+        // Another size resizes from the in point (and wraps if past it).
+        go(
+            &mut s,
+            8_000_000,
+            Action::BeatLoop {
+                deck: 0,
+                beats: 1.0,
+            },
+        );
+        assert_eq!(s.decks[0].active_loop(), Some((5.0, 5.5)));
+        assert!(close(at(&s, 0, 8_000_000), 5.0));
+        // Double and halve keep the in point.
+        go(&mut s, 8_100_000, Action::LoopDouble { deck: 0 });
+        assert_eq!(s.decks[0].active_loop(), Some((5.0, 6.0)));
+        assert_eq!(s.decks[0].loop_beats, Some(2.0));
+        go(&mut s, 8_700_000, Action::LoopHalve { deck: 0 });
+        assert_eq!(s.decks[0].active_loop(), Some((5.0, 5.5)));
+        assert_eq!(s.decks[0].loop_beats, Some(1.0));
+        assert!(close(at(&s, 0, 8_700_000), 5.2), "{}", at(&s, 0, 8_700_000));
+        // The same size again leaves the loop; playback carries on.
+        go(
+            &mut s,
+            9_000_000,
+            Action::BeatLoop {
+                deck: 0,
+                beats: 1.0,
+            },
+        );
+        assert!(!s.decks[0].looping);
+        assert!(close(at(&s, 0, 10_000_000), 6.5));
+        // A quarter beat: the slice of the beat the playhead is in.
+        go(
+            &mut s,
+            10_000_000,
+            Action::BeatLoop {
+                deck: 0,
+                beats: 0.25,
+            },
+        );
+        assert_eq!(s.decks[0].active_loop(), Some((6.5, 6.625)));
+        // Halving stops at the shortest loop.
+        for i in 0..8 {
+            go(&mut s, 10_100_000 + i, Action::LoopHalve { deck: 0 });
+        }
+        let (a, b) = s.decks[0].active_loop().unwrap();
+        assert!(b - a >= MIN_LOOP && b - a < 2.0 * MIN_LOOP, "{}", b - a);
+    }
+
+    #[test]
+    fn beat_loops_without_a_grid_and_at_the_ends() {
+        let mut s = RoomState::default();
+        s.apply(&ev(
+            0,
+            1,
+            1,
+            Action::Load {
+                deck: 0,
+                track: tid(1),
+                duration: 10.0,
+                cue: 0.0,
+                grid: None,
+                key: -1,
+            },
+        ));
+        s.apply(&ev(0, 1, 2, Action::Seek { deck: 0, pos: 3.3 }));
+        s.apply(&ev(
+            0,
+            1,
+            3,
+            Action::BeatLoop {
+                deck: 0,
+                beats: 2.0,
+            },
+        ));
+        // No grid: from the playhead, at 120 BPM.
+        assert_eq!(s.decks[0].active_loop(), Some((3.3, 4.3)));
+        // Near the end, the loop stops at the end of the track.
+        s.apply(&ev(1, 1, 4, Action::Reloop { deck: 0 }));
+        s.apply(&ev(1, 1, 5, Action::Seek { deck: 0, pos: 9.5 }));
+        s.apply(&ev(
+            1,
+            1,
+            6,
+            Action::BeatLoop {
+                deck: 0,
+                beats: 4.0,
+            },
+        ));
+        assert_eq!(s.decks[0].active_loop(), Some((9.5, 10.0)));
+        assert_eq!(s.decks[0].loop_beats, None);
+    }
+
+    #[test]
+    fn jumping_out_of_a_loop_leaves_it() {
+        let mut s = RoomState::default();
+        let mut seq = 0;
+        let mut go = |s: &mut RoomState, t: i64, a: Action| {
+            seq += 1;
+            s.apply(&ev(t, 1, seq, a));
+        };
+        go(&mut s, 0, grid_load(0, 1, 120.0, 0.0));
+        go(&mut s, 0, Action::Seek { deck: 0, pos: 30.0 });
+        go(&mut s, 0, Action::HotCue { deck: 0, slot: 0 });
+        go(&mut s, 0, Action::Seek { deck: 0, pos: 10.0 });
+        go(&mut s, 0, Action::Play { deck: 0 });
+        go(
+            &mut s,
+            0,
+            Action::BeatLoop {
+                deck: 0,
+                beats: 8.0,
+            },
+        );
+        assert_eq!(s.decks[0].active_loop(), Some((10.0, 14.0)));
+        // A seek inside the loop keeps looping...
+        go(&mut s, 1_000_000, Action::Seek { deck: 0, pos: 13.0 });
+        assert!(s.decks[0].looping);
+        assert!(close(at(&s, 0, 2_500_000), 10.5));
+        // ...a hot cue outside it leaves the loop (RELOOP can go back).
+        go(&mut s, 3_000_000, Action::HotCue { deck: 0, slot: 0 });
+        assert!(!s.decks[0].looping);
+        assert!(close(at(&s, 0, 8_000_000), 35.0));
+        go(&mut s, 8_000_000, Action::Reloop { deck: 0 });
+        assert!(close(at(&s, 0, 9_000_000), 11.0));
+        // Scratching forwards past the out point goes round the loop.
+        go(
+            &mut s,
+            9_000_000,
+            Action::JogTouch {
+                deck: 0,
+                down: true,
+            },
+        );
+        go(
+            &mut s,
+            9_100_000,
+            Action::Nudge {
+                deck: 0,
+                delta: 3.5,
+            },
+        );
+        assert!(s.decks[0].looping);
+        assert!(close(at(&s, 0, 9_100_000), 10.5));
+    }
+
+    #[test]
+    fn a_looping_deck_stays_in_sync() {
+        let mut tl = Timeline::new(0);
+        let mut seq = 0;
+        let mut go = |tl: &mut Timeline, t: i64, a: Action| {
+            seq += 1;
+            tl.insert(ev(t, 1, seq, a));
+        };
+        go(&mut tl, 0, grid_load(0, 1, 128.0, 0.1));
+        go(&mut tl, 0, grid_load(1, 2, 124.0, 0.37));
+        go(&mut tl, 0, Action::Play { deck: 0 });
+        go(&mut tl, 0, Action::Play { deck: 1 });
+        go(&mut tl, 1_000_000, Action::Sync { deck: 1, on: true });
+        // A 1-beat loop on the synced deck, then a ¼ beat, then out again.
+        go(
+            &mut tl,
+            2_345_000,
+            Action::BeatLoop {
+                deck: 1,
+                beats: 1.0,
+            },
+        );
+        for t in [2_400_000, 5_000_000, 9_876_000] {
+            assert!(beat_offset(&tl.state_at(t), t, 1.0).abs() < 1e-6, "at {t}");
+        }
+        // A ¼-beat loop stutters the first quarter of that beat...
+        go(
+            &mut tl,
+            10_000_000,
+            Action::BeatLoop {
+                deck: 1,
+                beats: 0.25,
+            },
+        );
+        let t = 12_345_678;
+        let b = tl.state_at(t).decks[1];
+        assert!(b.beat_phase(1.0, t) < 0.25 + 1e-9);
+        // ...and leaving it puts the synced deck back on the beat.
+        go(&mut tl, 13_000_000, Action::Reloop { deck: 1 });
+        let t = 20_000_000;
+        assert!(beat_offset(&tl.state_at(t), t, 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn loops_and_tempo_changes() {
+        // 120 BPM up to 20 s, then 125.
+        let mut s = RoomState::default();
+        s.apply(&ev(0, 1, 1, grid_load(0, 2, 120.0, 0.0)));
+        s.apply(&ev(0, 1, 2, set_grid(0, 2, two_tempo_grid())));
+        s.apply(&ev(0, 1, 3, Action::Seek { deck: 0, pos: 16.0 }));
+        s.apply(&ev(0, 1, 4, Action::Play { deck: 0 }));
+        s.apply(&ev(
+            0,
+            1,
+            5,
+            Action::BeatLoop {
+                deck: 0,
+                beats: 4.0,
+            },
+        ));
+        // A loop before the marker never reaches it.
+        assert_eq!(s.decks[0].next_tempo_change(0, 60_000_000), None);
+        // A loop across the marker reaches it, and changes back at the wrap.
+        s.apply(&ev(0, 1, 6, Action::LoopDouble { deck: 0 }));
+        assert_eq!(s.decks[0].active_loop(), Some((16.0, 20.0)));
+        s.apply(&ev(0, 1, 7, Action::Reloop { deck: 0 }));
+        s.apply(&ev(0, 1, 8, Action::Seek { deck: 0, pos: 18.0 }));
+        s.apply(&ev(0, 1, 9, Action::LoopIn { deck: 0 }));
+        s.apply(&ev(4_000_000, 1, 10, Action::LoopOut { deck: 0 }));
+        assert_eq!(s.decks[0].active_loop(), Some((18.0, 22.0)));
+        let t = 4_000_000;
+        assert_eq!(
+            s.decks[0].next_tempo_change(t, 60_000_000),
+            Some(t + 2_000_000)
+        );
+        let t = 7_000_000; // at 21 s, in the 125 BPM section
+        assert_eq!(
+            s.decks[0].next_tempo_change(t, 60_000_000),
+            Some(t + 1_000_000)
+        );
+    }
+
+    #[test]
+    fn loops_converge_regardless_of_arrival_order() {
+        let mut events = vec![
+            ev(0, 1, 1, grid_load(0, 1, 126.0, 0.2)),
+            ev(0, 2, 1, grid_load(1, 2, 124.0, 0.1)),
+            ev(100_000, 1, 2, Action::Play { deck: 0 }),
+            ev(150_000, 2, 2, Action::Play { deck: 1 }),
+            ev(
+                900_000,
+                1,
+                3,
+                Action::BeatLoop {
+                    deck: 0,
+                    beats: 2.0,
+                },
+            ),
+            ev(1_500_000, 2, 3, Action::LoopIn { deck: 1 }),
+            ev(2_700_000, 2, 4, Action::LoopOut { deck: 1 }),
+            ev(3_100_000, 1, 4, Action::LoopHalve { deck: 0 }),
+            ev(4_000_000, 2, 5, Action::Sync { deck: 1, on: true }),
+            ev(5_200_000, 1, 5, Action::Reloop { deck: 0 }),
+            ev(6_000_000, 2, 6, Action::LoopDouble { deck: 1 }),
+        ];
+        let mut a = Timeline::new(0);
+        for e in &events {
+            a.insert(e.clone());
+        }
+        fastrand::Rng::with_seed(9).shuffle(&mut events);
+        let mut b = Timeline::new(0);
+        for e in &events {
+            b.insert(e.clone());
+        }
+        for t in [0, 1_000_000, 3_000_000, 5_500_000, 9_000_000] {
+            assert_eq!(
+                a.state_at(t).digest(),
+                b.state_at(t).digest(),
+                "diverged at {t}"
+            );
+        }
+        let json = serde_json::to_string(&events[0]).unwrap();
+        assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), events[0]);
     }
 
     #[test]

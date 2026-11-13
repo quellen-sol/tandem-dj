@@ -23,12 +23,22 @@ pub fn name(key: i8) -> String {
     }
 }
 
-/// Camelot wheel code: 8A = A minor, 8B = C major, 9B = G major...
-pub fn camelot(key: i8) -> String {
+/// Camelot wheel number, 1 to 12.
+fn camelot_number(key: i8) -> i32 {
     let pc = (key % 12) as i32;
     let major_pc = if is_minor(key) { (pc + 3) % 12 } else { pc };
-    let num = ((major_pc * 7) % 12 + 7) % 12 + 1;
+    ((major_pc * 7) % 12 + 7) % 12 + 1
+}
+
+/// Camelot wheel code: 8A = A minor, 8B = C major, 9B = G major...
+pub fn camelot(key: i8) -> String {
+    let num = camelot_number(key);
     format!("{num}{}", if is_minor(key) { 'A' } else { 'B' })
+}
+
+/// Where a key sorts in Camelot order: 1A, 1B, 2A, 2B … 12B.
+pub fn camelot_rank(key: i8) -> u8 {
+    ((camelot_number(key) - 1) * 2 + if is_minor(key) { 0 } else { 1 }) as u8
 }
 
 /// Parse a key tag: "Am", "A minor", "C#", "Dbm", "8A", "11B"...
@@ -228,6 +238,15 @@ pub fn detect(audio: &TrackAudio) -> Option<i8> {
 mod tests {
     use super::*;
     use crate::model::TrackId;
+
+    #[test]
+    fn camelot_order() {
+        let mut keys: Vec<i8> = (0..24).collect();
+        keys.sort_by_key(|k| camelot_rank(*k));
+        let codes: Vec<String> = keys.iter().take(5).map(|k| camelot(*k)).collect();
+        assert_eq!(codes, ["1A", "1B", "2A", "2B", "3A"]);
+        assert_eq!(camelot(keys[23]), "12B");
+    }
 
     #[test]
     fn camelot_codes() {

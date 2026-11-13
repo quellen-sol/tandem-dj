@@ -4,7 +4,7 @@ Back-to-back DJing with a friend, from anywhere. Two DJs in different places sha
 
 **Personal, non-commercial use only.** See [TERMS.md](TERMS.md).
 
-> **Status: v0.3.** Windows only. Rooms, BPM and key detection, beatgrid editing, sync, key lock and a ready-made DDJ-FLX6 mapping all work; this is still an early version for two people to try. See [docs/ROADMAP.md](docs/ROADMAP.md) for what's next and a test plan.
+> **Status: v0.3.** Windows only. Rooms, BPM and key detection, beatgrid editing, sync, key lock, loops and a ready-made DDJ-FLX6 mapping all work; this is still an early version for two people to try. See [docs/ROADMAP.md](docs/ROADMAP.md) for what's next and a test plan.
 
 ## How it works
 
@@ -33,6 +33,7 @@ The self-test lists your audio and MIDI devices, opens your default output for h
 ## Set up your booth
 
 1. **Music.** In the library, click **Add music folder…**. Serato crates from `Music\_Serato_` (and `X:\_Serato_` on external drives) show up automatically. Tandem only reads them and never writes Serato files.
+   - **Click a column heading** (TITLE, ARTIST, BPM, KEY, TIME) to sort the list by it. Click again to reverse it, and a third time to go back to the list's own order. Keys sort in Camelot order (1A, 1B, 2A…). Tracks with no BPM or key yet go last. Tandem remembers the sort.
 2. **Audio.** Open **Settings → Audio**.
    - **Speakers (master):** your controller's sound card, channels 1/2.
    - **Headphones (cue):** the same device, channels 3/4. Most controllers expose four channels.
@@ -45,6 +46,7 @@ The self-test lists your audio and MIDI devices, opens your default output for h
    - **The tempo fader never waits.** After SYNC (or your partner) moves a deck's tempo away from where your fader sits, the fader changes the tempo by exactly as much as you move it, starting from the deck's current tempo. **SHIFT + SYNC** puts the deck back on the fader.
    - **SHIFT + CUE** (or right-clicking CUE) jumps back to the start of the track.
    - **Hot cues held while paused are gated.** The deck plays from the hot cue only while you hold the pad. Let go and it snaps back to the hot cue, paused. Press PLAY while holding to keep it playing.
+   - **Loops:** **IN**, **OUT** and **RELOOP/EXIT** work as in [Loops](#loops). **SHIFT + IN** is a 4-beat loop, and **CUE/LOOP CALL ◀ / ▶** halve and double the loop. Switch the pads to **BEAT LOOP** (SHIFT + BEAT JUMP) for ¼, ½, 1, 2, 4, 8, 16 and 32-beat loops. The pad of the loop that's playing lights up.
    - **Jog wheel moves the wrong way or jumps?** Tick **1/127 style** or **invert** next to it.
 
 Mappings are saved per controller, so you only do this once. When Tandem's built-in mapping gains new controls, your saved mapping picks them up automatically. Your calibration and changes are kept.
@@ -59,6 +61,18 @@ Mappings are saved per controller, so you only do this once. When Tandem's built
 - **Keys** show in Camelot notation (8A, 11B…), in green when the two decks are harmonically compatible. Use **−/+** to shift a deck by semitones. **MATCH KEY** shifts it the smallest amount needed to sit in the other deck's key, or its relative major/minor.
 - **Loading onto a playing deck** swaps the track instantly. The new track starts on the beat of what's playing: the other deck if it's playing, otherwise the track you replaced. It starts at bar 1 (its first grid marker). A synced deck stays synced.
 - **Bar numbers** run along the bottom of each scrolling waveform, and the deck shows the bar and beat you're on (e.g. `12.3`). Bar 1 is the first grid marker. The bars before it count down **−1, −2…**, so you can park a track a bar or two early, press play and wait for the 1.
+
+## Loops
+
+Each deck has a **LOOP** row, and the controller's loop buttons and BEAT LOOP pads do the same things.
+
+- **IN** marks where a loop starts. **OUT** marks where it ends, and the deck goes straight back to IN and loops. While looping, IN and OUT move the start or the end to the playhead.
+- **RELOOP/EXIT** leaves the loop, and playback carries on through it. Press it again to jump back to the loop and go round it again.
+- **Beat loops (¼ to 32 beats)** start on the beat the playhead is in, so they're always on the beat. A ¼-beat loop is the quarter of the beat the playhead is in. Press the same size again to leave the loop. Another size resizes the loop, keeping its start. Without a beatgrid, a beat loop starts at the playhead, at 120 BPM.
+- **×½ / ×2** halve and double the loop, keeping its start.
+- **Jumping outside the loop** (a hot cue, CUE, clicking the overview) leaves it. RELOOP still brings it back.
+- **SYNC keeps working.** A synced deck stays on the beat while it loops. Leaving a loop shorter than a beat puts it back on the beat.
+- The loop shows as a green band on the waveforms. Going round is seamless, with no click at the join, and your partner hears it exactly as you do.
 
 ### Fixing a beatgrid
 
@@ -113,9 +127,10 @@ Host in one window and join `127.0.0.1` from the other.
 ## Known limits in v0.3
 
 - **Decks and DJs:** 2 decks, 2 DJs per room.
-- **Beatgrids:** detection assumes a steady tempo and doesn't find bars (the "1"). Set markers by hand for both: see [Fixing a beatgrid](#fixing-a-beatgrid). A grid can have up to 32 markers, and every bar is 4 beats. Hot cues and play aren't snapped to the beat, except on a synced deck.
+- **Beatgrids:** detection assumes a steady tempo and doesn't find bars (the "1"). Set markers by hand for both: see [Fixing a beatgrid](#fixing-a-beatgrid). A grid can have up to 32 markers, and every bar is 4 beats. Hot cues and play aren't snapped to the beat, except on a synced deck. Loop IN and OUT aren't either (beat loops always are).
+- **Loops:** no slip mode or loop rolls, no fine-adjusting IN/OUT with the jog wheel, and loops aren't saved with the track.
 - **Keys:** detection is good but not perfect. It can mix up a key with its relative major/minor (same Camelot number), and very drum-heavy tracks are harder.
-- **Mixer:** no effects or loops. EQ is a 3-band isolator, plus a filter and trim per channel.
+- **Mixer:** no effects. EQ is a 3-band isolator, plus a filter and trim per channel.
 - **Controllers:** MIDI only. Controllers that only speak HID aren't supported.
 - **CPU:** the screen redraws use more CPU than the audio does. Key lock costs under 2% of one core per deck.
 - **Audio driver:** WASAPI shared mode, roughly 10–20 ms of output latency. No ASIO yet.

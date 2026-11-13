@@ -61,8 +61,9 @@ impl TrackAudio {
         self.frames.len() as f64 / self.sample_rate as f64
     }
 
+    /// One frame as f32 (silence outside the track).
     #[inline]
-    fn frame(&self, i: isize) -> [f32; 2] {
+    pub(crate) fn frame(&self, i: isize) -> [f32; 2] {
         if i < 0 || i as usize >= self.frames.len() {
             return [0.0; 2];
         }
@@ -73,14 +74,16 @@ impl TrackAudio {
     /// Stereo sample at fractional frame `pos` (cubic Hermite interpolation).
     #[inline]
     pub fn sample(&self, pos: f64) -> [f32; 2] {
+        self.sample_with(pos, |i| self.frame(i))
+    }
+
+    /// Like [`TrackAudio::sample`], reading frames through `frame` (which
+    /// can remap them, e.g. round a loop).
+    #[inline]
+    pub(crate) fn sample_with(&self, pos: f64, frame: impl Fn(isize) -> [f32; 2]) -> [f32; 2] {
         let i = pos.floor() as isize;
         let x = (pos - i as f64) as f32;
-        let (y0, y1, y2, y3) = (
-            self.frame(i - 1),
-            self.frame(i),
-            self.frame(i + 1),
-            self.frame(i + 2),
-        );
+        let (y0, y1, y2, y3) = (frame(i - 1), frame(i), frame(i + 1), frame(i + 2));
         let mut out = [0.0; 2];
         for c in 0..2 {
             let c0 = y1[c];

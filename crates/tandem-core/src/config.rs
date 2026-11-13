@@ -34,6 +34,23 @@ impl Default for AudioSettings {
     }
 }
 
+/// A column of the library's track list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SortColumn {
+    Title,
+    Artist,
+    Bpm,
+    Key,
+    Time,
+}
+
+/// How the library's track list is sorted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LibrarySort {
+    pub column: SortColumn,
+    pub descending: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -49,6 +66,8 @@ pub struct Settings {
     /// Tempo fader range, e.g. 0.08 = ±8%.
     pub tempo_range: f64,
     pub local: LocalParams,
+    /// None: each list in its own order (folder, crate or share order).
+    pub library_sort: Option<LibrarySort>,
 }
 
 impl Default for Settings {
@@ -64,6 +83,7 @@ impl Default for Settings {
             max_upload_mb_s: 2.0,
             tempo_range: 0.08,
             local: LocalParams::default(),
+            library_sort: None,
         }
     }
 }

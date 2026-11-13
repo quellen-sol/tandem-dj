@@ -8,10 +8,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tandem_core::config::{Paths, Settings};
-use tandem_core::library::{self, Library, SourceKind};
+use tandem_core::config::{LibrarySort, Paths, Settings};
+use tandem_core::library::{self, LibTrack, Library, SortRow, SourceKind};
 use tandem_core::mapping::MidiOut;
 use tandem_core::model::{Action, TrackId, DECKS};
+use tandem_core::protocol::TrackInfo;
 use tandem_core::render::LocalParams;
 use tandem_core::serato::SeratoCrate;
 use tandem_core::session::{Session, SessionHandle, SessionView};
@@ -70,6 +71,58 @@ pub enum SettingsTab {
     General,
 }
 
+/// What the visible rows were last worked out from.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FilterKey {
+    source: String,
+    query: String,
+    len: usize,
+    /// Changes when tracks' details (BPM, key, names) change.
+    rev: u64,
+    sort: Option<LibrarySort>,
+}
+
+/// BPM shown for a library track: analysed (or edited) first, then tags.
+pub fn lib_bpm(t: &LibTrack) -> Option<f64> {
+    t.grid_bpm.or(t.bpm.map(|b| b as f64))
+}
+
+/// BPM shown for a track in this room.
+pub fn room_bpm(t: &TrackInfo) -> Option<f64> {
+    t.grid
+        .map(|g| g.main_bpm(t.duration))
+        .or(t.bpm.map(|b| b as f64))
+}
+
+fn lib_row(t: &LibTrack) -> SortRow<'_> {
+    SortRow {
+        title: &t.title,
+        artist: &t.artist,
+        bpm: lib_bpm(t),
+        key: t.key,
+        duration: t.duration,
+    }
+}
+
+fn room_row(t: &TrackInfo) -> SortRow<'_> {
+    SortRow {
+        title: &t.title,
+        artist: &t.artist,
+        bpm: room_bpm(t),
+        key: t.key,
+        duration: t.duration,
+    }
+}
+
+/// Changes when any room track's BPM or key does (the room list is short).
+fn room_rev(tracks: &[TrackInfo]) -> u64 {
+    tracks.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, t| {
+        let bpm = room_bpm(t).unwrap_or(-1.0).to_bits();
+        let key = t.key.unwrap_or(-1) as u64;
+        (h ^ bpm ^ key.rotate_left(17)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
 pub struct ShareDraft {
     pub title: String,
     pub paths: Vec<PathBuf>,
@@ -83,7 +136,7 @@ pub struct UiState {
     pub sel_index: usize,
     pub scroll_to_sel: bool,
     pub filtered: Vec<usize>,
-    pub filter_key: (String, String, usize),
+    pub filter_key: Option<FilterKey>,
     pub show_settings: bool,
     pub settings_tab: SettingsTab,
     pub show_terms: bool,
@@ -104,7 +157,8 @@ pub struct UiState {
 }
 
 /// Developer options: `--screenshot <file.bmp>` saves the window and exits;
-/// `--demo` loads the first two library tracks and starts playing.
+/// `--demo` loads the first two library tracks and starts playing (deck B
+/// synced, key-matched and on a 4-beat loop).
 pub struct DevOpts {
     pub screenshot: Option<PathBuf>,
     pub shot_frame: u64,
@@ -197,7 +251,7 @@ impl TandemApp {
             sel_index: 0,
             scroll_to_sel: false,
             filtered: Vec::new(),
-            filter_key: (String::new(), String::new(), usize::MAX),
+            filter_key: None,
             show_settings: false,
             settings_tab: SettingsTab::Audio,
             show_terms: false,
@@ -294,20 +348,51 @@ impl TandemApp {
         self.mark_dirty();
     }
 
-    /// Recompute which rows match the search when the list or query changes.
+    /// Click on a column heading: sort by it, then the other way round,
+    /// then back to the list's own order.
+    pub(crate) fn sort_by(&mut self, column: tandem_core::config::SortColumn) {
+        self.settings.library_sort = match self.settings.library_sort {
+            Some(s) if s.column == column && !s.descending => Some(LibrarySort {
+                column,
+                descending: true,
+            }),
+            Some(s) if s.column == column => None,
+            _ => Some(LibrarySort {
+                column,
+                descending: false,
+            }),
+        };
+        self.mark_dirty();
+    }
+
+    /// Recompute which rows match the search, in sorted order, when the
+    /// list, the query, the sort or the tracks' details change.
     fn refresh_filter(&mut self, view: &SessionView) {
         let q = self.ui.search.trim().to_lowercase();
         let src = self.ui.source.key();
+        let sort = self.settings.library_sort;
         let lib = self.library.clone();
         let lib = lib.lock();
-        let len = match &self.ui.source {
-            Source::Room => view.room_tracks.len(),
-            _ => lib.lists.get(&src).map(|l| l.tracks.len()).unwrap_or(0),
+        let (len, rev) = match &self.ui.source {
+            Source::Room => (view.room_tracks.len(), room_rev(&view.room_tracks)),
+            _ => lib
+                .lists
+                .get(&src)
+                .map(|l| (l.tracks.len(), l.rev))
+                .unwrap_or((0, 0)),
         };
-        let key = (src.clone(), q.clone(), len);
-        if self.ui.filter_key == key {
+        let key = FilterKey {
+            source: src.clone(),
+            query: q.clone(),
+            len,
+            rev,
+            sort,
+        };
+        if self.ui.filter_key.as_ref() == Some(&key) {
             return;
         }
+        // The track under the selection, to keep it selected.
+        let selected = self.ui.filtered.get(self.ui.sel_index).copied();
         let matches = |t: &str, a: &str| {
             let (t, a) = (t.to_lowercase(), a.to_lowercase());
             // Words must all match; "|" separates alternatives ("house | garage").
@@ -337,10 +422,33 @@ impl TandemApp {
                 })
                 .unwrap_or_default(),
         };
-        if self.ui.filter_key.0 != key.0 || self.ui.filter_key.1 != key.1 {
-            self.ui.sel_index = 0;
+        if let Some(sort) = sort {
+            match &self.ui.source {
+                Source::Room => library::sort_rows(&mut self.ui.filtered, sort, |i| {
+                    room_row(&view.room_tracks[i])
+                }),
+                _ => {
+                    if let Some(l) = lib.lists.get(&src) {
+                        library::sort_rows(&mut self.ui.filtered, sort, |i| lib_row(&l.tracks[i]));
+                    }
+                }
+            }
         }
-        self.ui.filter_key = key;
+        let prev = self.ui.filter_key.replace(key.clone());
+        let same_list = prev
+            .as_ref()
+            .is_some_and(|p| p.source == key.source && p.query == key.query);
+        if !same_list {
+            self.ui.sel_index = 0;
+        } else if let Some(row) =
+            selected.and_then(|s| self.ui.filtered.iter().position(|&i| i == s))
+        {
+            self.ui.sel_index = row;
+            // Re-sorted by hand: bring the selected track into view.
+            if prev.is_some_and(|p| p.sort != key.sort) {
+                self.ui.scroll_to_sel = true;
+            }
+        }
         if self.ui.sel_index >= self.ui.filtered.len() {
             self.ui.sel_index = self.ui.filtered.len().saturating_sub(1);
         }
@@ -506,6 +614,10 @@ impl TandemApp {
                     }
                 }
                 s.act(Action::Crossfader { v: 0.25 });
+                s.act(Action::BeatLoop {
+                    deck: 1,
+                    beats: 4.0,
+                });
                 drop(s);
                 self.dev.frame = self.dev.shot_frame.saturating_sub(600);
             }

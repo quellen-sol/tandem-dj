@@ -9,6 +9,7 @@
 
 use crate::analysis::{self, BeatGrid};
 use crate::audio::TrackAudio;
+use crate::config::{LibrarySort, SortColumn};
 use crate::model::TrackId;
 use crate::serato::{self, SeratoCrate};
 use parking_lot::Mutex;
@@ -200,6 +201,61 @@ pub struct TrackList {
     pub tracks: Vec<LibTrack>,
     pub scanning: bool,
     pub error: Option<String>,
+    /// Bumped whenever a track's details change (BPM, key, names), so a
+    /// sorted view knows to re-sort.
+    pub rev: u64,
+}
+
+/// The sortable columns of one row in the track list.
+pub struct SortRow<'a> {
+    pub title: &'a str,
+    pub artist: &'a str,
+    pub bpm: Option<f64>,
+    pub key: Option<i8>,
+    /// Seconds; 0 = unknown.
+    pub duration: f64,
+}
+
+/// Order `rows` (indices into a list) by `sort`. Text sorts case-blind and
+/// keys sort in Camelot order (1A, 1B, 2A…). Rows with an empty cell (no
+/// BPM yet, no key, unknown length) go last either way, and rows that tie
+/// keep their order from `rows`.
+pub fn sort_rows<'a>(rows: &mut [usize], sort: LibrarySort, row: impl Fn(usize) -> SortRow<'a>) {
+    #[derive(PartialEq, PartialOrd)]
+    enum Cell {
+        Text(String),
+        Num(f64),
+    }
+    let cell = |r: SortRow| {
+        match sort.column {
+            SortColumn::Title => Some(Cell::Text(r.title.trim().to_lowercase())),
+            SortColumn::Artist => Some(Cell::Text(r.artist.trim().to_lowercase())),
+            SortColumn::Bpm => r.bpm.filter(|b| *b > 0.0).map(Cell::Num),
+            SortColumn::Key => r
+                .key
+                .filter(|k| (0..24).contains(k))
+                .map(|k| Cell::Num(crate::keys::camelot_rank(k) as f64)),
+            SortColumn::Time => Some(r.duration).filter(|d| *d > 0.0).map(Cell::Num),
+        }
+        .filter(|c| !matches!(c, Cell::Text(t) if t.is_empty()))
+    };
+    let mut keyed: Vec<(usize, Option<Cell>)> = rows.iter().map(|&i| (i, cell(row(i)))).collect();
+    keyed.sort_by(|(_, a), (_, b)| match (a, b) {
+        (Some(a), Some(b)) => {
+            let o = a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal);
+            if sort.descending {
+                o.reverse()
+            } else {
+                o
+            }
+        }
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
+    for (slot, (i, _)) in rows.iter_mut().zip(keyed) {
+        *slot = i;
+    }
 }
 
 pub struct Library {
@@ -435,7 +491,9 @@ pub fn scan(lib: &Arc<Mutex<Library>>, key: String, kind: SourceKind) {
             });
             if i % 500 == 499 {
                 let mut l = lib.lock();
-                l.lists.entry(key.clone()).or_default().tracks = out.clone();
+                let entry = l.lists.entry(key.clone()).or_default();
+                entry.tracks = out.clone();
+                entry.rev += 1;
             }
         }
         let swapped = fix_file_names(&mut out);
@@ -448,6 +506,7 @@ pub fn scan(lib: &Arc<Mutex<Library>>, key: String, kind: SourceKind) {
         l.index(&out);
         let entry = l.lists.entry(key).or_default();
         entry.tracks = out;
+        entry.rev += 1;
         entry.scanning = false;
         entry.error = error;
         l.save_cache();
@@ -544,6 +603,7 @@ pub fn set_user_grid(
     for list in l.lists.values_mut() {
         for t in list.tracks.iter_mut().filter(|t| t.path == path) {
             t.grid_bpm = shown;
+            list.rev += 1;
         }
     }
 }
@@ -582,6 +642,7 @@ pub fn record_grid(lib: &Arc<Mutex<Library>>, path: &Path, grid: Option<BeatGrid
     for list in l.lists.values_mut() {
         for t in list.tracks.iter_mut().filter(|t| t.path == path) {
             t.grid_bpm = shown;
+            list.rev += 1;
         }
     }
 }
@@ -622,6 +683,7 @@ fn record_key(lib: &Arc<Mutex<Library>>, path: &Path, key: Option<i8>) {
     for list in l.lists.values_mut() {
         for t in list.tracks.iter_mut().filter(|t| t.path == path) {
             t.key = key;
+            list.rev += 1;
         }
     }
 }
@@ -757,6 +819,57 @@ pub fn find_by_hash(lib: &Arc<Mutex<Library>>, id: TrackId, size: u64) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sorting_rows() {
+        // (title, artist, bpm, key, duration)
+        type Fields = (&'static str, &'static str, Option<f64>, Option<i8>, f64);
+        let rows: [Fields; 5] = [
+            ("beta", "Zed", Some(128.0), Some(9 + 12), 300.0), // 8A
+            ("Alpha", "", None, None, 0.0),
+            ("gamma", "amy", Some(122.5), Some(0), 240.0), // 8B
+            ("alpha", "Bo", Some(174.0), Some(8 + 12), 410.0), // 1A
+            ("Delta", "bo", Some(122.5), Some(7), 200.0),  // 9B
+        ];
+        let field = |i: usize| {
+            let r = rows[i];
+            SortRow {
+                title: r.0,
+                artist: r.1,
+                bpm: r.2,
+                key: r.3,
+                duration: r.4,
+            }
+        };
+        let order = |column, descending| {
+            let mut v: Vec<usize> = (0..rows.len()).collect();
+            sort_rows(&mut v, LibrarySort { column, descending }, field);
+            v
+        };
+        // Case-blind; ties keep their order.
+        assert_eq!(order(SortColumn::Title, false), [1, 3, 0, 4, 2]);
+        assert_eq!(order(SortColumn::Title, true), [2, 4, 0, 1, 3]);
+        // Empty cells last, both ways.
+        assert_eq!(order(SortColumn::Artist, false), [2, 3, 4, 0, 1]);
+        assert_eq!(order(SortColumn::Artist, true), [0, 3, 4, 2, 1]);
+        assert_eq!(order(SortColumn::Bpm, false), [2, 4, 0, 3, 1]);
+        assert_eq!(order(SortColumn::Bpm, true), [3, 0, 2, 4, 1]);
+        // Camelot order: 1A, 8A, 8B, 9B.
+        assert_eq!(order(SortColumn::Key, false), [3, 0, 2, 4, 1]);
+        assert_eq!(order(SortColumn::Time, false), [4, 2, 0, 3, 1]);
+        assert_eq!(order(SortColumn::Time, true), [3, 0, 2, 4, 1]);
+        // Sorting a filtered subset only reorders that subset.
+        let mut v = vec![4, 0, 2];
+        sort_rows(
+            &mut v,
+            LibrarySort {
+                column: SortColumn::Bpm,
+                descending: false,
+            },
+            field,
+        );
+        assert_eq!(v, [4, 2, 0]);
+    }
 
     #[test]
     fn detects_title_first_file_names() {

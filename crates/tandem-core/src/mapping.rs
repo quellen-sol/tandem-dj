@@ -9,7 +9,7 @@
 //! SYNC moves tempos without moving the fader, so when the two disagree the
 //! fader works *relatively* (see [`MidiEngine::tempo_fader`]).
 
-use crate::model::{Action, RoomState, DECKS};
+use crate::model::{Action, RoomState, BEAT_LOOPS, DECKS};
 use crate::render::LocalParams;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -89,6 +89,27 @@ pub enum Target {
         deck: u8,
         slot: u8,
     },
+    LoopIn {
+        deck: u8,
+    },
+    LoopOut {
+        deck: u8,
+    },
+    /// RELOOP/EXIT.
+    Reloop {
+        deck: u8,
+    },
+    LoopHalve {
+        deck: u8,
+    },
+    LoopDouble {
+        deck: u8,
+    },
+    /// A beat loop of [`BEAT_LOOPS`]`[size]` beats (¼ to 32).
+    BeatLoop {
+        deck: u8,
+        size: u8,
+    },
     Tempo {
         deck: u8,
     },
@@ -142,6 +163,18 @@ impl Target {
             Target::HotCue { deck: d, slot } => format!("Deck {} · Hot cue {}", deck(d), slot + 1),
             Target::HotCueClear { deck: d, slot } => {
                 format!("Deck {} · Clear hot cue {}", deck(d), slot + 1)
+            }
+            Target::LoopIn { deck: d } => format!("Deck {} · Loop in", deck(d)),
+            Target::LoopOut { deck: d } => format!("Deck {} · Loop out", deck(d)),
+            Target::Reloop { deck: d } => format!("Deck {} · Reloop / exit", deck(d)),
+            Target::LoopHalve { deck: d } => format!("Deck {} · Loop ½", deck(d)),
+            Target::LoopDouble { deck: d } => format!("Deck {} · Loop ×2", deck(d)),
+            Target::BeatLoop { deck: d, size } => {
+                format!(
+                    "Deck {} · Beat loop {}",
+                    deck(d),
+                    beats_label(beat_loop_beats(size))
+                )
             }
             Target::Tempo { deck: d } => format!("Deck {} · Tempo fader", deck(d)),
             Target::Volume { deck: d } => format!("Deck {} · Channel fader", deck(d)),
@@ -200,6 +233,14 @@ impl Target {
             for slot in 0..8 {
                 v.push(Target::HotCue { deck: d, slot });
             }
+            v.push(Target::LoopIn { deck: d });
+            v.push(Target::LoopOut { deck: d });
+            v.push(Target::Reloop { deck: d });
+            v.push(Target::LoopHalve { deck: d });
+            v.push(Target::LoopDouble { deck: d });
+            for size in 0..BEAT_LOOPS.len() as u8 {
+                v.push(Target::BeatLoop { deck: d, size });
+            }
             v.push(Target::Load { deck: d });
             v.push(Target::JogTouch { deck: d });
             v.push(Target::Jog { deck: d });
@@ -218,6 +259,22 @@ impl Target {
         v.push(Target::CueMix);
         v.push(Target::Browse);
         v
+    }
+}
+
+/// Beats in beat loop `size` (an index into [`BEAT_LOOPS`]).
+pub fn beat_loop_beats(size: u8) -> f64 {
+    BEAT_LOOPS[(size as usize).min(BEAT_LOOPS.len() - 1)]
+}
+
+/// "¼", "½", "1", "16"… for a loop length in beats.
+pub fn beats_label(beats: f64) -> String {
+    match beats {
+        b if (b - 0.25).abs() < 1e-9 => "¼".into(),
+        b if (b - 0.5).abs() < 1e-9 => "½".into(),
+        b if b >= 1.0 && b.fract() == 0.0 => format!("{b}"),
+        b if b < 1.0 && (1.0 / b).fract().abs() < 1e-9 => format!("1/{}", 1.0 / b),
+        b => format!("{b:.2}"),
     }
 }
 
@@ -276,7 +333,7 @@ pub struct Mapping {
 }
 
 /// Bump when built-in presets gain controls; saved mappings pick them up.
-pub const PRESET_VERSION: u32 = 4;
+pub const PRESET_VERSION: u32 = 5;
 
 impl Mapping {
     pub fn empty(device: &str) -> Self {
@@ -662,6 +719,27 @@ impl MidiEngine {
                 Target::HotCueClear { deck, slot } if down => {
                     out.push(MidiOut::Action(Action::ClearHotCue { deck, slot }))
                 }
+                Target::LoopIn { deck } if down => {
+                    out.push(MidiOut::Action(Action::LoopIn { deck }))
+                }
+                Target::LoopOut { deck } if down => {
+                    out.push(MidiOut::Action(Action::LoopOut { deck }))
+                }
+                Target::Reloop { deck } if down => {
+                    out.push(MidiOut::Action(Action::Reloop { deck }))
+                }
+                Target::LoopHalve { deck } if down => {
+                    out.push(MidiOut::Action(Action::LoopHalve { deck }))
+                }
+                Target::LoopDouble { deck } if down => {
+                    out.push(MidiOut::Action(Action::LoopDouble { deck }))
+                }
+                Target::BeatLoop { deck, size } if down => {
+                    out.push(MidiOut::Action(Action::BeatLoop {
+                        deck,
+                        beats: beat_loop_beats(size),
+                    }))
+                }
                 Target::Pfl { deck } if down => out.push(MidiOut::TogglePfl(deck)),
                 Target::JogTouch { deck } => {
                     let scratching = room.decks[deck as usize].scratching;
@@ -906,6 +984,21 @@ impl MidiEngine {
                 }
                 Target::Sync { deck } => room.decks[deck as usize].synced,
                 Target::Pfl { deck } => local.pfl[deck as usize],
+                // Lit while looping; LOOP IN also while it waits for LOOP OUT.
+                Target::LoopIn { deck } => {
+                    let d = &room.decks[deck as usize];
+                    d.looping || (d.loop_in.is_some() && d.loop_out.is_none())
+                }
+                Target::LoopOut { deck } | Target::Reloop { deck } => {
+                    room.decks[deck as usize].looping
+                }
+                // The pad of the beat loop that's playing.
+                Target::BeatLoop { deck, size } => {
+                    let d = &room.decks[deck as usize];
+                    d.looping
+                        && d.loop_beats
+                            .is_some_and(|b| (b - beat_loop_beats(size)).abs() < 1e-9)
+                }
                 _ => continue,
             };
             let key = (0x90 | b.trigger.channel, b.trigger.number);
@@ -962,6 +1055,11 @@ pub fn builtin_preset(port_name: &str) -> Option<Mapping> {
 /// channel 8 (deck 1), 10 (deck 2), 12 (deck 3), 14 (deck 4), with SHIFT on
 /// the next channel up. On 4-deck controllers decks 1 and 3 drive Tandem's
 /// deck A and decks 2 and 4 drive deck B, whichever the DECK button selects.
+///
+/// The pads send a different note range in each pad mode: HOT CUE 0x00,
+/// PAD FX1 0x10, BEAT JUMP 0x20, SAMPLER 0x30, and with SHIFT + the mode
+/// button KEYBOARD 0x40, PAD FX2 0x50, BEAT LOOP 0x60, KEY SHIFT 0x70
+/// (recorded from a DDJ-FLX6).
 fn pioneer_ddj(device: &str, name: &str, hw_decks: u8, ticks_per_rev: f32) -> Mapping {
     let mut m = Mapping::empty(device);
     m.preset = Some(name.to_string());
@@ -981,6 +1079,14 @@ fn pioneer_ddj(device: &str, name: &str, hw_decks: u8, ticks_per_rev: f32) -> Ma
         }
         m.bind(Trigger::cc(ch, 0x00), Target::Tempo { deck });
         m.bind(Trigger::note(6, 0x46 + hw), Target::Load { deck });
+        // Loop section: IN, OUT, RELOOP/EXIT; SHIFT + IN is a 4-beat loop;
+        // CUE/LOOP CALL ◀ / ▶ halve and double the loop.
+        m.bind(Trigger::note(ch, 0x10), Target::LoopIn { deck });
+        m.bind(Trigger::note(ch, 0x11), Target::LoopOut { deck });
+        m.bind(Trigger::note(ch, 0x4D), Target::Reloop { deck });
+        m.bind(Trigger::note(ch, 0x4C), Target::BeatLoop { deck, size: 4 });
+        m.bind(Trigger::note(ch, 0x51), Target::LoopHalve { deck });
+        m.bind(Trigger::note(ch, 0x53), Target::LoopDouble { deck });
         // The mixer has its own strip per channel: only channels 1 and 2
         // are Tandem's two decks. Channels 3/4 are left alone.
         if hw < 2 {
@@ -998,6 +1104,11 @@ fn pioneer_ddj(device: &str, name: &str, hw_decks: u8, ticks_per_rev: f32) -> Ma
             m.bind(
                 Trigger::note(pads + 1, slot),
                 Target::HotCueClear { deck, slot },
+            );
+            // BEAT LOOP pad mode: ¼, ½, 1, 2, 4, 8, 16, 32 beats.
+            m.bind(
+                Trigger::note(pads, 0x60 + slot),
+                Target::BeatLoop { deck, size: slot },
             );
         }
     }
@@ -1396,6 +1507,132 @@ mod tests {
             act(Action::ClearHotCue { deck: 0, slot: 2 })
         );
         assert!(e.handle(&[0x98, 0x02, 0], &room, &local).is_empty());
+    }
+
+    #[test]
+    fn flx6_loop_controls_as_recorded() {
+        // Messages recorded from a DDJ-FLX6 with Tandem's MIDI monitor.
+        let mut e = MidiEngine::new(pioneer_ddj("DDJ-FLX6", "test", 4, 2048.0), 0.08);
+        let (room, local) = (RoomState::default(), LocalParams::default());
+        let act = |a| vec![MidiOut::Action(a)];
+        let mut press = |msg: [u8; 3]| {
+            let out = e.handle(&msg, &room, &local);
+            // Every button and pad's release does nothing.
+            assert!(e.handle(&[msg[0], msg[1], 0], &room, &local).is_empty());
+            out
+        };
+        assert_eq!(press([0x90, 0x10, 0x7F]), act(Action::LoopIn { deck: 0 }));
+        assert_eq!(press([0x90, 0x11, 0x7F]), act(Action::LoopOut { deck: 0 }));
+        assert_eq!(press([0x90, 0x4D, 0x7F]), act(Action::Reloop { deck: 0 }));
+        assert_eq!(
+            press([0x90, 0x4C, 0x7F]),
+            act(Action::BeatLoop {
+                deck: 0,
+                beats: 4.0
+            }),
+            "SHIFT + IN"
+        );
+        assert_eq!(
+            press([0x90, 0x51, 0x7F]),
+            act(Action::LoopHalve { deck: 0 })
+        );
+        assert_eq!(
+            press([0x90, 0x53, 0x7F]),
+            act(Action::LoopDouble { deck: 0 })
+        );
+        assert_eq!(press([0x91, 0x10, 0x7F]), act(Action::LoopIn { deck: 1 }));
+        assert_eq!(press([0x91, 0x4D, 0x7F]), act(Action::Reloop { deck: 1 }));
+        // BEAT LOOP pads (SHIFT + BEAT JUMP): ¼ to 32 beats.
+        for (i, beats) in BEAT_LOOPS.iter().enumerate() {
+            let pad = 0x60 + i as u8;
+            assert_eq!(
+                press([0x97, pad, 0x7F]),
+                act(Action::BeatLoop {
+                    deck: 0,
+                    beats: *beats
+                })
+            );
+            assert_eq!(
+                press([0x99, pad, 0x7F]),
+                act(Action::BeatLoop {
+                    deck: 1,
+                    beats: *beats
+                })
+            );
+        }
+        // Left alone: SHIFT + OUT, SHIFT + RELOOP/EXIT, SHIFT + ◀/▶, BEAT JUMP pads.
+        for msg in [
+            [0x90, 0x77, 0x7F],
+            [0x90, 0x50, 0x7F],
+            [0x90, 0x61, 0x7F],
+            [0x90, 0x62, 0x7F],
+            [0x97, 0x20, 0x7F],
+        ] {
+            assert!(press(msg).is_empty(), "{msg:02X?}");
+        }
+    }
+
+    #[test]
+    fn saved_v4_mappings_gain_the_loop_controls() {
+        let preset = pioneer_ddj("DDJ-FLX6", "Pioneer DDJ-FLX6", 4, 2048.0);
+        let mut saved = preset.clone();
+        saved.preset_version = 4;
+        saved.bindings.retain(|b| {
+            !matches!(
+                b.target,
+                Target::LoopIn { .. }
+                    | Target::LoopOut { .. }
+                    | Target::Reloop { .. }
+                    | Target::LoopHalve { .. }
+                    | Target::LoopDouble { .. }
+                    | Target::BeatLoop { .. }
+            )
+        });
+        // Six loop buttons and eight pads on each of the four hardware decks.
+        assert_eq!(saved.upgrade_from(&preset), 4 * (6 + 8));
+        assert_eq!(saved.bindings.len(), preset.bindings.len());
+    }
+
+    #[test]
+    fn loop_lights() {
+        let e = MidiEngine::new(pioneer_ddj("DDJ-FLX6", "test", 4, 2048.0), 0.08);
+        let mut room = RoomState::default();
+        let on = |room: &RoomState, k: (u8, u8)| {
+            let leds = e.leds(room, &LocalParams::default());
+            leds.iter().find(|(kk, _)| *kk == k).map(|x| x.1)
+        };
+        // LOOP IN pressed: its light waits for LOOP OUT.
+        room.decks[0].loop_in = Some(10.0);
+        assert_eq!(on(&room, (0x90, 0x10)), Some(true));
+        assert_eq!(on(&room, (0x90, 0x11)), Some(false));
+        // A 4-beat loop playing: IN, OUT, RELOOP/EXIT and pad 5 light up.
+        room.decks[0].loop_out = Some(12.0);
+        room.decks[0].looping = true;
+        room.decks[0].loop_beats = Some(4.0);
+        for k in [
+            (0x90, 0x10),
+            (0x90, 0x11),
+            (0x90, 0x4D),
+            (0x97, 0x64),
+            (0x9B, 0x64),
+        ] {
+            assert_eq!(on(&room, k), Some(true), "{k:02X?}");
+        }
+        assert_eq!(on(&room, (0x97, 0x63)), Some(false));
+        assert_eq!(on(&room, (0x99, 0x64)), Some(false), "deck B");
+        // Left the loop: all off.
+        room.decks[0].looping = false;
+        for k in [(0x90, 0x10), (0x90, 0x11), (0x90, 0x4D), (0x97, 0x64)] {
+            assert_eq!(on(&room, k), Some(false), "{k:02X?}");
+        }
+    }
+
+    #[test]
+    fn beat_loop_labels() {
+        let labels: Vec<String> = BEAT_LOOPS.iter().map(|b| beats_label(*b)).collect();
+        assert_eq!(labels, ["¼", "½", "1", "2", "4", "8", "16", "32"]);
+        assert_eq!(beats_label(0.125), "1/8");
+        assert_eq!(beats_label(64.0), "64");
     }
 
     #[test]

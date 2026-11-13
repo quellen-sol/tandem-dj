@@ -4,7 +4,8 @@ use crate::app::TandemApp;
 use eframe::egui::{self, pos2, vec2, Align, Color32, Layout, RichText, Sense, Stroke};
 use tandem_core::audio::PEAK_BLOCK;
 use tandem_core::grid::{BeatGrid, Marker, MAX_MARKERS};
-use tandem_core::model::{Action, DECKS};
+use tandem_core::mapping::beats_label;
+use tandem_core::model::{Action, DeckState, BEAT_LOOPS, DECKS};
 use tandem_core::session::{deck_letter, DeckView, RoleView, SessionView, TrackStatus};
 
 pub const DECK_COLORS: [Color32; DECKS] = [
@@ -26,6 +27,8 @@ const RED: Color32 = Color32::from_rgb(240, 90, 90);
 const AMBER: Color32 = Color32::from_rgb(250, 190, 60);
 /// Beatgrid markers (red, like Serato's).
 const MARKER: Color32 = Color32::from_rgb(235, 70, 70);
+/// Loops, on the buttons and the waveforms.
+const LOOP: Color32 = Color32::from_rgb(60, 200, 150);
 
 /// ADJUST steps (BPM): a little, a bit more, more than that.
 const ADJUST_STEPS: [f64; 3] = [0.01, 0.1, 1.0];
@@ -362,6 +365,8 @@ impl TandemApp {
             });
 
             ui.add_space(2.0);
+            self.loop_row(ui, deck, &st);
+            ui.add_space(2.0);
             if self.ui.grid_edit[d] && st.track.is_some() {
                 self.grid_editor(ui, d, dv, pos);
                 return;
@@ -472,6 +477,87 @@ impl TandemApp {
                     }
                     if up {
                         self.pending.push(Action::Bend { deck, bend: 0.0 });
+                    }
+                }
+            });
+        });
+    }
+
+    /// LOOP IN, OUT and RELOOP/EXIT, halve and double, and beat loops.
+    fn loop_row(&mut self, ui: &mut egui::Ui, deck: u8, st: &DeckState) {
+        let lit = LOOP.gamma_multiply(0.55);
+        let off = Color32::from_gray(50);
+        let h = 20.0;
+        let span = st.loop_span();
+        ui.add_enabled_ui(st.track.is_some(), |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 3.0;
+                let title = RichText::new("LOOP").small().strong();
+                let r = ui.label(if st.looping { title.color(LOOP) } else { title.weak() });
+                if let Some((a, b)) = span {
+                    let beats = st.grid.map(|g| (b - a) * g.bpm_at(a) / 60.0);
+                    r.on_hover_text(match beats {
+                        Some(n) => format!("{:.3} s, {n:.2} beats", b - a),
+                        None => format!("{:.3} s", b - a),
+                    });
+                }
+                let waiting = st.loop_in.is_some() && st.loop_out.is_none();
+                let button = |text: &str, on: bool, w: f32| {
+                    egui::Button::new(RichText::new(text).small().strong())
+                        .fill(if on { lit } else { off })
+                        .min_size(vec2(w, h))
+                };
+                if ui
+                    .add(button("IN", st.looping || waiting, 26.0))
+                    .on_hover_text("Loop in: mark where a loop starts, then press OUT where it ends. While looping, moves the start of the loop to here.")
+                    .clicked()
+                {
+                    self.pending.push(Action::LoopIn { deck });
+                }
+                if ui
+                    .add_enabled(st.loop_in.is_some(), button("OUT", st.looping, 30.0))
+                    .on_hover_text("Loop out: end the loop here and go round it. While looping, moves the end of the loop to here.")
+                    .on_disabled_hover_text("Press IN first, where the loop should start.")
+                    .clicked()
+                {
+                    self.pending.push(Action::LoopOut { deck });
+                }
+                let label = if st.looping { "EXIT" } else { "RELOOP" };
+                if ui
+                    .add_enabled(span.is_some(), button(label, st.looping, 52.0))
+                    .on_hover_text("While looping: leave the loop and play on. Otherwise: jump back to the loop and go round it again.")
+                    .clicked()
+                {
+                    self.pending.push(Action::Reloop { deck });
+                }
+                ui.add_space(4.0);
+                if ui
+                    .add_enabled(span.is_some(), button("×½", false, 24.0))
+                    .on_hover_text("Halve the loop")
+                    .clicked()
+                {
+                    self.pending.push(Action::LoopHalve { deck });
+                }
+                if ui
+                    .add_enabled(span.is_some(), button("×2", false, 24.0))
+                    .on_hover_text("Double the loop")
+                    .clicked()
+                {
+                    self.pending.push(Action::LoopDouble { deck });
+                }
+                ui.add_space(4.0);
+                for beats in BEAT_LOOPS {
+                    let on = st.looping && st.loop_beats.is_some_and(|b| (b - beats).abs() < 1e-9);
+                    let text = beats_label(beats);
+                    let tip = if beats <= 1.0 { "beat" } else { "beats" };
+                    if ui
+                        .add(button(&text, on, 22.0))
+                        .on_hover_text(format!(
+                            "{text} {tip} loop, from the beat the playhead is in. Press it again to leave the loop; another size while looping resizes it."
+                        ))
+                        .clicked()
+                    {
+                        self.pending.push(Action::BeatLoop { deck, beats });
                     }
                 }
             });
@@ -806,6 +892,7 @@ fn overview(
     }
     if dur > 0.0 {
         let x_of = |t: f64| rect.left() + (t / dur) as f32 * rect.width();
+        loop_band(&p, rect, &dv.state, x_of);
         let cx = x_of(dv.state.cue_point);
         p.line_segment(
             [pos2(cx, rect.top()), pos2(cx, rect.bottom())],
@@ -844,6 +931,42 @@ fn overview(
         }
     }
     None
+}
+
+/// The loop on a waveform: a band from loop in to loop out (bright while
+/// looping), or just the in point while LOOP IN waits for LOOP OUT.
+fn loop_band(p: &egui::Painter, rect: egui::Rect, st: &DeckState, x_of: impl Fn(f64) -> f32) {
+    let edge = |x: f32, c: Color32| {
+        if rect.x_range().contains(x) {
+            p.line_segment(
+                [pos2(x, rect.top()), pos2(x, rect.bottom())],
+                Stroke::new(1.5_f32, c),
+            );
+        }
+    };
+    match (st.loop_span(), st.loop_in) {
+        (Some((a, b)), _) => {
+            let c = if st.looping {
+                LOOP
+            } else {
+                LOOP.gamma_multiply(0.45)
+            };
+            let band =
+                egui::Rect::from_min_max(pos2(x_of(a), rect.top()), pos2(x_of(b), rect.bottom()))
+                    .intersect(rect);
+            if band.width() > 0.0 {
+                p.rect_filled(
+                    band,
+                    0.0,
+                    c.gamma_multiply(if st.looping { 0.22 } else { 0.1 }),
+                );
+            }
+            edge(x_of(a), c);
+            edge(x_of(b), c);
+        }
+        (None, Some(a)) => edge(x_of(a), LOOP),
+        _ => {}
+    }
 }
 
 /// Scrolling waveform centred on the playhead. The window is 8 seconds of
@@ -896,6 +1019,7 @@ fn scrolling_waveform(
             );
         }
         let x_of = |t: f64| rect.center().x + ((t - pos) / span) as f32 * rect.width();
+        loop_band(&p, rect, &st, x_of);
         if let Some(g) = st.grid {
             // Beat lines: downbeats full height with their bar number.
             let font = egui::FontId::monospace(10.0);

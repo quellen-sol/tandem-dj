@@ -80,13 +80,39 @@ Work through these in order and note anything that fails. `tandem.log` (Settings
    - Does RESET bring back the detected one?
 6. In a room: edit a grid on one PC. Does the other PC's waveform follow straight away?
 
+## Round 4 (v0.4)
+
+- **Loops.** IN, OUT and RELOOP/EXIT, beat loops of ¼ to 32 beats on the beat, and halve/double. They're on every deck's LOOP row and on the FLX6/FLX4/DDJ-400.
+  - FLX6 controls: SHIFT + IN for a 4-beat loop, CUE/LOOP CALL ◀ / ▶ to halve and double, and BEAT LOOP pad mode (SHIFT + BEAT JUMP).
+  - Loop, pad and button lights follow.
+  - Going round is seamless and click-free, with key lock too. Synced decks stay on the beat.
+  - Saved FLX6/FLX4 mappings pick up the loop controls automatically.
+- **Library sorting.** Click a column heading to sort by title, artist, BPM, key (Camelot order) or time. Click again to reverse, and a third time for the list's own order. The sort is remembered, and the selected track stays selected.
+- Protocol version 6: both booths need this version.
+
+### Test plan for loops
+
+1. Play a track and press a beat loop (deck LOOP row, or the FLX6 pads in BEAT LOOP mode).
+   - Does it loop on the beat with no click at the join?
+   - Is the band on the waveform, and is the pad lit?
+2. Press the same pad again: the loop ends and the track plays on. Try ¼ and ½ loops, and switch between sizes while looping.
+3. IN, then OUT a few beats later.
+   - Does it loop between them?
+   - Does RELOOP/EXIT leave the loop, and pressing it again go back?
+   - Do ◀ / ▶ (CUE/LOOP CALL) halve and double it?
+4. Turn key lock off and on while looping. Any clicks or drift?
+5. Sync deck B to deck A, loop deck B, then leave the loop. Are they still on the beat?
+6. In a room: loop on one PC.
+   - Does the other PC loop at the same moment?
+   - Is the broadcast recording clean?
+
 ## Next candidates
 
 Rough priority order:
 
-1. **Automatic downbeats (bars)** in the detected beatgrid, plus quantize for hot cues, play and loops. Grids already have bars; for now you set bar 1 by hand.
+1. **Automatic downbeats (bars)** in the detected beatgrid, plus quantize for hot cues, play and loop IN/OUT. Grids already have bars; for now you set bar 1 by hand.
 2. **Beatgrid editing from the controller**, and placing markers by clicking the waveform.
-3. **Loops:** auto-loop, loop in/out and reloop on the FLX6 controls.
+3. **More loop tools:** BEAT JUMP pads, slip mode and loop rolls, and fine-adjusting IN/OUT with the jog wheel.
 4. **Lower UI CPU:** redraw waveforms only when they change, and cap the frame rate.
 5. **Serato cue points and loops** from the Markers2 tag.
 6. **Lower-latency audio:** WASAPI exclusive mode or ASIO.

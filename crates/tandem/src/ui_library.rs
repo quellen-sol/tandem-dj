@@ -1,8 +1,9 @@
 //! Library browser: sources on the left, tracks on the right.
 
-use crate::app::{ShareDraft, Source, TandemApp};
+use crate::app::{lib_bpm, room_bpm, ShareDraft, Source, TandemApp};
 use crate::ui_decks::fmt_time;
 use eframe::egui::{self, pos2, vec2, Align2, Color32, FontId, RichText, Sense};
+use tandem_core::config::SortColumn;
 use tandem_core::library::KEY_SHARED;
 use tandem_core::session::{deck_letter, SessionView, ShareState, TransferState};
 
@@ -269,16 +270,78 @@ impl TandemApp {
         let row_h = 22.0;
         let width = ui.available_width();
         let cols = [0.0, width * 0.42, width * 0.74, width * 0.83, width * 0.91];
+        // Column headings sort the list: once ascending, again descending,
+        // a third time back to the list's own order.
         let header = ui.allocate_exact_size(vec2(width, 18.0), Sense::hover()).0;
         let hp = ui.painter_at(header);
-        for (x, label) in cols.iter().zip(["TITLE", "ARTIST", "BPM", "KEY", "TIME"]) {
-            hp.text(
-                pos2(header.left() + x + 6.0, header.center().y),
+        let sort = self.settings.library_sort;
+        let mut sort_click = None;
+        let headings = [
+            (SortColumn::Title, "TITLE"),
+            (SortColumn::Artist, "ARTIST"),
+            (SortColumn::Bpm, "BPM"),
+            (SortColumn::Key, "KEY"),
+            (SortColumn::Time, "TIME"),
+        ];
+        for (c, (column, label)) in headings.into_iter().enumerate() {
+            let left = header.left() + cols[c];
+            let right = cols
+                .get(c + 1)
+                .map_or(header.right(), |x| header.left() + x);
+            let cell =
+                egui::Rect::from_min_max(pos2(left, header.top()), pos2(right, header.bottom()));
+            let resp = ui
+                .interact(cell, ui.id().with(("sort", c)), Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text(match sort {
+                    Some(s) if s.column == column && !s.descending => {
+                        "Sorted A→Z / low→high. Click for the other way round."
+                    }
+                    Some(s) if s.column == column => {
+                        "Sorted Z→A / high→low. Click to go back to the list's own order."
+                    }
+                    _ => "Sort by this column",
+                });
+            let active = sort.filter(|s| s.column == column);
+            if resp.hovered() {
+                hp.rect_filled(cell.shrink2(vec2(1.0, 0.0)), 2.0, Color32::from_gray(34));
+            }
+            let color = Color32::from_gray(match (active.is_some(), resp.hovered()) {
+                (true, _) => 225,
+                (false, true) => 190,
+                _ => 130,
+            });
+            let text = hp.text(
+                pos2(left + 6.0, header.center().y),
                 Align2::LEFT_CENTER,
                 label,
                 FontId::proportional(11.0),
-                Color32::from_gray(130),
+                color,
             );
+            if let Some(s) = active {
+                // A small arrow: up for ascending, down for descending.
+                let (x, y) = (text.right() + 7.0, header.center().y);
+                let (tip, base) = if s.descending {
+                    (3.0, -2.5)
+                } else {
+                    (-3.0, 2.5)
+                };
+                hp.add(egui::Shape::convex_polygon(
+                    vec![
+                        pos2(x, y + tip),
+                        pos2(x + 3.5, y + base),
+                        pos2(x - 3.5, y + base),
+                    ],
+                    color,
+                    egui::Stroke::NONE,
+                ));
+            }
+            if resp.clicked() {
+                sort_click = Some(column);
+            }
+        }
+        if let Some(column) = sort_click {
+            self.sort_by(column);
         }
 
         let n = self.ui.filtered.len();
@@ -317,17 +380,14 @@ impl TandemApp {
                     Source::Room => view.room_tracks.get(idx).map(|t| Row {
                         title: t.title.clone(),
                         artist: t.artist.clone(),
-                        bpm: t
-                            .grid
-                            .map(|g| g.main_bpm(t.duration))
-                            .or(t.bpm.map(|b| b as f64)),
+                        bpm: room_bpm(t),
                         key: t.key,
                         duration: t.duration,
                     }),
                     _ => list.and_then(|l| l.tracks.get(idx)).map(|t| Row {
                         title: t.title.clone(),
                         artist: t.artist.clone(),
-                        bpm: t.grid_bpm.or(t.bpm.map(|b| b as f64)),
+                        bpm: lib_bpm(t),
                         key: t.key,
                         duration: t.duration,
                     }),

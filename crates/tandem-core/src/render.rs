@@ -10,6 +10,10 @@
 //! from the model: discontinuities (play, cue, hot cue, load) make it jump
 //! with a 2 ms crossfade; small differences (jog nudges, sound-card drift,
 //! clock corrections) are absorbed by speeding up or slowing down slightly.
+//!
+//! Loops are followed by the read head itself: it reads the track as if it
+//! went round the loop (see [`looped_frame`]), so going round is seamless,
+//! even through the time-stretcher, and needs no jump.
 
 use crate::audio::TrackAudio;
 use crate::model::{DeckState, RoomState, Timeline, TrackId, DECKS};
@@ -119,17 +123,92 @@ const CLICK_LEN_US: i64 = 15_000;
 const SEEK_FRAMES: usize = 8192;
 const HEAD_BUF_FRAMES: usize = 32_768;
 
-/// Copy track frames `[start, start + n)` as interleaved f32 (silence outside the track).
-fn fill(audio: &TrackAudio, start: i64, buf: &mut [f32]) {
-    for (i, c) in buf.chunks_exact_mut(2).enumerate() {
-        let idx = start + i as i64;
-        let f = if idx >= 0 && (idx as usize) < audio.frames.len() {
-            audio.frames[idx as usize]
+/// Frames before a loop's out point that fade into the frames just before
+/// its in point, so going round the loop never clicks (about 2 ms).
+const LOOP_BLEND: i64 = 96;
+
+/// A loop, in source frames.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LoopSpan {
+    start: f64,
+    end: f64,
+}
+
+impl LoopSpan {
+    /// The loop deck `st` is going round, at `sr` frames per second.
+    fn of(st: &DeckState, sr: f64) -> Option<Self> {
+        st.active_loop().map(|(a, b)| LoopSpan {
+            start: a * sr,
+            end: b * sr,
+        })
+    }
+
+    fn len(&self) -> f64 {
+        self.end - self.start
+    }
+
+    /// The loop in whole frames: `[start, end)`.
+    fn frames(&self) -> (i64, i64) {
+        let s = self.start.round() as i64;
+        (s, (self.end.round() as i64).max(s + 1))
+    }
+
+    /// A whole-frame position, gone round the loop if at or past its end.
+    fn wrap_frames(&self, pos: f64) -> f64 {
+        let (s, e) = self.frames();
+        if pos >= e as f64 {
+            s as f64 + (pos - s as f64).rem_euclid((e - s) as f64)
         } else {
-            [0, 0]
-        };
-        c[0] = f[0] as f32 * (1.0 / 32768.0);
-        c[1] = f[1] as f32 * (1.0 / 32768.0);
+            pos
+        }
+    }
+}
+
+/// Error between where the model and the read head are, going round the
+/// loop the shorter way (a head that has just gone round is not a loop
+/// length behind).
+fn fold(err: f64, lp: Option<LoopSpan>) -> f64 {
+    match lp {
+        Some(l) if l.len() > 0.0 => err - (err / l.len()).round() * l.len(),
+        _ => err,
+    }
+}
+
+/// Track frame `idx` as heard going round `lp`: past the out point it
+/// carries on from the in point, and the last [`LOOP_BLEND`] frames before
+/// the out point fade into the frames just before the in point, so the
+/// jump back joins up seamlessly. Deterministic, so both booths hear the
+/// same loop.
+#[inline]
+fn looped_frame(a: &TrackAudio, idx: i64, lp: Option<LoopSpan>) -> [f32; 2] {
+    let Some(lp) = lp else {
+        return a.frame(idx as isize);
+    };
+    let (s, e) = lp.frames();
+    let len = e - s;
+    let i = if idx >= e {
+        s + (idx - s).rem_euclid(len)
+    } else {
+        idx
+    };
+    let x = a.frame(i as isize);
+    let blend = LOOP_BLEND.min(len / 4);
+    if blend > 0 && i >= e - blend && i < e {
+        let w = (i - (e - blend) + 1) as f32 / (blend + 1) as f32;
+        let y = a.frame((i - len) as isize);
+        [x[0] + (y[0] - x[0]) * w, x[1] + (y[1] - x[1]) * w]
+    } else {
+        x
+    }
+}
+
+/// Copy track frames `[start, start + n)` as interleaved f32, going round
+/// `lp` (silence outside the track).
+fn fill(audio: &TrackAudio, start: i64, buf: &mut [f32], lp: Option<LoopSpan>) {
+    for (i, c) in buf.chunks_exact_mut(2).enumerate() {
+        let f = looped_frame(audio, start + i as i64, lp);
+        c[0] = f[0];
+        c[1] = f[1];
     }
 }
 
@@ -141,6 +220,8 @@ struct Head {
     stretched: bool,
     /// Vinyl: read position. Stretched: next input frame to feed.
     pos: f64,
+    /// The loop this head goes round.
+    lp: Option<LoopSpan>,
     /// Source frames consumed per output frame.
     step: f64,
     carry: f64,
@@ -156,6 +237,7 @@ impl Head {
             playing: false,
             stretched: false,
             pos: 0.0,
+            lp: None,
             step: 0.0,
             carry: 0.0,
             stretch: Stretcher::new(sr as f32),
@@ -206,16 +288,20 @@ impl Head {
             a,
             feed as i64 - SEEK_FRAMES as i64,
             &mut self.inbuf[..SEEK_FRAMES * 2],
+            self.lp,
         );
         self.stretch.seek(&mut self.inbuf[..SEEK_FRAMES * 2], step);
         let out_lat = self.stretch.output_latency().min(HEAD_BUF_FRAMES / 2);
         let pre_in = ((out_lat as f64 * step).round() as usize).min(HEAD_BUF_FRAMES);
-        fill(a, feed as i64, &mut self.inbuf[..pre_in * 2]);
+        fill(a, feed as i64, &mut self.inbuf[..pre_in * 2], self.lp);
         self.stretch.process(
             &mut self.inbuf[..pre_in * 2],
             &mut self.outbuf[..out_lat * 2],
         );
         self.pos = feed + pre_in as f64;
+        if let Some(l) = self.lp {
+            self.pos = l.wrap_frames(self.pos);
+        }
     }
 
     fn render(&mut self, audio: Option<&TrackAudio>, out: &mut [[f32; 2]]) {
@@ -224,9 +310,23 @@ impl Head {
             return;
         };
         if !self.stretched {
-            for o in out.iter_mut() {
-                *o = a.sample(self.pos);
-                self.pos += self.step;
+            match self.lp {
+                None => {
+                    for o in out.iter_mut() {
+                        *o = a.sample(self.pos);
+                        self.pos += self.step;
+                    }
+                }
+                Some(l) => {
+                    for o in out.iter_mut() {
+                        *o = a.sample_with(self.pos, |i| looped_frame(a, i as i64, self.lp));
+                        let before = self.pos;
+                        self.pos += self.step;
+                        if self.pos >= l.end && before < l.end {
+                            self.pos -= l.len();
+                        }
+                    }
+                }
             }
             return;
         }
@@ -234,10 +334,18 @@ impl Head {
         let want = self.carry + n as f64 * self.step.max(0.0);
         let in_frames = (want.floor() as usize).min(HEAD_BUF_FRAMES);
         self.carry = want - in_frames as f64;
-        fill(a, self.pos as i64, &mut self.inbuf[..in_frames * 2]);
+        fill(
+            a,
+            self.pos as i64,
+            &mut self.inbuf[..in_frames * 2],
+            self.lp,
+        );
         self.stretch
             .process(&mut self.inbuf[..in_frames * 2], &mut self.outbuf[..n * 2]);
         self.pos += in_frames as f64;
+        if let Some(l) = self.lp {
+            self.pos = l.wrap_frames(self.pos);
+        }
         for (i, o) in out.iter_mut().enumerate() {
             *o = [self.outbuf[i * 2], self.outbuf[i * 2 + 1]];
         }
@@ -248,6 +356,8 @@ struct Player {
     track: Option<TrackId>,
     has_audio: bool,
     gen: u64,
+    /// The loop the deck is going round (source frames), as of this block.
+    lp: Option<LoopSpan>,
     cur: Head,
     /// The previous head, faded out after a jump.
     old: Head,
@@ -257,6 +367,8 @@ struct Player {
     scratching: bool,
     /// Velocity (source frames per output frame), eased while scratching.
     vel: f64,
+    /// Hard syncs so far (for tests).
+    syncs: u32,
 }
 
 impl Player {
@@ -265,6 +377,7 @@ impl Player {
             track: None,
             has_audio: false,
             gen: 0,
+            lp: None,
             cur: Head::new(sr),
             old: Head::new(sr),
             xfade: 0,
@@ -272,6 +385,7 @@ impl Player {
             corr: 0.0,
             scratching: false,
             vel: 0.0,
+            syncs: 0,
         }
     }
 
@@ -291,7 +405,25 @@ impl Player {
             || st.gen != self.gen
             || has_audio != self.has_audio
             || (want_playing && self.cur.playing && stretched != self.cur.stretched);
-        if changed {
+        // A new, changed or ended loop. The head can take it on the fly,
+        // unless it has already read audio the loop says it shouldn't:
+        // a vinyl head past the new out point (e.g. LOOP OUT pressed at
+        // the playhead, or arriving from the partner a little late), or a
+        // stretched head, whose stretcher holds audio read ahead.
+        self.lp = LoopSpan::of(st, track_sr).filter(|_| has_audio);
+        let lp = self.lp;
+        let loop_changed = lp != self.cur.lp;
+        let loop_jump = loop_changed
+            && self.cur.playing
+            && !scratching
+            && match lp {
+                Some(l) => self.cur.stretched || self.cur.pos >= l.end,
+                None => self.cur.stretched,
+            };
+        if !changed && !loop_jump {
+            self.cur.lp = lp;
+        }
+        if changed || loop_jump {
             self.hard_sync(
                 st,
                 target,
@@ -307,8 +439,9 @@ impl Player {
         if scratching {
             // Vinyl: the read head follows the hand, forwards or backwards,
             // with eased velocity so grabbing and releasing sound natural.
-            let err = target - self.cur.pos;
-            if err.abs() > 2.0 * track_sr {
+            let outside = lp.is_some_and(|l| self.cur.pos >= l.end);
+            let err = fold(target - self.cur.pos, lp);
+            if err.abs() > 2.0 * track_sr || outside {
                 self.hard_sync(st, target, true, has_audio, false, 0.0, 1.0, audio);
             }
             if !self.cur.playing {
@@ -317,7 +450,8 @@ impl Player {
                 self.cur.playing = true;
             }
             let max = SCRATCH_MAX_SPEED * track_sr / out_sr;
-            let want = ((target - self.cur.pos) / (SCRATCH_TAU_S * out_sr)).clamp(-max, max);
+            let err = fold(target - self.cur.pos, lp);
+            let want = (err / (SCRATCH_TAU_S * out_sr)).clamp(-max, max);
             self.vel += (want - self.vel) * 0.35;
             self.cur.step = self.vel;
             self.scratching = true;
@@ -328,7 +462,7 @@ impl Player {
 
         if !changed {
             if want_playing {
-                let err = target - self.cur.heard();
+                let err = fold(target - self.cur.heard(), lp);
                 if !self.cur.playing || err.abs() > HARD_SYNC_S * track_sr {
                     self.hard_sync(
                         st,
@@ -382,6 +516,8 @@ impl Player {
         } else {
             0
         };
+        self.syncs += 1;
+        self.cur.lp = self.lp;
         self.cur
             .start(st.track, target, playing, stretched, step, transpose, audio);
         self.track = st.track;
@@ -1129,6 +1265,161 @@ mod tests {
         let vinyl = zero_crossings_hz(&render_deck(&a, false, 1.08, 2.0));
         assert!((locked - 440.0).abs() < 5.0, "key-locked pitch {locked} Hz");
         assert!((vinyl - 475.2).abs() < 5.0, "vinyl pitch {vinyl} Hz");
+    }
+
+    /// Deck A alone, playing from 0 at shared time 0, with `extra` events.
+    /// Renders `secs` in 10 ms blocks and checks after each block (once
+    /// settled) that the read head is where the model says, going round any
+    /// loop. Returns the left channel and the player's hard-sync count.
+    fn render_loop(
+        a: &Arc<TrackAudio>,
+        key_lock: bool,
+        extra: &[(i64, Action)],
+        secs: f64,
+    ) -> (Vec<f32>, u32) {
+        let mut tl = Timeline::new(-1_000_000);
+        let mut seq = 0;
+        let mut go = |tl: &mut Timeline, t: i64, action: Action| {
+            seq += 1;
+            tl.insert(Event {
+                time: t,
+                origin: 1,
+                seq,
+                action,
+            });
+        };
+        go(
+            &mut tl,
+            -1_000_000,
+            Action::Load {
+                deck: 0,
+                track: a.id,
+                duration: a.duration(),
+                cue: 0.0,
+                grid: crate::grid::BeatGrid::new(0.0, 120.0).map(Box::new),
+                key: -1,
+            },
+        );
+        go(&mut tl, -1_000_000, Action::Crossfader { v: 0.0 });
+        go(
+            &mut tl,
+            -1_000_000,
+            Action::KeyLock {
+                deck: 0,
+                on: key_lock,
+            },
+        );
+        go(&mut tl, 0, Action::Play { deck: 0 });
+        for (t, action) in extra {
+            go(&mut tl, *t, action.clone());
+        }
+        let snap = snap_with(tl, a.clone());
+        let sr = 44_100.0;
+        let mut lane = Lane::new(sr, 0, LaneKind::Live);
+        let block = 441;
+        let (mut m, mut c) = (vec![0.0; block * 2], vec![0.0; block * 2]);
+        let mut out = Vec::new();
+        let mut t = 0i64;
+        while t < (secs * 1e6) as i64 {
+            lane.render(&snap, t, &mut m, &mut c);
+            out.extend(m.iter().step_by(2));
+            t += 10_000;
+            if t > 300_000 {
+                // Events at exactly `t` reach the head in the next block.
+                let st = snap.timeline.state_at(t - 1).decks[0];
+                let p = &lane.players[0];
+                let err = fold(
+                    st.position_at(t) * sr - p.cur.heard(),
+                    LoopSpan::of(&st, sr),
+                );
+                assert!(
+                    err.abs() / sr < 0.002,
+                    "{:.1} ms off at {t}",
+                    err / sr * 1e3
+                );
+            }
+        }
+        (out, lane.players[0].syncs)
+    }
+
+    /// A sine that's a quarter cycle in at the loop's in point (1.0 s) and
+    /// at -45° at its out point (1.5 s), so a plain jump back would click.
+    fn sine_track() -> Arc<TrackAudio> {
+        let frames: Vec<[i16; 2]> = (0..44_100 * 12)
+            .map(|i| {
+                let v = ((2.0 * std::f64::consts::PI * 207.25 * i as f64 / 44_100.0).sin()
+                    * 16_000.0) as i16;
+                [v, v]
+            })
+            .collect();
+        Arc::new(TrackAudio::new(TrackId([7; 32]), 44_100, frames))
+    }
+
+    /// Biggest jump between neighbouring samples, ignoring the first `skip`.
+    fn max_step(x: &[f32], skip: usize) -> f32 {
+        x[skip..]
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0, f32::max)
+    }
+
+    #[test]
+    fn loops_go_round_seamlessly() {
+        let a = sine_track();
+        // The steepest the sine itself ever gets, sample to sample.
+        let natural = 2.0 * std::f32::consts::PI * 207.25 / 44_100.0 * 16_000.0 / 32_768.0;
+        for key_lock in [false, true] {
+            // A 1-beat loop (0.5 s, from the beat at 1.0 s), set while playing:
+            // the out point is ahead, so the head goes round on its own.
+            let (out, syncs) = render_loop(
+                &a,
+                key_lock,
+                &[(
+                    1_234_000,
+                    Action::BeatLoop {
+                        deck: 0,
+                        beats: 1.0,
+                    },
+                )],
+                4.0,
+            );
+            let limit = if key_lock { 1 + 1 } else { 1 };
+            assert!(syncs <= limit, "key lock {key_lock}: {syncs} hard syncs");
+            if !key_lock {
+                let step = max_step(&out, 4410);
+                assert!(
+                    step < natural * 1.6,
+                    "click going round: {step} vs {natural}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn loop_out_at_the_playhead_and_exit() {
+        let a = sine_track();
+        for key_lock in [false, true] {
+            render_loop(
+                &a,
+                key_lock,
+                &[
+                    (1_000_000, Action::LoopIn { deck: 0 }),
+                    (1_730_000, Action::LoopOut { deck: 0 }),
+                    (3_100_000, Action::LoopHalve { deck: 0 }),
+                    (4_000_000, Action::Reloop { deck: 0 }),
+                    (5_000_000, Action::Reloop { deck: 0 }),
+                    (
+                        5_500_000,
+                        Action::BeatLoop {
+                            deck: 0,
+                            beats: 0.25,
+                        },
+                    ),
+                    (6_500_000, Action::Reloop { deck: 0 }),
+                ],
+                7.5,
+            );
+        }
     }
 
     #[test]

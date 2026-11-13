@@ -222,6 +222,20 @@ impl BeatGrid {
         }
     }
 
+    /// A loop `beats` long that starts on the grid and contains `pos`:
+    /// `(start, end)`. A loop of a beat or more starts on the beat at or
+    /// before `pos`. A shorter one starts on the same fraction of a beat, so
+    /// a ¼-beat loop is the quarter beat the playhead is in. The length uses
+    /// the tempo of the section `pos` is in.
+    pub fn beat_loop(&self, pos: f64, beats: f64) -> (f64, f64) {
+        let m = self.markers[self.section(pos)];
+        let len = m.beat_len();
+        let step = beats.min(1.0);
+        let local = (pos - m.pos) / len;
+        let start = m.pos + ((local + 1e-9) / step).floor() * step * len;
+        (start, start + beats * len)
+    }
+
     /// Every beat in `[from, to]`, in order.
     pub fn beats_in(&self, from: f64, to: f64, mut f: impl FnMut(Beat)) {
         let n = self.len as usize;
@@ -404,6 +418,24 @@ mod tests {
         let mut v = Vec::new();
         g.beats_in(from, to, |b| v.push(b));
         v
+    }
+
+    #[test]
+    fn beat_loops_start_on_the_grid_around_the_playhead() {
+        // 120 BPM from 0.25 s: beats at 0.25, 0.75, 1.25…
+        let g = BeatGrid::new(0.25, 120.0).unwrap();
+        let close =
+            |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).abs() < 1e-9 && (a.1 - b.1).abs() < 1e-9;
+        assert!(close(g.beat_loop(1.6, 4.0), (1.25, 3.25)));
+        assert!(close(g.beat_loop(1.25, 1.0), (1.25, 1.75)));
+        // Shorter than a beat: the slice of the beat the playhead is in.
+        assert!(close(g.beat_loop(1.6, 0.25), (1.5, 1.625)));
+        assert!(close(g.beat_loop(1.6, 0.5), (1.5, 1.75)));
+        // Before the first marker the beats carry on backwards.
+        assert!(close(g.beat_loop(0.1, 1.0), (-0.25, 0.25)));
+        // A later section uses its own tempo.
+        let g = grid(&[(0.0, 120.0), (20.0, 150.0)]);
+        assert!(close(g.beat_loop(20.5, 2.0), (20.4, 21.2)));
     }
 
     #[test]
