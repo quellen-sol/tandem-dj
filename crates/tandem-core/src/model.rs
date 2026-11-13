@@ -84,8 +84,12 @@ pub struct DeckState {
     /// Temporary speed offset while a pitch-bend button is held (e.g. -0.04).
     pub bend: f64,
     pub cue_point: f64,
-    /// True while CUE is held from the cue point (CDJ-style preview).
+    /// True while CUE or a hot cue is held from a pause (CDJ-style
+    /// preview): releasing it goes back to that point, paused.
     pub cue_preview: bool,
+    /// While previewing: the hot cue being held (`None` = the CUE button).
+    #[serde(default)]
+    pub preview_slot: Option<u8>,
     pub hot_cues: [Option<f64>; HOT_CUES],
     pub volume: f32,
     /// [low, mid, high]; 0.5 = unity, 0 = kill.
@@ -126,6 +130,7 @@ impl Default for DeckState {
             bend: 0.0,
             cue_point: 0.0,
             cue_preview: false,
+            preview_slot: None,
             hot_cues: [None; HOT_CUES],
             volume: 1.0,
             eq: [0.5; 3],
@@ -306,7 +311,14 @@ pub enum Action {
         deck: u8,
     },
     /// Jump to the hot cue and play; if the slot is empty, set it here.
+    /// Pressed while paused, it plays only while held (see [`Action::HotCueUp`]).
     HotCue {
+        deck: u8,
+        slot: u8,
+    },
+    /// Hot cue released. Ends a preview started from a pause: back to the
+    /// hot cue, paused.
+    HotCueUp {
         deck: u8,
         slot: u8,
     },
@@ -372,6 +384,7 @@ impl Action {
             | CueDown { deck }
             | CueUp { deck }
             | HotCue { deck, .. }
+            | HotCueUp { deck, .. }
             | ClearHotCue { deck, .. }
             | Seek { deck, .. }
             | Tempo { deck, .. }
@@ -437,6 +450,7 @@ impl RoomState {
             ev.action,
             Action::Seek { .. }
                 | Action::HotCue { .. }
+                | Action::HotCueUp { .. }
                 | Action::CueDown { .. }
                 | Action::CueUp { .. }
                 | Action::Nudge { .. }
@@ -614,6 +628,7 @@ impl RoomState {
                 d.duration = duration.max(0.0);
                 d.playing = false;
                 d.cue_preview = false;
+                d.preview_slot = None;
                 d.anchor_time = t;
                 d.anchor_pos = cue.clamp(0.0, d.duration);
                 d.cue_point = d.anchor_pos;
@@ -627,6 +642,7 @@ impl RoomState {
                 d.duration = 0.0;
                 d.playing = false;
                 d.cue_preview = false;
+                d.preview_slot = None;
                 d.anchor_time = t;
                 d.anchor_pos = 0.0;
                 d.cue_point = 0.0;
@@ -649,7 +665,9 @@ impl RoomState {
                         d.playing = true;
                         d.gen += 1;
                     }
+                    // Play during a preview: keep playing after the release.
                     d.cue_preview = false;
+                    d.preview_slot = None;
                 }
             }
             Action::Pause { .. } => {
@@ -659,6 +677,7 @@ impl RoomState {
                     d.gen += 1;
                 }
                 d.cue_preview = false;
+                d.preview_slot = None;
             }
             Action::CueDown { .. } => {
                 if d.track.is_none() {
@@ -688,7 +707,7 @@ impl RoomState {
                 }
             }
             Action::CueUp { .. } => {
-                if d.cue_preview {
+                if d.cue_preview && d.preview_slot.is_none() {
                     d.cue_preview = false;
                     d.playing = false;
                     d.anchor_pos = d.cue_point;
@@ -703,13 +722,29 @@ impl RoomState {
                 }
                 match d.hot_cues[s] {
                     Some(p) => {
+                        // Paused (or only previewing): play while held.
+                        // Playing: jump and keep playing.
+                        let preview = !d.playing || d.cue_preview;
                         d.anchor_pos = p;
                         d.anchor_time = t;
                         d.playing = true;
-                        d.cue_preview = false;
+                        d.cue_preview = preview;
+                        d.preview_slot = preview.then_some(slot);
                         d.gen += 1;
                     }
                     None => d.hot_cues[s] = Some(d.position_at(t)),
+                }
+            }
+            Action::HotCueUp { slot, .. } => {
+                if d.cue_preview && d.preview_slot == Some(slot) {
+                    let held = d.hot_cues.get(slot as usize).copied().flatten();
+                    let back = held.unwrap_or(d.position_at(t));
+                    d.cue_preview = false;
+                    d.preview_slot = None;
+                    d.playing = false;
+                    d.anchor_pos = back;
+                    d.anchor_time = t;
+                    d.gen += 1;
                 }
             }
             Action::ClearHotCue { slot, .. } => {
@@ -778,6 +813,7 @@ impl RoomState {
             h.f64(d.bend);
             h.f64(d.cue_point);
             h.u64(d.cue_preview as u64);
+            h.u64(d.preview_slot.map_or(u64::MAX, u64::from));
             for c in &d.hot_cues {
                 h.f64(c.unwrap_or(-1.0));
             }
@@ -1443,6 +1479,17 @@ mod tests {
         assert!((s.decks[1].tempo - 128.0 / 125.0).abs() < 1e-9);
         s.apply(&ev(2_000_000, 1, 6, Action::Seek { deck: 1, pos: 5.0 }));
         assert!((s.decks[1].tempo - 128.0 / 120.0).abs() < 1e-9);
+        // A gated hot cue held across the marker, then released: back in
+        // the 120 BPM section, so back to its tempo.
+        s.apply(&ev(2_000_000, 1, 7, Action::Seek { deck: 1, pos: 19.0 }));
+        s.apply(&ev(2_000_000, 1, 8, Action::HotCue { deck: 1, slot: 0 }));
+        s.apply(&ev(3_000_000, 1, 9, Action::HotCue { deck: 1, slot: 0 }));
+        assert!(s.decks[1].cue_preview);
+        s.apply(&ev(4_500_000, 1, 10, Action::Relock { deck: 1 }));
+        assert!((s.decks[1].tempo - 128.0 / 125.0).abs() < 1e-9);
+        s.apply(&ev(5_000_000, 1, 11, Action::HotCueUp { deck: 1, slot: 0 }));
+        assert_eq!(s.decks[1].position_at(5_000_000), 19.0);
+        assert!((s.decks[1].tempo - 128.0 / 120.0).abs() < 1e-9);
     }
 
     #[test]
@@ -1492,5 +1539,56 @@ mod tests {
         assert_eq!(s.decks[1].hot_cues[2], Some(10.0));
         s.apply(&ev(20_000_000, 1, 4, Action::HotCue { deck: 1, slot: 2 }));
         assert!((s.decks[1].position_at(21_000_000) - 11.0).abs() < 1e-9);
+        // Playing: releasing the pad changes nothing.
+        s.apply(&ev(21_000_000, 1, 5, Action::HotCueUp { deck: 1, slot: 2 }));
+        assert!(s.decks[1].playing && !s.decks[1].cue_preview);
+        assert!((s.decks[1].position_at(22_000_000) - 12.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn hot_cue_from_pause_is_gated() {
+        let mut s = RoomState::default();
+        let mut seq = 0;
+        let mut go = |s: &mut RoomState, t: i64, a: Action| {
+            seq += 1;
+            s.apply(&ev(t, 1, seq, a));
+        };
+        go(
+            &mut s,
+            0,
+            Action::Load {
+                deck: 0,
+                track: tid(3),
+                duration: 100.0,
+                cue: 0.0,
+                grid: None,
+                key: -1,
+            },
+        );
+        go(&mut s, 0, Action::Seek { deck: 0, pos: 30.0 });
+        go(&mut s, 0, Action::HotCue { deck: 0, slot: 1 });
+        go(&mut s, 0, Action::Seek { deck: 0, pos: 50.0 });
+        // Paused: hold plays from the hot cue...
+        go(&mut s, 1_000_000, Action::HotCue { deck: 0, slot: 1 });
+        let d = s.decks[0];
+        assert!(d.playing && d.cue_preview && d.preview_slot == Some(1));
+        assert!((d.position_at(3_000_000) - 32.0).abs() < 1e-9);
+        // ...releasing another control doesn't end it...
+        go(&mut s, 2_000_000, Action::CueUp { deck: 0 });
+        go(&mut s, 2_000_000, Action::HotCueUp { deck: 0, slot: 0 });
+        assert!(s.decks[0].playing);
+        // ...and release snaps back to the hot cue, paused.
+        go(&mut s, 3_000_000, Action::HotCueUp { deck: 0, slot: 1 });
+        let d = s.decks[0];
+        assert!(!d.playing && !d.cue_preview && d.preview_slot.is_none());
+        assert_eq!(d.position_at(9_000_000), 30.0);
+        assert_eq!(d.cue_point, 0.0);
+        // PLAY while holding: keeps playing after the release.
+        go(&mut s, 4_000_000, Action::HotCue { deck: 0, slot: 1 });
+        go(&mut s, 5_000_000, Action::Play { deck: 0 });
+        go(&mut s, 6_000_000, Action::HotCueUp { deck: 0, slot: 1 });
+        let d = s.decks[0];
+        assert!(d.playing && !d.cue_preview);
+        assert!((d.position_at(7_000_000) - 33.0).abs() < 1e-9);
     }
 }

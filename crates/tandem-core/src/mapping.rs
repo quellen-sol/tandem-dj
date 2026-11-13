@@ -70,6 +70,10 @@ pub enum Target {
     Cue {
         deck: u8,
     },
+    /// SHIFT + CUE: back to the start of the track.
+    BackToStart {
+        deck: u8,
+    },
     Sync {
         deck: u8,
     },
@@ -130,6 +134,7 @@ impl Target {
         match *self {
             Target::Play { deck: d } => format!("Deck {} · Play/Pause", deck(d)),
             Target::Cue { deck: d } => format!("Deck {} · Cue", deck(d)),
+            Target::BackToStart { deck: d } => format!("Deck {} · Back to start", deck(d)),
             Target::Sync { deck: d } => format!("Deck {} · Sync", deck(d)),
             Target::SyncOff { deck: d } => {
                 format!("Deck {} · Sync off (back to tempo fader)", deck(d))
@@ -189,6 +194,7 @@ impl Target {
         for d in 0..DECKS as u8 {
             v.push(Target::Play { deck: d });
             v.push(Target::Cue { deck: d });
+            v.push(Target::BackToStart { deck: d });
             v.push(Target::Sync { deck: d });
             v.push(Target::SyncOff { deck: d });
             for slot in 0..8 {
@@ -270,7 +276,7 @@ pub struct Mapping {
 }
 
 /// Bump when built-in presets gain controls; saved mappings pick them up.
-pub const PRESET_VERSION: u32 = 3;
+pub const PRESET_VERSION: u32 = 4;
 
 impl Mapping {
     pub fn empty(device: &str) -> Self {
@@ -631,6 +637,9 @@ impl MidiEngine {
                 } else {
                     Action::CueUp { deck }
                 })),
+                Target::BackToStart { deck } if down => {
+                    out.push(MidiOut::Action(Action::Seek { deck, pos: 0.0 }))
+                }
                 Target::Sync { deck } if down => {
                     let on = !room.decks[deck as usize].synced;
                     out.push(MidiOut::Action(Action::Sync { deck, on }));
@@ -645,9 +654,11 @@ impl MidiEngine {
                         t.last_sent = t.last_hw;
                     }
                 }
-                Target::HotCue { deck, slot } if down => {
-                    out.push(MidiOut::Action(Action::HotCue { deck, slot }))
-                }
+                Target::HotCue { deck, slot } => out.push(MidiOut::Action(if down {
+                    Action::HotCue { deck, slot }
+                } else {
+                    Action::HotCueUp { deck, slot }
+                })),
                 Target::HotCueClear { deck, slot } if down => {
                     out.push(MidiOut::Action(Action::ClearHotCue { deck, slot }))
                 }
@@ -961,6 +972,7 @@ fn pioneer_ddj(device: &str, name: &str, hw_decks: u8, ticks_per_rev: f32) -> Ma
         let deck = hw % 2;
         m.bind(Trigger::note(ch, 0x0B), Target::Play { deck });
         m.bind(Trigger::note(ch, 0x0C), Target::Cue { deck });
+        m.bind(Trigger::note(ch, 0x48), Target::BackToStart { deck });
         m.bind(Trigger::note(ch, 0x58), Target::Sync { deck });
         m.bind(Trigger::note(ch, 0x60), Target::SyncOff { deck });
         m.bind(Trigger::note(ch, 0x36), Target::JogTouch { deck });
@@ -1357,6 +1369,33 @@ mod tests {
         assert_eq!(on((0x90, 0x0B)), Some(false)); // deck A play
         assert_eq!(on((0x97, 0x02)), Some(true)); // deck A pad 3
         assert_eq!(on((0x97, 0x03)), Some(false));
+    }
+
+    #[test]
+    fn shift_cue_and_held_pads() {
+        let mut e = MidiEngine::new(pioneer_ddj("DDJ-FLX6", "test", 4, 2048.0), 0.08);
+        let (room, local) = (RoomState::default(), LocalParams::default());
+        let act = |a| vec![MidiOut::Action(a)];
+        // SHIFT + CUE (deck 2, and deck 4 on the same Tandem deck): back to the start.
+        let start = || act(Action::Seek { deck: 1, pos: 0.0 });
+        assert_eq!(e.handle(&[0x91, 0x48, 127], &room, &local), start());
+        assert!(e.handle(&[0x91, 0x48, 0], &room, &local).is_empty());
+        assert_eq!(e.handle(&[0x93, 0x48, 127], &room, &local), start());
+        // Pads report their release too, for gated hot cues.
+        assert_eq!(
+            e.handle(&[0x97, 0x02, 127], &room, &local),
+            act(Action::HotCue { deck: 0, slot: 2 })
+        );
+        assert_eq!(
+            e.handle(&[0x87, 0x02, 0], &room, &local),
+            act(Action::HotCueUp { deck: 0, slot: 2 })
+        );
+        // SHIFT + pad still clears, and its release does nothing.
+        assert_eq!(
+            e.handle(&[0x98, 0x02, 127], &room, &local),
+            act(Action::ClearHotCue { deck: 0, slot: 2 })
+        );
+        assert!(e.handle(&[0x98, 0x02, 0], &room, &local).is_empty());
     }
 
     #[test]

@@ -280,11 +280,13 @@ impl TandemApp {
                 } else {
                     Color32::from_gray(50)
                 };
-                let r = ui.add(
-                    egui::Button::new(RichText::new("CUE").strong().size(15.0))
-                        .min_size(big)
-                        .fill(cue_fill),
-                );
+                let r = ui
+                    .add(
+                        egui::Button::new(RichText::new("CUE").strong().size(15.0))
+                            .min_size(big)
+                            .fill(cue_fill),
+                    )
+                    .on_hover_text("Right-click (or SHIFT + CUE): back to the start of the track.");
                 let (down, up) =
                     self.hold(format!("cue{d}"), r.is_pointer_button_down_on() && primary);
                 if down {
@@ -292,6 +294,9 @@ impl TandemApp {
                 }
                 if up {
                     self.pending.push(Action::CueUp { deck });
+                }
+                if r.secondary_clicked() {
+                    self.pending.push(Action::Seek { deck, pos: 0.0 });
                 }
                 let playing = st.playing && !st.cue_preview;
                 let play_fill = if playing {
@@ -335,16 +340,17 @@ impl TandemApp {
                                         .fill(fill),
                                     )
                                     .on_hover_text(
-                                        "Click: set / jump to hot cue. Right-click: clear.",
+                                        "Click: set / jump to hot cue. While paused, plays only as long as you hold it. Right-click: clear.",
                                     );
-                                if self
-                                    .hold(
-                                        format!("hc{d}-{slot}"),
-                                        r.is_pointer_button_down_on() && primary,
-                                    )
-                                    .0
-                                {
+                                let (down, up) = self.hold(
+                                    format!("hc{d}-{slot}"),
+                                    r.is_pointer_button_down_on() && primary,
+                                );
+                                if down {
                                     self.pending.push(Action::HotCue { deck, slot });
+                                }
+                                if up {
+                                    self.pending.push(Action::HotCueUp { deck, slot });
                                 }
                                 if r.secondary_clicked() {
                                     self.pending.push(Action::ClearHotCue { deck, slot });

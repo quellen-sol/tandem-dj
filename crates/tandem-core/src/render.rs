@@ -502,12 +502,25 @@ fn cascade(f: &mut [Biquad; 2], x: [f32; 2]) -> [f32; 2] {
 /// One-knob DJ filter: a low-pass and a high-pass in series. At the centre
 /// both sit at the edges of hearing; turning left sweeps the low-pass down,
 /// right sweeps the high-pass up. Both always run, so crossing the centre
-/// never clicks.
+/// never clicks. Each sweep runs right out of the audible range, and over
+/// the last stretch of travel the output fades away, so a knob turned all
+/// the way is silent.
 struct DjFilter {
     lp: Biquad,
     hp: Biquad,
     last: f32,
+    /// Output gain (smoothed towards `gain_target`, so the fade never zippers).
+    gain: f32,
+    gain_target: f32,
+    smooth: f32,
 }
+
+/// Low-pass cutoff at full left, and high-pass cutoff at full right (the
+/// biquad clamps it just below Nyquist).
+const FILTER_LP_MIN: f64 = 20.0;
+const FILTER_HP_MAX: f64 = 22_000.0;
+/// Knob travel (from either end) over which the filter fades to silence.
+const FILTER_FADE: f32 = 0.1;
 
 impl DjFilter {
     fn new(sr: f64) -> Self {
@@ -515,8 +528,12 @@ impl DjFilter {
             lp: Biquad::default(),
             hp: Biquad::default(),
             last: -1.0,
+            gain: 1.0,
+            gain_target: 1.0,
+            smooth: (1.0 - (-1.0 / (0.010 * sr)).exp()) as f32,
         };
         f.update(0.5, sr);
+        f.gain = f.gain_target;
         f
     }
 
@@ -525,14 +542,15 @@ impl DjFilter {
             return;
         }
         self.last = k;
+        self.gain_target = filter_edge_gain(k);
         let k = k as f64;
         let lp_fc = if k < 0.5 {
-            20_000.0 * (60.0f64 / 20_000.0).powf((0.5 - k) / 0.5)
+            20_000.0 * (FILTER_LP_MIN / 20_000.0).powf((0.5 - k) / 0.5)
         } else {
             20_000.0
         };
         let hp_fc = if k > 0.5 {
-            20.0 * (8_000.0f64 / 20.0).powf((k - 0.5) / 0.5)
+            20.0 * (FILTER_HP_MAX / 20.0).powf((k - 0.5) / 0.5)
         } else {
             20.0
         };
@@ -547,9 +565,26 @@ impl DjFilter {
 
     #[inline]
     fn run(&mut self, x: [f32; 2]) -> [f32; 2] {
+        self.gain += (self.gain_target - self.gain) * self.smooth;
+        if (self.gain - self.gain_target).abs() < 1e-6 {
+            // Land exactly (true silence at the ends, and no denormals).
+            self.gain = self.gain_target;
+        }
         let y = self.lp.run(x);
-        self.hp.run(y)
+        let y = self.hp.run(y);
+        [y[0] * self.gain, y[1] * self.gain]
     }
+}
+
+/// Filter knob (0..1) to output gain: unity except over the last
+/// [`FILTER_FADE`] of travel at either end, where it eases down to silence.
+fn filter_edge_gain(k: f32) -> f32 {
+    let edge = k.min(1.0 - k).clamp(0.0, 0.5);
+    if edge >= FILTER_FADE {
+        return 1.0;
+    }
+    let x = edge / FILTER_FADE;
+    x * x * (3.0 - 2.0 * x)
 }
 
 /// Trim knob (0..1, 0.5 = unity) to gain: silent at 0, +12 dB at 1.
@@ -758,6 +793,48 @@ mod tests {
             tracks: vec![audio],
             local: LocalParams::default(),
         }
+    }
+
+    /// Level (RMS out / RMS in) of a 40 Hz + 1 kHz + 12 kHz mix through the
+    /// DJ filter at knob `k`, once settled.
+    fn filter_level(k: f32) -> f32 {
+        let sr = 48_000.0;
+        let mut f = DjFilter::new(sr);
+        f.update(k, sr);
+        let (mut out, mut inp) = (0.0f64, 0.0f64);
+        for i in 0..sr as usize {
+            let t = i as f64 / sr;
+            let x = [40.0, 1_000.0, 12_000.0]
+                .iter()
+                .map(|hz| (2.0 * std::f64::consts::PI * hz * t).sin() * 0.3)
+                .sum::<f64>() as f32;
+            let y = f.run([x, x]);
+            if i >= sr as usize / 2 {
+                out += (y[0] as f64).powi(2) + (y[1] as f64).powi(2);
+                inp += 2.0 * (x as f64).powi(2);
+            }
+        }
+        (out / inp).sqrt() as f32
+    }
+
+    #[test]
+    fn filter_turned_all_the_way_is_silent() {
+        assert!(
+            (filter_level(0.5) - 1.0).abs() < 0.1,
+            "{}",
+            filter_level(0.5)
+        );
+        assert_eq!(filter_level(0.0), 0.0);
+        assert_eq!(filter_level(1.0), 0.0);
+        // Short of the end, each side still lets its end of the spectrum through...
+        for k in [0.15, 0.85] {
+            assert!(filter_level(k) > 0.4, "k {k}: {}", filter_level(k));
+        }
+        // ...and the last stretch fades it out.
+        assert!(filter_level(0.03) < filter_level(0.15) * 0.3);
+        assert!(filter_level(0.97) < filter_level(0.85) * 0.3);
+        assert_eq!(filter_edge_gain(0.5), 1.0);
+        assert_eq!(filter_edge_gain(1.0 - FILTER_FADE), 1.0);
     }
 
     fn track() -> Arc<TrackAudio> {

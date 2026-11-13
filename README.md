@@ -43,6 +43,8 @@ The self-test lists your audio and MIDI devices, opens your default output for h
    - **Calibrate the jog wheel** once (Settings → Controller → **Calibrate…**: turn the platter exactly one full turn). Then scratching moves the record exactly as far as your hand, like a 33⅓ record.
    - **Faders and knobs use soft takeover.** A control nobody has moved yet takes your hardware position straight away. Once the room value has changed, your fader takes over only when it reaches that value, so you never jump over your partner's mix.
    - **The tempo fader never waits.** After SYNC (or your partner) moves a deck's tempo away from where your fader sits, the fader changes the tempo by exactly as much as you move it, starting from the deck's current tempo. **SHIFT + SYNC** puts the deck back on the fader.
+   - **SHIFT + CUE** (or right-clicking CUE) jumps back to the start of the track.
+   - **Hot cues held while paused are gated.** The deck plays from the hot cue only while you hold the pad. Let go and it snaps back to the hot cue, paused. Press PLAY while holding to keep it playing.
    - **Jog wheel moves the wrong way or jumps?** Tick **1/127 style** or **invert** next to it.
 
 Mappings are saved per controller, so you only do this once. When Tandem's built-in mapping gains new controls, your saved mapping picks them up automatically. Your calibration and changes are kept.

@@ -61,7 +61,10 @@ Work through these in order and note anything that fails. `tandem.log` (Settings
   - Several markers handle tracks whose tempo changes, and synced decks re-lock at every tempo change.
   - Edits are saved per track (by content hash) and shared with your partner.
 - **Bar numbers** on the waveforms and a bar.beat readout. The first marker is bar 1 and the bars before it count down from −1, for counting a track in.
-- Protocol version 4: both booths need this version.
+- **SHIFT + CUE** (or right-click CUE) jumps back to the start of the track. Saved FLX6/FLX4 mappings pick it up automatically.
+- **Gated hot cues:** a hot cue pressed while paused plays only while held, then snaps back to the hot cue, paused. While playing, hot cues jump as before.
+- **Filter mutes at the ends.** The low-pass sweeps down to 20 Hz and the high-pass up to the top of the audio band. The last 10% of travel fades out, so a knob turned all the way is silent.
+- Protocol version 5: both booths need this version.
 
 ### Test plan for beatgrid editing
 
