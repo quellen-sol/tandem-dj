@@ -55,7 +55,7 @@ Work through these in order and note anything that fails. `tandem.log` (Settings
 
 - **Tempo fader responds straight away after SYNC.** It used to wait for pickup (the fader had to reach the synced tempo first), which could take seconds or never happen. Now, whenever the deck's tempo isn't where the fader sits, the fader moves it relatively.
 
-## Round 3 (v0.3): in progress
+## Round 3 (v0.3): done
 
 - **Beatgrid editing**, Serato-style. Press **GRID** on a deck, then **SET** puts a marker at the playhead. **ADJUST** (±.01/.1/1 BPM, ½, ×2) stretches the grid and **SLIP** (±1/5/25 ms) slides it. Both act only on the section under the playhead.
   - Several markers handle tracks whose tempo changes, and synced decks re-lock at every tempo change.
