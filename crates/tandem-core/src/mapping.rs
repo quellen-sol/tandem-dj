@@ -64,6 +64,7 @@ pub enum TargetKind {
 pub enum Target {
     Play { deck: u8 },
     Cue { deck: u8 },
+    Sync { deck: u8 },
     HotCue { deck: u8, slot: u8 },
     HotCueClear { deck: u8, slot: u8 },
     Tempo { deck: u8 },
@@ -88,6 +89,7 @@ impl Target {
         match *self {
             Target::Play { deck: d } => format!("Deck {} · Play/Pause", deck(d)),
             Target::Cue { deck: d } => format!("Deck {} · Cue", deck(d)),
+            Target::Sync { deck: d } => format!("Deck {} · Sync", deck(d)),
             Target::HotCue { deck: d, slot } => format!("Deck {} · Hot cue {}", deck(d), slot + 1),
             Target::HotCueClear { deck: d, slot } => {
                 format!("Deck {} · Clear hot cue {}", deck(d), slot + 1)
@@ -143,6 +145,7 @@ impl Target {
         for d in 0..DECKS as u8 {
             v.push(Target::Play { deck: d });
             v.push(Target::Cue { deck: d });
+            v.push(Target::Sync { deck: d });
             for slot in 0..8 {
                 v.push(Target::HotCue { deck: d, slot });
             }
@@ -548,6 +551,10 @@ impl MidiEngine {
                 } else {
                     Action::CueUp { deck }
                 })),
+                Target::Sync { deck } if down => {
+                    let on = !room.decks[deck as usize].synced;
+                    out.push(MidiOut::Action(Action::Sync { deck, on }));
+                }
                 Target::HotCue { deck, slot } if down => {
                     out.push(MidiOut::Action(Action::HotCue { deck, slot }))
                 }
@@ -741,6 +748,7 @@ impl MidiEngine {
                 Target::HotCue { deck, slot } => {
                     room.decks[deck as usize].hot_cues[slot as usize].is_some()
                 }
+                Target::Sync { deck } => room.decks[deck as usize].synced,
                 Target::Pfl { deck } => local.pfl[deck as usize],
                 _ => continue,
             };
@@ -807,6 +815,7 @@ fn pioneer_ddj(device: &str, name: &str, hw_decks: u8, ticks_per_rev: f32) -> Ma
         let deck = hw % 2;
         m.bind(Trigger::note(ch, 0x0B), Target::Play { deck });
         m.bind(Trigger::note(ch, 0x0C), Target::Cue { deck });
+        m.bind(Trigger::note(ch, 0x58), Target::Sync { deck });
         m.bind(Trigger::note(ch, 0x36), Target::JogTouch { deck });
         for cc in [0x21, 0x22, 0x23] {
             m.bind(Trigger::cc(ch, cc), Target::Jog { deck });

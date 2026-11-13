@@ -13,7 +13,7 @@ use crate::model::{Event, Timeline, TrackId};
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 pub const DEFAULT_PORT: u16 = 47800;
 const MAX_JSON: u32 = 64 << 20;
 const MAX_PAYLOAD: u32 = 8 << 20;
@@ -27,6 +27,9 @@ pub struct TrackInfo {
     pub duration: f64,
     pub size: u64,
     pub file_name: String,
+    /// Detected tempo and beat positions, if analysed.
+    #[serde(default)]
+    pub grid: Option<crate::analysis::BeatGrid>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

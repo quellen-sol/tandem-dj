@@ -55,7 +55,9 @@ fn main() {
         demo: args.iter().any(|a| a == "--demo"),
         host_port: arg_after("--dev-host").and_then(|p| p.to_string_lossy().parse().ok()),
         join: arg_after("--dev-join").map(|p| p.to_string_lossy().to_string()),
+        search: arg_after("--dev-search").map(|p| p.to_string_lossy().to_string()),
         shared: false,
+        demo_started: false,
         frame: 0,
     };
     let _ = paths.ensure();

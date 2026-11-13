@@ -406,9 +406,11 @@ impl Session {
         std::thread::spawn(move || {
             let res = (|| -> anyhow::Result<(TrackInfo, TrackAudio)> {
                 let id = library::hash_path(&lib, &path)?;
-                let (title, artist, bpm, _) = library::read_tags(&path);
+                let (_, _, bpm, _) = library::read_tags(&path);
+                let (title, artist) = library::display_names(&lib, &path);
                 let audio = decode_file(&path, id)?;
                 let size = std::fs::metadata(&path)?.len();
+                let grid = library::grid_for(&lib, &path, &audio, bpm);
                 let info = TrackInfo {
                     id,
                     title,
@@ -417,6 +419,7 @@ impl Session {
                     duration: audio.duration(),
                     size,
                     file_name: name.clone(),
+                    grid,
                 };
                 Ok((info, audio))
             })();
@@ -449,12 +452,7 @@ impl Session {
         );
         self.track_meta.insert(id, info.clone());
         self.send(Msg::Track { info: info.clone() });
-        self.act(Action::Load {
-            deck: deck as u8,
-            track: id,
-            duration: info.duration,
-            cue: 0.0,
-        });
+        self.act(load_action(deck, &info));
     }
 
     /// Load a track already known in this room (e.g. one your partner played).
@@ -462,12 +460,7 @@ impl Session {
         let Some(info) = self.track_meta.get(&id).cloned() else {
             return;
         };
-        self.act(Action::Load {
-            deck: deck as u8,
-            track: id,
-            duration: info.duration,
-            cue: 0.0,
-        });
+        self.act(load_action(deck, &info));
     }
 
     /// Make sure we have audio for a track a deck refers to: decode it from
@@ -770,7 +763,8 @@ impl Session {
                 let Ok(meta) = std::fs::metadata(&p) else {
                     continue;
                 };
-                let (t, a, bpm, dur) = library::read_tags(&p);
+                let (_, _, bpm, dur) = library::read_tags(&p);
+                let (t, a) = library::display_names(&lib, &p);
                 let file_name = p
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
@@ -783,6 +777,7 @@ impl Session {
                     duration: dur,
                     size: meta.len(),
                     file_name,
+                    grid: library::cached_grid(&lib, &p),
                 });
                 files.push((id, p));
             }
@@ -1354,6 +1349,17 @@ impl Session {
 fn decode_into(h: &SessionHandle, id: TrackId, path: &Path) {
     let res = decode_file(path, id);
     h.lock().on_decoded(id, res);
+}
+
+fn load_action(deck: usize, info: &TrackInfo) -> Action {
+    Action::Load {
+        deck: deck as u8,
+        track: info.id,
+        duration: info.duration,
+        cue: 0.0,
+        bpm: info.grid.map(|g| g.bpm).unwrap_or(0.0),
+        first_beat: info.grid.map(|g| g.first_beat).unwrap_or(0.0),
+    }
 }
 
 pub fn deck_letter(d: usize) -> char {

@@ -9,7 +9,7 @@ use tandem_core::session::{deck_letter, SessionView, ShareState, TransferState};
 struct Row {
     title: String,
     artist: String,
-    bpm: Option<f32>,
+    bpm: Option<f64>,
     duration: f64,
 }
 
@@ -236,6 +236,23 @@ impl TandemApp {
                 ui.spinner();
                 ui.label(RichText::new("Scanning…").weak());
             }
+            let analyzing = self.library.lock().analyzing.clone();
+            match analyzing {
+                Some((_, done, total)) => {
+                    ui.spinner();
+                    ui.label(RichText::new(format!("Analysing BPM {done}/{total}")).weak());
+                }
+                None if !matches!(src, Source::Room) && !scanning && !all_paths.is_empty() => {
+                    if ui
+                        .button("Analyze BPM")
+                        .on_hover_text("Detect the tempo and beatgrid of every track in this list (runs in the background; each track is only analysed once).")
+                        .clicked()
+                    {
+                        tandem_core::library::analyze_list(&self.library, &key);
+                    }
+                }
+                None => {}
+            }
             if key == KEY_SHARED {
                 if ui.small_button("Open folder").clicked() {
                     let _ = std::process::Command::new("explorer")
@@ -299,13 +316,13 @@ impl TandemApp {
                     Source::Room => view.room_tracks.get(idx).map(|t| Row {
                         title: t.title.clone(),
                         artist: t.artist.clone(),
-                        bpm: t.bpm,
+                        bpm: t.grid.map(|g| g.bpm).or(t.bpm.map(|b| b as f64)),
                         duration: t.duration,
                     }),
                     _ => list.and_then(|l| l.tracks.get(idx)).map(|t| Row {
                         title: t.title.clone(),
                         artist: t.artist.clone(),
-                        bpm: t.bpm,
+                        bpm: t.grid_bpm.or(t.bpm.map(|b| b as f64)),
                         duration: t.duration,
                     }),
                 };

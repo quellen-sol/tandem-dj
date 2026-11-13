@@ -200,10 +200,12 @@ impl TandemApp {
                 ui.monospace(RichText::new(fmt_time(pos)).size(15.0));
                 ui.monospace(RichText::new(format!("-{}", fmt_time(st.duration - pos))).weak());
                 ui.separator();
-                match dv.meta.as_ref().and_then(|m| m.bpm) {
-                    Some(b) => ui.monospace(
-                        RichText::new(format!("{:.2} BPM", b as f64 * st.tempo)).size(15.0),
-                    ),
+                let bpm = st
+                    .effective_bpm()
+                    .or_else(|| dv.meta.as_ref().and_then(|m| m.bpm).map(|b| b as f64 * st.tempo));
+                match bpm {
+                    Some(b) => ui.monospace(RichText::new(format!("{b:.2} BPM")).size(15.0)),
+                    None if st.track.is_some() => ui.monospace(RichText::new("no beat").weak()),
                     None => ui.monospace(RichText::new("--- BPM").weak()),
                 };
                 ui.monospace(format!("{:+.2}%", (st.tempo - 1.0) * 100.0));
@@ -299,6 +301,25 @@ impl TandemApp {
 
             ui.add_space(4.0);
             ui.horizontal(|ui| {
+                let other = &view.room.decks[(d + 1) % 2];
+                let can_sync = st.bpm > 0.0 && other.bpm > 0.0 && other.track.is_some();
+                let sync_fill = if st.synced {
+                    Color32::from_rgb(40, 120, 200)
+                } else {
+                    Color32::from_gray(50)
+                };
+                let r = ui
+                    .add_enabled(
+                        can_sync || st.synced,
+                        egui::Button::new(RichText::new("SYNC").strong())
+                            .min_size(vec2(52.0, 20.0))
+                            .fill(sync_fill),
+                    )
+                    .on_hover_text("Match this deck's tempo and beats to the other deck, and keep their tempos locked together.")
+                    .on_disabled_hover_text("Both decks need a track with a detected beat.");
+                if r.clicked() {
+                    self.pending.push(Action::Sync { deck, on: !st.synced });
+                }
                 let range = (self.settings.tempo_range * 100.0) as f32;
                 let mut pct = ((st.tempo - 1.0) * 100.0) as f32;
                 ui.spacing_mut().slider_width = (ui.available_width() - 190.0).max(80.0);
@@ -589,6 +610,36 @@ fn scrolling_waveform(ui: &mut egui::Ui, d: usize, dv: &DeckView, now: i64, heig
             );
         }
         let x_of = |t: f64| rect.center().x + ((t - pos) / span) as f32 * rect.width();
+        // Beat markers from the beatgrid; every 4th beat brighter.
+        if st.bpm > 0.0 {
+            let beat = 60.0 / st.bpm;
+            let first = ((pos - span / 2.0 - st.first_beat) / beat).ceil() as i64;
+            let last = ((pos + span / 2.0 - st.first_beat) / beat).floor() as i64;
+            for k in first..=last {
+                let tb = st.first_beat + k as f64 * beat;
+                if tb < 0.0 || tb > st.duration {
+                    continue;
+                }
+                let x = x_of(tb);
+                let strong = k.rem_euclid(4) == 0;
+                let c = Color32::WHITE.gamma_multiply(if strong { 0.6 } else { 0.3 });
+                p.line_segment(
+                    [
+                        pos2(x, rect.top()),
+                        pos2(
+                            x,
+                            rect.top()
+                                + if strong {
+                                    rect.height()
+                                } else {
+                                    rect.height() * 0.25
+                                },
+                        ),
+                    ],
+                    Stroke::new(1.0_f32, c),
+                );
+            }
+        }
         for (i, hc) in st.hot_cues.iter().enumerate().take(8) {
             if let Some(t) = hc {
                 let x = x_of(*t);

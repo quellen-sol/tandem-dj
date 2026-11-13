@@ -13,6 +13,7 @@
 //! * [`net`] / [`files`] — rooms over TCP and track transfer.
 //! * [`session`] — glue the UI talks to.
 
+pub mod analysis;
 pub mod audio;
 pub mod clock;
 pub mod config;

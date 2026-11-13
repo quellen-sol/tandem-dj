@@ -3,6 +3,8 @@
 //! Tags and content hashes are cached on disk (keyed by path, size and
 //! modified time), so rescans are fast and a track is only hashed once.
 
+use crate::analysis::{self, BeatGrid};
+use crate::audio::TrackAudio;
 use crate::model::TrackId;
 use crate::serato::{self, SeratoCrate};
 use parking_lot::Mutex;
@@ -32,6 +34,9 @@ pub struct LibTrack {
     pub artist: String,
     pub bpm: Option<f32>,
     pub duration: f64,
+    /// BPM from Tandem's own analysis, once analysed.
+    #[serde(default)]
+    pub grid_bpm: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -43,6 +48,65 @@ struct CacheEntry {
     bpm: Option<f32>,
     duration: f64,
     id: Option<TrackId>,
+    /// Analysis result (`analyzed` is true even when no steady beat was found).
+    #[serde(default)]
+    grid: Option<BeatGrid>,
+    #[serde(default)]
+    analyzed: bool,
+}
+
+/// "Left - Right" parts of a file name, if it has that shape.
+fn name_split(path: &Path) -> Option<(String, String)> {
+    let stem = path.file_stem()?.to_string_lossy().to_string();
+    let (a, b) = stem.split_once(" - ")?;
+    Some((a.trim().to_string(), b.trim().to_string()))
+}
+
+fn tidy(s: &str) -> String {
+    s.replace('_', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Untagged files take their names from "A - B" file names. Libraries
+/// differ on which side is the artist; the artist side repeats across files
+/// (one artist, many tracks), the title side mostly doesn't. Decide per
+/// list and tidy underscores into spaces.
+fn fix_file_names(tracks: &mut [LibTrack]) -> bool {
+    let derived: Vec<usize> = tracks
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| {
+            name_split(&t.path)
+                .map(|(a, b)| t.artist == a && t.title == b)
+                .unwrap_or(false)
+        })
+        .map(|(i, _)| i)
+        .collect();
+    if derived.is_empty() {
+        return false;
+    }
+    let mut left: HashMap<String, usize> = HashMap::new();
+    let mut right: HashMap<String, usize> = HashMap::new();
+    for &i in &derived {
+        *left.entry(tracks[i].artist.to_lowercase()).or_default() += 1;
+        *right.entry(tracks[i].title.to_lowercase()).or_default() += 1;
+    }
+    let repeats = |m: &HashMap<String, usize>| m.values().filter(|&&c| c > 1).sum::<usize>();
+    let swap = derived.len() >= 6 && repeats(&right) > repeats(&left) * 2;
+    for &i in &derived {
+        let t = &mut tracks[i];
+        let (a, b) = (tidy(&t.artist), tidy(&t.title));
+        if swap {
+            t.title = a;
+            t.artist = b;
+        } else {
+            t.artist = a;
+            t.title = b;
+        }
+    }
+    swap
 }
 
 /// Title/artist/BPM/duration from tags, falling back to "Artist - Title" file names.
@@ -129,6 +193,10 @@ pub struct Library {
     cache_path: PathBuf,
     cache_dirty: bool,
     size_index: HashMap<u64, Vec<PathBuf>>,
+    /// Background BPM analysis: (list key, done, total).
+    pub analyzing: Option<(String, usize, usize)>,
+    /// Folders whose untagged files are named "Title - Artist".
+    title_first_dirs: std::collections::HashSet<PathBuf>,
 }
 
 pub const KEY_SHARED: &str = "shared";
@@ -156,6 +224,8 @@ impl Library {
             cache_path,
             cache_dirty: false,
             size_index: HashMap::new(),
+            analyzing: None,
+            title_first_dirs: Default::default(),
         }
     }
 
@@ -206,6 +276,8 @@ impl Library {
                         bpm,
                         duration,
                         id: Some(id),
+                        grid: None,
+                        analyzed: false,
                     },
                 );
             }
@@ -217,6 +289,7 @@ impl Library {
             artist: String::new(),
             bpm: None,
             duration: 0.0,
+            grid_bpm: None,
         }]);
         self.cache_dirty = true;
     }
@@ -269,6 +342,8 @@ pub fn scan(lib: &Arc<Mutex<Library>>, key: String, kind: SourceKind) {
                         bpm,
                         duration,
                         id: None,
+                        grid: None,
+                        analyzed: false,
                     };
                     let mut l = lib.lock();
                     l.cache
@@ -284,13 +359,20 @@ pub fn scan(lib: &Arc<Mutex<Library>>, key: String, kind: SourceKind) {
                 artist: e.artist,
                 bpm: e.bpm,
                 duration: e.duration,
+                grid_bpm: e.grid.map(|g| g.bpm),
             });
             if i % 500 == 499 {
                 let mut l = lib.lock();
                 l.lists.entry(key.clone()).or_default().tracks = out.clone();
             }
         }
+        let swapped = fix_file_names(&mut out);
         let mut l = lib.lock();
+        if swapped {
+            if let SourceKind::Folder(dir) = &kind {
+                l.title_first_dirs.insert(dir.clone());
+            }
+        }
         l.index(&out);
         let entry = l.lists.entry(key).or_default();
         entry.tracks = out;
@@ -323,6 +405,134 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
     }
     out.sort();
     out
+}
+
+/// Title and artist for a file as the library shows them (tags, or the
+/// tidied file name in the order its folder uses).
+pub fn display_names(lib: &Arc<Mutex<Library>>, path: &Path) -> (String, String) {
+    let (title, artist, _, _) = read_tags(path);
+    let Some((a, b)) = name_split(path) else {
+        return (title, artist);
+    };
+    if artist != a || title != b {
+        return (title, artist); // came from real tags
+    }
+    let title_first = lib
+        .lock()
+        .title_first_dirs
+        .iter()
+        .any(|d| path.starts_with(d));
+    if title_first {
+        (tidy(&a), tidy(&b))
+    } else {
+        (tidy(&b), tidy(&a))
+    }
+}
+
+/// The cached beatgrid for a file, if it has been analysed (and hasn't changed).
+pub fn cached_grid(lib: &Arc<Mutex<Library>>, path: &Path) -> Option<BeatGrid> {
+    let (size, mtime) = stat(path)?;
+    lib.lock().cached(path, size, mtime).and_then(|e| e.grid)
+}
+
+fn is_analyzed(lib: &Arc<Mutex<Library>>, path: &Path) -> bool {
+    let Some((size, mtime)) = stat(path) else {
+        return true;
+    };
+    lib.lock()
+        .cached(path, size, mtime)
+        .map(|e| e.analyzed)
+        .unwrap_or(false)
+}
+
+/// Remember an analysis result for a file and show it in every list.
+pub fn record_grid(lib: &Arc<Mutex<Library>>, path: &Path, grid: Option<BeatGrid>) {
+    let Some((size, mtime)) = stat(path) else {
+        return;
+    };
+    let mut l = lib.lock();
+    let key = path.to_string_lossy().to_string();
+    if let Some(e) = l
+        .cache
+        .get_mut(&key)
+        .filter(|e| e.size == size && e.mtime == mtime)
+    {
+        e.grid = grid;
+        e.analyzed = true;
+        l.cache_dirty = true;
+    }
+    for list in l.lists.values_mut() {
+        for t in list.tracks.iter_mut().filter(|t| t.path == path) {
+            t.grid_bpm = grid.map(|g| g.bpm);
+        }
+    }
+}
+
+/// Beatgrid for a decoded track: from the cache, or analysed now and cached.
+pub fn grid_for(
+    lib: &Arc<Mutex<Library>>,
+    path: &Path,
+    audio: &TrackAudio,
+    tag_bpm: Option<f32>,
+) -> Option<BeatGrid> {
+    if is_analyzed(lib, path) {
+        return cached_grid(lib, path);
+    }
+    let grid = analysis::analyze(audio, tag_bpm.map(|b| b as f64));
+    record_grid(lib, path, grid);
+    grid
+}
+
+/// Analyse every not-yet-analysed track in a list, in the background.
+pub fn analyze_list(lib: &Arc<Mutex<Library>>, key: &str) {
+    let paths: Vec<PathBuf> = {
+        let l = lib.lock();
+        if l.analyzing.is_some() {
+            return;
+        }
+        l.lists
+            .get(key)
+            .map(|li| li.tracks.iter().map(|t| t.path.clone()).collect())
+            .unwrap_or_default()
+    };
+    let todo: Vec<PathBuf> = paths.into_iter().filter(|p| !is_analyzed(lib, p)).collect();
+    if todo.is_empty() {
+        return;
+    }
+    let total = todo.len();
+    log::info!("Analysing BPM for {total} tracks…");
+    lib.lock().analyzing = Some((key.to_string(), 0, total));
+    let queue = Arc::new(Mutex::new(todo));
+    let workers = Arc::new(std::sync::atomic::AtomicUsize::new(2));
+    for _ in 0..2 {
+        let (lib, queue, workers) = (lib.clone(), queue.clone(), workers.clone());
+        std::thread::spawn(move || {
+            loop {
+                let Some(path) = queue.lock().pop() else {
+                    break;
+                };
+                if !is_analyzed(&lib, &path) {
+                    // Make sure the file has a cache entry to hold the result.
+                    let _ = hash_path(&lib, &path);
+                    let hint = stat(&path)
+                        .and_then(|(s, m)| lib.lock().cached(&path, s, m).and_then(|e| e.bpm));
+                    let grid = crate::audio::decode_file(&path, TrackId([0; 32]))
+                        .ok()
+                        .and_then(|a| analysis::analyze(&a, hint.map(|b| b as f64)));
+                    record_grid(&lib, &path, grid);
+                }
+                if let Some(a) = lib.lock().analyzing.as_mut() {
+                    a.1 += 1;
+                }
+            }
+            if workers.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                let mut l = lib.lock();
+                l.analyzing = None;
+                l.save_cache();
+                log::info!("BPM analysis finished");
+            }
+        });
+    }
 }
 
 /// Content hash of a file, using the cache when the file hasn't changed.
@@ -363,6 +573,39 @@ pub fn find_by_hash(lib: &Arc<Mutex<Library>>, id: TrackId, size: u64) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detects_title_first_file_names() {
+        let names = [
+            "Air_Maxes - KETTAMA_Shady_Nasty_Fred_again..",
+            "Me_heavy - Fred_again..",
+            "Bleu_better_with_time - Fred_again..",
+            "Already - Rochelle_Jordan",
+            "All_Along - Rochelle_Jordan",
+            "Around - Rochelle_Jordan",
+            "21_Years - Skepta_Fred_again..",
+            "Back_2_Back - Skepta_Fred_again..",
+        ];
+        let mut tracks: Vec<LibTrack> = names
+            .iter()
+            .map(|n| {
+                let (a, b) = n.split_once(" - ").unwrap();
+                LibTrack {
+                    path: PathBuf::from(format!("/m/{n}.wav")),
+                    size: 1,
+                    title: b.to_string(),
+                    artist: a.to_string(),
+                    bpm: None,
+                    duration: 0.0,
+                    grid_bpm: None,
+                }
+            })
+            .collect();
+        assert!(fix_file_names(&mut tracks));
+        assert_eq!(tracks[3].title, "Already");
+        assert_eq!(tracks[3].artist, "Rochelle Jordan");
+        assert_eq!(tracks[0].title, "Air Maxes");
+    }
 
     #[test]
     fn finds_tracks_by_hash_via_size_index() {

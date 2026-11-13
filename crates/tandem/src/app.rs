@@ -109,7 +109,9 @@ pub struct DevOpts {
     pub demo: bool,
     pub host_port: Option<u16>,
     pub join: Option<String>,
+    pub search: Option<String>,
     pub shared: bool,
+    pub demo_started: bool,
     pub frame: u64,
 }
 
@@ -454,6 +456,11 @@ impl TandemApp {
     fn dev_hooks(&mut self, ctx: &egui::Context, view: &SessionView) {
         self.dev.frame += 1;
         let f = self.dev.frame;
+        if f == 2 {
+            if let Some(q) = self.dev.search.clone() {
+                self.ui.search = q;
+            }
+        }
         if self.dev.demo {
             if f == 120 {
                 for d in 0..DECKS {
@@ -462,15 +469,25 @@ impl TandemApp {
                     }
                 }
             }
-            if f == 200 {
+            let loaded = view
+                .decks
+                .iter()
+                .all(|d| d.state.track.is_some() && d.audio.is_some());
+            if f >= 200 && loaded && !self.dev.demo_started {
+                self.dev.demo_started = true;
                 let mut s = self.session.lock();
+                s.act(Action::Seek { deck: 0, pos: 60.0 });
                 s.act(Action::Play { deck: 0 });
-                s.act(Action::Tempo {
-                    deck: 0,
-                    tempo: 1.021,
-                });
                 s.act(Action::HotCue { deck: 0, slot: 0 });
+                s.act(Action::Seek {
+                    deck: 1,
+                    pos: 61.37,
+                });
+                s.act(Action::Sync { deck: 1, on: true });
+                s.act(Action::Play { deck: 1 });
                 s.act(Action::Crossfader { v: 0.25 });
+                drop(s);
+                self.dev.frame = self.dev.shot_frame.saturating_sub(90);
             }
         }
         if let (Some(port), 30) = (self.dev.host_port, f) {

@@ -604,6 +604,8 @@ mod tests {
                 track: a.id,
                 duration: a.duration(),
                 cue: 0.0,
+                bpm: 0.0,
+                first_beat: 0.0,
             },
         });
         tl.insert(Event {
@@ -643,6 +645,8 @@ mod tests {
                 track: a.id,
                 duration: a.duration(),
                 cue: 0.0,
+                bpm: 0.0,
+                first_beat: 0.0,
             },
         });
         tl.insert(Event {
@@ -703,6 +707,8 @@ mod tests {
                 track: a.id,
                 duration: a.duration(),
                 cue: 0.0,
+                bpm: 0.0,
+                first_beat: 0.0,
             },
         );
         push(&mut tl, 0, Action::Seek { deck: 0, pos: 5.0 });
