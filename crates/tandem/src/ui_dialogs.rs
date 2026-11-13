@@ -583,7 +583,7 @@ impl TandemApp {
             );
         }
         ui.label(
-            RichText::new("Click Learn, then press or move the control on your controller. Faders pick up once they reach the current value, so you never jump over your partner.")
+            RichText::new("Click Learn, then press or move the control on your controller. Faders pick up once they reach the current value, so you never jump over your partner. Tempo faders never wait: when SYNC has moved the tempo they move it relatively (SHIFT + SYNC puts the deck back on the fader).")
                 .small()
                 .weak(),
         );

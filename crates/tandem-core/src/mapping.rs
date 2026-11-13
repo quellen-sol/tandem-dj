@@ -5,7 +5,9 @@
 //! shared. Because two people control one mixer, absolute controls (faders,
 //! knobs) use *soft takeover*: once the room value has been changed, your
 //! hardware control only takes effect after it reaches that value, so it
-//! never jumps over what your partner set.
+//! never jumps over what your partner set. The tempo fader is the exception:
+//! SYNC moves tempos without moving the fader, so when the two disagree the
+//! fader works *relatively* (see [`MidiEngine::tempo_fader`]).
 
 use crate::model::{Action, RoomState, DECKS};
 use crate::render::LocalParams;
@@ -485,9 +487,11 @@ impl MidiEngine {
     }
 
     /// Targets whose hardware control hasn't "picked up" the room value yet.
+    /// (Never the tempo fader: it works relatively instead of waiting.)
     pub fn waiting_for_pickup(&self) -> Vec<Target> {
         self.takeover
             .iter()
+            .filter(|(k, _)| !matches!(k, Target::Tempo { .. }))
             .filter(|(_, t)| !t.engaged && t.last_hw.is_some())
             .map(|(k, _)| *k)
             .collect()
@@ -733,6 +737,12 @@ impl MidiEngine {
                 }
                 TargetKind::Absolute => {
                     let v = if b.invert { 1.0 - v } else { v };
+                    if let Target::Tempo { deck } = b.target {
+                        if let Some(tempo) = self.tempo_fader(deck, v, room) {
+                            out.push(MidiOut::Action(Action::Tempo { deck, tempo }));
+                        }
+                        continue;
+                    }
                     let current = self.current(b.target, room, local);
                     if !self.pickup(b.target, v, current) {
                         continue;
@@ -754,6 +764,55 @@ impl MidiEngine {
                 }
             }
         }
+    }
+
+    /// The tempo fader at `v` (0..1). It responds at once, never waits for
+    /// pickup and never makes the tempo jump:
+    ///
+    /// - While the deck's tempo is where the fader says, the fader sets it
+    ///   directly.
+    /// - When they disagree (SYNC changed the tempo, the other deck's fader
+    ///   carried it, or your partner moved it), moving the fader changes the
+    ///   tempo by exactly as much as the fader moved, from wherever the deck
+    ///   is. SHIFT + SYNC puts the deck back on the fader.
+    ///
+    /// A deck nobody has touched (tempo 0%) takes the fader's position
+    /// straight away, like the other controls.
+    fn tempo_fader(&mut self, deck: u8, v: f32, room: &RoomState) -> Option<f64> {
+        /// Closer than this (0.05%) counts as "on the fader".
+        const MATCH: f64 = 0.0005;
+        let range = self.tempo_range;
+        let at = |v: f32| 1.0 + (v as f64 - 0.5) * 2.0 * range;
+        let current = room.decks.get(deck as usize)?.tempo;
+        let t = self
+            .takeover
+            .entry(Target::Tempo { deck })
+            .or_insert(Takeover {
+                engaged: false,
+                last_sent: None,
+                last_hw: None,
+            });
+        let prev = t.last_hw.replace(v);
+        let hw = at(v);
+        let next = match prev {
+            _ if (hw - current).abs() < MATCH => hw,
+            None if t.last_sent.is_none() && (current - 1.0).abs() < 1e-9 => hw,
+            // First reading from this fader: we only learn where it is.
+            None => return None,
+            Some(p) => {
+                let next = (current + hw - at(p)).clamp(0.5, 1.5);
+                // Rejoined the fader (e.g. it hit the deck's tempo after
+                // someone else moved it): snap so rounding can't build up.
+                if (next - hw).abs() < MATCH {
+                    hw
+                } else {
+                    next
+                }
+            }
+        };
+        t.engaged = next == hw;
+        t.last_sent = Some(v);
+        (next != current).then_some(next)
     }
 
     /// Where the control currently is in the room, in 0..1 fader units.
@@ -1168,6 +1227,122 @@ mod tests {
             }
             ref other => panic!("{other:?}"),
         }
+    }
+
+    /// Feed MIDI to the engine and apply what it sends to the room, the
+    /// way the app does. Returns the tempos it sent.
+    fn drive(e: &mut MidiEngine, room: &mut RoomState, msgs: &[[u8; 3]]) -> Vec<f64> {
+        let local = LocalParams::default();
+        let mut tempos = Vec::new();
+        for m in msgs {
+            for o in e.handle(m, room, &local) {
+                if let MidiOut::Action(a) = o {
+                    if let Action::Tempo { tempo, .. } = a {
+                        tempos.push(tempo);
+                    }
+                    let seq = room.decks[0].gen + room.decks[1].gen + tempos.len() as u64;
+                    room.apply(&crate::model::Event {
+                        time: 1_000_000 + seq as i64 * 1000,
+                        origin: 1,
+                        seq,
+                        action: a,
+                    });
+                }
+            }
+        }
+        tempos
+    }
+
+    #[test]
+    fn tempo_fader_responds_at_once_after_sync() {
+        let mut e = MidiEngine::new(pioneer_ddj("DDJ-FLX6", "test", 4, 2048.0), 0.08);
+        let mut room = RoomState::default();
+        for (d, bpm) in [(0, 128.0), (1, 115.0)] {
+            let deck = &mut room.decks[d];
+            deck.track = Some(crate::model::TrackId([d as u8 + 1; 32]));
+            deck.duration = 300.0;
+            deck.bpm = bpm;
+        }
+        // Both tempo faders sit at 0%.
+        let centre = [
+            [0xb0, 0x00, 64],
+            [0xb0, 0x20, 0],
+            [0xb1, 0x00, 64],
+            [0xb1, 0x20, 0],
+        ];
+        drive(&mut e, &mut room, &centre);
+        room.decks[0].tempo = 1.0;
+        room.decks[1].tempo = 1.0;
+
+        // SYNC deck A onto deck B: 128 -> 115 BPM, far below where the fader is.
+        let out = e.handle(&[0x90, 0x58, 127], &room, &LocalParams::default());
+        let [MidiOut::Action(a)] = out[..] else {
+            panic!("{out:?}")
+        };
+        room.apply(&crate::model::Event {
+            time: 2_000_000,
+            origin: 1,
+            seq: 99,
+            action: a,
+        });
+        let synced = room.decks[0].tempo;
+        assert!((synced - 115.0 / 128.0).abs() < 1e-9);
+        assert!(e.waiting_for_pickup().is_empty());
+
+        // Nudge the fader up 1%: the very first message moves the tempo by 1%,
+        // and deck B (still in sync) comes along.
+        let step = 0.01 / 0.16 * 16383.0;
+        let up = (8192.0 + step) as u16;
+        let tempos = drive(
+            &mut e,
+            &mut room,
+            &[
+                [0xb0, 0x00, (up >> 7) as u8],
+                [0xb0, 0x20, (up & 0x7f) as u8],
+            ],
+        );
+        assert!(!tempos.is_empty(), "the fader must respond straight away");
+        let moved = room.decks[0].tempo - synced;
+        assert!((moved - 0.01).abs() < 0.0002, "moved {moved}");
+        assert!((room.decks[1].tempo * 115.0 - room.decks[0].tempo * 128.0).abs() < 1e-6);
+
+        // Deck B's own fader also moves from where sync left it, no jump.
+        let b_before = room.decks[1].tempo;
+        let tempos = drive(&mut e, &mut room, &[[0xb1, 0x00, 63], [0xb1, 0x20, 0]]);
+        assert!(!tempos.is_empty());
+        let moved = room.decks[1].tempo - b_before;
+        assert!(
+            (moved + 0.16 * 128.0 / 16383.0).abs() < 0.0002,
+            "moved {moved}"
+        );
+
+        // Back to the centre: deck A returns to its synced tempo (B carried it).
+        let a_before = room.decks[0].tempo;
+        drive(&mut e, &mut room, &[[0xb0, 0x00, 64], [0xb0, 0x20, 0]]);
+        assert!((room.decks[0].tempo - (a_before - 0.01)).abs() < 0.0002);
+
+        // SYNC off (plain SYNC press): tempo stays, the fader keeps working relatively.
+        drive(&mut e, &mut room, &[[0x90, 0x58, 127]]);
+        assert!(!room.decks[0].synced);
+        let kept = room.decks[0].tempo;
+        assert!((kept - 1.0).abs() > 0.05);
+        drive(
+            &mut e,
+            &mut room,
+            &[
+                [0xb0, 0x00, (up >> 7) as u8],
+                [0xb0, 0x20, (up & 0x7f) as u8],
+            ],
+        );
+        assert!((room.decks[0].tempo - kept - 0.01).abs() < 0.0002);
+
+        // SHIFT + SYNC puts the deck back on the fader (+1%), and from then on
+        // the fader sets the tempo directly again.
+        drive(&mut e, &mut room, &[[0x90, 0x60, 127]]);
+        assert!((room.decks[0].tempo - 1.01).abs() < 0.0002);
+        drive(&mut e, &mut room, &[[0xb0, 0x00, 72], [0xb0, 0x20, 0]]);
+        let want = 1.0 + (72.0 * 128.0 / 16383.0 - 0.5) * 0.16;
+        assert!((room.decks[0].tempo - want).abs() < 1e-9);
     }
 
     #[test]

@@ -51,6 +51,10 @@ Work through these in order and note anything that fails. `tandem.log` (Settings
 - **Loading onto a playing deck** starts the new track on the beat.
 - **Library:** analysed BPM and key columns; "Title - Artist" file names detected; `|` in search means "or".
 
+### v0.2.1
+
+- **Tempo fader responds straight away after SYNC.** It used to wait for pickup (the fader had to reach the synced tempo first), which could take seconds or never happen. Now, whenever the deck's tempo isn't where the fader sits, the fader moves it relatively.
+
 ## Next candidates
 
 Rough priority order:
