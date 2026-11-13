@@ -219,7 +219,13 @@ pub struct Mapping {
     /// Name of the built-in preset this mapping started from, if any.
     #[serde(default)]
     pub preset: Option<String>,
+    /// Version of that preset when this mapping was saved.
+    #[serde(default)]
+    pub preset_version: u32,
 }
+
+/// Bump when built-in presets gain controls; saved mappings pick them up.
+pub const PRESET_VERSION: u32 = 2;
 
 impl Mapping {
     pub fn empty(device: &str) -> Self {
@@ -231,6 +237,7 @@ impl Mapping {
             jog_ticks_per_rev: None,
             vinyl: true,
             preset: None,
+            preset_version: 0,
         }
     }
 
@@ -240,6 +247,26 @@ impl Mapping {
 
     pub fn binding_for(&self, target: Target) -> Option<&Binding> {
         self.bindings.iter().find(|b| b.target == target)
+    }
+
+    /// A mapping saved from an older built-in preset: add the controls the
+    /// preset has gained since (only on buttons/knobs the user hasn't bound
+    /// to something else), keeping calibration and customisations. Returns
+    /// how many bindings were added.
+    pub fn upgrade_from(&mut self, preset: &Mapping) -> usize {
+        if self.preset.is_none() || self.preset_version >= preset.preset_version {
+            return 0;
+        }
+        let mut added = 0;
+        for b in &preset.bindings {
+            let trigger_used = self.bindings.iter().any(|x| x.trigger == b.trigger);
+            if !trigger_used {
+                self.bindings.push(b.clone());
+                added += 1;
+            }
+        }
+        self.preset_version = preset.preset_version;
+        added
     }
 
     fn bind(&mut self, trigger: Trigger, target: Target) -> &mut Binding {
@@ -809,6 +836,7 @@ pub fn builtin_preset(port_name: &str) -> Option<Mapping> {
 fn pioneer_ddj(device: &str, name: &str, hw_decks: u8, ticks_per_rev: f32) -> Mapping {
     let mut m = Mapping::empty(device);
     m.preset = Some(name.to_string());
+    m.preset_version = PRESET_VERSION;
     m.jog_ticks_per_rev = Some(ticks_per_rev);
     for hw in 0..hw_decks {
         let ch = hw;
@@ -1031,6 +1059,35 @@ mod tests {
             bound(Trigger::note(2, 0x0B)),
             "deck 3 play still drives deck A"
         );
+    }
+
+    #[test]
+    fn saved_preset_mappings_gain_new_controls() {
+        let preset = pioneer_ddj("DDJ-FLX6", "Pioneer DDJ-FLX6", 4, 2048.0);
+        // A mapping saved before SYNC existed, with a calibrated jog and one
+        // custom binding on a pad.
+        let mut saved = preset.clone();
+        saved.preset_version = 0;
+        saved.jog_ticks_per_rev = Some(6387.0);
+        saved
+            .bindings
+            .retain(|b| !matches!(b.target, Target::Sync { .. }));
+        saved.bindings.retain(|b| b.trigger != Trigger::note(7, 0));
+        saved.bind(Trigger::note(7, 0), Target::Play { deck: 0 });
+        let added = saved.upgrade_from(&preset);
+        assert_eq!(added, 4, "SYNC on decks 1-4");
+        assert!(saved
+            .bindings
+            .iter()
+            .any(|b| b.trigger == Trigger::note(0, 0x58)));
+        assert_eq!(saved.jog_ticks_per_rev, Some(6387.0));
+        let pad1: Vec<_> = saved
+            .bindings
+            .iter()
+            .filter(|b| b.trigger == Trigger::note(7, 0))
+            .collect();
+        assert_eq!(pad1.len(), 1, "custom binding kept, not doubled");
+        assert_eq!(saved.upgrade_from(&preset), 0, "only once");
     }
 
     #[test]

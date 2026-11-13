@@ -93,6 +93,16 @@ impl Midi {
             .and_then(|b| serde_json::from_slice(&b).ok());
         let mapping = match saved {
             Some(mut m) => {
+                // Pick up controls added to the built-in preset since this was saved.
+                if let Some(p) = builtin_preset(port_name) {
+                    let added = m.upgrade_from(&p);
+                    if added > 0 {
+                        log::info!("MIDI: added {added} new controls from the built-in mapping");
+                        if let Ok(b) = serde_json::to_vec_pretty(&m) {
+                            let _ = std::fs::write(Self::mapping_path(mappings_dir, port_name), b);
+                        }
+                    }
+                }
                 // Older saved mappings don't know the jog resolution yet.
                 if m.jog_ticks_per_rev.is_none() {
                     m.jog_ticks_per_rev =
