@@ -4,7 +4,7 @@ Back-to-back DJing with a friend, from anywhere. Two DJs in different places sha
 
 **Personal, non-commercial use only.** See [TERMS.md](TERMS.md).
 
-> **Status: v0.3.** Windows only. Rooms, BPM and key detection, beatgrid editing, sync, key lock, loops and a ready-made DDJ-FLX6 mapping all work; this is still an early version for two people to try. See [docs/ROADMAP.md](docs/ROADMAP.md) for what's next and a test plan.
+> **Status: v0.4.** Windows only. Rooms, BPM and key detection, beatgrid editing, sync, key lock, loops and a ready-made DDJ-FLX6 mapping all work; this is still an early version for two people to try. See [docs/ROADMAP.md](docs/ROADMAP.md) for what's next and a test plan.
 
 ## How it works
 
@@ -124,7 +124,7 @@ tandem.exe --data-dir C:\temp\tandem-bob
 
 Host in one window and join `127.0.0.1` from the other.
 
-## Known limits in v0.3
+## Known limits in v0.4
 
 - **Decks and DJs:** 2 decks, 2 DJs per room.
 - **Beatgrids:** detection assumes a steady tempo and doesn't find bars (the "1"). Set markers by hand for both: see [Fixing a beatgrid](#fixing-a-beatgrid). A grid can have up to 32 markers, and every bar is 4 beats. Hot cues and play aren't snapped to the beat, except on a synced deck. Loop IN and OUT aren't either (beat loops always are).

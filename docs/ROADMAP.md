@@ -80,7 +80,7 @@ Work through these in order and note anything that fails. `tandem.log` (Settings
    - Does RESET bring back the detected one?
 6. In a room: edit a grid on one PC. Does the other PC's waveform follow straight away?
 
-## Round 4 (v0.4)
+## Round 4 (v0.4): done
 
 - **Loops.** IN, OUT and RELOOP/EXIT, beat loops of ¼ to 32 beats on the beat, and halve/double. They're on every deck's LOOP row and on the FLX6/FLX4/DDJ-400.
   - FLX6 controls: SHIFT + IN for a 4-beat loop, CUE/LOOP CALL ◀ / ▶ to halve and double, and BEAT LOOP pad mode (SHIFT + BEAT JUMP).
