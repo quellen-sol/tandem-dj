@@ -503,14 +503,54 @@ impl TandemApp {
                 engine.tempo_range = range;
                 self.mark_dirty();
             }
-            ui.label("Jog sensitivity");
+        });
+        ui.horizontal(|ui| {
             changed |= ui
-                .add(
-                    egui::Slider::new(&mut engine.mapping.jog_sensitivity, 0.1..=5.0)
-                        .logarithmic(true),
-                )
+                .checkbox(&mut engine.mapping.vinyl, "Vinyl mode")
+                .on_hover_text("Touching the top of the jog wheel holds the record, so you can scratch. Off: the jog only nudges.")
+                .changed();
+            ui.label("Scratch");
+            changed |= ui
+                .add(egui::Slider::new(&mut engine.mapping.scratch_sensitivity, 0.25..=4.0).logarithmic(true))
+                .changed();
+            ui.label("Nudge");
+            changed |= ui
+                .add(egui::Slider::new(&mut engine.mapping.jog_sensitivity, 0.1..=5.0).logarithmic(true))
                 .changed();
         });
+        ui.horizontal(|ui| {
+            match &engine.mapping.preset {
+                Some(p) => ui.label(
+                    RichText::new(format!("Started from the built-in {p} mapping.")).small(),
+                ),
+                None => ui.label(RichText::new("Custom mapping.").small()),
+            };
+            let port = self.midi.port.clone().unwrap_or_default();
+            if let Some(preset) = tandem_core::mapping::builtin_preset(&port) {
+                if ui.small_button("Reset to built-in mapping").clicked() {
+                    engine.mapping = preset;
+                    changed = true;
+                }
+            }
+            ui.label(
+                RichText::new(if self.midi.has_output {
+                    "· lights: on"
+                } else {
+                    "· lights: no output port"
+                })
+                .small()
+                .weak(),
+            );
+        });
+        let waiting = engine.waiting_for_pickup();
+        if !waiting.is_empty() {
+            let names: Vec<String> = waiting.iter().map(|t| t.label()).collect();
+            ui.label(
+                RichText::new(format!("Move to pick up: {}", names.join(", ")))
+                    .small()
+                    .color(AMBER),
+            );
+        }
         ui.label(
             RichText::new("Click Learn, then press or move the control on your controller. Faders pick up once they reach the current value, so you never jump over your partner.")
                 .small()

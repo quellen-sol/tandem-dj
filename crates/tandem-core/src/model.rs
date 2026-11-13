@@ -89,6 +89,13 @@ pub struct DeckState {
     pub volume: f32,
     /// [low, mid, high]; 0.5 = unity, 0 = kill.
     pub eq: [f32; 3],
+    /// Channel trim (gain); 0.5 = unity.
+    pub trim: f32,
+    /// One-knob filter: 0.5 = off, below = low-pass, above = high-pass.
+    pub filter: f32,
+    /// True while the DJ's hand is on the jog platter (vinyl mode): the
+    /// record is held, and jog movement moves the playhead directly.
+    pub scratching: bool,
     /// Bumped on every discontinuity (load, play, pause, jump). The renderer
     /// hard-syncs when it changes and smoothly chases otherwise.
     pub gen: u64,
@@ -111,6 +118,9 @@ impl Default for DeckState {
             hot_cues: [None; HOT_CUES],
             volume: 1.0,
             eq: [0.5; 3],
+            trim: 0.5,
+            filter: 0.5,
+            scratching: false,
             gen: 0,
             last_touch: 0,
         }
@@ -127,7 +137,7 @@ impl DeckState {
         if self.track.is_none() {
             return 0.0;
         }
-        let p = if self.playing {
+        let p = if self.playing && !self.scratching {
             self.anchor_pos + (t - self.anchor_time) as f64 * 1e-6 * self.rate()
         } else {
             self.anchor_pos
@@ -221,6 +231,19 @@ pub enum Action {
         band: u8,
         v: f32,
     },
+    Trim {
+        deck: u8,
+        v: f32,
+    },
+    Filter {
+        deck: u8,
+        v: f32,
+    },
+    /// Hand on / off the jog platter (vinyl mode).
+    JogTouch {
+        deck: u8,
+        down: bool,
+    },
     Crossfader {
         v: f32,
     },
@@ -243,7 +266,10 @@ impl Action {
             | Bend { deck, .. }
             | Nudge { deck, .. }
             | Volume { deck, .. }
-            | Eq { deck, .. } => Some(deck as usize),
+            | Eq { deck, .. }
+            | Trim { deck, .. }
+            | Filter { deck, .. }
+            | JogTouch { deck, .. } => Some(deck as usize),
             Crossfader { .. } => None,
         }
     }
@@ -296,6 +322,7 @@ impl RoomState {
                 d.cue_point = d.anchor_pos;
                 d.hot_cues = [None; HOT_CUES];
                 d.bend = 0.0;
+                d.scratching = false;
                 d.gen += 1;
             }
             Action::Eject { .. } => {
@@ -406,6 +433,15 @@ impl RoomState {
                 }
             }
             Action::Volume { v, .. } => d.volume = v.clamp(0.0, 1.0),
+            Action::Trim { v, .. } => d.trim = v.clamp(0.0, 1.0),
+            Action::Filter { v, .. } => d.filter = v.clamp(0.0, 1.0),
+            Action::JogTouch { down, .. } => {
+                if d.track.is_some() && d.scratching != down {
+                    // Re-anchor so the playhead is continuous either way.
+                    d.reanchor(t);
+                    d.scratching = down;
+                }
+            }
             Action::Eq { band, v, .. } => {
                 if let Some(e) = d.eq.get_mut(band as usize) {
                     *e = v.clamp(0.0, 1.0);
@@ -438,6 +474,9 @@ impl RoomState {
             for e in &d.eq {
                 h.u64(e.to_bits() as u64);
             }
+            h.u64(d.trim.to_bits() as u64);
+            h.u64(d.filter.to_bits() as u64);
+            h.u64(d.scratching as u64);
             h.u64(d.gen);
         }
         h.u64(self.crossfader.to_bits() as u64);
@@ -715,6 +754,55 @@ mod tests {
         go(&mut s, 6_000_000, Action::Seek { deck: 0, pos: 42.0 });
         go(&mut s, 6_100_000, Action::CueDown { deck: 0 });
         assert_eq!(s.decks[0].cue_point, 42.0);
+    }
+
+    #[test]
+    fn scratching_holds_the_record_and_moves_with_the_jog() {
+        let mut s = RoomState::default();
+        s.apply(&ev(
+            0,
+            1,
+            1,
+            Action::Load {
+                deck: 0,
+                track: tid(3),
+                duration: 100.0,
+                cue: 0.0,
+            },
+        ));
+        s.apply(&ev(0, 1, 2, Action::Play { deck: 0 }));
+        s.apply(&ev(
+            10_000_000,
+            1,
+            3,
+            Action::JogTouch {
+                deck: 0,
+                down: true,
+            },
+        ));
+        // Hand on the platter: the record stops where it was.
+        assert!((s.decks[0].position_at(12_000_000) - 10.0).abs() < 1e-9);
+        s.apply(&ev(
+            12_000_000,
+            1,
+            4,
+            Action::Nudge {
+                deck: 0,
+                delta: -0.5,
+            },
+        ));
+        assert!((s.decks[0].position_at(12_500_000) - 9.5).abs() < 1e-9);
+        // Let go: it plays on from there.
+        s.apply(&ev(
+            13_000_000,
+            1,
+            5,
+            Action::JogTouch {
+                deck: 0,
+                down: false,
+            },
+        ));
+        assert!((s.decks[0].position_at(14_000_000) - 10.5).abs() < 1e-9);
     }
 
     #[test]

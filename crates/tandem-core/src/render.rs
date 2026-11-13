@@ -108,6 +108,9 @@ const XFADE: u32 = 96;
 const HARD_SYNC_S: f64 = 0.050;
 const CHASE_TAU_S: f64 = 0.15;
 const CHASE_MAX: f64 = 0.10;
+/// While scratching, the read head trails the hand by about this much.
+const SCRATCH_TAU_S: f64 = 0.012;
+const SCRATCH_MAX_SPEED: f64 = 8.0;
 const CLICK_PERIOD_US: i64 = 500_000;
 const CLICK_LEN_US: i64 = 15_000;
 
@@ -126,6 +129,9 @@ struct Player {
     old_pos: f64,
     old_step: f64,
     old_playing: bool,
+    scratching: bool,
+    /// Current velocity (source frames per output frame), eased while scratching.
+    vel: f64,
 }
 
 impl Player {
@@ -133,30 +139,59 @@ impl Player {
         let track_sr = audio.map(|a| a.sample_rate as f64).unwrap_or(out_sr);
         let model_pos = st.position_at(ts);
         let target = model_pos * track_sr;
-        let want_playing = st.playing && audio.is_some() && model_pos < st.duration - 1e-3;
-        let changed =
-            st.track != self.track || st.gen != self.gen || audio.is_some() != self.has_audio;
+        let has_audio = audio.is_some();
+        let scratching = st.scratching && has_audio;
+        let want_playing =
+            scratching || (st.playing && has_audio && model_pos < st.duration - 1e-3);
+        let changed = st.track != self.track || st.gen != self.gen || has_audio != self.has_audio;
         if changed {
-            self.hard_sync(st, target, want_playing, audio.is_some());
-        } else if want_playing {
+            self.hard_sync(st, target, want_playing, has_audio);
+        }
+
+        if scratching {
+            // Vinyl: the read head follows the hand, forwards or backwards,
+            // with eased velocity so grabbing and releasing sound natural.
             let err = target - self.pos;
-            if !self.playing || err.abs() > HARD_SYNC_S * track_sr {
-                self.hard_sync(st, target, want_playing, audio.is_some());
-            } else {
-                self.corr = (err / track_sr / CHASE_TAU_S).clamp(-CHASE_MAX, CHASE_MAX);
+            if err.abs() > 2.0 * track_sr {
+                self.hard_sync(st, target, true, has_audio);
             }
-        } else {
-            if self.playing {
-                self.hard_sync(st, target, false, audio.is_some());
+            if !self.playing {
+                self.old_playing = false;
+                self.xfade = XFADE;
+                self.playing = true;
             }
-            self.pos = target; // paused: follow scrubs/nudges directly
+            let max = SCRATCH_MAX_SPEED * track_sr / out_sr;
+            let want = ((target - self.pos) / (SCRATCH_TAU_S * out_sr)).clamp(-max, max);
+            self.vel += (want - self.vel) * 0.35;
+            self.step = self.vel;
+            self.scratching = true;
             self.corr = 0.0;
+            return;
+        }
+        self.scratching = false;
+
+        if !changed {
+            if want_playing {
+                let err = target - self.pos;
+                if !self.playing || err.abs() > HARD_SYNC_S * track_sr {
+                    self.hard_sync(st, target, want_playing, has_audio);
+                } else {
+                    self.corr = (err / track_sr / CHASE_TAU_S).clamp(-CHASE_MAX, CHASE_MAX);
+                }
+            } else {
+                if self.playing {
+                    self.hard_sync(st, target, false, has_audio);
+                }
+                self.pos = target; // paused: follow scrubs/nudges directly
+                self.corr = 0.0;
+            }
         }
         self.step = if self.playing {
             track_sr / out_sr * st.rate() * (1.0 + self.corr)
         } else {
             0.0
         };
+        self.vel = self.step;
     }
 
     fn hard_sync(&mut self, st: &DeckState, target: f64, playing: bool, has_audio: bool) {
@@ -211,24 +246,28 @@ struct Biquad {
 
 impl Biquad {
     fn new(lowpass: bool, fc: f64, sr: f64) -> Self {
+        let mut b = Self::default();
+        b.set(lowpass, fc, sr, std::f64::consts::FRAC_1_SQRT_2);
+        b
+    }
+
+    /// Change the response, keeping the filter's state (no clicks).
+    fn set(&mut self, lowpass: bool, fc: f64, sr: f64, q: f64) {
+        let fc = fc.clamp(10.0, sr * 0.45);
         let w0 = 2.0 * std::f64::consts::PI * fc / sr;
         let (sin, cos) = w0.sin_cos();
-        let alpha = sin / (2.0 * std::f64::consts::FRAC_1_SQRT_2);
+        let alpha = sin / (2.0 * q);
         let a0 = 1.0 + alpha;
         let (b0, b1, b2) = if lowpass {
             ((1.0 - cos) / 2.0, 1.0 - cos, (1.0 - cos) / 2.0)
         } else {
             ((1.0 + cos) / 2.0, -(1.0 + cos), (1.0 + cos) / 2.0)
         };
-        Self {
-            b0: (b0 / a0) as f32,
-            b1: (b1 / a0) as f32,
-            b2: (b2 / a0) as f32,
-            a1: (-2.0 * cos / a0) as f32,
-            a2: ((1.0 - alpha) / a0) as f32,
-            z1: [0.0; 2],
-            z2: [0.0; 2],
-        }
+        self.b0 = (b0 / a0) as f32;
+        self.b1 = (b1 / a0) as f32;
+        self.b2 = (b2 / a0) as f32;
+        self.a1 = (-2.0 * cos / a0) as f32;
+        self.a2 = ((1.0 - alpha) / a0) as f32;
     }
 
     #[inline]
@@ -283,6 +322,69 @@ fn cascade(f: &mut [Biquad; 2], x: [f32; 2]) -> [f32; 2] {
     f[1].run(y)
 }
 
+/// One-knob DJ filter: a low-pass and a high-pass in series. At the centre
+/// both sit at the edges of hearing; turning left sweeps the low-pass down,
+/// right sweeps the high-pass up. Both always run, so crossing the centre
+/// never clicks.
+struct DjFilter {
+    lp: Biquad,
+    hp: Biquad,
+    last: f32,
+}
+
+impl DjFilter {
+    fn new(sr: f64) -> Self {
+        let mut f = Self {
+            lp: Biquad::default(),
+            hp: Biquad::default(),
+            last: -1.0,
+        };
+        f.update(0.5, sr);
+        f
+    }
+
+    fn update(&mut self, k: f32, sr: f64) {
+        if (k - self.last).abs() < 1e-4 {
+            return;
+        }
+        self.last = k;
+        let k = k as f64;
+        let lp_fc = if k < 0.5 {
+            20_000.0 * (60.0f64 / 20_000.0).powf((0.5 - k) / 0.5)
+        } else {
+            20_000.0
+        };
+        let hp_fc = if k > 0.5 {
+            20.0 * (8_000.0f64 / 20.0).powf((k - 0.5) / 0.5)
+        } else {
+            20.0
+        };
+        let q = if (k - 0.5).abs() < 0.02 {
+            std::f64::consts::FRAC_1_SQRT_2
+        } else {
+            1.1
+        };
+        self.lp.set(true, lp_fc, sr, q);
+        self.hp.set(false, hp_fc, sr, q);
+    }
+
+    #[inline]
+    fn run(&mut self, x: [f32; 2]) -> [f32; 2] {
+        let y = self.lp.run(x);
+        self.hp.run(y)
+    }
+}
+
+/// Trim knob (0..1, 0.5 = unity) to gain: silent at 0, +12 dB at 1.
+pub fn trim_gain(k: f32) -> f32 {
+    if k <= 0.5 {
+        let x = k / 0.5;
+        x * x
+    } else {
+        1.0 + (k - 0.5) / 0.5 * 2.98
+    }
+}
+
 /// EQ knob (0..1, 0.5 = unity) to linear gain: full kill at 0, +6 dB at 1.
 pub fn eq_gain(k: f32) -> f32 {
     if k <= 0.5 {
@@ -324,8 +426,10 @@ pub struct Lane {
     sr: f64,
     players: [Player; DECKS],
     iso: [Isolator; DECKS],
+    filt: [DjFilter; DECKS],
     deck_buf: [[[f32; 2]; SUB]; DECKS],
     vol: [f32; DECKS],
+    trim: [f32; DECKS],
     eqg: [[f32; 3]; DECKS],
     smooth: f32,
     primed: bool,
@@ -339,8 +443,10 @@ impl Lane {
             sr: sample_rate,
             players: Default::default(),
             iso: std::array::from_fn(|_| Isolator::new(sample_rate)),
+            filt: std::array::from_fn(|_| DjFilter::new(sample_rate)),
             deck_buf: [[[0.0; 2]; SUB]; DECKS],
             vol: [0.0; DECKS],
+            trim: [1.0; DECKS],
             eqg: [[1.0; 3]; DECKS],
             // ~10 ms parameter smoothing.
             smooth: (1.0 - (-1.0 / (0.010 * sample_rate)).exp()) as f32,
@@ -370,7 +476,11 @@ impl Lane {
             if !self.primed {
                 self.vol = targets.0;
                 self.eqg = targets.1;
+                self.trim = targets.2;
                 self.primed = true;
+            }
+            for d in 0..DECKS {
+                self.filt[d].update(state.decks[d].filter, self.sr);
             }
             for i in 0..n {
                 let mut m = [0.0f32; 2];
@@ -380,7 +490,11 @@ impl Lane {
                     for b in 0..3 {
                         self.eqg[d][b] += (targets.1[d][b] - self.eqg[d][b]) * self.smooth;
                     }
-                    let s = self.iso[d].process(self.deck_buf[d][i], self.eqg[d]);
+                    self.trim[d] += (targets.2[d] - self.trim[d]) * self.smooth;
+                    let x = self.deck_buf[d][i];
+                    let x = [x[0] * self.trim[d], x[1] * self.trim[d]];
+                    let s = self.iso[d].process(x, self.eqg[d]);
+                    let s = self.filt[d].run(s);
                     m[0] += s[0] * self.vol[d];
                     m[1] += s[1] * self.vol[d];
                     if local.pfl[d] {
@@ -420,17 +534,20 @@ impl Lane {
         }
     }
 
-    fn targets(&self, state: &RoomState) -> ([f32; DECKS], [[f32; 3]; DECKS]) {
+    #[allow(clippy::type_complexity)]
+    fn targets(&self, state: &RoomState) -> ([f32; DECKS], [[f32; 3]; DECKS], [f32; DECKS]) {
         let mut vol = [0.0; DECKS];
         let mut eq = [[1.0; 3]; DECKS];
+        let mut trim = [1.0; DECKS];
         for d in 0..DECKS {
             let st = &state.decks[d];
             vol[d] = fader_gain(st.volume) * xfader_gain(d, state.crossfader);
+            trim[d] = trim_gain(st.trim);
             for b in 0..3 {
                 eq[d][b] = eq_gain(st.eq[b]);
             }
         }
-        (vol, eq)
+        (vol, eq, trim)
     }
 }
 
@@ -562,6 +679,72 @@ mod tests {
         let model = snap.timeline.state_at(t).decks[0].position_at(t) * 44_100.0;
         let err_ms = (model - lane.players[0].pos).abs() / 44.1;
         assert!(err_ms < 1.0, "still {err_ms} ms off after 1 s");
+    }
+
+    #[test]
+    fn scratch_follows_the_hand_backwards() {
+        let a = track();
+        let mut tl = Timeline::new(0);
+        let mut seq = 0;
+        let mut push = |tl: &mut Timeline, t: i64, action: Action| {
+            seq += 1;
+            tl.insert(Event {
+                time: t,
+                origin: 1,
+                seq,
+                action,
+            });
+        };
+        push(
+            &mut tl,
+            0,
+            Action::Load {
+                deck: 0,
+                track: a.id,
+                duration: a.duration(),
+                cue: 0.0,
+            },
+        );
+        push(&mut tl, 0, Action::Seek { deck: 0, pos: 5.0 });
+        push(&mut tl, 0, Action::Play { deck: 0 });
+        push(
+            &mut tl,
+            1_000_000,
+            Action::JogTouch {
+                deck: 0,
+                down: true,
+            },
+        );
+        // Drag the record back 0.3 s over 100 ms.
+        for i in 0..20 {
+            push(
+                &mut tl,
+                1_000_000 + i * 5_000,
+                Action::Nudge {
+                    deck: 0,
+                    delta: -0.015,
+                },
+            );
+        }
+        let snap = snap_with(tl, a.clone());
+        let mut lane = Lane::new(48_000.0, 0, LaneKind::Live);
+        let (mut m, mut c) = (vec![0.0; 960], vec![0.0; 960]);
+        let mut t = 900_000;
+        let mut min_step = f64::MAX;
+        while t < 1_300_000 {
+            lane.render(&snap, t, &mut m, &mut c);
+            min_step = min_step.min(lane.players[0].step);
+            t += 10_000;
+        }
+        assert!(
+            min_step < -0.5,
+            "never played backwards (min step {min_step})"
+        );
+        let pos_s = lane.players[0].pos / 44_100.0;
+        assert!(
+            (pos_s - 5.7).abs() < 0.01,
+            "ended at {pos_s} s, expected 5.7"
+        );
     }
 
     #[test]

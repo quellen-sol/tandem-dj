@@ -18,6 +18,11 @@ fn main() {
         attach_console();
         std::process::exit(selftest::run());
     }
+    if let Some(i) = args.iter().position(|a| a == "--midi-monitor") {
+        attach_console();
+        let secs = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(60);
+        std::process::exit(midi::monitor(secs));
+    }
     if args.iter().any(|a| a == "--version") {
         attach_console();
         println!("tandem {}", env!("CARGO_PKG_VERSION"));

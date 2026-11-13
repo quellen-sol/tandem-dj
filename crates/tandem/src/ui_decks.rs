@@ -135,7 +135,7 @@ impl TandemApp {
         let mixer_w = 290.0;
         let gap = ui.spacing().item_spacing.x;
         let deck_w = ((ui.available_width() - mixer_w - 2.0 * gap) / 2.0).max(260.0);
-        let top_h = 318.0;
+        let top_h = 352.0;
         ui.with_layout(Layout::left_to_right(Align::Min), |ui| {
             ui.allocate_ui_with_layout(vec2(deck_w, top_h), Layout::top_down(Align::Min), |ui| {
                 self.deck_panel(ui, 0, view)
@@ -162,7 +162,7 @@ impl TandemApp {
         let deck = d as u8;
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            ui.set_min_height(304.0);
+            ui.set_min_height(338.0);
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new(format!("DECK {}", deck_letter(d)))
@@ -175,6 +175,9 @@ impl TandemApp {
                             .small()
                             .weak(),
                     );
+                }
+                if st.scratching {
+                    ui.label(RichText::new("SCRATCH").small().strong().color(AMBER));
                 }
             });
             let (title, artist) = match &dv.meta {
@@ -254,33 +257,44 @@ impl TandemApp {
                     });
                 }
                 ui.add_space(8.0);
-                for slot in 0..4u8 {
-                    let set = st.hot_cues[slot as usize].is_some();
-                    let fill = if set {
-                        HOT_CUE_COLORS[slot as usize].gamma_multiply(0.7)
-                    } else {
-                        Color32::from_gray(35)
-                    };
-                    let r = ui
-                        .add(
-                            egui::Button::new(RichText::new(format!("{}", slot + 1)).strong())
-                                .min_size(vec2(38.0, 40.0))
-                                .fill(fill),
-                        )
-                        .on_hover_text("Click: set / jump to hot cue. Right-click: clear.");
-                    if self
-                        .hold(
-                            format!("hc{d}-{slot}"),
-                            r.is_pointer_button_down_on() && primary,
-                        )
-                        .0
-                    {
-                        self.pending.push(Action::HotCue { deck, slot });
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(3.0, 2.0);
+                    for row in 0..2u8 {
+                        ui.horizontal(|ui| {
+                            for slot in row * 4..row * 4 + 4 {
+                                let set = st.hot_cues[slot as usize].is_some();
+                                let fill = if set {
+                                    HOT_CUE_COLORS[slot as usize].gamma_multiply(0.7)
+                                } else {
+                                    Color32::from_gray(35)
+                                };
+                                let r = ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new(format!("{}", slot + 1)).strong(),
+                                        )
+                                        .min_size(vec2(34.0, 19.0))
+                                        .fill(fill),
+                                    )
+                                    .on_hover_text(
+                                        "Click: set / jump to hot cue. Right-click: clear.",
+                                    );
+                                if self
+                                    .hold(
+                                        format!("hc{d}-{slot}"),
+                                        r.is_pointer_button_down_on() && primary,
+                                    )
+                                    .0
+                                {
+                                    self.pending.push(Action::HotCue { deck, slot });
+                                }
+                                if r.secondary_clicked() {
+                                    self.pending.push(Action::ClearHotCue { deck, slot });
+                                }
+                            }
+                        });
                     }
-                    if r.secondary_clicked() {
-                        self.pending.push(Action::ClearHotCue { deck, slot });
-                    }
-                }
+                });
             });
 
             ui.add_space(4.0);
@@ -327,7 +341,7 @@ impl TandemApp {
     fn mixer_panel(&mut self, ui: &mut egui::Ui, view: &SessionView) {
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            ui.set_min_height(304.0);
+            ui.set_min_height(338.0);
             ui.spacing_mut().item_spacing.y = 3.0;
             ui.vertical_centered(|ui| ui.label(RichText::new("MIXER").strong()));
             ui.columns(DECKS, |cols| {
@@ -387,6 +401,20 @@ impl TandemApp {
                     .color(DECK_COLORS[d]),
             );
             ui.spacing_mut().slider_width = 70.0;
+            let mut trim = st.trim;
+            let r = ui
+                .add(
+                    egui::Slider::new(&mut trim, 0.0..=1.0)
+                        .show_value(false)
+                        .text("TRIM"),
+                )
+                .on_hover_text("Double-click to reset");
+            if r.changed() {
+                self.pending.push(Action::Trim { deck, v: trim });
+            }
+            if r.double_clicked() {
+                self.pending.push(Action::Trim { deck, v: 0.5 });
+            }
             for (band, name) in [(2u8, "HI"), (1, "MID"), (0, "LOW")] {
                 let mut v = st.eq[band as usize];
                 let r = ui
@@ -402,6 +430,20 @@ impl TandemApp {
                 if r.double_clicked() {
                     self.pending.push(Action::Eq { deck, band, v: 0.5 });
                 }
+            }
+            let mut filt = st.filter;
+            let r = ui
+                .add(
+                    egui::Slider::new(&mut filt, 0.0..=1.0)
+                        .show_value(false)
+                        .text("FILTER"),
+                )
+                .on_hover_text("Left: low-pass. Right: high-pass. Double-click to reset.");
+            if r.changed() {
+                self.pending.push(Action::Filter { deck, v: filt });
+            }
+            if r.double_clicked() {
+                self.pending.push(Action::Filter { deck, v: 0.5 });
             }
             ui.toggle_value(&mut self.local_edit.pfl[d], "🎧 CUE")
                 .on_hover_text("Send this deck to your headphones (your booth only)");
@@ -482,7 +524,7 @@ fn overview(ui: &mut egui::Ui, dv: &DeckView, pos: f64, col: Color32) -> Option<
             [pos2(cx, rect.top()), pos2(cx, rect.bottom())],
             Stroke::new(1.0_f32, Color32::WHITE.gamma_multiply(0.6)),
         );
-        for (i, hc) in dv.state.hot_cues.iter().enumerate().take(4) {
+        for (i, hc) in dv.state.hot_cues.iter().enumerate().take(8) {
             if let Some(t) = hc {
                 let x = x_of(*t);
                 p.rect_filled(
@@ -545,7 +587,7 @@ fn scrolling_waveform(ui: &mut egui::Ui, d: usize, dv: &DeckView, now: i64, heig
             );
         }
         let x_of = |t: f64| rect.center().x + ((t - pos) / span) as f32 * rect.width();
-        for (i, hc) in st.hot_cues.iter().enumerate().take(4) {
+        for (i, hc) in st.hot_cues.iter().enumerate().take(8) {
             if let Some(t) = hc {
                 let x = x_of(*t);
                 if rect.x_range().contains(x) {
