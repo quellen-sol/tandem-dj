@@ -49,13 +49,28 @@ Mappings are saved per controller, so you only do this once. When Tandem's built
 
 ## BPM, sync and keys
 
-- **Analyze BPM** (library toolbar) works out the tempo, beatgrid and musical key of every track in the list, in the background. Each track is only analysed once, and tracks are also analysed when you load them. A key already in the file's tags is used as-is.
+- **Analyze BPM** (library toolbar) works out the tempo, beatgrid and musical key of every track in the list, in the background. Each track is only analysed once, and tracks are also analysed when you load them. A key already in the file's tags is used as-is. A grid you've edited always wins over analysis.
 - **Beat markers** run along the top of each scrolling waveform.
 - **SYNC** matches a deck's tempo and beats to the other deck, using half or double time when that's closer. While SYNC is on, moving either deck's tempo fader moves both, and pressing play on a synced deck starts it on the beat.
 - **SHIFT + SYNC** on the controller, or right-clicking SYNC, turns sync off. The deck goes back to its own BPM, offset only by where your tempo fader sits.
 - **KEY LOCK** is on by default, so changing tempo doesn't change pitch. Turn it off for vinyl-style pitch. Scratching always sounds like vinyl.
 - **Keys** show in Camelot notation (8A, 11B…), in green when the two decks are harmonically compatible. Use **−/+** to shift a deck by semitones. **MATCH KEY** shifts it the smallest amount needed to sit in the other deck's key, or its relative major/minor.
-- **Loading onto a playing deck** swaps the track instantly. The new track starts on the beat of what's playing: the other deck if it's playing, otherwise the track you replaced. A synced deck stays synced.
+- **Loading onto a playing deck** swaps the track instantly. The new track starts on the beat of what's playing: the other deck if it's playing, otherwise the track you replaced. It starts at bar 1 (its first grid marker). A synced deck stays synced.
+- **Bar numbers** run along the bottom of each scrolling waveform, and the deck shows the bar and beat you're on (e.g. `12.3`). Bar 1 is the first grid marker. The bars before it count down **−1, −2…**, so you can park a track a bar or two early, press play and wait for the 1.
+
+### Fixing a beatgrid
+
+Detection isn't always right, and some tracks change tempo part-way through. Click **GRID** on a deck to edit its grid. The key and tempo rows are replaced by the grid controls.
+
+1. **SET** puts a red marker exactly where the playhead is. Put markers on the first beat of a bar (the 1). Pause and jog onto the kick for the most precise spot.
+   - On a detected grid, the first SET moves the whole grid so it lines up there, and that spot becomes bar 1.
+   - After that, each SET adds a marker. Add one wherever the tempo changes. If a marker is already within half a beat, SET moves that marker instead.
+2. Each marker starts a **section** with its own BPM, running up to the next marker. **ADJUST** and **SLIP** only change the section the playhead is in (its marker is the bright one), so fixing one part never moves another.
+   - **ADJUST** stretches the section to the track's tempo. Its marker stays put and the beats further away move more. The buttons are **±.01**, **±.1** and **±1** BPM, plus **½** and **×2** for a grid at half or double time.
+   - **SLIP** slides the section's beats earlier (◀) or later (▶) by **1**, **5** or **25 ms**, without changing the BPM.
+3. **DELETE** removes the section's marker. **RESET** throws away your edits and goes back to the detected grid.
+
+Your edits are saved for the track and used every time you load it. They're matched by the file's content, so moving or renaming it keeps them, but editing its tags (or re-encoding it) doesn't. They're shared with your partner live, and their booth saves them too. If a deck is synced, it keeps following: a synced deck re-locks its tempo the moment either track passes a tempo change.
 
 ## Play together
 
@@ -96,7 +111,7 @@ Host in one window and join `127.0.0.1` from the other.
 ## Known limits in v0.2
 
 - **Decks and DJs:** 2 decks, 2 DJs per room.
-- **Beatgrids:** a steady tempo is assumed, and bars (the "1") aren't detected yet. Hot cues and play aren't snapped to the beat, except on a synced deck.
+- **Beatgrids:** detection assumes a steady tempo and doesn't find bars (the "1"). Set markers by hand for both: see [Fixing a beatgrid](#fixing-a-beatgrid). A grid can have up to 32 markers, and every bar is 4 beats. Hot cues and play aren't snapped to the beat, except on a synced deck.
 - **Keys:** detection is good but not perfect. It can mix up a key with its relative major/minor (same Camelot number), and very drum-heavy tracks are harder.
 - **Mixer:** no effects or loops. EQ is a 3-band isolator, plus a filter and trim per channel.
 - **Controllers:** MIDI only. Controllers that only speak HID aren't supported.

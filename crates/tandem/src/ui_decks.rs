@@ -3,6 +3,7 @@
 use crate::app::TandemApp;
 use eframe::egui::{self, pos2, vec2, Align, Color32, Layout, RichText, Sense, Stroke};
 use tandem_core::audio::PEAK_BLOCK;
+use tandem_core::grid::{BeatGrid, Marker, MAX_MARKERS};
 use tandem_core::model::{Action, DECKS};
 use tandem_core::session::{deck_letter, DeckView, RoleView, SessionView, TrackStatus};
 
@@ -23,6 +24,13 @@ const HOT_CUE_COLORS: [Color32; 8] = [
 const GREEN: Color32 = Color32::from_rgb(90, 220, 120);
 const RED: Color32 = Color32::from_rgb(240, 90, 90);
 const AMBER: Color32 = Color32::from_rgb(250, 190, 60);
+/// Beatgrid markers (red, like Serato's).
+const MARKER: Color32 = Color32::from_rgb(235, 70, 70);
+
+/// ADJUST steps (BPM): a little, a bit more, more than that.
+const ADJUST_STEPS: [f64; 3] = [0.01, 0.1, 1.0];
+/// SLIP steps (seconds).
+const SLIP_STEPS: [f64; 3] = [0.001, 0.005, 0.025];
 
 /// Camelot-compatible: same key, relative major/minor, or one step round the wheel.
 fn keys_fit(a: i8, b: i8) -> bool {
@@ -164,7 +172,7 @@ impl TandemApp {
         ui.add_space(6.0);
         let h = ((ui.available_height() - 8.0) / 2.0).clamp(40.0, 90.0);
         for d in 0..DECKS {
-            scrolling_waveform(ui, d, &view.decks[d], view.now, h);
+            scrolling_waveform(ui, d, &view.decks[d], view.now, h, self.ui.grid_edit[d]);
         }
     }
 
@@ -193,6 +201,26 @@ impl TandemApp {
                 if st.scratching {
                     ui.label(RichText::new("SCRATCH").small().strong().color(AMBER));
                 }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let editing = &mut self.ui.grid_edit[d];
+                    let fill = if *editing { MARKER.gamma_multiply(0.55) } else { Color32::from_gray(50) };
+                    if ui
+                        .add_enabled(
+                            st.track.is_some(),
+                            egui::Button::new(RichText::new("GRID").small().strong()).fill(fill),
+                        )
+                        .on_hover_text("Edit the beatgrid: set markers, ADJUST the BPM, SLIP the beats into place.")
+                        .clicked()
+                    {
+                        *editing = !*editing;
+                    }
+                    if let (Some(g), Some(_)) = (st.grid, st.track) {
+                        let (bar, beat) = g.bar_beat_at(pos);
+                        ui.monospace(RichText::new(format!("{bar}.{beat}")).strong())
+                            .on_hover_text("Bar.beat. Bar 1 is the first grid marker; the bars before it count down -1, -2…, so you can park the track a bar or two early, press play and wait for the 1.");
+                        ui.label(RichText::new("bar").small().weak());
+                    }
+                });
             });
             let (title, artist) = match &dv.meta {
                 Some(m) => (m.title.clone(), m.artist.clone()),
@@ -215,7 +243,7 @@ impl TandemApp {
                 ui.monospace(RichText::new(format!("-{}", fmt_time(st.duration - pos))).weak());
                 ui.separator();
                 let bpm = st
-                    .effective_bpm()
+                    .effective_bpm_at(view.now)
                     .or_else(|| dv.meta.as_ref().and_then(|m| m.bpm).map(|b| b as f64 * st.tempo));
                 match bpm {
                     Some(b) => ui.monospace(RichText::new(format!("{b:.2} BPM")).size(15.0)),
@@ -239,7 +267,7 @@ impl TandemApp {
                 }
             });
 
-            if let Some(seek) = overview(ui, dv, pos, col) {
+            if let Some(seek) = overview(ui, dv, pos, col, self.ui.grid_edit[d]) {
                 self.pending.push(Action::Seek { deck, pos: seek });
             }
 
@@ -328,6 +356,10 @@ impl TandemApp {
             });
 
             ui.add_space(2.0);
+            if self.ui.grid_edit[d] && st.track.is_some() {
+                self.grid_editor(ui, d, dv, pos);
+                return;
+            }
             ui.horizontal(|ui| {
                 let other = view.room.decks[(d + 1) % 2];
                 let lock_fill = if st.key_lock { Color32::from_rgb(110, 70, 170) } else { Color32::from_gray(50) };
@@ -376,7 +408,7 @@ impl TandemApp {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 let other = &view.room.decks[(d + 1) % 2];
-                let can_sync = st.bpm > 0.0 && other.bpm > 0.0 && other.track.is_some();
+                let can_sync = st.grid.is_some() && other.grid.is_some() && other.track.is_some();
                 let sync_fill = if st.synced {
                     Color32::from_rgb(40, 120, 200)
                 } else {
@@ -438,6 +470,141 @@ impl TandemApp {
                 }
             });
         });
+    }
+
+    /// Beatgrid editing, in place of the key and tempo rows. Every edit acts
+    /// on the section under the playhead (from its marker to the next), so
+    /// fixing one part of a track never moves another.
+    fn grid_editor(&mut self, ui: &mut egui::Ui, d: usize, dv: &DeckView, pos: f64) {
+        let st = dv.state;
+        let Some(track) = st.track else { return };
+        let grid = st.grid;
+        let i = grid.map(|g| g.section(pos)).unwrap_or(0);
+        let mut new: Option<Option<BeatGrid>> = None;
+        let mut reset = false;
+        let small = vec2(30.0, 18.0);
+        ui.spacing_mut().item_spacing = vec2(3.0, 3.0);
+
+        ui.horizontal(|ui| {
+            let r = ui
+                .add(
+                    egui::Button::new(RichText::new("SET").strong())
+                        .fill(MARKER.gamma_multiply(0.6))
+                        .min_size(vec2(46.0, 20.0)),
+                )
+                .on_hover_text(
+                    "Put a marker right where the playhead is, on the first beat of a bar (the 1). \
+                     The first marker is bar 1.\n\nOn a detected grid, the first SET moves the whole grid \
+                     to line up here. After that, SET adds a marker (for a tempo change), or moves the \
+                     marker within half a beat of the playhead.",
+                );
+            if r.clicked() {
+                let bpm = dv.meta.as_ref().and_then(|m| m.bpm).map(|b| b as f64).unwrap_or(120.0);
+                let g = match grid {
+                    Some(g) => g.set_marker(pos),
+                    None => BeatGrid::from_markers(&[Marker { pos, bpm }], true),
+                };
+                match g {
+                    Some(g) => new = Some(Some(g)),
+                    None => self.toast(format!("A beatgrid can have at most {MAX_MARKERS} markers.")),
+                }
+            }
+            let markers = grid.map(|g| g.markers().len()).unwrap_or(0);
+            if ui
+                .add_enabled(markers > 1, egui::Button::new("DELETE").min_size(vec2(0.0, 20.0)))
+                .on_hover_text("Remove this section's marker (the bright one on the waveform). The section before takes over.")
+                .on_disabled_hover_text("A grid keeps at least one marker. RESET goes back to the detected grid.")
+                .clicked()
+            {
+                new = grid.and_then(|g| g.remove_marker(i)).map(Some);
+            }
+            let edited = grid.map(|g| g.edited).unwrap_or(false);
+            if ui
+                .add_enabled(edited, egui::Button::new("RESET").min_size(vec2(0.0, 20.0)))
+                .on_hover_text("Throw away your edits and go back to the grid Tandem detected.")
+                .clicked()
+            {
+                reset = true;
+            }
+            ui.separator();
+            match grid {
+                Some(_) if markers > 1 => {
+                    ui.label(RichText::new(format!("marker {} of {markers}", i + 1)).small().weak());
+                }
+                Some(g) if !g.edited => {
+                    ui.label(RichText::new("detected grid").small().weak());
+                }
+                Some(_) => {}
+                None => {
+                    ui.label(RichText::new("no beat found: SET starts a grid here").small().weak());
+                }
+            }
+        });
+
+        ui.add_enabled_ui(grid.is_some(), |ui| {
+            ui.horizontal(|ui| {
+                ui.add_sized(vec2(44.0, 18.0), egui::Label::new(RichText::new("ADJUST").small().strong()))
+                    .on_hover_text("Stretch this section's grid to the track's tempo. Its marker stays put; beats further from it move more.");
+                let mut adjust = |ui: &mut egui::Ui, label: &str, delta: f64| {
+                    let r = ui
+                        .add(egui::Button::new(label).min_size(small))
+                        .on_hover_text(format!("{delta:+} BPM"));
+                    if r.clicked() {
+                        new = grid.map(|g| Some(g.adjust(i, delta)));
+                    }
+                };
+                for step in ADJUST_STEPS.iter().rev() {
+                    adjust(ui, &format!("−{}", step_label(*step)), -step);
+                }
+                let bpm = grid.map(|g| g.markers()[i].bpm).unwrap_or(0.0);
+                ui.add_sized(
+                    vec2(54.0, 18.0),
+                    egui::Label::new(RichText::new(format!("{bpm:.2}")).monospace().strong()),
+                )
+                .on_hover_text("This section's BPM (before the tempo fader)");
+                for step in ADJUST_STEPS {
+                    adjust(ui, &format!("+{}", step_label(step)), step);
+                }
+                ui.add_space(4.0);
+                for (label, factor, tip) in [("½", 0.5, "Half the BPM"), ("×2", 2.0, "Double the BPM")] {
+                    if ui.add(egui::Button::new(label).min_size(vec2(24.0, 18.0))).on_hover_text(tip).clicked() {
+                        new = grid.map(|g| Some(g.scale(i, factor)));
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.add_sized(vec2(44.0, 18.0), egui::Label::new(RichText::new("SLIP").small().strong()))
+                    .on_hover_text("Slide this section's beats earlier or later, without changing the BPM.");
+                for (k, step) in SLIP_STEPS.iter().enumerate().rev() {
+                    let r = ui
+                        .add(egui::Button::new("◀".repeat(k + 1)).min_size(small))
+                        .on_hover_text(format!("{:.0} ms earlier", step * 1000.0));
+                    if r.clicked() {
+                        new = grid.map(|g| Some(g.slip(i, -step)));
+                    }
+                }
+                ui.add_space(6.0);
+                for (k, step) in SLIP_STEPS.iter().enumerate() {
+                    let r = ui
+                        .add(egui::Button::new("▶".repeat(k + 1)).min_size(small))
+                        .on_hover_text(format!("{:.0} ms later", step * 1000.0));
+                    if r.clicked() {
+                        new = grid.map(|g| Some(g.slip(i, *step)));
+                    }
+                }
+            });
+        });
+
+        if reset {
+            self.session.lock().reset_grid(d);
+        }
+        if let Some(g) = new {
+            self.pending.push(Action::SetGrid {
+                deck: d as u8,
+                track,
+                grid: g.map(Box::new),
+            });
+        }
     }
 
     fn mixer_panel(&mut self, ui: &mut egui::Ui, view: &SessionView) {
@@ -565,6 +732,12 @@ impl TandemApp {
     }
 }
 
+/// "1", ".1", ".01" for an ADJUST step.
+fn step_label(step: f64) -> String {
+    let s = format!("{step}");
+    s.strip_prefix('0').unwrap_or(&s).to_string()
+}
+
 fn deck_status(dv: &DeckView, view: &SessionView) -> Option<(String, Color32)> {
     if let Some(l) = &dv.loading {
         return Some((format!("Loading {l}…"), AMBER));
@@ -591,7 +764,13 @@ fn deck_status(dv: &DeckView, view: &SessionView) -> Option<(String, Color32)> {
 }
 
 /// Whole-track overview; click to seek. Returns the seek position.
-fn overview(ui: &mut egui::Ui, dv: &DeckView, pos: f64, col: Color32) -> Option<f64> {
+fn overview(
+    ui: &mut egui::Ui,
+    dv: &DeckView,
+    pos: f64,
+    col: Color32,
+    grid_edit: bool,
+) -> Option<f64> {
     let (rect, resp) =
         ui.allocate_exact_size(vec2(ui.available_width(), 42.0), Sense::click_and_drag());
     let p = ui.painter_at(rect);
@@ -636,6 +815,17 @@ fn overview(ui: &mut egui::Ui, dv: &DeckView, pos: f64, col: Color32) -> Option<
                 );
             }
         }
+        // Grid markers (where the tempo can change) along the bottom.
+        if let Some(g) = dv.state.grid.filter(|g| grid_edit || g.markers().len() > 1) {
+            for m in g.markers() {
+                let x = x_of(m.pos.max(0.0));
+                p.rect_filled(
+                    egui::Rect::from_min_size(pos2(x - 1.0, rect.bottom() - 6.0), vec2(2.0, 6.0)),
+                    0.0,
+                    MARKER,
+                );
+            }
+        }
         let px = x_of(pos);
         p.line_segment(
             [pos2(px, rect.top()), pos2(px, rect.bottom())],
@@ -651,8 +841,17 @@ fn overview(ui: &mut egui::Ui, dv: &DeckView, pos: f64, col: Color32) -> Option<
 }
 
 /// Scrolling waveform centred on the playhead. The window is 8 seconds of
-/// real time, so two decks at the same effective BPM show the same beat spacing.
-fn scrolling_waveform(ui: &mut egui::Ui, d: usize, dv: &DeckView, now: i64, height: f32) {
+/// real time, so two decks at the same effective BPM show the same beat
+/// spacing. Beat lines come from the grid, with bar numbers on the
+/// downbeats; grid markers show while editing (or when there are several).
+fn scrolling_waveform(
+    ui: &mut egui::Ui,
+    d: usize,
+    dv: &DeckView,
+    now: i64,
+    height: f32,
+    grid_edit: bool,
+) {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
     let p = ui.painter_at(rect);
     p.rect_filled(rect, 3.0, Color32::from_gray(12));
@@ -691,34 +890,71 @@ fn scrolling_waveform(ui: &mut egui::Ui, d: usize, dv: &DeckView, now: i64, heig
             );
         }
         let x_of = |t: f64| rect.center().x + ((t - pos) / span) as f32 * rect.width();
-        // Beat markers from the beatgrid; every 4th beat brighter.
-        if st.bpm > 0.0 {
-            let beat = 60.0 / st.bpm;
-            let first = ((pos - span / 2.0 - st.first_beat) / beat).ceil() as i64;
-            let last = ((pos + span / 2.0 - st.first_beat) / beat).floor() as i64;
-            for k in first..=last {
-                let tb = st.first_beat + k as f64 * beat;
-                if tb < 0.0 || tb > st.duration {
-                    continue;
-                }
-                let x = x_of(tb);
-                let strong = k.rem_euclid(4) == 0;
-                let c = Color32::WHITE.gamma_multiply(if strong { 0.6 } else { 0.3 });
+        if let Some(g) = st.grid {
+            // Beat lines: downbeats full height with their bar number.
+            let font = egui::FontId::monospace(10.0);
+            let from = (pos - span / 2.0).max(0.0);
+            let to = (pos + span / 2.0).min(st.duration);
+            g.beats_in(from, to, |b| {
+                let x = x_of(b.pos);
+                let downbeat = b.beat == 1;
+                let c = Color32::WHITE.gamma_multiply(if downbeat { 0.6 } else { 0.3 });
+                let h = if downbeat {
+                    rect.height()
+                } else {
+                    rect.height() * 0.25
+                };
                 p.line_segment(
-                    [
-                        pos2(x, rect.top()),
-                        pos2(
-                            x,
-                            rect.top()
-                                + if strong {
-                                    rect.height()
-                                } else {
-                                    rect.height() * 0.25
-                                },
-                        ),
-                    ],
+                    [pos2(x, rect.top()), pos2(x, rect.top() + h)],
                     Stroke::new(1.0_f32, c),
                 );
+                if downbeat {
+                    let galley = p.layout_no_wrap(
+                        b.bar.to_string(),
+                        font.clone(),
+                        Color32::WHITE.gamma_multiply(0.85),
+                    );
+                    let at = pos2(x + 3.0, rect.bottom() - galley.size().y - 1.0);
+                    p.rect_filled(
+                        egui::Rect::from_min_size(
+                            at - vec2(1.0, 0.0),
+                            galley.size() + vec2(2.0, 0.0),
+                        ),
+                        2.0,
+                        Color32::from_black_alpha(170),
+                    );
+                    p.galley(at, galley, Color32::WHITE);
+                }
+            });
+            if grid_edit || g.markers().len() > 1 {
+                let active = g.section(pos);
+                for (k, m) in g.markers().iter().enumerate() {
+                    let x = x_of(m.pos);
+                    if !rect.x_range().contains(x) {
+                        continue;
+                    }
+                    let bright = grid_edit && k == active;
+                    let c = if bright {
+                        MARKER
+                    } else {
+                        MARKER.gamma_multiply(0.6)
+                    };
+                    if grid_edit {
+                        p.line_segment(
+                            [pos2(x, rect.top()), pos2(x, rect.bottom())],
+                            Stroke::new(if bright { 2.0_f32 } else { 1.0 }, c),
+                        );
+                    }
+                    p.add(egui::Shape::convex_polygon(
+                        vec![
+                            pos2(x - 5.0, rect.top()),
+                            pos2(x + 5.0, rect.top()),
+                            pos2(x, rect.top() + 7.0),
+                        ],
+                        c,
+                        Stroke::NONE,
+                    ));
+                }
             }
         }
         for (i, hc) in st.hot_cues.iter().enumerate().take(8) {

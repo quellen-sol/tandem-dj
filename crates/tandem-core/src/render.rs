@@ -781,8 +781,7 @@ mod tests {
                 track: a.id,
                 duration: a.duration(),
                 cue: 0.0,
-                bpm: 0.0,
-                first_beat: 0.0,
+                grid: None,
                 key: -1,
             },
         });
@@ -823,8 +822,7 @@ mod tests {
                 track: a.id,
                 duration: a.duration(),
                 cue: 0.0,
-                bpm: 0.0,
-                first_beat: 0.0,
+                grid: None,
                 key: -1,
             },
         });
@@ -886,8 +884,7 @@ mod tests {
                 track: a.id,
                 duration: a.duration(),
                 cue: 0.0,
-                bpm: 0.0,
-                first_beat: 0.0,
+                grid: None,
                 key: -1,
             },
         );
@@ -954,8 +951,7 @@ mod tests {
                 track: a.id,
                 duration: a.duration(),
                 cue: 0.0,
-                bpm: 0.0,
-                first_beat: 0.0,
+                grid: None,
                 key: -1,
             },
         );

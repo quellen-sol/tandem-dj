@@ -6,9 +6,11 @@
 //! they read an [`AudioSnapshot`] that is swapped in atomically after every
 //! change.
 
+use crate::analysis;
 use crate::audio::{decode_file, TrackAudio};
 use crate::clock::ClockEstimator;
 use crate::config::{sanitize_file_name, unique_path, Paths};
+use crate::grid::BeatGrid;
 use crate::library::{self, Library};
 use crate::model::{Action, DeckState, Event, RoomState, Timeline, TrackId, DECKS};
 use crate::net::PeerConn;
@@ -212,10 +214,20 @@ pub struct Session {
     preparing_share: Option<String>,
     pub max_upload_bytes_s: f64,
     pub bcast_delay_us: i64,
+    /// Per deck, as of the last maintenance tick: track, gen and the BPM of
+    /// the grid section under the playhead. A change means the deck crossed
+    /// into a section with another tempo.
+    grid_watch: [(Option<TrackId>, u64, Option<f64>); DECKS],
+    /// Relock events already scheduled: (deck, shared time).
+    relocks: Vec<(u8, i64)>,
     weak: Weak<Mutex<Session>>,
 }
 
 const MAX_CONCURRENT_FETCHES: usize = 2;
+/// How far ahead (us) to schedule a relock for a deck about to reach a tempo
+/// change. Longer than the maintenance tick so none slips through, short so
+/// the event is only briefly in the future.
+const RELOCK_HORIZON_US: i64 = 300_000;
 const TRANSFER_STALL: Duration = Duration::from_secs(45);
 
 impl Session {
@@ -260,6 +272,8 @@ impl Session {
                 preparing_share: None,
                 max_upload_bytes_s: 2.0 * 1024.0 * 1024.0,
                 bcast_delay_us: 500_000,
+                grid_watch: [(None, 0, None); DECKS],
+                relocks: Vec::new(),
                 weak: weak.clone(),
             })
         });
@@ -360,16 +374,54 @@ impl Session {
             seq: self.seq,
             action: a,
         };
-        self.timeline.insert(ev);
+        self.timeline.insert(ev.clone());
         self.after_event(&ev);
         self.send(Msg::Event { ev });
         self.publish();
     }
 
     fn after_event(&mut self, ev: &Event) {
-        if let Action::Load { track, .. } = ev.action {
-            self.ensure_track(track);
+        match &ev.action {
+            Action::Load { track, .. } => self.ensure_track(*track),
+            Action::SetGrid { track, grid, .. } => {
+                self.remember_grid(*track, grid.as_deref().copied())
+            }
+            _ => {}
         }
+    }
+
+    /// A deck's grid was edited (here or by the partner): use it the next
+    /// time this track is loaded, and save it to this booth's library.
+    fn remember_grid(&mut self, id: TrackId, grid: Option<BeatGrid>) {
+        if let Some(m) = self.track_meta.get_mut(&id) {
+            m.grid = grid;
+        }
+        let path = self.servable.get(&id).cloned();
+        library::set_user_grid(&self.library, id, path.as_deref(), grid);
+    }
+
+    /// Put a deck's beatgrid back to what analysis found (analysing the
+    /// track now if this booth hasn't already).
+    pub fn reset_grid(&mut self, deck: usize) {
+        let Some(id) = self.timeline.latest().decks.get(deck).and_then(|d| d.track) else {
+            return;
+        };
+        let path = self.servable.get(&id).cloned();
+        let audio = self.tracks.get(&id).and_then(|s| s.audio.clone());
+        let hint = self.track_meta.get(&id).and_then(|m| m.bpm);
+        let lib = self.library.clone();
+        let weak = self.weak.clone();
+        std::thread::spawn(move || {
+            let grid = path
+                .and_then(|p| library::detected_grid(&lib, &p))
+                .or_else(|| audio.and_then(|a| analysis::analyze(&a, hint.map(|b| b as f64))));
+            let Some(h) = weak.upgrade() else { return };
+            h.lock().act(Action::SetGrid {
+                deck: deck as u8,
+                track: id,
+                grid: grid.map(Box::new),
+            });
+        });
     }
 
     pub fn set_local(&mut self, local: LocalParams) {
@@ -1072,7 +1124,7 @@ impl Session {
     pub fn on_control_msg(&mut self, msg: Msg) {
         match msg {
             Msg::Event { ev } => {
-                if self.timeline.insert(ev) {
+                if self.timeline.insert(ev.clone()) {
                     self.after_event(&ev);
                     self.publish();
                 }
@@ -1103,7 +1155,7 @@ impl Session {
                     .events()
                     .iter()
                     .filter(|e| e.origin == self.me.id)
-                    .copied()
+                    .cloned()
                     .collect();
                 self.timeline = timeline;
                 for e in mine {
@@ -1187,6 +1239,8 @@ impl Session {
     fn maintenance(&mut self) {
         let now = self.now();
         self.timeline.compact(now - self.bcast_delay_us - 3_000_000);
+        self.follow_grid_tempos(now);
+        self.library.lock().save_grids();
 
         if matches!(self.role, Role::Host { .. })
             && self.peer.is_some()
@@ -1259,6 +1313,42 @@ impl Session {
             }
         }
         self.publish();
+    }
+
+    /// Keep synced decks locked through tempo changes in their grids. When
+    /// a playing deck is about to reach a marker where its tempo changes,
+    /// schedule a Relock for the exact moment; if one was missed (the deck
+    /// sped up, say), relock as soon as we notice. Relocks are harmless
+    /// when not needed, so only the host (or a booth on its own) sends them.
+    fn follow_grid_tempos(&mut self, now: i64) {
+        let room = self.timeline.state_at(now);
+        self.relocks.retain(|&(_, t)| t > now - 1_000_000);
+        let quiet = matches!(self.role, Role::Client { .. }) && self.peer.is_some();
+        for c in 0..DECKS {
+            let d = &room.decks[c];
+            let watched = (d.track, d.gen, d.bpm_at(now));
+            let prev = std::mem::replace(&mut self.grid_watch[c], watched);
+            let other = &room.decks[(c + 1) % DECKS];
+            if quiet || !(d.synced || other.synced) || !d.playing {
+                continue;
+            }
+            let deck = c as u8;
+            if prev.0 == watched.0 && prev.1 == watched.1 && prev.2 != watched.2 {
+                self.act_at(Action::Relock { deck }, now);
+            }
+            if let Some(tc) = d.next_tempo_change(now, RELOCK_HORIZON_US) {
+                // A hair after the marker, so the deck is surely past it.
+                let at = tc + 1_000;
+                if !self
+                    .relocks
+                    .iter()
+                    .any(|&(dd, t)| dd == deck && (t - at).abs() < 1_000)
+                {
+                    self.relocks.push((deck, at));
+                    self.act_at(Action::Relock { deck }, at);
+                }
+            }
+        }
     }
 
     // ------------------------------------------------------------ UI view
@@ -1359,8 +1449,7 @@ fn load_action(deck: usize, info: &TrackInfo) -> Action {
         track: info.id,
         duration: info.duration,
         cue: 0.0,
-        bpm: info.grid.map(|g| g.bpm).unwrap_or(0.0),
-        first_beat: info.grid.map(|g| g.first_beat).unwrap_or(0.0),
+        grid: info.grid.map(Box::new),
         key: info.key.unwrap_or(-1),
     }
 }

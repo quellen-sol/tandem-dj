@@ -317,7 +317,10 @@ impl TandemApp {
                     Source::Room => view.room_tracks.get(idx).map(|t| Row {
                         title: t.title.clone(),
                         artist: t.artist.clone(),
-                        bpm: t.grid.map(|g| g.bpm).or(t.bpm.map(|b| b as f64)),
+                        bpm: t
+                            .grid
+                            .map(|g| g.main_bpm(t.duration))
+                            .or(t.bpm.map(|b| b as f64)),
                         key: t.key,
                         duration: t.duration,
                     }),

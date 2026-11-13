@@ -13,7 +13,7 @@ use crate::model::{Event, Timeline, TrackId};
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 pub const DEFAULT_PORT: u16 = 47800;
 const MAX_JSON: u32 = 64 << 20;
 const MAX_PAYLOAD: u32 = 8 << 20;
@@ -206,7 +206,7 @@ mod tests {
             seq: 2,
             action: Action::Crossfader { v: 0.25 },
         };
-        write_msg(&mut buf, &Msg::Event { ev }, &[]).unwrap();
+        write_msg(&mut buf, &Msg::Event { ev: ev.clone() }, &[]).unwrap();
         write_msg(&mut buf, &Msg::Chunk, &[1, 2, 3]).unwrap();
         let mut r = &buf[..];
         match read_msg(&mut r).unwrap() {

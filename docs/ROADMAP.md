@@ -55,16 +55,39 @@ Work through these in order and note anything that fails. `tandem.log` (Settings
 
 - **Tempo fader responds straight away after SYNC.** It used to wait for pickup (the fader had to reach the synced tempo first), which could take seconds or never happen. Now, whenever the deck's tempo isn't where the fader sits, the fader moves it relatively.
 
+## Round 3 (v0.3): in progress
+
+- **Beatgrid editing**, Serato-style. Press **GRID** on a deck, then **SET** puts a marker at the playhead. **ADJUST** (±.01/.1/1 BPM, ½, ×2) stretches the grid and **SLIP** (±1/5/25 ms) slides it. Both act only on the section under the playhead.
+  - Several markers handle tracks whose tempo changes, and synced decks re-lock at every tempo change.
+  - Edits are saved per track (by content hash) and shared with your partner.
+- **Bar numbers** on the waveforms and a bar.beat readout. The first marker is bar 1 and the bars before it count down from −1, for counting a track in.
+- Protocol version 4: both booths need this version.
+
+### Test plan for beatgrid editing
+
+1. Load a track whose detected grid is off. Press GRID, pause on the first kick of a bar, and press SET.
+   - Does the grid snap there?
+   - Is that spot bar 1, with −1, −2 before it?
+2. Play it. Where the beats drift away from the kicks, press ADJUST until they line up, then SLIP if they're all early or late.
+3. Find a track that changes tempo. Press SET at the change, then ADJUST the new section.
+   - Does the first section stay put?
+4. Sync another deck to it and play through the tempo change. Do the beats stay locked?
+5. Reload the track.
+   - Is your grid still there?
+   - Does RESET bring back the detected one?
+6. In a room: edit a grid on one PC. Does the other PC's waveform follow straight away?
+
 ## Next candidates
 
 Rough priority order:
 
-1. **Downbeats (bars)** in the beatgrid, plus quantize for hot cues, play and loops.
-2. **Loops:** auto-loop, loop in/out and reloop on the FLX6 controls.
-3. **Lower UI CPU:** redraw waveforms only when they change, and cap the frame rate.
-4. **Serato cue points and loops** from the Markers2 tag.
-5. **Lower-latency audio:** WASAPI exclusive mode or ASIO.
-6. **Recording** the broadcast lane to WAV.
-7. **Effects:** beat FX (echo, reverb) on the FLX6's FX section.
-8. **Encrypted transport** (QUIC/TLS) and an optional relay server, so neither DJ needs Tailscale or port forwarding.
-9. **Four decks.**
+1. **Automatic downbeats (bars)** in the detected beatgrid, plus quantize for hot cues, play and loops. Grids already have bars; for now you set bar 1 by hand.
+2. **Beatgrid editing from the controller**, and placing markers by clicking the waveform.
+3. **Loops:** auto-loop, loop in/out and reloop on the FLX6 controls.
+4. **Lower UI CPU:** redraw waveforms only when they change, and cap the frame rate.
+5. **Serato cue points and loops** from the Markers2 tag.
+6. **Lower-latency audio:** WASAPI exclusive mode or ASIO.
+7. **Recording** the broadcast lane to WAV.
+8. **Effects:** beat FX (echo, reverb) on the FLX6's FX section.
+9. **Encrypted transport** (QUIC/TLS) and an optional relay server, so neither DJ needs Tailscale or port forwarding.
+10. **Four decks.**

@@ -14,20 +14,7 @@
 //! Assumes a steady tempo, like most DJ music.
 
 use crate::audio::TrackAudio;
-use serde::{Deserialize, Serialize};
-
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-pub struct BeatGrid {
-    pub bpm: f64,
-    /// Position (seconds) of the first beat; later beats are every 60/bpm s.
-    pub first_beat: f64,
-}
-
-impl BeatGrid {
-    pub fn beat_len(&self) -> f64 {
-        60.0 / self.bpm
-    }
-}
+pub use crate::grid::BeatGrid;
 
 const HOP: usize = 256;
 
@@ -285,7 +272,7 @@ pub fn analyze(audio: &TrackAudio, hint: Option<f64>) -> Option<BeatGrid> {
     let first_hop = phase + off - 0.75;
     let beat_len = 60.0 / bpm;
     let first_beat = (first_hop / fps).rem_euclid(beat_len);
-    Some(BeatGrid { bpm, first_beat })
+    BeatGrid::new(first_beat, bpm)
 }
 
 #[cfg(test)]
@@ -341,12 +328,16 @@ mod tests {
     #[test]
     fn four_on_the_floor_house() {
         let g = analyze(&synth(60.0, house(124.0, 0.137)), None).unwrap();
-        assert!((g.bpm - 124.0).abs() < 0.02, "bpm {}", g.bpm);
-        let err = (g.first_beat - 0.137).abs();
+        assert!(
+            (g.bpm_at(0.0) - 124.0).abs() < 0.02,
+            "bpm {}",
+            g.bpm_at(0.0)
+        );
+        let err = (g.first_beat() - 0.137).abs();
         assert!(
             err < 0.006,
             "first beat {} (err {:.1} ms)",
-            g.first_beat,
+            g.first_beat(),
             err * 1000.0
         );
     }
@@ -354,7 +345,11 @@ mod tests {
     #[test]
     fn non_integer_tempo_is_kept() {
         let g = analyze(&synth(90.0, house(127.6, 0.05)), None).unwrap();
-        assert!((g.bpm - 127.6).abs() < 0.02, "bpm {}", g.bpm);
+        assert!(
+            (g.bpm_at(0.0) - 127.6).abs() < 0.02,
+            "bpm {}",
+            g.bpm_at(0.0)
+        );
     }
 
     #[test]
@@ -369,13 +364,21 @@ mod tests {
             kick(bar) + 0.8 * hat(bar - 2.0 * beat, 1.0) * 2.0 + hat(eighth, k)
         };
         let g = analyze(&synth(60.0, f), None).unwrap();
-        assert!((g.bpm - 140.0).abs() < 0.05, "bpm {}", g.bpm);
+        assert!(
+            (g.bpm_at(0.0) - 140.0).abs() < 0.05,
+            "bpm {}",
+            g.bpm_at(0.0)
+        );
     }
 
     #[test]
     fn hint_resolves_ambiguity() {
         let g = analyze(&synth(60.0, house(87.0, 0.2)), Some(174.0)).unwrap();
-        assert!((g.bpm - 174.0).abs() < 0.05, "bpm {}", g.bpm);
+        assert!(
+            (g.bpm_at(0.0) - 174.0).abs() < 0.05,
+            "bpm {}",
+            g.bpm_at(0.0)
+        );
     }
 
     #[test]

@@ -51,11 +51,21 @@ With key lock on, or with a key shift, a read head feeds the track through Signa
 
 `analysis.rs` builds a kick-weighted onset envelope and sweeps every tempo from 68 to 190 BPM over the whole track. Each tempo is scored together with its double and half, with a mild preference for dance tempos, so dotted 2-step rhythms and half-time grooves don't win. The beat phase comes from the same comb. `keys.rs` folds sustained note energy into pitch classes and matches them against Temperley's major/minor key profiles. Results are cached per file (and versioned, so better detection re-runs). They travel with the `Load` event, so both booths use the same grid and key.
 
+### Beatgrids and editing them
+
+A grid (`grid.rs`) is a list of up to 32 markers. Each marker sits on a downbeat and starts a section with its own BPM, which runs until the next marker; analysis gives a one-marker grid. Bars are four beats: the first marker is bar 1, the bars before it count -1, -2…, and every marker starts a new bar. A section's last beat stretches or shrinks by up to half a beat to meet the next marker.
+
+Edits (SET, DELETE, ADJUST, SLIP, ½/×2, RESET) are worked out in the UI from the deck's current grid and sent as one `SetGrid` event carrying the whole new grid, so both booths apply exactly the same thing. ADJUST and SLIP only touch the section under the playhead. Each booth saves an edited grid to `beatgrids.json`, keyed by content hash, and uses it the next time that track loads. Analysis never overwrites it, and RESET removes it. The library cache keeps the detected grid, so RESET can go back to it.
+
+Grids are boxed inside `Action` (which is therefore `Clone`, not `Copy`) so the common events stay small. `DeckState` keeps its grid inline, so the state stays `Copy` and the audio threads never allocate.
+
+**Sync through tempo changes.** A synced deck's tempo is matched to the other deck's BPM *at the playhead*. When a playing deck reaches a marker where its BPM changes, the lock has to be redone at that exact moment. The host (or a booth on its own) looks ahead every maintenance tick and schedules a `Relock` event for the moment the deck reaches the marker; if it missed one, it sends a `Relock` straight away. A `Relock` recomputes the lock from the state when it's applied, so a spare one does nothing. Jumps (seek, hot cue, cue, jog) into a section with another tempo, and grid edits, relock as part of applying that event.
+
 ### Local vs shared
 
 | Shared (in the timeline) | Local (this booth only) |
 |---|---|
-| decks: load, play, cue, hot cues, tempo, bend, nudge | headphone cue (PFL) per deck |
+| decks: load, play, cue, hot cues, tempo, bend, nudge, beatgrids | headphone cue (PFL) per deck |
 | channel faders, EQ, crossfader | headphone mix and level |
 | | master and broadcast levels, sync click |
 

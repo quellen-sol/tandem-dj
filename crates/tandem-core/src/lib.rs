@@ -10,6 +10,7 @@
 //!   state at any moment is a pure function of the events before it.
 //! * [`render`] — turns a timeline into audio for one output ("lane"),
 //!   including the delayed broadcast lane.
+//! * [`grid`] — beatgrids: markers, bars, and the edits a DJ can make.
 //! * [`net`] / [`files`] — rooms over TCP and track transfer.
 //! * [`session`] — glue the UI talks to.
 
@@ -18,6 +19,7 @@ pub mod audio;
 pub mod clock;
 pub mod config;
 pub mod files;
+pub mod grid;
 pub mod keys;
 pub mod library;
 pub mod logging;

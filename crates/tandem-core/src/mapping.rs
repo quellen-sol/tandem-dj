@@ -1261,7 +1261,7 @@ mod tests {
             let deck = &mut room.decks[d];
             deck.track = Some(crate::model::TrackId([d as u8 + 1; 32]));
             deck.duration = 300.0;
-            deck.bpm = bpm;
+            deck.grid = crate::grid::BeatGrid::new(0.0, bpm);
         }
         // Both tempo faders sit at 0%.
         let centre = [
@@ -1276,14 +1276,14 @@ mod tests {
 
         // SYNC deck A onto deck B: 128 -> 115 BPM, far below where the fader is.
         let out = e.handle(&[0x90, 0x58, 127], &room, &LocalParams::default());
-        let [MidiOut::Action(a)] = out[..] else {
+        let [MidiOut::Action(a)] = &out[..] else {
             panic!("{out:?}")
         };
         room.apply(&crate::model::Event {
             time: 2_000_000,
             origin: 1,
             seq: 99,
-            action: a,
+            action: a.clone(),
         });
         let synced = room.decks[0].tempo;
         assert!((synced - 115.0 / 128.0).abs() < 1e-9);

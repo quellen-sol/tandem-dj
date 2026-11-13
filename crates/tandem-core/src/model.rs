@@ -7,6 +7,7 @@
 //! times in the past (that is how the delayed broadcast lane works) and
 //! including events that arrive late over the network.
 
+use crate::grid::BeatGrid;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 
@@ -96,9 +97,8 @@ pub struct DeckState {
     /// True while the DJ's hand is on the jog platter (vinyl mode): the
     /// record is held, and jog movement moves the playhead directly.
     pub scratching: bool,
-    /// Beatgrid: the track's own BPM (0 = unknown) and first beat (seconds).
-    pub bpm: f64,
-    pub first_beat: f64,
+    /// Where the track's beats and bars are (None: no steady beat found).
+    pub grid: Option<BeatGrid>,
     /// Tempo-locked to the other deck (SYNC on).
     pub synced: bool,
     /// Detected key: 0-11 major (C = 0), 12-23 minor; -1 unknown.
@@ -132,8 +132,7 @@ impl Default for DeckState {
             trim: 0.5,
             filter: 0.5,
             scratching: false,
-            bpm: 0.0,
-            first_beat: 0.0,
+            grid: None,
             synced: false,
             key: -1,
             key_shift: 0,
@@ -184,14 +183,39 @@ impl DeckState {
         Some((pc + if self.key >= 12 { 12 } else { 0 }) as i8)
     }
 
-    /// The deck's current BPM, as the tempo fader sets it (ignores nudges).
-    pub fn effective_bpm(&self) -> Option<f64> {
-        (self.bpm > 0.0).then(|| self.bpm * self.tempo)
+    /// The track's own BPM where the playhead is at time `t` (from the grid).
+    pub fn bpm_at(&self, t: i64) -> Option<f64> {
+        let g = self.grid.as_ref()?;
+        self.track.map(|_| g.bpm_at(self.position_at(t)))
     }
 
-    /// Position within the beat (0..1) at time `t`, counting beats at `beat_bpm`.
-    fn beat_phase(&self, beat_bpm: f64, t: i64) -> f64 {
-        ((self.position_at(t) - self.first_beat) * beat_bpm / 60.0).rem_euclid(1.0)
+    /// The deck's BPM at time `t`, as the tempo fader sets it (ignores nudges).
+    pub fn effective_bpm_at(&self, t: i64) -> Option<f64> {
+        self.bpm_at(t).map(|b| b * self.tempo)
+    }
+
+    /// Position within the beat (0..1) at time `t`, counting beats `mult`
+    /// times as fast (0.5 = half time).
+    fn beat_phase(&self, mult: f64, t: i64) -> f64 {
+        self.grid
+            .map(|g| g.phase(self.position_at(t), mult))
+            .unwrap_or(0.0)
+    }
+
+    /// When (shared time) the playing deck will next reach a grid marker
+    /// where the tempo changes, if that's within `horizon` us of `now`.
+    pub fn next_tempo_change(&self, now: i64, horizon: i64) -> Option<i64> {
+        let g = self.grid.as_ref()?;
+        let rate = self.rate();
+        if self.track.is_none() || !self.playing || self.scratching || rate <= 1e-6 {
+            return None;
+        }
+        let pos = self.position_at(now);
+        let m = g.markers();
+        let here = m[g.section(pos)].bpm;
+        let next = m.iter().find(|x| x.pos > pos && x.bpm != here)?;
+        let dt = ((next.pos - pos) / rate * 1e6).ceil() as i64;
+        (dt <= horizon).then_some(now + dt)
     }
 
     fn reanchor(&mut self, t: i64) {
@@ -220,7 +244,9 @@ impl Default for RoomState {
 
 /// Everything a DJ can do to the shared room. Deterministic: applying the
 /// same actions in the same order gives bit-identical state on any machine.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+///
+/// Not `Copy`: beatgrids are boxed so the common, tiny events stay small.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "a")]
 pub enum Action {
     Load {
@@ -228,15 +254,25 @@ pub enum Action {
         track: TrackId,
         duration: f64,
         cue: f64,
-        /// Beatgrid from the loader's analysis (bpm 0 = none), so every
-        /// booth uses the same grid.
+        /// The loader's beatgrid, so every booth uses the same one.
         #[serde(default)]
-        bpm: f64,
-        #[serde(default)]
-        first_beat: f64,
+        grid: Option<Box<BeatGrid>>,
         /// Detected key (see [`DeckState::key`]), -1 unknown.
         #[serde(default = "no_key")]
         key: i8,
+    },
+    /// Replace the beatgrid of `track` (ignored if the deck has moved on to
+    /// another track). None: no beat.
+    SetGrid {
+        deck: u8,
+        track: TrackId,
+        grid: Option<Box<BeatGrid>>,
+    },
+    /// The deck has just reached a grid marker where the tempo changes: if
+    /// it (or the other deck) is synced, re-match the tempos so the beats
+    /// stay locked. Scheduled by a booth for the exact moment.
+    Relock {
+        deck: u8,
     },
     /// Key lock on/off.
     KeyLock {
@@ -328,6 +364,8 @@ impl Action {
         use Action::*;
         match *self {
             Load { deck, .. }
+            | SetGrid { deck, .. }
+            | Relock { deck }
             | Eject { deck }
             | Play { deck }
             | Pause { deck }
@@ -352,7 +390,7 @@ impl Action {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Event {
     /// Shared time (us) at which the action happened.
     pub time: i64,
@@ -387,16 +425,43 @@ impl RoomState {
             self.decks[deck].synced = on && self.sync_deck(deck, t, true);
             return;
         }
-        let before = self.decks[deck];
-        let was_playing = before.playing;
+        if let Action::Relock { .. } = ev.action {
+            // Automatic, so it doesn't count as anyone touching the deck.
+            self.relock(deck, t);
+            return;
+        }
+        let was_playing = self.decks[deck].playing;
+        // Only a load needs the whole previous deck (and DeckState is big).
+        let before = matches!(ev.action, Action::Load { .. }).then(|| self.decks[deck]);
+        let jumps = matches!(
+            ev.action,
+            Action::Seek { .. }
+                | Action::HotCue { .. }
+                | Action::CueDown { .. }
+                | Action::CueUp { .. }
+                | Action::Nudge { .. }
+                | Action::JogTouch { .. }
+        );
+        let bpm_before = if jumps {
+            self.decks[deck].bpm_at(t)
+        } else {
+            None
+        };
         self.apply_deck(deck, ev);
         match ev.action {
-            Action::Load { .. } if was_playing => self.start_on_beat(deck, t, before),
+            Action::Load { .. } if was_playing => {
+                if let Some(before) = before {
+                    self.start_on_beat(deck, t, before)
+                }
+            }
             Action::Tempo { .. } => self.follow_tempo(deck, t),
             Action::Play { .. } if !was_playing && self.decks[deck].synced => {
                 // Starting a synced deck: start it on the beat.
                 self.sync_deck(deck, t, false);
             }
+            // The deck's own BPM may have changed under a sync lock.
+            Action::SetGrid { .. } => self.relock(deck, t),
+            _ if jumps && self.decks[deck].bpm_at(t) != bpm_before => self.relock(deck, t),
             _ => {}
         }
     }
@@ -414,37 +479,35 @@ impl RoomState {
         }
         d.playing = true;
         d.anchor_time = t;
-        if d.bpm <= 0.0 {
+        let Some(g) = d.grid else {
             d.anchor_pos = 0.0;
             return;
-        }
-        let reference = if other.playing && other.bpm > 0.0 && other.track.is_some() {
+        };
+        let reference = if other.playing && other.grid.is_some() && other.track.is_some() {
             Some(other)
-        } else if prev.bpm > 0.0 && prev.track.is_some() {
+        } else if prev.grid.is_some() && prev.track.is_some() {
             Some(prev)
         } else {
             None
         };
-        let beat_len = 60.0 / d.bpm;
-        d.anchor_pos = match reference {
-            None => d.first_beat,
-            Some(r) => {
+        // Start on the first marker (bar 1), or the first beat after it we
+        // can reach without going before 0:00.
+        let first = g.first_beat().max(0.0);
+        d.anchor_pos = match reference.and_then(|r| r.bpm_at(t).map(|b| (r, b))) {
+            None => g.next_beat(first),
+            Some((r, r_bpm)) => {
                 // Seconds until the reference's next beat.
-                let phase = r.beat_phase(r.bpm, t);
+                let phase = r.beat_phase(1.0, t);
                 let wait = if phase < 1e-9 {
                     0.0
                 } else {
-                    (1.0 - phase) * 60.0 / (r.bpm * r.rate())
+                    (1.0 - phase) * 60.0 / (r_bpm * r.rate())
                 };
                 let lead = wait * d.rate();
-                let mut k = 0.0;
-                while d.first_beat + k * beat_len - lead < 0.0 {
-                    k += 1.0;
-                }
-                d.first_beat + k * beat_len - lead
+                g.next_beat(first.max(lead)) - lead
             }
         };
-        if prev.synced && other.bpm > 0.0 && other.track.is_some() {
+        if prev.synced && other.grid.is_some() && other.track.is_some() {
             self.decks[x].synced = self.sync_deck(x, t, true);
         }
     }
@@ -454,26 +517,26 @@ impl RoomState {
     /// 87 BPM track against 174). Returns false if either deck lacks a grid.
     fn sync_deck(&mut self, x: usize, t: i64, match_tempo: bool) -> bool {
         let y = (x + 1) % DECKS;
-        let (dx, dy) = (self.decks[x], self.decks[y]);
-        if dx.track.is_none() || dy.track.is_none() || dx.bpm <= 0.0 || dy.bpm <= 0.0 {
+        let (Some(bx), Some(by)) = (self.decks[x].bpm_at(t), self.decks[y].bpm_at(t)) else {
             return false;
-        }
-        let target = dy.bpm * dy.tempo;
+        };
+        let phase_y = self.decks[y].beat_phase(1.0, t);
+        let target = by * self.decks[y].tempo;
         let k = [1.0, 0.5, 2.0]
             .into_iter()
             .min_by(|a, b| {
-                let ca = (target / (dx.bpm * a)).ln().abs();
-                let cb = (target / (dx.bpm * b)).ln().abs();
+                let ca = (target / (bx * a)).ln().abs();
+                let cb = (target / (bx * b)).ln().abs();
                 ca.partial_cmp(&cb).unwrap()
             })
             .unwrap_or(1.0);
-        let beat_bpm = dx.bpm * k;
+        let beat_bpm = bx * k;
         let d = &mut self.decks[x];
         d.reanchor(t);
         if match_tempo {
             d.tempo = (target / beat_bpm).clamp(0.5, 1.5);
         }
-        let mut diff = dy.beat_phase(dy.bpm, t) - d.beat_phase(beat_bpm, t);
+        let mut diff = phase_y - d.beat_phase(k, t);
         if diff >= 0.5 {
             diff -= 1.0;
         } else if diff < -0.5 {
@@ -490,26 +553,44 @@ impl RoomState {
     /// While either deck is synced, a tempo change on one carries the other.
     fn follow_tempo(&mut self, moved: usize, t: i64) {
         let other = (moved + 1) % DECKS;
-        if !(self.decks[moved].synced || self.decks[other].synced) {
-            return;
+        if self.decks[moved].synced || self.decks[other].synced {
+            self.lock_tempo(other, t);
         }
-        let (dm, d_o) = (self.decks[moved], self.decks[other]);
-        if dm.bpm <= 0.0 || d_o.bpm <= 0.0 || d_o.track.is_none() {
-            return;
+    }
+
+    /// Deck `c`'s own BPM just changed (its grid was edited, or it reached
+    /// or jumped to a section with another tempo). If it's synced, it keeps
+    /// matching the other deck; if the other deck is synced, that follows it.
+    fn relock(&mut self, c: usize, t: i64) {
+        let other = (c + 1) % DECKS;
+        if self.decks[c].synced {
+            self.lock_tempo(c, t);
+        } else if self.decks[other].synced {
+            self.lock_tempo(other, t);
         }
-        let target = dm.bpm * dm.tempo;
-        // Keep whatever half/double relation the decks already have.
+    }
+
+    /// Set deck `x`'s tempo so its BPM matches the other deck's, keeping
+    /// whatever half/double relation is the smallest change. Beat phase is
+    /// left alone.
+    fn lock_tempo(&mut self, x: usize, t: i64) {
+        let y = (x + 1) % DECKS;
+        let (Some(bx), Some(target)) = (self.decks[x].bpm_at(t), self.decks[y].effective_bpm_at(t))
+        else {
+            return;
+        };
+        let tempo = self.decks[x].tempo;
         let k = [1.0, 0.5, 2.0]
             .into_iter()
             .min_by(|a, b| {
-                let ca = (d_o.bpm * a * d_o.tempo / (dm.bpm * dm.tempo)).ln().abs();
-                let cb = (d_o.bpm * b * d_o.tempo / (dm.bpm * dm.tempo)).ln().abs();
+                let ca = (bx * a * tempo / target).ln().abs();
+                let cb = (bx * b * tempo / target).ln().abs();
                 ca.partial_cmp(&cb).unwrap()
             })
             .unwrap_or(1.0);
-        let d = &mut self.decks[other];
+        let d = &mut self.decks[x];
         d.reanchor(t);
-        d.tempo = (target / (d.bpm * k)).clamp(0.5, 1.5);
+        d.tempo = (target / (bx * k)).clamp(0.5, 1.5);
     }
 
     fn apply_deck(&mut self, deck: usize, ev: &Event) {
@@ -521,20 +602,14 @@ impl RoomState {
                 track,
                 duration,
                 cue,
-                bpm,
-                first_beat,
+                ref grid,
                 key,
                 ..
             } => {
                 d.key = if (0..24).contains(&key) { key } else { -1 };
                 d.key_shift = 0;
                 d.track = Some(track);
-                d.bpm = if bpm.is_finite() && bpm > 0.0 {
-                    bpm
-                } else {
-                    0.0
-                };
-                d.first_beat = first_beat;
+                d.grid = grid.as_deref().copied();
                 d.synced = false;
                 d.duration = duration.max(0.0);
                 d.playing = false;
@@ -556,9 +631,16 @@ impl RoomState {
                 d.anchor_pos = 0.0;
                 d.cue_point = 0.0;
                 d.hot_cues = [None; HOT_CUES];
-                d.bpm = 0.0;
+                d.grid = None;
                 d.synced = false;
                 d.gen += 1;
+            }
+            Action::SetGrid {
+                track, ref grid, ..
+            } => {
+                if d.track == Some(track) {
+                    d.grid = grid.as_deref().copied();
+                }
             }
             Action::Play { .. } => {
                 if d.track.is_some() {
@@ -676,7 +758,7 @@ impl RoomState {
                 d.key_lock = on;
             }
             Action::KeyShift { semitones, .. } => d.key_shift = semitones.clamp(-12, 12),
-            Action::Crossfader { .. } | Action::Sync { .. } => {}
+            Action::Crossfader { .. } | Action::Sync { .. } | Action::Relock { .. } => {}
         }
     }
 
@@ -706,8 +788,17 @@ impl RoomState {
             h.u64(d.trim.to_bits() as u64);
             h.u64(d.filter.to_bits() as u64);
             h.u64(d.scratching as u64);
-            h.f64(d.bpm);
-            h.f64(d.first_beat);
+            match &d.grid {
+                Some(g) => {
+                    h.u64(g.markers().len() as u64);
+                    for m in g.markers() {
+                        h.f64(m.pos);
+                        h.f64(m.bpm);
+                    }
+                    h.u64(g.edited as u64);
+                }
+                None => h.u64(0),
+            }
             h.u64(d.synced as u64);
             h.u64(d.key as u64);
             h.u64(d.key_shift as u64);
@@ -869,8 +960,7 @@ mod tests {
                 track: tid(1),
                 duration: 300.0,
                 cue: 0.0,
-                bpm: 0.0,
-                first_beat: 0.0,
+                grid: None,
                 key: -1,
             },
         ));
@@ -901,8 +991,7 @@ mod tests {
                     track: tid(1),
                     duration: 200.0,
                     cue: 0.0,
-                    bpm: 0.0,
-                    first_beat: 0.0,
+                    grid: None,
                     key: -1,
                 },
             ),
@@ -915,8 +1004,7 @@ mod tests {
                     track: tid(2),
                     duration: 180.0,
                     cue: 5.0,
-                    bpm: 0.0,
-                    first_beat: 0.0,
+                    grid: None,
                     key: -1,
                 },
             ),
@@ -946,14 +1034,14 @@ mod tests {
         ];
         let mut a = Timeline::new(0);
         for e in &events {
-            a.insert(*e);
+            a.insert(e.clone());
         }
         let mut b = Timeline::new(0);
         let mut shuffled = events.clone();
         fastrand::Rng::with_seed(3).shuffle(&mut shuffled);
         for e in &shuffled {
-            b.insert(*e);
-            b.insert(*e); // duplicates are ignored
+            b.insert(e.clone());
+            b.insert(e.clone()); // duplicates are ignored
         }
         for t in [0, 600_000, 1_000_000, 1_800_000, 5_000_000] {
             assert_eq!(
@@ -984,8 +1072,7 @@ mod tests {
                 track: tid(1),
                 duration: 100.0,
                 cue: 0.0,
-                bpm: 0.0,
-                first_beat: 0.0,
+                grid: None,
                 key: -1,
             },
         );
@@ -1019,8 +1106,7 @@ mod tests {
                 track: tid(3),
                 duration: 100.0,
                 cue: 0.0,
-                bpm: 0.0,
-                first_beat: 0.0,
+                grid: None,
                 key: -1,
             },
         ));
@@ -1065,8 +1151,7 @@ mod tests {
             track: tid(n),
             duration: 300.0,
             cue: 0.0,
-            bpm,
-            first_beat,
+            grid: BeatGrid::new(first_beat, bpm).map(Box::new),
             key: -1,
         }
     }
@@ -1074,8 +1159,8 @@ mod tests {
     /// Phase difference (in beats, -0.5..0.5) between the decks' beats at t.
     fn beat_offset(s: &RoomState, t: i64, beat_mult_b: f64) -> f64 {
         let (a, b) = (&s.decks[0], &s.decks[1]);
-        let pa = ((a.position_at(t) - a.first_beat) * a.bpm / 60.0).rem_euclid(1.0);
-        let pb = ((b.position_at(t) - b.first_beat) * b.bpm * beat_mult_b / 60.0).rem_euclid(1.0);
+        let pa = a.beat_phase(1.0, t);
+        let pb = b.beat_phase(beat_mult_b, t);
         let mut d = pa - pb;
         if d >= 0.5 {
             d -= 1.0
@@ -1100,7 +1185,7 @@ mod tests {
         go(&mut tl, 5_000_000, Action::Sync { deck: 1, on: true });
         let s = tl.state_at(5_000_000);
         assert!(s.decks[1].synced);
-        assert!((s.decks[1].effective_bpm().unwrap() - 128.0).abs() < 1e-9);
+        assert!((s.decks[1].effective_bpm_at(0).unwrap() - 128.0).abs() < 1e-9);
         for t in [5_000_000, 65_000_000] {
             assert!(
                 beat_offset(&tl.state_at(t), t, 1.0).abs() < 1e-6,
@@ -1117,7 +1202,7 @@ mod tests {
             },
         );
         let s = tl.state_at(100_000_000);
-        assert!((s.decks[1].effective_bpm().unwrap() - 128.0 * 1.03).abs() < 1e-9);
+        assert!((s.decks[1].effective_bpm_at(0).unwrap() - 128.0 * 1.03).abs() < 1e-9);
         assert!(beat_offset(&s, 100_000_000, 1.0).abs() < 1e-6);
         // SYNC off: B keeps its tempo but no longer follows.
         go(&mut tl, 101_000_000, Action::Sync { deck: 1, on: false });
@@ -1130,7 +1215,7 @@ mod tests {
             },
         );
         let s = tl.state_at(103_000_000);
-        assert!((s.decks[1].effective_bpm().unwrap() - 128.0 * 1.03).abs() < 1e-9);
+        assert!((s.decks[1].effective_bpm_at(0).unwrap() - 128.0 * 1.03).abs() < 1e-9);
     }
 
     #[test]
@@ -1226,8 +1311,7 @@ mod tests {
                 track: tid(1),
                 duration: 100.0,
                 cue: 0.0,
-                bpm: 120.0,
-                first_beat: 0.0,
+                grid: BeatGrid::new(0.0, 120.0).map(Box::new),
                 key: 9 + 12,
             },
         ));
@@ -1270,6 +1354,123 @@ mod tests {
         assert_eq!(s.decks[0].sounding_key(), Some(10 + 12));
     }
 
+    fn two_tempo_grid() -> BeatGrid {
+        // 120 BPM for 40 beats (20 s), then 125 BPM.
+        BeatGrid::from_markers(
+            &[
+                crate::grid::Marker {
+                    pos: 0.0,
+                    bpm: 120.0,
+                },
+                crate::grid::Marker {
+                    pos: 20.0,
+                    bpm: 125.0,
+                },
+            ],
+            true,
+        )
+        .unwrap()
+    }
+
+    fn set_grid(deck: u8, n: u8, g: BeatGrid) -> Action {
+        Action::SetGrid {
+            deck,
+            track: tid(n),
+            grid: Some(Box::new(g)),
+        }
+    }
+
+    #[test]
+    fn set_grid_only_applies_to_the_track_it_was_made_for() {
+        let mut s = RoomState::default();
+        s.apply(&ev(0, 1, 1, grid_load(0, 1, 120.0, 0.0)));
+        s.apply(&ev(1, 2, 1, set_grid(0, 1, two_tempo_grid())));
+        assert_eq!(s.decks[0].grid, Some(two_tempo_grid()));
+        assert_eq!(s.decks[0].bpm_at(1), Some(120.0));
+        // An edit that arrives after another track was loaded is dropped.
+        s.apply(&ev(2, 1, 2, grid_load(0, 2, 128.0, 0.0)));
+        s.apply(&ev(3, 2, 2, set_grid(0, 1, two_tempo_grid())));
+        assert_eq!(s.decks[0].bpm_at(3), Some(128.0));
+    }
+
+    #[test]
+    fn synced_deck_stays_locked_through_a_tempo_change() {
+        let mut tl = Timeline::new(0);
+        let mut seq = 0;
+        let mut go = |tl: &mut Timeline, t: i64, a: Action| {
+            seq += 1;
+            tl.insert(ev(t, 1, seq, a));
+        };
+        go(&mut tl, 0, grid_load(0, 1, 128.0, 0.0));
+        go(&mut tl, 0, grid_load(1, 2, 120.0, 0.0));
+        go(&mut tl, 0, set_grid(1, 2, two_tempo_grid()));
+        go(&mut tl, 0, Action::Play { deck: 0 });
+        go(&mut tl, 0, Action::Play { deck: 1 });
+        go(&mut tl, 1_000_000, Action::Sync { deck: 1, on: true });
+        let s = tl.state_at(1_000_000);
+        assert!((s.decks[1].tempo - 128.0 / 120.0).abs() < 1e-9);
+        // B reaches its 125 BPM section (20 s into the track) at about 18.75 s.
+        let horizon = 400_000;
+        let early = tl.state_at(18_000_000).decks[1].next_tempo_change(18_000_000, horizon);
+        assert_eq!(early, None, "not within the horizon yet");
+        let t = 18_500_000;
+        let tc = tl.state_at(t).decks[1]
+            .next_tempo_change(t, horizon)
+            .unwrap();
+        let at = tl.state_at(tc).decks[1].position_at(tc);
+        assert!((at - 20.0).abs() < 2e-6, "reaches the marker at {at}");
+        go(&mut tl, tc + 1_000, Action::Relock { deck: 1 });
+        let later = 60_000_000;
+        let s = tl.state_at(later);
+        assert!((s.decks[1].effective_bpm_at(later).unwrap() - 128.0).abs() < 1e-9);
+        assert!((s.decks[1].tempo - 128.0 / 125.0).abs() < 1e-9);
+        assert!(
+            beat_offset(&s, later, 1.0).abs() < 1e-3,
+            "beats drifted by {}",
+            beat_offset(&s, later, 1.0)
+        );
+        assert_eq!(s.decks[1].last_touch, 1, "a relock isn't a touch");
+    }
+
+    #[test]
+    fn jumping_into_another_tempo_section_relocks_at_once() {
+        let mut s = RoomState::default();
+        s.apply(&ev(0, 1, 1, grid_load(0, 1, 128.0, 0.0)));
+        s.apply(&ev(0, 1, 2, grid_load(1, 2, 120.0, 0.0)));
+        s.apply(&ev(0, 1, 3, set_grid(1, 2, two_tempo_grid())));
+        s.apply(&ev(0, 1, 4, Action::Sync { deck: 1, on: true }));
+        s.apply(&ev(1_000_000, 1, 5, Action::Seek { deck: 1, pos: 50.0 }));
+        assert!((s.decks[1].tempo - 128.0 / 125.0).abs() < 1e-9);
+        s.apply(&ev(2_000_000, 1, 6, Action::Seek { deck: 1, pos: 5.0 }));
+        assert!((s.decks[1].tempo - 128.0 / 120.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn editing_the_master_grid_carries_a_synced_deck() {
+        let mut s = RoomState::default();
+        s.apply(&ev(0, 1, 1, grid_load(0, 1, 124.0, 0.0)));
+        s.apply(&ev(0, 1, 2, grid_load(1, 2, 120.0, 0.0)));
+        s.apply(&ev(0, 1, 3, Action::Sync { deck: 1, on: true }));
+        assert!((s.decks[1].effective_bpm_at(0).unwrap() - 124.0).abs() < 1e-9);
+        // Deck A's grid was a little slow: fix it, and synced B follows.
+        let fixed = s.decks[0].grid.unwrap().adjust(0, 0.1);
+        s.apply(&ev(1_000_000, 1, 4, set_grid(0, 1, fixed)));
+        assert!((s.decks[1].effective_bpm_at(1_000_000).unwrap() - 124.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn grid_edits_survive_the_wire() {
+        let e = ev(5, 1, 1, set_grid(0, 1, two_tempo_grid()));
+        let json = serde_json::to_string(&e).unwrap();
+        assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), e);
+        // Small events stay small: grids are boxed.
+        assert!(
+            std::mem::size_of::<Event>() <= 112,
+            "{}",
+            std::mem::size_of::<Event>()
+        );
+    }
+
     #[test]
     fn hot_cue_sets_then_jumps() {
         let mut s = RoomState::default();
@@ -1282,8 +1483,7 @@ mod tests {
                 track: tid(9),
                 duration: 100.0,
                 cue: 0.0,
-                bpm: 0.0,
-                first_beat: 0.0,
+                grid: None,
                 key: -1,
             },
         ));

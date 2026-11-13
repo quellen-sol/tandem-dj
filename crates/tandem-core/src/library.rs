@@ -2,6 +2,10 @@
 //!
 //! Tags and content hashes are cached on disk (keyed by path, size and
 //! modified time), so rescans are fast and a track is only hashed once.
+//!
+//! Beatgrids a DJ has edited are kept separately (`beatgrids.json`), keyed by
+//! content hash, so they're never overwritten by analysis and follow the
+//! track wherever it's loaded from.
 
 use crate::analysis::{self, BeatGrid};
 use crate::audio::TrackAudio;
@@ -34,7 +38,7 @@ pub struct LibTrack {
     pub artist: String,
     pub bpm: Option<f32>,
     pub duration: f64,
-    /// BPM from Tandem's own analysis, once analysed.
+    /// BPM from Tandem's own analysis (or the DJ's edited grid), once known.
     #[serde(default)]
     pub grid_bpm: Option<f64>,
     /// Detected (or tagged) key, see [`crate::keys`].
@@ -52,6 +56,7 @@ struct CacheEntry {
     duration: f64,
     id: Option<TrackId>,
     /// Analysis result (`analyzed` is true even when no steady beat was found).
+    /// Always the detected grid; edits live in [`Library::user_grids`].
     #[serde(default)]
     grid: Option<BeatGrid>,
     #[serde(default)]
@@ -210,6 +215,10 @@ pub struct Library {
     pub analyzing: Option<(String, usize, usize)>,
     /// Folders whose untagged files are named "Title - Artist".
     title_first_dirs: std::collections::HashSet<PathBuf>,
+    /// Beatgrids edited by hand, by content hash.
+    user_grids: HashMap<TrackId, BeatGrid>,
+    grids_path: PathBuf,
+    grids_dirty: bool,
 }
 
 pub const KEY_SHARED: &str = "shared";
@@ -228,6 +237,14 @@ impl Library {
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
+        let grids_path = cache_path.with_file_name("beatgrids.json");
+        let user_grids = match std::fs::read(&grids_path) {
+            Ok(b) => serde_json::from_slice(&b).unwrap_or_else(|e| {
+                log::error!("Couldn't read {}: {e}", grids_path.display());
+                HashMap::new()
+            }),
+            Err(_) => HashMap::new(),
+        };
         Self {
             folders: Vec::new(),
             crates: Vec::new(),
@@ -239,10 +256,42 @@ impl Library {
             size_index: HashMap::new(),
             analyzing: None,
             title_first_dirs: Default::default(),
+            user_grids,
+            grids_path,
+            grids_dirty: false,
         }
     }
 
+    /// Write edited beatgrids to disk, if any changed.
+    pub fn save_grids(&mut self) {
+        if !self.grids_dirty {
+            return;
+        }
+        self.grids_dirty = false;
+        let res = serde_json::to_vec(&self.user_grids)
+            .map_err(std::io::Error::other)
+            .and_then(|bytes| {
+                let tmp = self.grids_path.with_extension("tmp");
+                std::fs::write(&tmp, bytes)?;
+                std::fs::rename(&tmp, &self.grids_path)
+            });
+        if let Err(e) = res {
+            log::error!("Couldn't save edited beatgrids: {e}");
+        }
+    }
+
+    /// The grid a track shows: the DJ's edit if there is one, else analysis.
+    fn shown_grid(&self, e: &CacheEntry) -> Option<BeatGrid> {
+        e.id.and_then(|id| self.user_grids.get(&id).copied())
+            .or(e.grid)
+    }
+
+    fn shown_bpm(&self, e: &CacheEntry) -> Option<f64> {
+        self.shown_grid(e).map(|g| g.main_bpm(e.duration))
+    }
+
     pub fn save_cache(&mut self) {
+        self.save_grids();
         if !self.cache_dirty {
             return;
         }
@@ -347,6 +396,7 @@ pub fn scan(lib: &Arc<Mutex<Library>>, key: String, kind: SourceKind) {
                 continue;
             };
             let hit = lib.lock().cached(path, size, mtime).cloned();
+            let mut shown_bpm = hit.as_ref().and_then(|e| lib.lock().shown_bpm(e));
             let e = match hit {
                 Some(e) => e,
                 None => {
@@ -369,6 +419,7 @@ pub fn scan(lib: &Arc<Mutex<Library>>, key: String, kind: SourceKind) {
                     l.cache
                         .insert(path.to_string_lossy().to_string(), e.clone());
                     l.cache_dirty = true;
+                    shown_bpm = None;
                     e
                 }
             };
@@ -379,7 +430,7 @@ pub fn scan(lib: &Arc<Mutex<Library>>, key: String, kind: SourceKind) {
                 artist: e.artist,
                 bpm: e.bpm,
                 duration: e.duration,
-                grid_bpm: e.grid.map(|g| g.bpm),
+                grid_bpm: shown_bpm,
                 key: e.key,
             });
             if i % 500 == 499 {
@@ -450,10 +501,51 @@ pub fn display_names(lib: &Arc<Mutex<Library>>, path: &Path) -> (String, String)
     }
 }
 
-/// The cached beatgrid for a file, if it has been analysed (and hasn't changed).
-pub fn cached_grid(lib: &Arc<Mutex<Library>>, path: &Path) -> Option<BeatGrid> {
+/// The grid analysis found for a file, if it has been analysed (and hasn't changed).
+pub fn detected_grid(lib: &Arc<Mutex<Library>>, path: &Path) -> Option<BeatGrid> {
     let (size, mtime) = stat(path)?;
     lib.lock().cached(path, size, mtime).and_then(|e| e.grid)
+}
+
+/// The grid to use for a file: the DJ's edit, else what analysis found.
+pub fn cached_grid(lib: &Arc<Mutex<Library>>, path: &Path) -> Option<BeatGrid> {
+    let (size, mtime) = stat(path)?;
+    let l = lib.lock();
+    l.cached(path, size, mtime).and_then(|e| l.shown_grid(e))
+}
+
+/// The DJ's edited beatgrid for a track, if any.
+pub fn user_grid(lib: &Arc<Mutex<Library>>, id: TrackId) -> Option<BeatGrid> {
+    lib.lock().user_grids.get(&id).copied()
+}
+
+/// Remember a beatgrid a DJ set for a track: kept if `grid` is an edit,
+/// forgotten otherwise (back to what analysis found). `path`, if this
+/// machine has the file, updates the BPM the library lists show.
+pub fn set_user_grid(
+    lib: &Arc<Mutex<Library>>,
+    id: TrackId,
+    path: Option<&Path>,
+    grid: Option<BeatGrid>,
+) {
+    let mut l = lib.lock();
+    let changed = match grid.filter(|g| g.edited) {
+        Some(g) => l.user_grids.insert(id, g) != Some(g),
+        None => l.user_grids.remove(&id).is_some(),
+    };
+    if !changed {
+        return;
+    }
+    l.grids_dirty = true;
+    let Some(path) = path else { return };
+    let shown = stat(path)
+        .and_then(|(size, mtime)| l.cached(path, size, mtime).cloned())
+        .and_then(|e| l.shown_bpm(&e));
+    for list in l.lists.values_mut() {
+        for t in list.tracks.iter_mut().filter(|t| t.path == path) {
+            t.grid_bpm = shown;
+        }
+    }
 }
 
 fn is_analyzed(lib: &Arc<Mutex<Library>>, path: &Path) -> bool {
@@ -482,9 +574,14 @@ pub fn record_grid(lib: &Arc<Mutex<Library>>, path: &Path, grid: Option<BeatGrid
         e.analyzed = true;
         l.cache_dirty = true;
     }
+    let shown = l
+        .cached(path, size, mtime)
+        .cloned()
+        .and_then(|e| l.shown_bpm(&e))
+        .or(grid.map(|g| g.bpm_at(0.0)));
     for list in l.lists.values_mut() {
         for t in list.tracks.iter_mut().filter(|t| t.path == path) {
-            t.grid_bpm = grid.map(|g| g.bpm);
+            t.grid_bpm = shown;
         }
     }
 }
@@ -530,20 +627,22 @@ fn record_key(lib: &Arc<Mutex<Library>>, path: &Path, key: Option<i8>) {
 }
 
 /// Beatgrid and key for a decoded track: from the cache, or worked out now
-/// (and cached). A key tag in the file wins over detection.
+/// (and cached). A beatgrid the DJ edited (looked up by `audio.id`) wins
+/// over analysis, and a key tag in the file wins over detection.
 pub fn analysis_for(
     lib: &Arc<Mutex<Library>>,
     path: &Path,
     audio: &TrackAudio,
     tag_bpm: Option<f32>,
 ) -> (Option<BeatGrid>, Option<i8>) {
-    let grid = if is_analyzed(lib, path) {
-        cached_grid(lib, path)
+    let detected = if is_analyzed(lib, path) {
+        detected_grid(lib, path)
     } else {
         let g = analysis::analyze(audio, tag_bpm.map(|b| b as f64));
         record_grid(lib, path, g);
         g
     };
+    let grid = user_grid(lib, audio.id).or(detected);
     let key = match key_known(lib, path) {
         Some(k) => k,
         None => {
@@ -691,6 +790,29 @@ mod tests {
         assert_eq!(tracks[3].title, "Already");
         assert_eq!(tracks[3].artist, "Rochelle Jordan");
         assert_eq!(tracks[0].title, "Air Maxes");
+    }
+
+    #[test]
+    fn edited_grids_are_saved_and_reset_forgets_them() {
+        let dir = std::env::temp_dir().join(format!("tandem-grid-test-{}", fastrand::u64(..)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let open = || {
+            Arc::new(Mutex::new(Library::new(
+                dir.join("shared"),
+                dir.join("library-cache.json"),
+            )))
+        };
+        let id = TrackId([3; 32]);
+        let edited = BeatGrid::new(0.2, 124.0).unwrap().set_marker(30.0).unwrap();
+        let lib = open();
+        set_user_grid(&lib, id, None, Some(edited));
+        lib.lock().save_cache();
+        assert_eq!(user_grid(&open(), id), Some(edited), "kept across restarts");
+        // Resetting sends the detected (unedited) grid: the edit is forgotten.
+        set_user_grid(&lib, id, None, BeatGrid::new(0.2, 124.0));
+        lib.lock().save_cache();
+        assert_eq!(user_grid(&open(), id), None);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

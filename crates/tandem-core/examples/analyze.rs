@@ -37,7 +37,11 @@ fn main() {
             .map(|k| format!("{:>3} {:<4}", keys::camelot(k), keys::name(k)))
             .unwrap_or_else(|| "  ?     ".into());
         let txt = match g {
-            Some(g) => format!("{:7.2} BPM  first beat {:6.3}s", g.bpm, g.first_beat),
+            Some(g) => format!(
+                "{:7.2} BPM  first beat {:6.3}s",
+                g.bpm_at(0.0),
+                g.first_beat()
+            ),
             None => "   no steady beat".to_string(),
         };
         println!(

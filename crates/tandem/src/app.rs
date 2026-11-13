@@ -99,6 +99,8 @@ pub struct UiState {
     pub toast: Option<(String, Instant)>,
     pub name_draft: String,
     pub terms_checked: bool,
+    /// Beatgrid editing open on this deck.
+    pub grid_edit: [bool; DECKS],
 }
 
 /// Developer options: `--screenshot <file.bmp>` saves the window and exits;
@@ -211,6 +213,7 @@ impl TandemApp {
             toast: None,
             name_draft: settings.name.clone(),
             terms_checked: false,
+            grid_edit: [false; DECKS],
         };
         let local_edit = settings.local;
         Self {
