@@ -377,8 +377,15 @@ impl TandemApp {
 
         let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]);
         if self.ui.scroll_to_sel {
+            // Keep the selected row near the top, but never scroll past the
+            // end of the list: egui only pulls an offset back after drawing,
+            // so near the end every knob tick drew one frame scrolled too
+            // far before snapping back (a flicker, very visible in short lists).
+            let gap = ui.spacing().item_spacing.y;
+            let content = n as f32 * (row_h + gap) - gap;
+            let max = (content - ui.available_height()).max(0.0);
             scroll = scroll.vertical_scroll_offset(
-                (self.ui.sel_index as f32 * (row_h + ui.spacing().item_spacing.y) - 60.0).max(0.0),
+                (self.ui.sel_index as f32 * (row_h + gap) - 60.0).clamp(0.0, max),
             );
             self.ui.scroll_to_sel = false;
         }
