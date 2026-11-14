@@ -401,7 +401,8 @@ impl TandemApp {
         ui.label(
             RichText::new(
                 "For streaming: pick a virtual cable (e.g. \"CABLE Input\" from VB-Audio) and capture its other end in OBS. \
-                 This feed is delayed so both DJs' moves land exactly on time in it.",
+                 This feed is delayed so both DJs' moves land exactly on time in it. \
+                 For the picture, share or capture the Broadcast view window (top bar): it runs the same delay behind, so it matches this feed.",
             )
             .small()
             .weak(),

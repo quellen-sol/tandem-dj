@@ -56,6 +56,10 @@ Read heads go round loops by themselves. They read the track through the loop: f
 
 A loop that appears or changes under audio the head has already read makes the head hard-sync with the usual 2 ms crossfade. That happens with LOOP OUT pressed at the playhead, a partner's loop arriving a little late, and always with a stretched head, because the stretcher reads ahead.
 
+### Broadcast view
+
+A stream needs a picture that's as late as its sound. The broadcast window (`ui_broadcast.rs`) draws `Session::broadcast_view()`: the room at `now − broadcast delay`, taken from the same timeline the broadcast lane renders. Every move appears on it at the moment its sound reaches the feed, including the partner's. It's read-only, names DJs by name (never "you"), and is a second OS window (an egui immediate viewport) so it can be captured or screenshared on its own.
+
 ### Key lock and key shift
 
 With key lock on, or with a key shift, a read head feeds the track through Signalsmith Stretch, which changes speed without changing pitch (and pitch without changing speed). The stretcher's latency is part of the read head's maths: the audio heard now is `fed position − input latency − speed × output latency`. Chasing and sync therefore work exactly as in vinyl mode. When starting at a cue point, the stretcher is primed and pre-rolled, so the first sample out is the cue point itself. A test checks that key-locked kicks land within 4 ms of vinyl ones. The stretcher uses a fixed random seed, so both booths still render identical audio. Scratching always uses vinyl mode.
@@ -118,4 +122,4 @@ Every peer decodes with the same decoder (symphonia) and the loader's exact dura
 | Crate | What |
 |---|---|
 | `tandem-core` | Everything platform-independent: `time`, `clock`, `model`, `render`, `audio` (decode), `net`, `files`, `session`, `library`, `serato`, `mapping` (MIDI learn and soft takeover), `terms`, `selftest`. Tests run anywhere. |
-| `tandem` | The Windows app: egui UI (`ui_*.rs`), sound output via cpal/WASAPI (`output.rs`), MIDI via midir (`midi.rs`). |
+| `tandem` | The Windows app: egui UI (`ui_*.rs`, including the broadcast window in `ui_broadcast.rs`), sound output via cpal/WASAPI (`output.rs`), MIDI via midir (`midi.rs`). |

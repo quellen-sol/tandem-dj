@@ -167,6 +167,29 @@ pub struct SessionView {
     pub preparing_share: Option<String>,
 }
 
+/// The room as the broadcast lane is playing it right now: `bcast_delay_us`
+/// in the past. The broadcast window draws this, so a stream's picture
+/// shows each move at the same moment its sound arrives.
+#[derive(Clone)]
+pub struct BroadcastView {
+    /// Shared time on screen: now minus the broadcast delay.
+    pub t: i64,
+    pub room: RoomState,
+    pub decks: [DeckView; DECKS],
+    /// Everyone in the room (this booth first), to name who touched what.
+    pub djs: Vec<PeerInfo>,
+}
+
+impl BroadcastView {
+    /// A DJ's real name (never "you": the audience is watching).
+    pub fn dj_name(&self, id: u64) -> Option<&str> {
+        self.djs
+            .iter()
+            .find(|p| p.id == id && id != 0)
+            .map(|p| p.name.as_str())
+    }
+}
+
 impl SessionView {
     pub fn name_of(&self, id: u64) -> Option<String> {
         if id == 0 {
@@ -1352,10 +1375,8 @@ impl Session {
 
     // ------------------------------------------------------------ UI view
 
-    pub fn view(&self) -> SessionView {
-        let now = self.now();
-        let room = self.timeline.latest();
-        let decks = std::array::from_fn(|d| {
+    fn deck_views(&self, room: &RoomState) -> [DeckView; DECKS] {
+        std::array::from_fn(|d| {
             let state = room.decks[d];
             let slot = state.track.and_then(|id| self.tracks.get(&id));
             DeckView {
@@ -1365,7 +1386,33 @@ impl Session {
                 audio: slot.and_then(|s| s.audio.clone()),
                 loading: self.loading[d].clone(),
             }
-        });
+        })
+    }
+
+    /// The room `bcast_delay_us` ago, in step with the broadcast lane.
+    /// Tracks that just left a deck are still decoded: the maintenance tick
+    /// keeps any track a deck used in the last minute.
+    pub fn broadcast_view(&self) -> BroadcastView {
+        let t = self.now() - self.bcast_delay_us;
+        let room = self.timeline.state_at(t);
+        let mut decks = self.deck_views(&room);
+        for d in &mut decks {
+            d.loading = None; // this booth's library at work, not the room's
+        }
+        let mut djs = vec![self.me.clone()];
+        djs.extend(self.peer.as_ref().map(|p| p.info.clone()));
+        BroadcastView {
+            t,
+            room,
+            decks,
+            djs,
+        }
+    }
+
+    pub fn view(&self) -> SessionView {
+        let now = self.now();
+        let room = self.timeline.latest();
+        let decks = self.deck_views(&room);
         let role = match &self.role {
             Role::Solo => RoleView::Solo,
             Role::Host { port, room, .. } => RoleView::Hosting {
@@ -1455,4 +1502,48 @@ fn load_action(deck: usize, info: &TrackInfo) -> Action {
 
 pub fn deck_letter(d: usize) -> char {
     (b'A' + d as u8) as char
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn solo(root: &Path) -> SessionHandle {
+        let paths = Paths::under(root);
+        paths.ensure().unwrap();
+        let lib = Arc::new(Mutex::new(Library::new(
+            paths.shared_dir.clone(),
+            paths.library_cache.clone(),
+        )));
+        Session::create("Alice".into(), paths, lib, Arc::new(SharedClock::new()))
+    }
+
+    /// The broadcast window shows the room as the broadcast lane plays it:
+    /// a move made now isn't on it yet, one made a delay ago is.
+    #[test]
+    fn broadcast_view_lags_by_the_broadcast_delay() {
+        let root = std::env::temp_dir().join(format!("tandem-bview-{}", fastrand::u64(..)));
+        let h = solo(&root);
+        {
+            let mut s = h.lock();
+            s.bcast_delay_us = 500_000;
+            let now = s.now();
+            s.act_at(Action::Crossfader { v: 0.1 }, now - 800_000);
+            s.act_at(Action::Crossfader { v: 0.9 }, now);
+
+            assert_eq!(s.view().room.crossfader, 0.9);
+            let b = s.broadcast_view();
+            assert!(
+                (now - 500_000..now - 400_000).contains(&b.t),
+                "t = {}",
+                b.t - now
+            );
+            assert_eq!(b.room.crossfader, 0.1);
+            assert_eq!(b.room.xf_touch, s.me.id);
+            assert_eq!(b.dj_name(s.me.id), Some("Alice"));
+            assert_eq!(b.dj_name(0), None);
+        }
+        drop(h);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

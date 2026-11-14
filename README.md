@@ -116,6 +116,12 @@ Every agreement is written to a local consent log (Settings → General → Logs
 
 The broadcast feed is delayed by 500 ms by default, so both DJs' moves are on time in it. If you add a camera in OBS, delay the video by the same amount.
 
+**Show the decks.** Click **Broadcast view** in the top bar. It opens a second window made for viewers: both decks, the mixer and the scrolling waveforms, with the name of whoever last touched each deck. It runs the same delay behind the room as the broadcast feed, so the picture matches the sound.
+
+- **OBS:** add a *Window Capture* of "Tandem broadcast". It needs no delay filter.
+- **Discord:** share the "Tandem broadcast" window with its sound **off**, and set Discord's input device to **CABLE Output**, with noise suppression, echo cancellation and automatic gain control turned off. Discord captures everything Tandem plays, not just the broadcast feed, so don't share the window's sound.
+- Keep the window visible, on a second screen if you have one. A minimised window can't be captured.
+
 ## Trying it on one PC
 
 Run a second, completely separate copy with its own settings:

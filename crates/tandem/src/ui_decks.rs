@@ -22,9 +22,9 @@ const HOT_CUE_COLORS: [Color32; 8] = [
     Color32::from_rgb(170, 80, 230),
     Color32::from_rgb(240, 90, 180),
 ];
-const GREEN: Color32 = Color32::from_rgb(90, 220, 120);
+pub(crate) const GREEN: Color32 = Color32::from_rgb(90, 220, 120);
 const RED: Color32 = Color32::from_rgb(240, 90, 90);
-const AMBER: Color32 = Color32::from_rgb(250, 190, 60);
+pub(crate) const AMBER: Color32 = Color32::from_rgb(250, 190, 60);
 /// Beatgrid markers (red, like Serato's).
 const MARKER: Color32 = Color32::from_rgb(235, 70, 70);
 /// Loops, on the buttons and the waveforms.
@@ -36,7 +36,7 @@ const ADJUST_STEPS: [f64; 3] = [0.01, 0.1, 1.0];
 const SLIP_STEPS: [f64; 3] = [0.001, 0.005, 0.025];
 
 /// Camelot-compatible: same key, relative major/minor, or one step round the wheel.
-fn keys_fit(a: i8, b: i8) -> bool {
+pub(crate) fn keys_fit(a: i8, b: i8) -> bool {
     let (ca, cb) = (tandem_core::keys::camelot(a), tandem_core::keys::camelot(b));
     let split = |c: &str| {
         (
@@ -99,6 +99,9 @@ impl TandemApp {
                     }
                     ui.toggle_value(&mut self.local_edit.click, "Sync click")
                         .on_hover_text("A metronome on the shared room clock. Both booths click at the same instant: put two laptops side by side to hear how well they're synced.");
+                    let delay = self.settings.audio.broadcast_delay_ms;
+                    ui.toggle_value(&mut self.ui.broadcast_view, "Broadcast view")
+                        .on_hover_text(format!("A second window for your stream: the decks and mixer as the broadcast feed plays them, {delay} ms behind the room, so the picture matches the sound. Share or capture that window, and take the sound from the broadcast feed (Settings → Audio)."));
                 });
             });
             ui.add_space(2.0);
@@ -268,7 +271,7 @@ impl TandemApp {
                 }
             });
 
-            if let Some(seek) = overview(ui, dv, pos, col, self.ui.grid_edit[d]) {
+            if let Some(seek) = overview(ui, dv, pos, col, self.ui.grid_edit[d], 42.0, true) {
                 self.pending.push(Action::Seek { deck, pos: seek });
             }
 
@@ -853,16 +856,22 @@ fn deck_status(dv: &DeckView, view: &SessionView) -> Option<(String, Color32)> {
     }
 }
 
-/// Whole-track overview; click to seek. Returns the seek position.
-fn overview(
+/// Whole-track overview. When `seekable`, a click returns the position to seek to.
+pub(crate) fn overview(
     ui: &mut egui::Ui,
     dv: &DeckView,
     pos: f64,
     col: Color32,
     grid_edit: bool,
+    height: f32,
+    seekable: bool,
 ) -> Option<f64> {
-    let (rect, resp) =
-        ui.allocate_exact_size(vec2(ui.available_width(), 42.0), Sense::click_and_drag());
+    let sense = if seekable {
+        Sense::click_and_drag()
+    } else {
+        Sense::hover()
+    };
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), height), sense);
     let p = ui.painter_at(rect);
     p.rect_filled(rect, 3.0, Color32::from_gray(16));
     let dur = dv.state.duration;
@@ -971,7 +980,7 @@ fn loop_band(p: &egui::Painter, rect: egui::Rect, st: &DeckState, x_of: impl Fn(
 /// real time, so two decks at the same effective BPM show the same beat
 /// spacing. Beat lines come from the grid, with bar numbers on the
 /// downbeats; grid markers show while editing (or when there are several).
-fn scrolling_waveform(
+pub(crate) fn scrolling_waveform(
     ui: &mut egui::Ui,
     d: usize,
     dv: &DeckView,

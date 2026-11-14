@@ -153,11 +153,14 @@ pub struct UiState {
     pub terms_checked: bool,
     /// Beatgrid editing open on this deck.
     pub grid_edit: [bool; DECKS],
+    /// The broadcast window is open.
+    pub broadcast_view: bool,
 }
 
 /// Developer options: `--screenshot <file.bmp>` saves the window and exits;
 /// `--demo` loads the first two library tracks and starts playing (deck B
-/// synced, key-matched and on a 4-beat loop).
+/// synced, key-matched and on a 4-beat loop);
+/// `--broadcast-view` opens the broadcast window at start.
 pub struct DevOpts {
     pub screenshot: Option<PathBuf>,
     pub shot_frame: u64,
@@ -165,6 +168,7 @@ pub struct DevOpts {
     pub host_port: Option<u16>,
     pub join: Option<String>,
     pub search: Option<String>,
+    pub broadcast_view: bool,
     pub shared: bool,
     pub demo_started: bool,
     pub frame: u64,
@@ -267,6 +271,7 @@ impl TandemApp {
             name_draft: settings.name.clone(),
             terms_checked: false,
             grid_edit: [false; DECKS],
+            broadcast_view: dev.broadcast_view,
         };
         let local_edit = settings.local;
         Self {
@@ -565,6 +570,7 @@ impl eframe::App for TandemApp {
         self.library_panel(ctx, &view);
         egui::CentralPanel::default().show(ctx, |ui| self.decks_area(ui, &view));
         self.windows(ctx, &view);
+        self.broadcast_window(ctx);
         self.end_frame(&view);
         self.dev_hooks(ctx, &view);
     }
