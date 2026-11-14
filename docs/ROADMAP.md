@@ -162,6 +162,26 @@ Work through these in order and note anything that fails. `tandem.log` (Settings
 - **All Music** in the library: every track in your folders, Shared with me and your Serato crates in one list, each track once. Search, sorting and Analyze BPM work on it. It's rescanned each time you pick it, while the last list stays on screen.
 - Rescanning a list of more than 500 tracks (a crate, or Shared with me after a share arrives) keeps the old list on screen until the new one is ready, instead of cutting it short to 500 while it scans.
 
+## Round 8 (v0.8): crossfader curves
+
+- **Crossfader curve:** **CURVE**, under the crossfader, picks Linear, Constant power, Full centre or Scratch. A small picture beside it shows each deck's volume across the fader.
+  - With **Full centre**, a deck playing on its own stays at full volume with the crossfader in the middle. Constant power, the only curve until now, drops it 3 dB there. Constant power is still the default.
+  - **Scratch** keeps both decks at full volume until the last 3% of travel, for cuts.
+  - The room has one curve, like a club mixer's curve switch: both booths and the broadcast hear the same one. Your booth remembers the curve you last picked and starts on it. Joining a room takes the host's.
+- Protocol version 7: v0.7 and earlier can't share a room with this version, so both booths need it.
+
+### Test plan for crossfader curves
+
+1. Play one deck alone with the crossfader on its side, then move the crossfader to the middle.
+   - With Constant power, does it get a little quieter?
+   - With Full centre, does it stay at full volume?
+2. Blend two tracks across on each curve. Linear dips the most in the middle; Full centre gets louder there.
+3. On Scratch, does the far deck cut in within the first couple of millimetres, with no click?
+4. Restart Tandem. Is your curve still picked?
+5. In a room: change the curve on one PC.
+   - Does the other PC's CURVE follow?
+   - Does the broadcast recording change at the same moment?
+
 ## Next candidates
 
 Rough priority order:

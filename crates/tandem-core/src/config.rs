@@ -1,5 +1,6 @@
 //! Settings and file locations.
 
+use crate::model::XfCurve;
 use crate::protocol::DEFAULT_PORT;
 use crate::render::LocalParams;
 use serde::{Deserialize, Serialize};
@@ -104,6 +105,9 @@ pub struct Settings {
     /// None: each list in its own order (folder, crate or share order).
     pub library_sort: Option<LibrarySort>,
     pub frame_rate: FrameRate,
+    /// The crossfader curve this booth last picked. It starts every session
+    /// on it; joining a room takes the host's curve instead.
+    pub crossfader_curve: XfCurve,
 }
 
 impl Default for Settings {
@@ -121,6 +125,7 @@ impl Default for Settings {
             local: LocalParams::default(),
             library_sort: None,
             frame_rate: FrameRate::default(),
+            crossfader_curve: XfCurve::default(),
         }
     }
 }

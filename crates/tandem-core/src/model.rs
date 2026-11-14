@@ -320,12 +320,69 @@ impl DeckState {
     }
 }
 
+/// How the crossfader shares the volume between the decks, like the curve
+/// switch on a club mixer. Part of the room, so both booths (and the
+/// broadcast) hear the same mix. Gains: [`crate::render::xfader_gain`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum XfCurve {
+    /// Straight fades: both decks at half volume (-6 dB) in the middle.
+    Linear,
+    /// Both decks at -3 dB in the middle, so a blend of two tracks stays
+    /// about as loud as one.
+    #[default]
+    ConstantPower,
+    /// Both decks at full volume in the middle; each only fades on the far
+    /// half. A deck playing on its own stays at full volume.
+    FullCentre,
+    /// Both decks at full volume almost all the way across: a deck cuts in
+    /// within the last few percent of travel.
+    Scratch,
+}
+
+impl XfCurve {
+    /// Smoothest to sharpest.
+    pub const ALL: [XfCurve; 4] = [
+        XfCurve::Linear,
+        XfCurve::ConstantPower,
+        XfCurve::FullCentre,
+        XfCurve::Scratch,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            XfCurve::Linear => "Linear",
+            XfCurve::ConstantPower => "Constant power",
+            XfCurve::FullCentre => "Full centre",
+            XfCurve::Scratch => "Scratch",
+        }
+    }
+
+    pub fn about(self) -> &'static str {
+        match self {
+            XfCurve::Linear => {
+                "Each deck fades evenly across the whole travel. In the middle both are at half volume (−6 dB): long, gentle blends."
+            }
+            XfCurve::ConstantPower => {
+                "Both decks at −3 dB in the middle, so a blend of two tracks stays about as loud as one. A deck playing on its own gets quieter in the middle."
+            }
+            XfCurve::FullCentre => {
+                "Both decks at full volume in the middle; each fades out only on the far half. A deck playing on its own stays at full volume until the fader passes the middle."
+            }
+            XfCurve::Scratch => {
+                "Both decks at full volume almost all the way across. A deck cuts in within the last 3% of travel, for cuts and scratching."
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RoomState {
     pub decks: [DeckState; DECKS],
     /// 0 = full deck A, 1 = full deck B.
     pub crossfader: f32,
     pub xf_touch: u64,
+    #[serde(default)]
+    pub xf_curve: XfCurve,
 }
 
 impl Default for RoomState {
@@ -334,6 +391,7 @@ impl Default for RoomState {
             decks: [DeckState::default(); DECKS],
             crossfader: 0.5,
             xf_touch: 0,
+            xf_curve: XfCurve::default(),
         }
     }
 }
@@ -490,6 +548,10 @@ pub enum Action {
     Crossfader {
         v: f32,
     },
+    /// The crossfader's curve, for the whole room.
+    CrossfaderCurve {
+        curve: XfCurve,
+    },
 }
 
 impl Action {
@@ -525,7 +587,7 @@ impl Action {
             | Sync { deck, .. }
             | KeyLock { deck, .. }
             | KeyShift { deck, .. } => Some(deck as usize),
-            Crossfader { .. } => None,
+            Crossfader { .. } | CrossfaderCurve { .. } => None,
         }
     }
 }
@@ -561,6 +623,10 @@ impl RoomState {
         if let Action::Crossfader { v } = ev.action {
             self.crossfader = v.clamp(0.0, 1.0);
             self.xf_touch = ev.origin;
+            return;
+        }
+        if let Action::CrossfaderCurve { curve } = ev.action {
+            self.xf_curve = curve;
             return;
         }
         let Some(deck) = ev.action.deck() else { return };
@@ -1068,7 +1134,10 @@ impl RoomState {
                 d.key_lock = on;
             }
             Action::KeyShift { semitones, .. } => d.key_shift = semitones.clamp(-12, 12),
-            Action::Crossfader { .. } | Action::Sync { .. } | Action::Relock { .. } => {}
+            Action::Crossfader { .. }
+            | Action::CrossfaderCurve { .. }
+            | Action::Sync { .. }
+            | Action::Relock { .. } => {}
         }
     }
 
@@ -1121,6 +1190,7 @@ impl RoomState {
             h.u64(d.gen);
         }
         h.u64(self.crossfader.to_bits() as u64);
+        h.u64(self.xf_curve as u64);
         h.0
     }
 }
@@ -1253,6 +1323,32 @@ mod tests {
 
     fn tid(n: u8) -> TrackId {
         TrackId([n; 32])
+    }
+
+    #[test]
+    fn crossfader_curve_is_room_state() {
+        let mut tl = Timeline::new(0);
+        tl.insert(ev(1_000, 1, 1, Action::Crossfader { v: 0.3 }));
+        let before = tl.latest();
+        assert_eq!(before.xf_curve, XfCurve::ConstantPower);
+        tl.insert(ev(
+            2_000,
+            2,
+            1,
+            Action::CrossfaderCurve {
+                curve: XfCurve::FullCentre,
+            },
+        ));
+        let after = tl.latest();
+        assert_eq!(after.xf_curve, XfCurve::FullCentre);
+        assert_eq!(tl.state_at(1_500).xf_curve, XfCurve::ConstantPower);
+        // The fader itself, and who last moved it, are untouched.
+        assert_eq!((after.crossfader, after.xf_touch), (0.3, 1));
+        assert_ne!(before.digest(), after.digest());
+        // Sent over the wire as part of a timeline.
+        let json = serde_json::to_string(&tl).unwrap();
+        let back: Timeline = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.latest(), after);
     }
 
     #[test]

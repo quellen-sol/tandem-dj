@@ -105,12 +105,25 @@ Grids are boxed inside `Action` (which is therefore `Clone`, not `Copy`) so the 
 
 **Sync through tempo changes.** A synced deck's tempo is matched to the other deck's BPM *at the playhead*. When a playing deck reaches a marker where its BPM changes, the lock has to be redone at that exact moment. The host (or a booth on its own) looks ahead every maintenance tick and schedules a `Relock` event for the moment the deck reaches the marker; if it missed one, it sends a `Relock` straight away. A `Relock` recomputes the lock from the state when it's applied, so a spare one does nothing. Jumps (seek, hot cue, cue, jog) into a section with another tempo, and grid edits, relock as part of applying that event.
 
+### Crossfader curve
+
+The curve is part of the room, like the curve switch on a club mixer. A `CrossfaderCurve` event sets it for both booths, and the broadcast lane switches at the moment it changed. `render::xfader_gain` gives each deck's gain. Deck B's curve is deck A's, mirrored.
+
+| Curve | Each deck in the middle | Shape |
+|---|---|---|
+| Linear | −6 dB | straight fades across the whole travel |
+| Constant power (default) | −3 dB | quarter-cosine fades across the whole travel; the decks' powers add up to one |
+| Full centre | 0 dB | full up to the middle, then a quarter-cosine fade over the far half |
+| Scratch | 0 dB | full until the last 3% of travel, then a quarter-cosine cut |
+
+Each booth remembers the last curve it picked (`Settings::crossfader_curve`) and starts a session on it. Joining a room takes the host's.
+
 ### Local vs shared
 
 | Shared (in the timeline) | Local (this booth only) |
 |---|---|
 | decks: load, play, cue, hot cues, loops, tempo, bend, nudge, beatgrids | headphone cue (PFL) per deck |
-| channel faders, EQ, crossfader | headphone mix and level |
+| channel faders, EQ, crossfader and its curve | headphone mix and level |
 | | master and broadcast levels, sync click |
 
 ### Tracks

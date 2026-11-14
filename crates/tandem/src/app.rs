@@ -13,7 +13,7 @@ use tandem_core::config::{FrameRate, LibrarySort, Paths, Settings};
 use tandem_core::library::{self, LibTrack, Library, SortRow, SourceKind};
 use tandem_core::mapping::MidiOut;
 use tandem_core::meter::LevelMeters;
-use tandem_core::model::{Action, TrackId, DECKS};
+use tandem_core::model::{Action, TrackId, XfCurve, DECKS};
 use tandem_core::protocol::TrackInfo;
 use tandem_core::render::LocalParams;
 use tandem_core::serato::SeratoCrate;
@@ -244,6 +244,11 @@ impl TandemApp {
             s.max_upload_bytes_s = settings.max_upload_mb_s as f64 * 1024.0 * 1024.0;
             s.bcast_delay_us = settings.audio.broadcast_delay_ms as i64 * 1000;
             s.set_local(settings.local);
+            if settings.crossfader_curve != XfCurve::default() {
+                s.act(Action::CrossfaderCurve {
+                    curve: settings.crossfader_curve,
+                });
+            }
         }
         let (snap, clock, meters) = {
             let s = session.lock();
@@ -553,8 +558,9 @@ impl TandemApp {
             .find(|d| !view.decks[*d].state.playing)
             .or_else(|| {
                 let gain = |d: usize| {
-                    tandem_core::render::fader_gain(view.room.decks[d].volume)
-                        * tandem_core::render::xfader_gain(d, view.room.crossfader)
+                    let room = &view.room;
+                    tandem_core::render::fader_gain(room.decks[d].volume)
+                        * tandem_core::render::xfader_gain(room.xf_curve, d, room.crossfader)
                 };
                 (0..DECKS).min_by(|a, b| gain(*a).partial_cmp(&gain(*b)).unwrap())
             })

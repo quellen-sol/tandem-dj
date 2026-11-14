@@ -6,7 +6,7 @@ use eframe::egui::{self, pos2, vec2, Align, Color32, Layout, Rect, RichText, Sen
 use tandem_core::audio::PEAK_BLOCK;
 use tandem_core::grid::{BeatGrid, Marker, MAX_MARKERS};
 use tandem_core::mapping::beats_label;
-use tandem_core::model::{Action, DeckState, BEAT_LOOPS, DECKS};
+use tandem_core::model::{Action, DeckState, XfCurve, BEAT_LOOPS, DECKS};
 use tandem_core::session::{deck_letter, DeckView, RoleView, SessionView, TrackStatus};
 
 pub const DECK_COLORS: [Color32; DECKS] = [
@@ -727,6 +727,7 @@ impl TandemApp {
                 }
                 ui.label(RichText::new("B").color(DECK_COLORS[1]).strong());
             });
+            self.crossfader_curve(ui, view);
             ui.separator();
             ui.label(RichText::new("Your booth only").small().weak());
             ui.spacing_mut().slider_width = 130.0;
@@ -753,6 +754,42 @@ impl TandemApp {
                 );
             }
         });
+    }
+
+    /// The crossfader's curve switch. It's part of the room (one mixer, one
+    /// switch), and this booth remembers the last curve it picked.
+    fn crossfader_curve(&mut self, ui: &mut egui::Ui, view: &SessionView) {
+        let cur = view.room.xf_curve;
+        let mut picked = None;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("CURVE").small().strong());
+            curve_icon(ui, cur);
+            let mut tip = cur.about().to_string();
+            if view.link.peer.is_some() {
+                tip.push_str("\n\nThe curve is part of the room: changing it changes it for your partner too.");
+            }
+            egui::ComboBox::from_id_salt("xf-curve")
+                .selected_text(cur.label())
+                .width(120.0)
+                .show_ui(ui, |ui| {
+                    for c in XfCurve::ALL {
+                        ui.horizontal(|ui| {
+                            curve_icon(ui, c);
+                            let r = ui.selectable_label(c == cur, c.label()).on_hover_text(c.about());
+                            if r.clicked() && c != cur {
+                                picked = Some(c);
+                            }
+                        });
+                    }
+                })
+                .response
+                .on_hover_text(tip);
+        });
+        if let Some(curve) = picked {
+            self.pending.push(Action::CrossfaderCurve { curve });
+            self.settings.crossfader_curve = curve;
+            self.mark_dirty();
+        }
     }
 
     fn channel_strip(&mut self, ui: &mut egui::Ui, d: usize, view: &SessionView) {
@@ -860,6 +897,34 @@ impl TandemApp {
 }
 
 /// "1", ".1", ".01" for an ADJUST step.
+/// A small picture of a crossfader curve: each deck's volume (up) across
+/// the fader's travel (left to right), in its deck colour.
+fn curve_icon(ui: &mut egui::Ui, curve: XfCurve) -> egui::Response {
+    let (rect, r) = ui.allocate_exact_size(vec2(26.0, 14.0), Sense::hover());
+    let p = ui.painter();
+    p.rect_stroke(
+        rect,
+        2.0,
+        Stroke::new(1.0_f32, ui.visuals().weak_text_color()),
+        egui::StrokeKind::Inside,
+    );
+    let inner = rect.shrink(2.5);
+    for (d, &color) in DECK_COLORS.iter().enumerate() {
+        let pts: Vec<egui::Pos2> = (0..=48)
+            .map(|i| {
+                let x = i as f32 / 48.0;
+                let g = tandem_core::render::xfader_gain(curve, d, x);
+                pos2(
+                    inner.left() + x * inner.width(),
+                    inner.bottom() - g * inner.height(),
+                )
+            })
+            .collect();
+        p.add(egui::Shape::line(pts, Stroke::new(1.5_f32, color)));
+    }
+    r
+}
+
 fn step_label(step: f64) -> String {
     let s = format!("{step}");
     s.strip_prefix('0').unwrap_or(&s).to_string()

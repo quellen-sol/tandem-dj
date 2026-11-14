@@ -102,6 +102,17 @@ The mixer has a level meter on the inside of each channel fader, and a stereo ma
 - **On the controller,** the FLX6's five lights per channel come on at −24 and −14 dB (green), −8 and −3 dB (orange), and over 0 dB (red), the same marks as on screen. Mixer channels 3 and 4 aren't Tandem's, so their meters stay dark.
 - **The broadcast view** shows the meters too, as late as the broadcast feed.
 
+## Crossfader curve
+
+**CURVE**, under the crossfader, sets how the crossfader shares the volume between the decks. The small picture next to it shows each deck's volume (A orange, B blue) from one end of the fader to the other.
+
+- **Constant power** (the default): both decks at −3 dB in the middle, so a blend of two tracks stays about as loud as one. A deck playing on its own gets a little quieter as the crossfader reaches the middle.
+- **Full centre:** both decks at full volume in the middle. Each fades out only on the far half, so a deck playing on its own stays at full volume until the crossfader passes the middle. Blends get louder in the middle, so ride the channel faders.
+- **Linear:** straight fades, with both decks at −6 dB in the middle, for long, gentle blends.
+- **Scratch:** both decks at full volume almost all the way across. A deck cuts in within the last 3% of travel, for cuts and scratching.
+
+The room has one curve, like the curve switch on a club mixer, so changing it changes it for your partner and the stream too. Tandem remembers the curve you last picked and starts on it. When you join a room, you get the host's.
+
 ## Play together
 
 1. **Get connected.** The easiest way is for both of you to install [Tailscale](https://tailscale.com) (free) and sign in. You'll each get a `100.x.y.z` address that works from anywhere. Without it, the host has to forward TCP port 47800 on their router.

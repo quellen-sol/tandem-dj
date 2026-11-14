@@ -17,7 +17,7 @@
 
 use crate::audio::TrackAudio;
 use crate::meter::{Ballistics, LevelMeters, Levels};
-use crate::model::{DeckState, RoomState, Timeline, TrackId, DECKS};
+use crate::model::{DeckState, RoomState, Timeline, TrackId, XfCurve, DECKS};
 use crate::stretch::Stretcher;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -749,13 +749,36 @@ pub fn fader_gain(v: f32) -> f32 {
     v * v
 }
 
-/// Constant-power crossfader. Deck A is on the left.
-pub fn xfader_gain(deck: usize, x: f32) -> f32 {
-    let a = x.clamp(0.0, 1.0) * std::f32::consts::FRAC_PI_2;
-    if deck == 0 {
-        a.cos()
+/// On the scratch curve, a deck cuts in over this much of the travel at the
+/// far end (3%, about 2 mm on a 60 mm crossfader).
+const SCRATCH_CUT: f32 = 0.03;
+
+/// Crossfader gain for `deck` at position `x` (0 = full deck A, 1 = full
+/// deck B) on `curve`. Deck B's curve is deck A's, mirrored.
+pub fn xfader_gain(curve: XfCurve, deck: usize, x: f32) -> f32 {
+    let x = x.clamp(0.0, 1.0);
+    // How far the fader is from this deck's end, and from the other end
+    // (each exact at the ends, so a deck is fully cut there).
+    let (away, left) = if deck == 0 {
+        (x, 1.0 - x)
     } else {
-        a.sin()
+        (1.0 - x, x)
+    };
+    // Quarter-cosine fade from full (t <= 0) to silent (t >= 1).
+    let fade = |t: f32| {
+        if t <= 0.0 {
+            1.0
+        } else if t >= 1.0 {
+            0.0
+        } else {
+            (t * std::f32::consts::FRAC_PI_2).cos()
+        }
+    };
+    match curve {
+        XfCurve::Linear => left,
+        XfCurve::ConstantPower => fade(away),
+        XfCurve::FullCentre => fade(1.0 - left / 0.5),
+        XfCurve::Scratch => fade(1.0 - left / SCRATCH_CUT),
     }
 }
 
@@ -917,7 +940,7 @@ impl Lane {
         let mut trim = [1.0; DECKS];
         for d in 0..DECKS {
             let st = &state.decks[d];
-            vol[d] = fader_gain(st.volume) * xfader_gain(d, state.crossfader);
+            vol[d] = fader_gain(st.volume) * xfader_gain(state.xf_curve, d, state.crossfader);
             trim[d] = trim_gain(st.trim);
             for b in 0..3 {
                 eq[d][b] = eq_gain(st.eq[b]);
@@ -1055,13 +1078,106 @@ mod tests {
         );
         assert_eq!(l.channels[1], 0.0);
         // Fader up, crossfader in the middle.
-        let bus = peak * xfader_gain(0, 0.5);
+        let bus = peak * xfader_gain(XfCurve::ConstantPower, 0, 0.5);
         assert!((l.master[0] - bus).abs() < 0.05 * bus, "{l:?} vs {bus}");
         // Fader down: the channel still reads, the bus falls away.
         render(&mut lane, 0.52, 2.52);
         let l = meters.read();
         assert!((l.channels[0] - peak).abs() < 0.05 * peak, "{l:?}");
         assert!(l.master[0] < 0.05 * bus, "{l:?}");
+    }
+
+    #[test]
+    fn crossfader_curves() {
+        use XfCurve::*;
+        let g = xfader_gain;
+        for c in XfCurve::ALL {
+            // Each end is one deck alone, at full volume.
+            assert_eq!((g(c, 0, 0.0), g(c, 1, 0.0)), (1.0, 0.0), "{c:?}");
+            assert_eq!((g(c, 0, 1.0), g(c, 1, 1.0)), (0.0, 1.0), "{c:?}");
+            // Deck B mirrors deck A, and a deck never gets louder as the
+            // fader moves away from it.
+            let mut last = 1.0;
+            for i in 0..=1000 {
+                let x = i as f32 / 1000.0;
+                let a = g(c, 0, x);
+                assert!((a - g(c, 1, 1.0 - x)).abs() < 1e-5, "{c:?} at {x}");
+                assert!(a <= last, "{c:?} rises at {x}");
+                last = a;
+            }
+        }
+        let mid = |c| g(c, 0, 0.5);
+        assert!((mid(Linear) - 0.5).abs() < 1e-6);
+        assert!((mid(ConstantPower) - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6);
+        assert_eq!(mid(FullCentre), 1.0);
+        assert_eq!(mid(Scratch), 1.0);
+        for i in 0..=100 {
+            let x = i as f32 / 100.0;
+            // Linear: the gains add up to one; constant power: their squares do.
+            assert!((g(Linear, 0, x) + g(Linear, 1, x) - 1.0).abs() < 1e-6);
+            let p = g(ConstantPower, 0, x).powi(2) + g(ConstantPower, 1, x).powi(2);
+            assert!((p - 1.0).abs() < 1e-5, "{x}: {p}");
+            // Full centre: the near deck is always at full volume.
+            assert_eq!(g(FullCentre, 0, x).max(g(FullCentre, 1, x)), 1.0);
+        }
+        // Full centre fades over the far half; scratch over the last 3%.
+        assert!((g(FullCentre, 0, 0.75) - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6);
+        assert_eq!(g(Scratch, 0, 0.96), 1.0);
+        assert_eq!(g(Scratch, 1, 0.04), 1.0);
+        assert!((g(Scratch, 0, 0.985) - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-3);
+    }
+
+    /// RMS out of a lane with deck A playing alone, the crossfader at `x`
+    /// on `curve`.
+    fn lone_deck_level(curve: XfCurve, x: f32) -> f32 {
+        let a = track();
+        let mut tl = Timeline::new(0);
+        let actions = [
+            Action::Load {
+                deck: 0,
+                track: a.id,
+                duration: a.duration(),
+                cue: 0.0,
+                grid: None,
+                key: -1,
+            },
+            Action::CrossfaderCurve { curve },
+            Action::Crossfader { v: x },
+            Action::Play { deck: 0 },
+        ];
+        for (i, action) in actions.into_iter().enumerate() {
+            tl.insert(Event {
+                time: 0,
+                origin: 1,
+                seq: i as u64 + 1,
+                action,
+            });
+        }
+        let snap = snap_with(tl, a);
+        let mut lane = Lane::new(44_100.0, 0, LaneKind::Live);
+        let n = 44_100;
+        let (mut m, mut c) = (vec![0.0; n * 2], vec![0.0; n * 2]);
+        lane.render(&snap, 500_000, &mut m, &mut c);
+        (m.iter().map(|v| v * v).sum::<f32>() / m.len() as f32).sqrt()
+    }
+
+    #[test]
+    fn full_centre_keeps_a_lone_deck_at_full_volume() {
+        let full = lone_deck_level(XfCurve::ConstantPower, 0.0);
+        assert!(full > 0.05, "silence");
+        for (curve, at_centre) in [
+            (XfCurve::Linear, 0.5),
+            (XfCurve::ConstantPower, std::f32::consts::FRAC_1_SQRT_2),
+            (XfCurve::FullCentre, 1.0),
+            (XfCurve::Scratch, 1.0),
+        ] {
+            assert!(
+                (lone_deck_level(curve, 0.0) - full).abs() < 1e-4,
+                "{curve:?}"
+            );
+            let r = lone_deck_level(curve, 0.5) / full;
+            assert!((r - at_centre).abs() < 0.01, "{curve:?}: {r}");
+        }
     }
 
     #[test]
