@@ -168,7 +168,8 @@ Work through these in order and note anything that fails. `tandem.log` (Settings
   - With **Full centre**, a deck playing on its own stays at full volume with the crossfader in the middle. Constant power, the only curve until now, drops it 3 dB there. Constant power is still the default.
   - **Scratch** keeps both decks at full volume until the last 3% of travel, for cuts.
   - The room has one curve, like a club mixer's curve switch: both booths and the broadcast hear the same one. Your booth remembers the curve you last picked and starts on it. Joining a room takes the host's.
-- Protocol version 7: v0.7 and earlier can't share a room with this version, so both booths need it.
+- **The browse knob no longer flickers** near the end of a short list. Each tick used to draw one frame with the list scrolled too far.
+- Protocol version 7: v0.8 can't share a room with v0.7 or earlier, so both booths need v0.8.
 
 ### Test plan for crossfader curves
 
