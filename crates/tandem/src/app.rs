@@ -82,16 +82,15 @@ pub struct FilterKey {
     sort: Option<LibrarySort>,
 }
 
-/// BPM shown for a library track: analysed (or edited) first, then tags.
+/// BPM shown for a library track: from analysis (or the DJ's edited grid),
+/// never from tags.
 pub fn lib_bpm(t: &LibTrack) -> Option<f64> {
-    t.grid_bpm.or(t.bpm.map(|b| b as f64))
+    t.grid_bpm
 }
 
 /// BPM shown for a track in this room.
 pub fn room_bpm(t: &TrackInfo) -> Option<f64> {
-    t.grid
-        .map(|g| g.main_bpm(t.duration))
-        .or(t.bpm.map(|b| b as f64))
+    t.grid.map(|g| g.main_bpm(t.duration))
 }
 
 fn lib_row(t: &LibTrack) -> SortRow<'_> {

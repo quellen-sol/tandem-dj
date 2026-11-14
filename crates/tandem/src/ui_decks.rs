@@ -245,9 +245,7 @@ impl TandemApp {
                 ui.monospace(RichText::new(fmt_time(pos)).size(15.0));
                 ui.monospace(RichText::new(format!("-{}", fmt_time(st.duration - pos))).weak());
                 ui.separator();
-                let bpm = st
-                    .effective_bpm_at(view.now)
-                    .or_else(|| dv.meta.as_ref().and_then(|m| m.bpm).map(|b| b as f64 * st.tempo));
+                let bpm = st.effective_bpm_at(view.now);
                 match bpm {
                     Some(b) => ui.monospace(RichText::new(format!("{b:.2} BPM")).size(15.0)),
                     None if st.track.is_some() => ui.monospace(RichText::new("no beat").weak()),

@@ -62,7 +62,15 @@ With key lock on, or with a key shift, a read head feeds the track through Signa
 
 ### BPM, beatgrid and key detection
 
-`analysis.rs` builds a kick-weighted onset envelope and sweeps every tempo from 68 to 190 BPM over the whole track. Each tempo is scored together with its double and half, with a mild preference for dance tempos, so dotted 2-step rhythms and half-time grooves don't win. The beat phase comes from the same comb. `keys.rs` folds sustained note energy into pitch classes and matches them against Temperley's major/minor key profiles. Results are cached per file (and versioned, so better detection re-runs). They travel with the `Load` event, so both booths use the same grid and key.
+Both come from the audio alone; BPM and key tags are ignored.
+
+`analysis.rs` builds a kick-weighted onset envelope and, over the middle ~100 s, sweeps every tempo from 68 to 190 BPM with a comb of beat ticks. Each tempo is scored together with the metrical levels around it (bars, half bars, eighths and sixteenths), since a real beat is supported at all of them. The strongest tempo family (equal up to octaves) wins, except when its rival is a dotted or triplet pulse 4:3 or 3:2 away, the classic confusion in R&B, jungle and 2-step. There the fine grid decides: the slower tempo's sixteenths are the faster one's triplets, so the faster tempo wins only if its own eighths are stronger. A mild preference for dance tempos picks the octave. A comb over the whole track then refines the BPM to about 0.01 and finds the phase.
+
+Tempo changes: 16 s windows across the track look for a long (32 s or more), confident stretch at a tempo unrelated to the main one (not half/double time, not a 4:3 or 3:2 feel), checked again over the whole stretch. Each becomes its own grid section, switching on the beat where the old grid's last beats and the new grid's first beats fit best. Gradual drifts aren't followed.
+
+`keys.rs` takes note magnitudes from C2 to B6 in ~0.7 s frames, log-compresses them, keeps only what stands above the local spectrum (±6 semitones, which removes drums, noise and the overall tilt), folds them into pitch classes and matches them against Temperley's major/minor key profiles.
+
+Results are cached per file, and versioned so better detection re-runs. They travel with the `Load` event, so both booths use the same grid and key.
 
 ### Beatgrids and editing them
 

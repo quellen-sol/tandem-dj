@@ -408,13 +408,12 @@ impl Session {
         };
         let path = self.servable.get(&id).cloned();
         let audio = self.tracks.get(&id).and_then(|s| s.audio.clone());
-        let hint = self.track_meta.get(&id).and_then(|m| m.bpm);
         let lib = self.library.clone();
         let weak = self.weak.clone();
         std::thread::spawn(move || {
             let grid = path
                 .and_then(|p| library::detected_grid(&lib, &p))
-                .or_else(|| audio.and_then(|a| analysis::analyze(&a, hint.map(|b| b as f64))));
+                .or_else(|| audio.and_then(|a| analysis::analyze(&a)));
             let Some(h) = weak.upgrade() else { return };
             h.lock().act(Action::SetGrid {
                 deck: deck as u8,
@@ -462,7 +461,7 @@ impl Session {
                 let (title, artist) = library::display_names(&lib, &path);
                 let audio = decode_file(&path, id)?;
                 let size = std::fs::metadata(&path)?.len();
-                let (grid, key) = library::analysis_for(&lib, &path, &audio, bpm);
+                let (grid, key) = library::analysis_for(&lib, &path, &audio);
                 let info = TrackInfo {
                     id,
                     title,

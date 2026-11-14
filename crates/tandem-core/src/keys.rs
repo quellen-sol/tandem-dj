@@ -125,7 +125,9 @@ fn correlate(chroma: &[f64; 12], profile: &[f64; 12], shift: usize) -> f64 {
     num / (dc.sqrt() * dp.sqrt()).max(1e-12)
 }
 
-/// Average pitch-class energy over the track.
+/// Pitch-class energy over the track: note magnitudes from C2 to B6 per
+/// ~0.7 s frame, log-compressed, keeping only what stands above the local
+/// spectrum (±6 semitones), summed over the track.
 pub fn chroma(audio: &TrackAudio) -> Option<[f64; 12]> {
     use realfft::RealFftPlanner;
     let decim = (audio.sample_rate as usize / 11_025).max(1);
@@ -150,21 +152,23 @@ pub fn chroma(audio: &TrackAudio) -> Option<[f64; 12]> {
     let window: Vec<f32> = (0..N)
         .map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / N as f32).cos())
         .collect();
-    // Notes C2 (MIDI 36) to B6 (95): bins within ±0.4 semitone of each.
-    let notes: Vec<(usize, usize, usize)> = (36..96)
+    // Notes C1 (MIDI 24) to B7 (107): bins within ±0.4 semitone of each.
+    // C2 to B6 count toward the key; the octave either side gives the
+    // whitening below its context.
+    let notes: Vec<(usize, usize)> = (FIRST_NOTE..FIRST_NOTE + NOTES)
         .map(|m| {
             let f = 440.0 * 2f64.powf((m as f64 - 69.0) / 12.0);
             let lo = ((f * 2f64.powf(-0.4 / 12.0)) * N as f64 / sr).floor() as usize;
             let hi = ((f * 2f64.powf(0.4 / 12.0)) * N as f64 / sr).ceil() as usize;
-            (m % 12, lo, hi.max(lo + 1).min(N / 2))
+            let hi = hi.max(lo + 1).min(N / 2);
+            (lo.min(hi - 1), hi)
         })
         .collect();
     let mut input = fft.make_input_vec();
     let mut spectrum = fft.make_output_vec();
-    let mut total = [0f64; 12];
-    let mut prev: Vec<f64> = Vec::new();
+    // Note magnitudes for every frame.
+    let mut frames: Vec<[f32; NOTES]> = Vec::new();
     let mut start = 0;
-    let mut frames = 0;
     while start + N <= mono.len() {
         for i in 0..N {
             input[i] = mono[start + i] * window[i];
@@ -172,41 +176,63 @@ pub fn chroma(audio: &TrackAudio) -> Option<[f64; 12]> {
         if fft.process(&mut input, &mut spectrum).is_err() {
             return None;
         }
-        let mut note_e: Vec<f64> = notes
-            .iter()
-            .map(|&(_, lo, hi)| {
-                spectrum[lo..hi]
-                    .iter()
-                    .map(|c| c.norm() as f64)
-                    .fold(0.0, f64::max)
-            })
-            .collect();
-        // Whiten: remove the broadband floor (drums, noise) per frame.
-        let mean = note_e.iter().sum::<f64>() / note_e.len() as f64;
-        for e in &mut note_e {
-            *e = (*e - mean).max(0.0).sqrt();
+        let mut e = [0f32; NOTES];
+        for (v, &(lo, hi)) in e.iter_mut().zip(&notes) {
+            *v = spectrum[lo..hi]
+                .iter()
+                .map(|c| c.norm())
+                .fold(0.0, f32::max);
         }
-        // Count only energy that holds across consecutive frames: sustained
-        // notes (bass, chords, vocals) carry the key; drum hits don't.
-        for (i, &(pc, _, _)) in notes.iter().enumerate() {
-            let held = if prev.is_empty() {
-                note_e[i]
-            } else {
-                note_e[i].min(prev[i])
-            };
-            total[pc] += held;
-        }
-        prev.clone_from(&note_e);
-        frames += 1;
+        frames.push(e);
         start += HOP;
     }
-    if frames == 0 || total.iter().sum::<f64>() <= 1e-9 {
+    if frames.is_empty() {
+        return None;
+    }
+    // Log-compress against the track's median level, so quiet sustained
+    // notes count for something next to loud ones.
+    let mut all: Vec<f32> = frames.iter().flatten().copied().collect();
+    let mid = all.len() / 2;
+    let median = *all.select_nth_unstable_by(mid, f32::total_cmp).1;
+    if median <= 0.0 {
+        return None;
+    }
+    let scale = 10.0 / median;
+    let mut total = [0f64; 12];
+    let mut c = [0f32; NOTES];
+    for e in &frames {
+        for (ci, v) in c.iter_mut().zip(e) {
+            *ci = (1.0 + scale * v).ln();
+        }
+        // Whiten: keep only what stands above the local level (±6
+        // semitones). That removes broadband drums and noise and the
+        // spectrum's overall tilt, leaving the notes.
+        for i in KEY_LO..KEY_HI {
+            let mut local = 0.0;
+            for j in i as isize - 6..=i as isize + 6 {
+                local += c[j.clamp(0, NOTES as isize - 1) as usize];
+            }
+            let v = c[i] - local / 13.0;
+            if v > 0.0 {
+                total[(FIRST_NOTE + i) % 12] += v as f64;
+            }
+        }
+    }
+    if total.iter().sum::<f64>() <= 1e-9 {
         return None;
     }
     Some(total)
 }
 
-/// Detect the key of a track.
+/// Lowest note analysed (C1), and how many (to B7).
+const FIRST_NOTE: usize = 24;
+const NOTES: usize = 84;
+/// The notes that count toward the key, C2 to B6, as indexes from C1.
+const KEY_LO: usize = 12;
+const KEY_HI: usize = 72;
+
+/// Detect the key of a track from its audio: the chroma correlated with
+/// Temperley's major and minor key profiles in all 24 keys.
 pub fn detect(audio: &TrackAudio) -> Option<i8> {
     let c = chroma(audio)?;
     let mut best = (-1i8, f64::MIN);
