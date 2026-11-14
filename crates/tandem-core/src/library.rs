@@ -1,4 +1,5 @@
-//! Music library: folders, Serato crates and the "Shared with me" folder.
+//! Music library: folders, Serato crates, the "Shared with me" folder, and
+//! "All Music" (all of them together).
 //!
 //! Tags and content hashes are cached on disk (keyed by path, size and
 //! modified time), so rescans are fast and a track is only hashed once.
@@ -14,7 +15,7 @@ use crate::model::TrackId;
 use crate::serato::{self, SeratoCrate};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -200,12 +201,17 @@ pub enum SourceKind {
     Folder(PathBuf),
     Crate(SeratoCrate),
     Shared,
+    /// Every library folder, "Shared with me" and every Serato crate, with
+    /// each file listed once.
+    All,
 }
 
 #[derive(Default)]
 pub struct TrackList {
     pub tracks: Vec<LibTrack>,
     pub scanning: bool,
+    /// Asked to scan again mid-scan (its sources changed): scan again after.
+    rescan: bool,
     pub error: Option<String>,
     /// Bumped whenever a track's details change (BPM, key, names), so a
     /// sorted view knows to re-sort.
@@ -276,7 +282,7 @@ pub struct Library {
     /// Background BPM analysis: (list key, done, total).
     pub analyzing: Option<(String, usize, usize)>,
     /// Folders whose untagged files are named "Title - Artist".
-    title_first_dirs: std::collections::HashSet<PathBuf>,
+    title_first_dirs: HashSet<PathBuf>,
     /// Beatgrids edited by hand, by content hash.
     user_grids: HashMap<TrackId, BeatGrid>,
     grids_path: PathBuf,
@@ -284,6 +290,7 @@ pub struct Library {
 }
 
 pub const KEY_SHARED: &str = "shared";
+pub const KEY_ALL: &str = "all";
 
 pub fn folder_key(p: &Path) -> String {
     format!("folder:{}", p.display())
@@ -437,12 +444,15 @@ impl Library {
     }
 }
 
-/// Scan one source in the background, filling `lists[key]`.
+/// Scan one source in the background, filling `lists[key]`. A first scan
+/// fills the list in as it goes; a rescan keeps the old list on screen until
+/// it's done. Asking while that source is scanning scans it again after.
 pub fn scan(lib: &Arc<Mutex<Library>>, key: String, kind: SourceKind) {
     {
         let mut l = lib.lock();
         let entry = l.lists.entry(key.clone()).or_default();
         if entry.scanning {
+            entry.rescan = true;
             return;
         }
         entry.scanning = true;
@@ -450,83 +460,159 @@ pub fn scan(lib: &Arc<Mutex<Library>>, key: String, kind: SourceKind) {
     }
     let lib = lib.clone();
     std::thread::spawn(move || {
-        let (files, error) = match &kind {
-            SourceKind::Folder(dir) => (walk(dir), None),
-            SourceKind::Shared => {
-                let dir = lib.lock().shared_dir.clone();
-                (walk(&dir), None)
-            }
-            SourceKind::Crate(c) => match serato::crate_tracks(c) {
-                Ok(paths) => (paths.into_iter().filter(|p| p.exists()).collect(), None),
-                Err(e) => (Vec::new(), Some(format!("couldn't read crate: {e}"))),
-            },
-        };
-        let mut out = Vec::with_capacity(files.len());
-        for (i, path) in files.iter().enumerate() {
-            let Some((size, mtime)) = stat(path) else {
-                continue;
-            };
-            let hit = lib.lock().cached(path, size, mtime).cloned();
-            let mut shown_bpm = hit.as_ref().and_then(|e| lib.lock().shown_bpm(e));
-            let e = match hit {
-                Some(e) => e,
-                None => {
-                    let (title, artist, bpm, duration) = read_tags(path);
-                    let e = CacheEntry {
-                        size,
-                        mtime,
-                        title,
-                        artist,
-                        bpm,
-                        duration,
-                        id: None,
-                        grid: None,
-                        analyzed: false,
-                        grid_version: 0,
-                        key: None,
-                        key_done: false,
-                        key_version: 0,
-                    };
-                    let mut l = lib.lock();
-                    l.cache
-                        .insert(path.to_string_lossy().to_string(), e.clone());
-                    l.cache_dirty = true;
-                    shown_bpm = None;
-                    e
+        let (groups, error) = source_files(&lib, &kind);
+        let mut out: Vec<LibTrack> = Vec::new();
+        let mut seen = HashSet::new();
+        let mut title_first = Vec::new();
+        for (dir, files) in groups {
+            let start = out.len();
+            for path in files {
+                if !seen.insert(same_file(&path)) {
+                    continue;
                 }
-            };
-            out.push(LibTrack {
-                path: path.clone(),
-                size,
-                title: e.title,
-                artist: e.artist,
-                bpm: e.bpm,
-                duration: e.duration,
-                grid_bpm: shown_bpm,
-                key: e.key,
-            });
-            if i % 500 == 499 {
-                let mut l = lib.lock();
-                let entry = l.lists.entry(key.clone()).or_default();
-                entry.tracks = out.clone();
-                entry.rev += 1;
+                let Some(t) = list_track(&lib, path) else {
+                    continue;
+                };
+                out.push(t);
+                if out.len().is_multiple_of(500) {
+                    let mut l = lib.lock();
+                    let entry = l.lists.entry(key.clone()).or_default();
+                    if out.len() > entry.tracks.len() {
+                        entry.tracks = out.clone();
+                        entry.rev += 1;
+                    }
+                }
+            }
+            if fix_file_names(&mut out[start..]) {
+                title_first.extend(dir);
             }
         }
-        let swapped = fix_file_names(&mut out);
         let mut l = lib.lock();
-        if swapped {
-            if let SourceKind::Folder(dir) = &kind {
-                l.title_first_dirs.insert(dir.clone());
-            }
-        }
+        l.title_first_dirs.extend(title_first);
         l.index(&out);
-        let entry = l.lists.entry(key).or_default();
+        let entry = l.lists.entry(key.clone()).or_default();
         entry.tracks = out;
         entry.rev += 1;
         entry.scanning = false;
         entry.error = error;
+        let again = std::mem::take(&mut entry.rescan);
         l.save_cache();
+        drop(l);
+        if again {
+            scan(&lib, key, kind);
+        }
     });
+}
+
+/// Rescan "All Music" after its sources change (a folder removed, crates
+/// rescanned, a share received), if it has been listed. Choosing it in the
+/// library always rescans it.
+pub fn refresh_all(lib: &Arc<Mutex<Library>>) {
+    if lib.lock().lists.contains_key(KEY_ALL) {
+        scan(lib, KEY_ALL.into(), SourceKind::All);
+    }
+}
+
+/// One group of files from a source, which decides on its own whether its
+/// untagged files are named "Title - Artist" (see [`fix_file_names`]), with
+/// the folder to remember that for.
+type FileGroup = (Option<PathBuf>, Vec<PathBuf>);
+
+/// The files a source lists, and an error to show for it.
+fn source_files(lib: &Arc<Mutex<Library>>, kind: &SourceKind) -> (Vec<FileGroup>, Option<String>) {
+    match kind {
+        SourceKind::Folder(dir) => (vec![(Some(dir.clone()), walk(dir))], None),
+        SourceKind::Shared => {
+            let dir = lib.lock().shared_dir.clone();
+            (vec![(None, walk(&dir))], None)
+        }
+        SourceKind::Crate(c) => match serato::crate_tracks(c) {
+            Ok(paths) => (
+                vec![(None, paths.into_iter().filter(|p| p.exists()).collect())],
+                None,
+            ),
+            Err(e) => (Vec::new(), Some(format!("couldn't read crate: {e}"))),
+        },
+        // Each part is grouped as its own list is, so names come out the
+        // same here as there. Folders come first, so a track that's also in
+        // a crate is listed from its folder.
+        SourceKind::All => {
+            let (folders, shared, crates) = {
+                let l = lib.lock();
+                (l.folders.clone(), l.shared_dir.clone(), l.crates.clone())
+            };
+            let mut groups: Vec<FileGroup> = folders
+                .into_iter()
+                .map(|dir| {
+                    let files = walk(&dir);
+                    (Some(dir), files)
+                })
+                .collect();
+            groups.push((None, walk(&shared)));
+            for c in &crates {
+                match serato::crate_tracks(c) {
+                    Ok(paths) => groups.push((None, paths)),
+                    Err(e) => log::warn!("All Music: couldn't read crate {}: {e}", c.name),
+                }
+            }
+            (groups, None)
+        }
+    }
+}
+
+/// A path as compared to list each file once: Windows paths ignore case.
+fn same_file(path: &Path) -> String {
+    let s = path.to_string_lossy();
+    if cfg!(windows) {
+        s.to_lowercase()
+    } else {
+        s.into_owned()
+    }
+}
+
+/// A file as a list shows it: from the cache, or its tags (then cached).
+/// `None` if the file is missing.
+fn list_track(lib: &Arc<Mutex<Library>>, path: PathBuf) -> Option<LibTrack> {
+    let (size, mtime) = stat(&path)?;
+    let hit = lib.lock().cached(&path, size, mtime).cloned();
+    let mut shown_bpm = hit.as_ref().and_then(|e| lib.lock().shown_bpm(e));
+    let e = match hit {
+        Some(e) => e,
+        None => {
+            let (title, artist, bpm, duration) = read_tags(&path);
+            let e = CacheEntry {
+                size,
+                mtime,
+                title,
+                artist,
+                bpm,
+                duration,
+                id: None,
+                grid: None,
+                analyzed: false,
+                grid_version: 0,
+                key: None,
+                key_done: false,
+                key_version: 0,
+            };
+            let mut l = lib.lock();
+            l.cache
+                .insert(path.to_string_lossy().to_string(), e.clone());
+            l.cache_dirty = true;
+            shown_bpm = None;
+            e
+        }
+    };
+    Some(LibTrack {
+        path,
+        size,
+        title: e.title,
+        artist: e.artist,
+        bpm: e.bpm,
+        duration: e.duration,
+        grid_bpm: shown_bpm,
+        key: e.key,
+    })
 }
 
 fn walk(dir: &Path) -> Vec<PathBuf> {
@@ -958,6 +1044,77 @@ mod tests {
         let id = hash_file(&wav).unwrap();
         assert_eq!(find_by_hash(&lib, id, t.size), Some(wav.clone()));
         assert_eq!(find_by_hash(&lib, TrackId([7; 32]), t.size), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn all_music_lists_every_source_once() {
+        let dir = std::env::temp_dir().join(format!("tandem-all-test-{}", fastrand::u64(..)));
+        let signal = crate::audio::test_signal(44_100, 0.2, 330.0);
+        for f in [
+            "a/Artist - Song.wav",
+            "a/sub/Other - Tune.wav",
+            "shared/Friend - Gift.wav",
+            "loose/Solo - One.wav",
+        ] {
+            let p = dir.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            crate::audio::write_wav(&p, 44_100, &signal).unwrap();
+        }
+        // A Serato crate holding a track that's also in a folder, one that
+        // isn't, and one that's gone.
+        let field = |tag: &[u8; 4], data: &[u8]| {
+            let mut v = tag.to_vec();
+            v.extend((data.len() as u32).to_be_bytes());
+            v.extend(data);
+            v
+        };
+        let mut crate_file = Vec::new();
+        for p in ["a/Artist - Song.wav", "loose/Solo - One.wav", "gone.wav"] {
+            let utf16: Vec<u8> = p.encode_utf16().flat_map(|u| u.to_be_bytes()).collect();
+            crate_file.extend(field(b"otrk", &field(b"ptrk", &utf16)));
+        }
+        std::fs::write(dir.join("Gig.crate"), crate_file).unwrap();
+
+        let lib = Arc::new(Mutex::new(Library::new(
+            dir.join("shared"),
+            dir.join("cache.json"),
+        )));
+        {
+            let mut l = lib.lock();
+            // The second folder is inside the first: its track is listed once.
+            l.folders = vec![dir.join("a"), dir.join("a").join("sub")];
+            l.crates = vec![SeratoCrate {
+                name: "Gig".into(),
+                file: dir.join("Gig.crate"),
+                root: dir.clone(),
+            }];
+        }
+        let titles = || {
+            for _ in 0..500 {
+                if !lib.lock().lists[KEY_ALL].scanning {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let l = lib.lock();
+            assert!(!l.lists[KEY_ALL].scanning, "scan didn't finish");
+            l.lists[KEY_ALL]
+                .tracks
+                .iter()
+                .map(|t| t.title.clone())
+                .collect::<Vec<_>>()
+        };
+        refresh_all(&lib);
+        assert!(!lib.lock().lists.contains_key(KEY_ALL), "only once listed");
+        scan(&lib, KEY_ALL.into(), SourceKind::All);
+        // Folders first, then Shared with me, then crate tracks not in a folder.
+        assert_eq!(titles(), ["Song", "Tune", "Gift", "One"]);
+
+        // Remove the outer folder: its track still comes from the crate.
+        lib.lock().folders = vec![dir.join("a").join("sub")];
+        refresh_all(&lib);
+        assert_eq!(titles(), ["Tune", "Gift", "Song", "One"]);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

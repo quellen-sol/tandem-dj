@@ -4,7 +4,7 @@ use crate::app::{lib_bpm, room_bpm, ShareDraft, Source, TandemApp};
 use crate::ui_decks::fmt_time;
 use eframe::egui::{self, pos2, vec2, Align2, Color32, FontId, RichText, Sense};
 use tandem_core::config::SortColumn;
-use tandem_core::library::KEY_SHARED;
+use tandem_core::library::{KEY_ALL, KEY_SHARED};
 use tandem_core::session::{deck_letter, SessionView, ShareState, TransferState};
 
 struct Row {
@@ -35,6 +35,21 @@ impl TandemApp {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let mut pick: Option<Source> = None;
+                let all_label = match self.library.lock().lists.get(KEY_ALL) {
+                    Some(l) if !l.scanning || !l.tracks.is_empty() => {
+                        format!("🎶 All Music ({})", l.tracks.len())
+                    }
+                    _ => "🎶 All Music".to_string(),
+                };
+                if ui
+                    .selectable_label(self.ui.source == Source::All, all_label)
+                    .on_hover_text(
+                        "Every track in your folders, Shared with me and your Serato crates",
+                    )
+                    .clicked()
+                {
+                    pick = Some(Source::All);
+                }
                 if ui
                     .selectable_label(
                         self.ui.source == Source::Room,
@@ -134,6 +149,7 @@ impl TandemApp {
                         self.library
                             .lock()
                             .refresh_crates(self.paths.music_dir.as_deref());
+                        tandem_core::library::refresh_all(&self.library);
                     }
                 });
 
@@ -352,6 +368,7 @@ impl TandemApp {
                 Source::Shared => "Nothing shared with you yet.",
                 _ if scanning => "Scanning…",
                 _ if !self.ui.search.is_empty() => "No matches.",
+                Source::All => "No music yet. Add a music folder on the left.",
                 _ => "No audio files here.",
             };
             ui.label(RichText::new(hint).weak());

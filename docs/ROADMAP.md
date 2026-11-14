@@ -157,6 +157,11 @@ Work through these in order and note anything that fails. `tandem.log` (Settings
 3. On the FLX6, do the CH1 and CH2 meters match the screen? Do CH3 and CH4 stay dark?
 4. Open the broadcast view and cut a deck with its fader. Does the broadcast window's master meter drop when the cut is heard in the feed, not before?
 
+### v0.7.1
+
+- **All Music** in the library: every track in your folders, Shared with me and your Serato crates in one list, each track once. Search, sorting and Analyze BPM work on it. It's rescanned each time you pick it, while the last list stays on screen.
+- Rescanning a list of more than 500 tracks (a crate, or Shared with me after a share arrives) keeps the old list on screen until the new one is ready, instead of cutting it short to 500 while it scans.
+
 ## Next candidates
 
 Rough priority order:

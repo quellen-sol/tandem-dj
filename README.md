@@ -33,6 +33,7 @@ The self-test lists your audio and MIDI devices, opens your default output for h
 ## Set up your booth
 
 1. **Music.** In the library, click **Add music folder…**. Serato crates from `Music\_Serato_` (and `X:\_Serato_` on external drives) show up automatically. Tandem only reads them and never writes Serato files.
+   - **All Music**, at the top of the library's list, shows every track in your folders, **Shared with me** and your Serato crates in one list, each track once. Search, sorting and **Analyze BPM** work on it like any other list. It's rescanned each time you pick it, so new files and crate changes show up.
    - **Click a column heading** (TITLE, ARTIST, BPM, KEY, TIME) to sort the list by it. Click again to reverse it, and a third time to go back to the list's own order. Keys sort in Camelot order (1A, 1B, 2A…). Tracks with no BPM or key yet go last. Tandem remembers the sort.
 2. **Audio.** Open **Settings → Audio**.
    - **Speakers (master):** your controller's sound card, channels 1/2.

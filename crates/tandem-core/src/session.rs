@@ -756,6 +756,7 @@ impl Session {
                             library::KEY_SHARED.into(),
                             library::SourceKind::Shared,
                         );
+                        library::refresh_all(&self.library);
                     }
                 }
             }

@@ -22,6 +22,8 @@ use tandem_core::time::{local_us, SharedClock};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Source {
+    /// Every folder, "Shared with me" and every Serato crate.
+    All,
     Room,
     Shared,
     Folder(PathBuf),
@@ -31,6 +33,7 @@ pub enum Source {
 impl Source {
     pub fn key(&self) -> String {
         match self {
+            Source::All => library::KEY_ALL.into(),
             Source::Room => "room".into(),
             Source::Shared => library::KEY_SHARED.into(),
             Source::Folder(p) => library::folder_key(p),
@@ -40,6 +43,7 @@ impl Source {
 
     pub fn label(&self) -> String {
         match self {
+            Source::All => "All Music".into(),
             Source::Room => "Tracks in this room".into(),
             Source::Shared => "Shared with me".into(),
             Source::Folder(p) => p
@@ -52,6 +56,7 @@ impl Source {
 
     pub fn kind(&self) -> Option<SourceKind> {
         match self {
+            Source::All => Some(SourceKind::All),
             Source::Room => None,
             Source::Shared => Some(SourceKind::Shared),
             Source::Folder(p) => Some(SourceKind::Folder(p.clone())),
@@ -371,11 +376,13 @@ impl TandemApp {
         (down && !prev, !down && prev)
     }
 
+    /// Show a list. Crates and All Music are rescanned every time, since
+    /// Serato may have changed them.
     pub(crate) fn set_source(&mut self, source: Source) {
         if let Some(kind) = source.kind() {
             let key = source.key();
-            let needs_scan =
-                !self.library.lock().lists.contains_key(&key) || matches!(source, Source::Crate(_));
+            let needs_scan = !self.library.lock().lists.contains_key(&key)
+                || matches!(source, Source::Crate(_) | Source::All);
             if needs_scan {
                 library::scan(&self.library, key, kind);
             }
@@ -402,7 +409,9 @@ impl TandemApp {
         self.settings.library_folders.retain(|f| f != dir);
         self.library.lock().folders = self.settings.library_folders.clone();
         if self.ui.source == Source::Folder(dir.clone()) {
-            self.set_source(Source::Shared);
+            self.set_source(Source::All);
+        } else {
+            library::refresh_all(&self.library);
         }
         self.mark_dirty();
     }
