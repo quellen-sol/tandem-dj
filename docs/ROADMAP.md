@@ -141,12 +141,12 @@ Work through these in order and note anything that fails. `tandem.log` (Settings
    - Do picture and sound line up? If not, by roughly how much?
 4. Close the broadcast window with its ✕. Does the main window carry on?
 
-## Round 7: level meters
+## Round 7 (v0.7): level meters
 
 - **Level meters** on the mixer: one per channel, before the fader, and a stereo master meter between them, in dBFS with a one-second peak hold. The broadcast view shows them too, as late as the feed.
 - **On the controller:** the DDJ-FLX6, FLX4 and DDJ-400 channel meters show decks A and B. The FLX6's light thresholds were measured on the hardware, so its lights come on at the same levels as the screen's marks. Saved mappings pick the meters up automatically.
 - **The controller's lights now go out reliably when Tandem closes.** Closing used to race the last "lights off" messages.
-- No protocol change.
+- No protocol change: v0.6 and v0.7 can share a room.
 
 ### Test plan for level meters
 
