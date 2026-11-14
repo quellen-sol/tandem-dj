@@ -106,6 +106,24 @@ Work through these in order and note anything that fails. `tandem.log` (Settings
    - Does the other PC loop at the same moment?
    - Is the broadcast recording clean?
 
+## Round 5 (v0.5): BPM and key detection
+
+- **BPM and key come only from the audio.** A key tag no longer overrides detection, a BPM tag no longer steers it, and tag BPMs aren't shown in place of a detected one.
+- **Better BPM.** Dotted and triplet rhythms no longer win over the beat: R&B and jungle that came out at 116 instead of 87/174 are fixed, and 2-step garage stays at 135. Fewer tracks end up with no grid.
+  - On a 253-track test library, checked against madmom, Essentia and Spotify's data, the tempo is right (up to half/double time) on 214 of the 229 tracks where the references agree, up from 201.
+- **Better keys.** Exactly right on 72% of the tracks where the references agree, up from 55%. Most misses are a compatible neighbour.
+- **Tempo changes are detected.** A big tempo change that holds for half a minute or more starts a new grid section.
+- Detection results from older versions are redone on the next **Analyze BPM** (edited grids are kept).
+
+### Test plan for detection
+
+1. Press **Analyze BPM** on a list analysed by an older version. Do the BPMs and keys fill in again?
+2. Load tracks you know: R&B or hip-hop around 85–95, jungle or DnB, and UK garage.
+   - Is the BPM right, or at most half/double?
+   - Does the key match what you hear (or a Camelot neighbour)?
+3. Load a track that changes tempo part-way through. Is there a second marker at the change, and do synced decks follow it?
+4. Load a track you've edited the grid of. Is your edit still there?
+
 ## Next candidates
 
 Rough priority order:

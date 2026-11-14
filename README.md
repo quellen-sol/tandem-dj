@@ -4,7 +4,7 @@ Back-to-back DJing with a friend, from anywhere. Two DJs in different places sha
 
 **Personal, non-commercial use only.** See [TERMS.md](TERMS.md).
 
-> **Status: v0.4.** Windows only. Rooms, BPM and key detection, beatgrid editing, sync, key lock, loops and a ready-made DDJ-FLX6 mapping all work; this is still an early version for two people to try. See [docs/ROADMAP.md](docs/ROADMAP.md) for what's next and a test plan.
+> **Status: v0.5.** Windows only. Rooms, BPM and key detection, beatgrid editing, sync, key lock, loops and a ready-made DDJ-FLX6 mapping all work; this is still an early version for two people to try. See [docs/ROADMAP.md](docs/ROADMAP.md) for what's next and a test plan.
 
 ## How it works
 
@@ -53,7 +53,9 @@ Mappings are saved per controller, so you only do this once. When Tandem's built
 
 ## BPM, sync and keys
 
-- **Analyze BPM** (library toolbar) works out the tempo, beatgrid and musical key of every track in the list, in the background. Each track is only analysed once, and tracks are also analysed when you load them. A key already in the file's tags is used as-is. A grid you've edited always wins over analysis.
+- **Analyze BPM** (library toolbar) works out the tempo, beatgrid and musical key of every track in the list from its audio, in the background. BPM and key tags in the files aren't used. Each track is only analysed once, and tracks are also analysed when you load them. A grid you've edited always wins over analysis.
+  - When a new version of Tandem detects better, its results from older versions are dropped: press **Analyze BPM** again on your lists. Grids you've edited are kept.
+  - A track that changes tempo part-way through gets a grid section for each tempo, if the change is big and holds for at least half a minute.
 - **Beat markers** run along the top of each scrolling waveform.
 - **SYNC** matches a deck's tempo and beats to the other deck, using half or double time when that's closer. While SYNC is on, moving either deck's tempo fader moves both, and pressing play on a synced deck starts it on the beat.
 - **SHIFT + SYNC** on the controller, or right-clicking SYNC, turns sync off. The deck goes back to its own BPM, offset only by where your tempo fader sits.
@@ -76,7 +78,7 @@ Each deck has a **LOOP** row, and the controller's loop buttons and BEAT LOOP pa
 
 ### Fixing a beatgrid
 
-Detection isn't always right, and some tracks change tempo part-way through. Click **GRID** on a deck to edit its grid. The key and tempo rows are replaced by the grid controls.
+Detection isn't always right. It doesn't find bars (the "1"), gradual tempo drifts or every tempo change, and a few tracks come out at half or double the BPM you'd count. Click **GRID** on a deck to edit its grid. The key and tempo rows are replaced by the grid controls.
 
 1. **SET** puts a red marker exactly where the playhead is. Put markers on the first beat of a bar (the 1). Pause and jog onto the kick for the most precise spot.
    - On a detected grid, the first SET moves the whole grid so it lines up there, and that spot becomes bar 1.
@@ -124,12 +126,12 @@ tandem.exe --data-dir C:\temp\tandem-bob
 
 Host in one window and join `127.0.0.1` from the other.
 
-## Known limits in v0.4
+## Known limits in v0.5
 
 - **Decks and DJs:** 2 decks, 2 DJs per room.
-- **Beatgrids:** detection assumes a steady tempo and doesn't find bars (the "1"). Set markers by hand for both: see [Fixing a beatgrid](#fixing-a-beatgrid). A grid can have up to 32 markers, and every bar is 4 beats. Hot cues and play aren't snapped to the beat, except on a synced deck. Loop IN and OUT aren't either (beat loops always are).
+- **Beatgrids:** detection finds big, steady tempo changes but not gradual drifts, and doesn't find bars (the "1"). Some tracks come out at half or double time (87 instead of 174, say): **½** and **×2** under GRID fix that. Set markers by hand for both: see [Fixing a beatgrid](#fixing-a-beatgrid). A grid can have up to 32 markers, and every bar is 4 beats. Hot cues and play aren't snapped to the beat, except on a synced deck. Loop IN and OUT aren't either (beat loops always are).
 - **Loops:** no slip mode or loop rolls, no fine-adjusting IN/OUT with the jog wheel, and loops aren't saved with the track.
-- **Keys:** detection is good but not perfect. It can mix up a key with its relative major/minor (same Camelot number), and very drum-heavy tracks are harder.
+- **Keys:** detection is good but not perfect: on a test library it matched reference tools on about 3 tracks in 4, and most misses were a compatible neighbour (the relative major/minor, or one step round the Camelot wheel). A track gets one key, even if it changes key part-way through.
 - **Mixer:** no effects. EQ is a 3-band isolator, plus a filter and trim per channel.
 - **Controllers:** MIDI only. Controllers that only speak HID aren't supported.
 - **CPU:** the screen redraws use more CPU than the audio does. Key lock costs under 2% of one core per deck.
