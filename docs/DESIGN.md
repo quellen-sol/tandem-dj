@@ -58,7 +58,11 @@ A loop that appears or changes under audio the head has already read makes the h
 
 ### Broadcast view
 
-A stream needs a picture that's as late as its sound. The broadcast window (`ui_broadcast.rs`) draws `Session::broadcast_view()`: the room at `now − broadcast delay`, taken from the same timeline the broadcast lane renders. Every move appears on it at the moment its sound reaches the feed, including the partner's. It's read-only, names DJs by name (never "you"), and is a second OS window (an egui immediate viewport) so it can be captured or screenshared on its own.
+A stream needs a picture that's as late as its sound. The broadcast window (`ui_broadcast.rs`) draws `Session::broadcast_view()`: the room at `now − broadcast delay`, taken from the same timeline the broadcast lane renders. Every move appears on it at the moment its sound reaches the feed, including the partner's. It's read-only, names DJs by name (never "you"), and is a second OS window (an egui immediate viewport) so it can be captured or screenshared on its own. It's drawn inside the main window's frame, so it redraws at the same rate.
+
+### Frame rate
+
+The UI redraws at the **Screen frame rate** setting (60 fps by default). Frames are due on a fixed beat (`TandemApp::pace_frames`), so vsync rounding a frame up to the next monitor refresh doesn't drag the average down. Input still redraws at once. Controller moves go straight from the MIDI thread to the session with their own timestamps, so they never wait for a frame. Note that egui brings a requested repaint forward by its predicted frame time (1/60 s): asking for a repaint after 16 ms means "now", which is why the UI used to run at the monitor's full rate.
 
 ### Key lock and key shift
 

@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tandem_core::config::{LibrarySort, Paths, Settings};
+use tandem_core::config::{FrameRate, LibrarySort, Paths, Settings};
 use tandem_core::library::{self, LibTrack, Library, SortRow, SourceKind};
 use tandem_core::mapping::MidiOut;
 use tandem_core::model::{Action, TrackId, DECKS};
@@ -190,6 +190,8 @@ pub struct TandemApp {
     pub(crate) pending: Vec<Action>,
     /// Local (this booth only) settings edited this frame.
     pub(crate) local_edit: LocalParams,
+    /// When the next frame is due, at the chosen frame rate.
+    next_frame: Instant,
 }
 
 impl TandemApp {
@@ -288,7 +290,33 @@ impl TandemApp {
             ui,
             pending: Vec::new(),
             local_edit,
+            next_frame: Instant::now(),
         }
+    }
+
+    /// Asks for the next frame at the chosen frame rate. Frames are due on a
+    /// fixed beat, so vsync rounding each one up to a monitor refresh doesn't
+    /// drag the average rate down. A frame that input brings forward (mouse,
+    /// keyboard) doesn't move the beat. The broadcast window is drawn inside
+    /// this window's frame, so it runs at the same rate.
+    fn pace_frames(&mut self, ctx: &egui::Context) {
+        let FrameRate::Cap(fps) = self.settings.frame_rate else {
+            ctx.request_repaint();
+            return;
+        };
+        let period = Duration::from_secs_f64(1.0 / fps.max(1) as f64);
+        let now = Instant::now();
+        if now + period / 4 >= self.next_frame {
+            self.next_frame += period;
+            if self.next_frame <= now {
+                // Behind: a slow frame, or a rate above the monitor's.
+                self.next_frame = now + period;
+            }
+        }
+        // egui brings a requested repaint forward by its predicted frame time
+        // (1/60 s), which would turn any shorter wait into "right now".
+        let ahead = Duration::from_secs_f32(ctx.input(|i| i.predicted_dt).max(0.0));
+        ctx.request_repaint_after(self.next_frame.saturating_duration_since(now) + ahead);
     }
 
     pub(crate) fn mark_dirty(&mut self) {
@@ -553,7 +581,7 @@ impl TandemApp {
 
 impl eframe::App for TandemApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.request_repaint_after(Duration::from_millis(16));
+        self.pace_frames(ctx);
         if self.settings.terms_accepted < tandem_core::terms::TERMS_VERSION
             || self.settings.name.trim().is_empty()
         {

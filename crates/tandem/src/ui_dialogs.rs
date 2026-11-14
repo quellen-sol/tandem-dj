@@ -4,7 +4,7 @@ use crate::app::{SettingsTab, TandemApp};
 use crate::output;
 use eframe::egui::{self, Color32, RichText};
 use std::net::IpAddr;
-use tandem_core::config::Route;
+use tandem_core::config::{FrameRate, Route};
 use tandem_core::mapping::{RelMode, Target};
 use tandem_core::session::{SessionView, ShareState};
 use tandem_core::terms::{
@@ -666,6 +666,23 @@ impl TandemApp {
             }
         });
         ui.label(RichText::new("Keeps track transfers from swamping your connection while you play. Lower it if your partner's controls feel laggy during a transfer.").small().weak());
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("Screen frame rate");
+            let mut rate = self.settings.frame_rate;
+            egui::ComboBox::from_id_salt("frame-rate")
+                .selected_text(rate.label())
+                .show_ui(ui, |ui| {
+                    for f in FrameRate::CHOICES {
+                        ui.selectable_value(&mut rate, f, f.label());
+                    }
+                });
+            if rate != self.settings.frame_rate {
+                self.settings.frame_rate = rate;
+                self.mark_dirty();
+            }
+        });
+        ui.label(RichText::new("How often the decks and waveforms redraw, here and in the broadcast window. Higher is smoother but uses more CPU and GPU. Your controller never waits for the screen. For the smoothest scrolling, pick your monitor's rate or half of it.").small().weak());
         ui.separator();
         for (label, path) in [
             ("Shared with me", &self.paths.shared_dir),

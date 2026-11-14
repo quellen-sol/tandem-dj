@@ -51,6 +51,41 @@ pub struct LibrarySort {
     pub descending: bool,
 }
 
+/// How often the screen redraws. The decks and waveforms animate at this
+/// rate; mouse and keyboard input still redraw straight away, and controller
+/// moves never wait for the screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FrameRate {
+    /// At most this many frames a second.
+    Cap(u32),
+    /// Every time the monitor refreshes (144 times a second on a 144 Hz monitor).
+    Monitor,
+}
+
+impl FrameRate {
+    pub const CHOICES: [FrameRate; 6] = [
+        FrameRate::Cap(30),
+        FrameRate::Cap(60),
+        FrameRate::Cap(75),
+        FrameRate::Cap(120),
+        FrameRate::Cap(144),
+        FrameRate::Monitor,
+    ];
+
+    pub fn label(self) -> String {
+        match self {
+            FrameRate::Cap(fps) => format!("{fps} fps"),
+            FrameRate::Monitor => "Match monitor".to_string(),
+        }
+    }
+}
+
+impl Default for FrameRate {
+    fn default() -> Self {
+        FrameRate::Cap(60)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -68,6 +103,7 @@ pub struct Settings {
     pub local: LocalParams,
     /// None: each list in its own order (folder, crate or share order).
     pub library_sort: Option<LibrarySort>,
+    pub frame_rate: FrameRate,
 }
 
 impl Default for Settings {
@@ -84,6 +120,7 @@ impl Default for Settings {
             tempo_range: 0.08,
             local: LocalParams::default(),
             library_sort: None,
+            frame_rate: FrameRate::default(),
         }
     }
 }
@@ -241,4 +278,24 @@ pub fn unique_path(path: PathBuf) -> PathBuf {
         }
     }
     path
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_rate_defaults_to_60_and_round_trips() {
+        // A settings file from before the option existed.
+        let old: Settings = serde_json::from_str(r#"{"name":"Alice"}"#).unwrap();
+        assert_eq!(old.frame_rate, FrameRate::Cap(60));
+        for f in FrameRate::CHOICES {
+            let s = Settings {
+                frame_rate: f,
+                ..Settings::default()
+            };
+            let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+            assert_eq!(back.frame_rate, f);
+        }
+    }
 }

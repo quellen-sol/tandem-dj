@@ -8,11 +8,12 @@
 
 use crate::app::TandemApp;
 use crate::ui_decks::{
-    fmt_time, keys_fit, overview, scrolling_waveform, AMBER, DECK_COLORS, GREEN,
+    fmt_time, keys_fit, overview, scrolling_waveform, AMBER, DECK_COLORS, GREEN, LOOP,
 };
 use eframe::egui::{
     self, pos2, vec2, Align, Color32, Layout, Margin, Rect, RichText, Sense, Stroke,
 };
+use tandem_core::mapping::beats_label;
 use tandem_core::model::{DeckState, DECKS};
 use tandem_core::session::{deck_letter, BroadcastView};
 
@@ -171,6 +172,13 @@ fn deck_card(ui: &mut egui::Ui, d: usize, b: &BroadcastView) {
         );
         if let Some((label, fill)) = deck_state(st, pos) {
             chip(ui, label, fill, 13.0 * s);
+        }
+        if st.looping {
+            let text = match st.loop_beats {
+                Some(n) => format!("LOOP {}", beats_label(n)),
+                None => "LOOP".to_string(),
+            };
+            chip(ui, &text, LOOP.gamma_multiply(0.7), 13.0 * s);
         }
         if st.synced {
             chip(ui, "SYNC", SYNC_BLUE, 13.0 * s);

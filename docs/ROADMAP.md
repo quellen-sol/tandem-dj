@@ -124,6 +124,23 @@ Work through these in order and note anything that fails. `tandem.log` (Settings
 3. Load a track that changes tempo part-way through. Is there a second marker at the change, and do synced decks follow it?
 4. Load a track you've edited the grid of. Is your edit still there?
 
+## Round 6 (v0.6): broadcast view and frame rate
+
+- **Broadcast view.** A second window for the stream, opened from the top bar. It shows both decks, the mixer and the scrolling waveforms, exactly as far behind the room as the broadcast feed, so a Discord or OBS capture of it matches the sound. Each deck, and the crossfader, shows the name of whoever touched it last. Nothing in it is clickable.
+- **Screen frame rate** (Settings → General): 30, 60, 75, 120 or 144 fps, or match the monitor. The default is 60. Until now the screen redrew at the monitor's full rate (144 fps on a 144 Hz monitor), so 60 fps cuts the UI's CPU use by more than half there. Controller moves never wait for the screen.
+- No protocol change: v0.5 and v0.6 can share a room.
+
+### Test plan for the broadcast view
+
+1. Host a room and click **Broadcast view**.
+   - Does the header read "*you* b2b *partner*"?
+   - Does each deck's name pill change when the other DJ touches that deck?
+2. Have your partner do something sharp: a hot cue, a cut on the crossfader. Watch the broadcast window, and listen to the broadcast feed (CABLE Output).
+   - Does the move appear in the window at the moment it's heard?
+3. Discord: share the window (sound off) with CABLE Output as your microphone, and join from a phone or second account.
+   - Do picture and sound line up? If not, by roughly how much?
+4. Close the broadcast window with its ✕. Does the main window carry on?
+
 ## Next candidates
 
 Rough priority order:
@@ -131,7 +148,7 @@ Rough priority order:
 1. **Automatic downbeats (bars)** in the detected beatgrid, plus quantize for hot cues, play and loop IN/OUT. Grids already have bars; for now you set bar 1 by hand.
 2. **Beatgrid editing from the controller**, and placing markers by clicking the waveform.
 3. **More loop tools:** BEAT JUMP pads, slip mode and loop rolls, and fine-adjusting IN/OUT with the jog wheel.
-4. **Lower UI CPU:** redraw waveforms only when they change, and cap the frame rate.
+4. **Lower UI CPU:** redraw waveforms only when they change (the frame rate cap is done).
 5. **Serato cue points and loops** from the Markers2 tag.
 6. **Lower-latency audio:** WASAPI exclusive mode or ASIO.
 7. **Recording** the broadcast lane to WAV.

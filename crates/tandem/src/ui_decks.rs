@@ -28,7 +28,7 @@ pub(crate) const AMBER: Color32 = Color32::from_rgb(250, 190, 60);
 /// Beatgrid markers (red, like Serato's).
 const MARKER: Color32 = Color32::from_rgb(235, 70, 70);
 /// Loops, on the buttons and the waveforms.
-const LOOP: Color32 = Color32::from_rgb(60, 200, 150);
+pub(crate) const LOOP: Color32 = Color32::from_rgb(60, 200, 150);
 
 /// ADJUST steps (BPM): a little, a bit more, more than that.
 const ADJUST_STEPS: [f64; 3] = [0.01, 0.1, 1.0];

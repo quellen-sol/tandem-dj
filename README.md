@@ -121,6 +121,7 @@ The broadcast feed is delayed by 500 ms by default, so both DJs' moves are on ti
 - **OBS:** add a *Window Capture* of "Tandem broadcast". It needs no delay filter.
 - **Discord:** share the "Tandem broadcast" window with its sound **off**, and set Discord's input device to **CABLE Output**, with noise suppression, echo cancellation and automatic gain control turned off. Discord captures everything Tandem plays, not just the broadcast feed, so don't share the window's sound.
 - Keep the window visible, on a second screen if you have one. A minimised window can't be captured.
+- It redraws at the **Screen frame rate** (Settings → General), 60 fps by default. That's already as smooth as the stream: Discord shares at 30 fps (60 with Nitro), and OBS usually records at 30 or 60.
 
 ## Trying it on one PC
 
@@ -140,7 +141,7 @@ Host in one window and join `127.0.0.1` from the other.
 - **Keys:** detection is good but not perfect: on a test library it matched reference tools on about 3 tracks in 4, and most misses were a compatible neighbour (the relative major/minor, or one step round the Camelot wheel). A track gets one key, even if it changes key part-way through.
 - **Mixer:** no effects. EQ is a 3-band isolator, plus a filter and trim per channel.
 - **Controllers:** MIDI only. Controllers that only speak HID aren't supported.
-- **CPU:** the screen redraws use more CPU than the audio does. Key lock costs under 2% of one core per deck.
+- **CPU:** the screen redraws use more CPU than the audio does, and the broadcast window adds about half again. They run at 60 fps by default. **Settings → General → Screen frame rate** goes from 30 fps up to your monitor's full rate, which costs two to three times as much CPU on a 120–144 Hz monitor. Key lock costs under 2% of one core per deck.
 - **Audio driver:** WASAPI shared mode, roughly 10–20 ms of output latency. No ASIO yet.
 - **Serato data:** crates are read, but Serato cue points and beatgrids aren't imported yet.
 - **Security:** traffic isn't encrypted by Tandem itself. Use Tailscale, which is encrypted. The room code is a simple gate, not a password.
