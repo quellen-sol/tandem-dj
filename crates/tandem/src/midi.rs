@@ -43,7 +43,8 @@ const PIONEER_KEEPALIVE: [u8; 12] = [
 
 pub struct Midi {
     conn: Option<MidiInputConnection<()>>,
-    feedback_stop: Option<Arc<AtomicBool>>,
+    /// The controller thread: its stop flag, and the thread to wait for.
+    feedback: Option<(Arc<AtomicBool>, std::thread::JoinHandle<()>)>,
     pub engine: Arc<Mutex<MidiEngine>>,
     pub port: Option<String>,
     pub has_output: bool,
@@ -56,7 +57,7 @@ impl Midi {
     pub fn new(tempo_range: f64) -> Self {
         Self {
             conn: None,
-            feedback_stop: None,
+            feedback: None,
             engine: Arc::new(Mutex::new(MidiEngine::new(Mapping::default(), tempo_range))),
             port: None,
             has_output: false,
@@ -69,9 +70,13 @@ impl Midi {
         dir.join(format!("{}.json", mapping_key(port)))
     }
 
+    /// Stop listening and wait for the controller thread to turn the lights
+    /// and meters off (it takes a few milliseconds), so a controller never
+    /// keeps showing levels after Tandem closes.
     pub fn disconnect(&mut self) {
-        if let Some(stop) = self.feedback_stop.take() {
+        if let Some((stop, thread)) = self.feedback.take() {
             stop.store(true, Ordering::Relaxed);
+            let _ = thread.join();
         }
         if let Some(c) = self.conn.take() {
             c.close();
@@ -174,12 +179,13 @@ impl Midi {
             log::info!("MIDI: no output port for {port_name}; lights won't follow Tandem");
         }
         let stop = Arc::new(AtomicBool::new(false));
-        self.feedback_stop = Some(stop.clone());
         let pioneer = port_name.to_uppercase().contains("DDJ");
         let engine = self.engine.clone();
-        std::thread::Builder::new()
+        let flag = stop.clone();
+        let thread = std::thread::Builder::new()
             .name("tandem-controller".into())
-            .spawn(move || controller_loop(out, session, engine, stop, pioneer))?;
+            .spawn(move || controller_loop(out, session, engine, flag, pioneer))?;
+        self.feedback = Some((stop, thread));
         Ok(())
     }
 
@@ -195,8 +201,8 @@ impl Midi {
 }
 
 /// The controller's clock: every 5 ms send gathered jog movement (scratch /
-/// search); every 25 ms update the jog-ring pitch bend and the lights; every
-/// 200 ms keep Pioneer controllers out of demo mode.
+/// search); every 25 ms update the jog-ring pitch bend, the lights and the
+/// level meters; every 200 ms keep Pioneer controllers out of demo mode.
 fn controller_loop(
     mut out: Option<MidiOutputConnection>,
     session: SessionHandle,
@@ -205,9 +211,13 @@ fn controller_loop(
     pioneer: bool,
 ) {
     let mut sent: HashMap<(u8, u8), bool> = HashMap::new();
+    let mut sent_meters: HashMap<(u8, u8), u8> = HashMap::new();
     let mut last_keepalive = Instant::now() - Duration::from_secs(1);
     let mut last_slow = Instant::now();
-    let clock = session.lock().clock();
+    let (clock, meters) = {
+        let s = session.lock();
+        (s.clock(), s.meters())
+    };
     while !stop.load(Ordering::Relaxed) {
         let slow = last_slow.elapsed() >= Duration::from_millis(25);
         let window = if slow {
@@ -235,11 +245,21 @@ fn controller_loop(
                     let s = session.lock();
                     (s.latest(), s.local)
                 };
-                let leds = engine.lock().leds(&room, &local);
+                let levels = meters.read();
+                let (leds, values) = {
+                    let e = engine.lock();
+                    (e.leds(&room, &local), e.meters(&levels))
+                };
                 for (key, on) in leds {
                     if sent.get(&key) != Some(&on) {
                         let _ = o.send(&[key.0, key.1, if on { 0x7F } else { 0x00 }]);
                         sent.insert(key, on);
+                    }
+                }
+                for (key, v) in values {
+                    if sent_meters.get(&key) != Some(&v) {
+                        let _ = o.send(&[key.0, key.1, v]);
+                        sent_meters.insert(key, v);
                     }
                 }
             }
@@ -249,6 +269,11 @@ fn controller_loop(
     if let Some(o) = out.as_mut() {
         for (key, on) in sent {
             if on {
+                let _ = o.send(&[key.0, key.1, 0x00]);
+            }
+        }
+        for (key, v) in sent_meters {
+            if v > 0 {
                 let _ = o.send(&[key.0, key.1, 0x00]);
             }
         }

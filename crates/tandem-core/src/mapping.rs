@@ -9,6 +9,7 @@
 //! SYNC moves tempos without moving the fader, so when the two disagree the
 //! fader works *relatively* (see [`MidiEngine::tempo_fader`]).
 
+use crate::meter::{to_db, Levels};
 use crate::model::{Action, RoomState, BEAT_LOOPS, DECKS};
 use crate::render::LocalParams;
 use serde::{Deserialize, Serialize};
@@ -298,6 +299,16 @@ pub struct Binding {
     pub rel: RelMode,
 }
 
+/// A level meter on the controller: a control change whose value sets how
+/// many of its lights are lit (Pioneer: CC 0x02 on the deck's channel).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeterLight {
+    pub channel: u8,
+    pub cc: u8,
+    /// The deck whose channel level it shows.
+    pub deck: u8,
+}
+
 fn one() -> f32 {
     1.0
 }
@@ -330,10 +341,13 @@ pub struct Mapping {
     /// Version of that preset when this mapping was saved.
     #[serde(default)]
     pub preset_version: u32,
+    /// Channel level meters on the controller (built-in presets only).
+    #[serde(default)]
+    pub meters: Vec<MeterLight>,
 }
 
 /// Bump when built-in presets gain controls; saved mappings pick them up.
-pub const PRESET_VERSION: u32 = 5;
+pub const PRESET_VERSION: u32 = 6;
 
 impl Mapping {
     pub fn empty(device: &str) -> Self {
@@ -346,6 +360,7 @@ impl Mapping {
             vinyl: true,
             preset: None,
             preset_version: 0,
+            meters: Vec::new(),
         }
     }
 
@@ -359,8 +374,8 @@ impl Mapping {
 
     /// A mapping saved from an older built-in preset: add the controls the
     /// preset has gained since (only on buttons/knobs the user hasn't bound
-    /// to something else), keeping calibration and customisations. Returns
-    /// how many bindings were added.
+    /// to something else) and its level meters, keeping calibration and
+    /// customisations. Returns how many controls were added.
     pub fn upgrade_from(&mut self, preset: &Mapping) -> usize {
         if self.preset.is_none() || self.preset_version >= preset.preset_version {
             return 0;
@@ -372,6 +387,10 @@ impl Mapping {
                 self.bindings.push(b.clone());
                 added += 1;
             }
+        }
+        if self.meters.is_empty() {
+            self.meters = preset.meters.clone();
+            added += self.meters.len();
         }
         self.preset_version = preset.preset_version;
         added
@@ -1009,7 +1028,54 @@ impl MidiEngine {
         }
         out
     }
+
+    /// Desired value of every level meter: (status, CC) -> value.
+    pub fn meters(&self, levels: &Levels) -> Vec<((u8, u8), u8)> {
+        self.mapping
+            .meters
+            .iter()
+            .map(|m| {
+                let level = levels.channels[(m.deck as usize).min(DECKS - 1)];
+                ((0xB0 | m.channel, m.cc), pioneer_meter_value(level))
+            })
+            .collect()
+    }
 }
+
+/// A Pioneer channel meter's value (0–127) for a level.
+///
+/// Measured on a DDJ-FLX6, whose meters have five lights (two green, two
+/// orange, red): they come on at values of about 37–40, 65–69, 85–88,
+/// 101–106 and exactly 119. Each anchor below sits at the top of one of
+/// those ranges, so each light comes on at a level the on-screen meter
+/// marks too: green from -24 and -14 dBFS, orange from -8 and -3, and red
+/// only over full scale. In between, the value climbs evenly in dB, so a
+/// meter with more lights also climbs smoothly.
+pub fn pioneer_meter_value(level: f32) -> u8 {
+    let db = to_db(level);
+    if db >= 0.0 {
+        return 127;
+    }
+    let mut prev = PIONEER_METER[0];
+    for &(at, v) in &PIONEER_METER[1..] {
+        if db < at {
+            let x = ((db - prev.0) / (at - prev.0)).clamp(0.0, 1.0);
+            return (prev.1 + x * (v - prev.1)).floor() as u8;
+        }
+        prev = (at, v);
+    }
+    PIONEER_METER[PIONEER_METER.len() - 1].1 as u8
+}
+
+/// (dBFS, value) anchors for [`pioneer_meter_value`], below full scale.
+const PIONEER_METER: [(f32, f32); 6] = [
+    (-48.0, 0.0),
+    (-24.0, 40.0),
+    (-14.0, 69.0),
+    (-8.0, 88.0),
+    (-3.0, 106.0),
+    (0.0, 118.0),
+];
 
 /// Mapping file name for a MIDI port. Windows prefixes ports with "2- " etc.,
 /// which can change between sessions, so strip it.
@@ -1111,6 +1177,14 @@ fn pioneer_ddj(device: &str, name: &str, hw_decks: u8, ticks_per_rev: f32) -> Ma
                 Target::BeatLoop { deck, size: slot },
             );
         }
+    }
+    // Channel level meters: channels 1 and 2 show decks A and B.
+    for deck in 0..2u8 {
+        m.meters.push(MeterLight {
+            channel: deck,
+            cc: 0x02,
+            deck,
+        });
     }
     m.bind(Trigger::cc(6, 0x1F), Target::Crossfader);
     m.bind(Trigger::cc(6, 0x0C), Target::CueMix);
@@ -1591,6 +1665,70 @@ mod tests {
         // Six loop buttons and eight pads on each of the four hardware decks.
         assert_eq!(saved.upgrade_from(&preset), 4 * (6 + 8));
         assert_eq!(saved.bindings.len(), preset.bindings.len());
+    }
+
+    #[test]
+    fn saved_v5_mappings_gain_the_level_meters() {
+        let preset = pioneer_ddj("DDJ-FLX6", "Pioneer DDJ-FLX6", 4, 2048.0);
+        let mut json = serde_json::to_value(&preset).unwrap();
+        json["preset_version"] = 5.into();
+        json.as_object_mut().unwrap().remove("meters");
+        let mut saved: Mapping = serde_json::from_value(json).unwrap();
+        assert!(saved.meters.is_empty());
+        assert_eq!(saved.upgrade_from(&preset), 2);
+        assert_eq!(saved.meters, preset.meters);
+        assert_eq!(saved.bindings.len(), preset.bindings.len());
+    }
+
+    #[test]
+    fn level_meters_follow_the_channels() {
+        let e = MidiEngine::new(pioneer_ddj("DDJ-FLX6", "test", 4, 2048.0), 0.08);
+        let db = |db: f32| 10f32.powf(db / 20.0);
+        let levels = Levels {
+            channels: [db(-6.0), 0.0],
+            master: [db(-3.0); 2],
+        };
+        let out = e.meters(&levels);
+        // Mixer channels 1 and 2 only: channels 3 and 4 aren't Tandem's.
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], ((0xB0, 0x02), pioneer_meter_value(db(-6.0))));
+        assert_eq!(out[1], ((0xB1, 0x02), 0));
+        // The FLX6's lights come on at 37–40, 65–69, 85–88, 101–106 and
+        // 119 (measured): count them at a level.
+        let lights = |db_fs: f32| {
+            let v = pioneer_meter_value(db(db_fs));
+            [(37, 40), (65, 69), (85, 88), (101, 106), (119, 119)]
+                .iter()
+                .map(|&(lo, hi)| {
+                    assert!(v < lo || v >= hi, "{db_fs} dB: {v} is ambiguous");
+                    (v >= hi) as u8
+                })
+                .sum::<u8>()
+        };
+        for (db_fs, want) in [
+            (-60.0, 0),
+            (-26.0, 0),
+            (-24.0, 1),
+            (-16.0, 1),
+            (-14.0, 2),
+            (-9.0, 2),
+            (-8.0, 3),
+            (-5.0, 3),
+            (-3.0, 4),
+            (-0.01, 4),
+            (0.0, 5),
+            (6.0, 5),
+        ] {
+            assert_eq!(lights(db_fs), want, "{db_fs} dB");
+        }
+        assert_eq!(pioneer_meter_value(0.0), 0);
+        assert_eq!(pioneer_meter_value(1.0), 127);
+        let mut last = 0;
+        for i in 0..600 {
+            let v = pioneer_meter_value(db(-60.0 + i as f32 * 0.1));
+            assert!(v >= last && v <= 118);
+            last = v;
+        }
     }
 
     #[test]

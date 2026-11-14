@@ -6,6 +6,7 @@ use arc_swap::ArcSwap;
 use std::sync::Arc;
 use std::time::Duration;
 use tandem_core::config::{AudioSettings, Paths};
+use tandem_core::meter::LevelMeters;
 use tandem_core::render::AudioSnapshot;
 use tandem_core::time::SharedClock;
 
@@ -38,6 +39,7 @@ pub fn run() -> i32 {
             &AudioSettings::default(),
             snap,
             Arc::new(SharedClock::new()),
+            Arc::new(LevelMeters::new()),
         );
         std::thread::sleep(Duration::from_millis(500));
         let errors = outs.errors.lock().clone();

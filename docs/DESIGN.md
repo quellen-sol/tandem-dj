@@ -64,6 +64,21 @@ A stream needs a picture that's as late as its sound. The broadcast window (`ui_
 
 The UI redraws at the **Screen frame rate** setting (60 fps by default). Frames are due on a fixed beat (`TandemApp::pace_frames`), so vsync rounding a frame up to the next monitor refresh doesn't drag the average down. Input still redraws at once. Controller moves go straight from the MIDI thread to the session with their own timestamps, so they never wait for a frame. Note that egui brings a requested repaint forward by its predicted frame time (1/60 s): asking for a repaint after 16 ms means "now", which is why the UI used to run at the monitor's full rate.
 
+### Level meters
+
+The mixer's meters measure the live lane of the device that plays the master output, in `Lane::render` (`meter.rs`):
+
+- **Channel meters** take each channel's peak after trim, EQ and filter, before the fader. That's what TRIM is for, and the meter keeps moving with the fader down.
+- **The master meter** takes the bus after the faders and crossfader, before this booth's master level, so both booths show the same levels.
+
+Peaks rise at once and fall at 24 dB/s, worked out per 64-frame block on the audio thread. After each callback they're published as `f32` bits in atomics, with a timestamp, so readers never lock and never block the audio. Levels that haven't been updated for 250 ms read as silence, in case the sound card stopped.
+
+- **The screen** reads the meters every frame and holds each peak for a second (`ui_meters.rs`).
+- **The broadcast window** keeps a short history keyed by the local clock (which never jumps, unlike the room clock when you join) and shows the levels from a broadcast delay ago.
+- **The controller thread** sends them every 25 ms, only when a value changes, and zeroes them when it stops. `disconnect` waits for that, so the lights go out when Tandem closes.
+
+Pioneer's channel meters are a control change per channel (CC 0x02 on the deck's channel, 0–127). Pioneer doesn't publish where each light comes on, so it was measured on a DDJ-FLX6: its five lights turn on at about 37–40, 65–69, 85–88, 101–106 and exactly 119. `pioneer_meter_value` maps dB onto those values so the lights come on at −24, −14, −8 and −3 dBFS, and red only over 0 dBFS. Those are the same marks as on screen.
+
 ### Key lock and key shift
 
 With key lock on, or with a key shift, a read head feeds the track through Signalsmith Stretch, which changes speed without changing pitch (and pitch without changing speed). The stretcher's latency is part of the read head's maths: the audio heard now is `fed position − input latency − speed × output latency`. Chasing and sync therefore work exactly as in vinyl mode. When starting at a cue point, the stretcher is primed and pre-rolled, so the first sample out is the cue point itself. A test checks that key-locked kicks land within 4 ms of vinyl ones. The stretcher uses a fixed random seed, so both booths still render identical audio. Scratching always uses vinyl mode.
@@ -125,5 +140,5 @@ Every peer decodes with the same decoder (symphonia) and the loader's exact dura
 
 | Crate | What |
 |---|---|
-| `tandem-core` | Everything platform-independent: `time`, `clock`, `model`, `render`, `audio` (decode), `net`, `files`, `session`, `library`, `serato`, `mapping` (MIDI learn and soft takeover), `terms`, `selftest`. Tests run anywhere. |
+| `tandem-core` | Everything platform-independent: `time`, `clock`, `model`, `render`, `meter` (level meters), `audio` (decode), `net`, `files`, `session`, `library`, `serato`, `mapping` (MIDI learn and soft takeover), `terms`, `selftest`. Tests run anywhere. |
 | `tandem` | The Windows app: egui UI (`ui_*.rs`, including the broadcast window in `ui_broadcast.rs`), sound output via cpal/WASAPI (`output.rs`), MIDI via midir (`midi.rs`). |

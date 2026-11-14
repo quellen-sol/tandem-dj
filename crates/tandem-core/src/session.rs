@@ -12,6 +12,7 @@ use crate::clock::ClockEstimator;
 use crate::config::{sanitize_file_name, unique_path, Paths};
 use crate::grid::BeatGrid;
 use crate::library::{self, Library};
+use crate::meter::LevelMeters;
 use crate::model::{Action, DeckState, Event, RoomState, Timeline, TrackId, DECKS};
 use crate::net::PeerConn;
 use crate::protocol::{Msg, PeerInfo, ShareOffer, TrackInfo};
@@ -226,6 +227,7 @@ pub struct Session {
     pub local: LocalParams,
     snapshot: Arc<ArcSwap<AudioSnapshot>>,
     keepalive: VecDeque<Arc<AudioSnapshot>>,
+    meters: Arc<LevelMeters>,
     role: Role,
     peer: Option<Peer>,
     est: ClockEstimator,
@@ -284,6 +286,7 @@ impl Session {
                 local: LocalParams::default(),
                 snapshot,
                 keepalive: VecDeque::new(),
+                meters: Arc::new(LevelMeters::new()),
                 role: Role::Solo,
                 peer: None,
                 est: ClockEstimator::default(),
@@ -325,6 +328,11 @@ impl Session {
 
     pub fn snapshot_handle(&self) -> Arc<ArcSwap<AudioSnapshot>> {
         self.snapshot.clone()
+    }
+
+    /// The mixer's level meters, which the master output's live lane fills.
+    pub fn meters(&self) -> Arc<LevelMeters> {
+        self.meters.clone()
     }
 
     pub fn library(&self) -> Arc<Mutex<Library>> {

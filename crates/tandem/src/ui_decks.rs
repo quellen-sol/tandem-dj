@@ -1,7 +1,8 @@
 //! Top bar, decks, mixer and waveforms.
 
 use crate::app::TandemApp;
-use eframe::egui::{self, pos2, vec2, Align, Color32, Layout, RichText, Sense, Stroke};
+use crate::ui_meters;
+use eframe::egui::{self, pos2, vec2, Align, Color32, Layout, Rect, RichText, Sense, Stroke};
 use tandem_core::audio::PEAK_BLOCK;
 use tandem_core::grid::{BeatGrid, Marker, MAX_MARKERS};
 use tandem_core::mapping::beats_label;
@@ -711,6 +712,7 @@ impl TandemApp {
                     self.channel_strip(ui, d, view);
                 }
             });
+            self.fader_row(ui, view);
             ui.add_space(4.0);
             let mut xf = view.room.crossfader;
             ui.horizontal(|ui| {
@@ -809,19 +811,51 @@ impl TandemApp {
             }
             ui.toggle_value(&mut self.local_edit.pfl[d], "🎧 CUE")
                 .on_hover_text("Send this deck to your headphones (your booth only)");
-            ui.spacing_mut().slider_width = 74.0;
-            let mut v = st.volume;
-            if ui
-                .add(
+        });
+    }
+
+    /// The channel faders, each with its level meter on the inside, and the
+    /// master meter between them.
+    fn fader_row(&mut self, ui: &mut egui::Ui, view: &SessionView) {
+        let h = 84.0;
+        let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::hover());
+        let meter_h = h - 8.0;
+        for d in 0..DECKS {
+            let deck = d as u8;
+            let x = row.left() + row.width() * (0.25 + 0.5 * d as f32);
+            let mut v = view.room.decks[d].volume;
+            let fader = Rect::from_center_size(pos2(x, row.center().y), vec2(24.0, h));
+            let r = ui.put(fader, |ui: &mut egui::Ui| {
+                ui.spacing_mut().slider_width = h - 4.0;
+                ui.add(
                     egui::Slider::new(&mut v, 0.0..=1.0)
                         .vertical()
                         .show_value(false),
                 )
-                .changed()
-            {
+            });
+            if r.changed() {
                 self.pending.push(Action::Volume { deck, v });
             }
-        });
+            let inward = if d == 0 { 1.0 } else { -1.0 };
+            let meter =
+                Rect::from_center_size(pos2(x + inward * 20.0, row.center().y), vec2(7.0, meter_h));
+            self.meter_view.channel(ui.painter(), meter, d);
+            ui.interact(meter, ui.id().with(("meter", d)), Sense::hover())
+                .on_hover_text(format!(
+                    "Deck {} level, before the fader (after trim, EQ and filter). Red: over full scale.",
+                    deck_letter(d)
+                ));
+        }
+        let master = Rect::from_center_size(
+            pos2(row.center().x + 8.0, row.center().y),
+            vec2(16.0, meter_h),
+        );
+        self.meter_view.master(ui.painter(), master);
+        ui_meters::scale(ui.painter(), master, master.left() - 3.0, 9.0);
+        ui.interact(master, ui.id().with("master-meter"), Sense::hover())
+            .on_hover_text(
+                "Master level: the mix after the faders and crossfader, before your master level. Red: over full scale.",
+            );
     }
 }
 

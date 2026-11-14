@@ -9,6 +9,7 @@ mod ui_broadcast;
 mod ui_decks;
 mod ui_dialogs;
 mod ui_library;
+mod ui_meters;
 
 use eframe::egui;
 use tandem_core::config::Paths;

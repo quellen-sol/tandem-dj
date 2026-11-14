@@ -10,6 +10,7 @@ use cpal::{FromSample, SizedSample};
 use parking_lot::Mutex;
 use std::sync::Arc;
 use tandem_core::config::{AudioSettings, Route};
+use tandem_core::meter::LevelMeters;
 use tandem_core::render::{AudioSnapshot, Lane, LaneKind, StreamClock};
 use tandem_core::time::SharedClock;
 
@@ -87,11 +88,13 @@ impl AudioOutputs {
     }
 }
 
-/// Open every device the settings route to.
+/// Open every device the settings route to. The live lane of the device
+/// that plays the master output fills `meters`.
 pub fn start(
     cfg: &AudioSettings,
     snap: Arc<ArcSwap<AudioSnapshot>>,
     clock: Arc<SharedClock>,
+    meters: Arc<LevelMeters>,
 ) -> AudioOutputs {
     let errors = Arc::new(Mutex::new(Vec::new()));
     let mut by_dev: Vec<(String, Vec<RouteOut>)> = Vec::new();
@@ -138,12 +141,16 @@ pub fn start(
     let mut streams = Vec::new();
     let mut status = Vec::new();
     for (dev, routes) in by_dev {
+        let metered = routes
+            .iter()
+            .any(|r| r.lane == LaneSel::Live && r.bus == Bus::Master);
         match open_device(
             &dev,
             routes,
             cfg.broadcast_delay_ms,
             snap.clone(),
             clock.clone(),
+            metered.then(|| meters.clone()),
             errors.clone(),
         ) {
             Ok((stream, desc)) => {
@@ -173,6 +180,7 @@ fn open_device(
     delay_ms: u32,
     snap: Arc<ArcSwap<AudioSnapshot>>,
     clock: Arc<SharedClock>,
+    meters: Option<Arc<LevelMeters>>,
     errors: Arc<Mutex<Vec<String>>>,
 ) -> anyhow::Result<(cpal::Stream, String)> {
     let host = cpal::default_host();
@@ -230,13 +238,13 @@ fn open_device(
     );
     let stream = match chosen.sample_format() {
         cpal::SampleFormat::F32 => {
-            build::<f32>(&dev, &config, routes, delay_ms, snap, clock, errors)?
+            build::<f32>(&dev, &config, routes, delay_ms, snap, clock, meters, errors)?
         }
         cpal::SampleFormat::I16 => {
-            build::<i16>(&dev, &config, routes, delay_ms, snap, clock, errors)?
+            build::<i16>(&dev, &config, routes, delay_ms, snap, clock, meters, errors)?
         }
         cpal::SampleFormat::I32 => {
-            build::<i32>(&dev, &config, routes, delay_ms, snap, clock, errors)?
+            build::<i32>(&dev, &config, routes, delay_ms, snap, clock, meters, errors)?
         }
         other => bail!("unsupported sample format {other:?}"),
     };
@@ -244,6 +252,7 @@ fn open_device(
     Ok((stream, desc))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build<T: SizedSample + FromSample<f32>>(
     dev: &cpal::Device,
     config: &cpal::StreamConfig,
@@ -251,15 +260,19 @@ fn build<T: SizedSample + FromSample<f32>>(
     delay_ms: u32,
     snap: Arc<ArcSwap<AudioSnapshot>>,
     clock: Arc<SharedClock>,
+    meters: Option<Arc<LevelMeters>>,
     errors: Arc<Mutex<Vec<String>>>,
 ) -> anyhow::Result<cpal::Stream> {
     const MAXF: usize = 4096;
     let ch = config.channels as usize;
     let sr = config.sample_rate.0 as f64;
-    let mut live = routes
-        .iter()
-        .any(|r| r.lane == LaneSel::Live)
-        .then(|| Lane::new(sr, 0, LaneKind::Live));
+    let mut live = routes.iter().any(|r| r.lane == LaneSel::Live).then(|| {
+        let lane = Lane::new(sr, 0, LaneKind::Live);
+        match meters {
+            Some(m) => lane.with_meters(m),
+            None => lane,
+        }
+    });
     let mut bcast = routes
         .iter()
         .any(|r| r.lane == LaneSel::Broadcast)

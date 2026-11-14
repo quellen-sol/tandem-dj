@@ -141,6 +141,22 @@ Work through these in order and note anything that fails. `tandem.log` (Settings
    - Do picture and sound line up? If not, by roughly how much?
 4. Close the broadcast window with its ✕. Does the main window carry on?
 
+## Round 7: level meters
+
+- **Level meters** on the mixer: one per channel, before the fader, and a stereo master meter between them, in dBFS with a one-second peak hold. The broadcast view shows them too, as late as the feed.
+- **On the controller:** the DDJ-FLX6, FLX4 and DDJ-400 channel meters show decks A and B. The FLX6's light thresholds were measured on the hardware, so its lights come on at the same levels as the screen's marks. Saved mappings pick the meters up automatically.
+- **The controller's lights now go out reliably when Tandem closes.** Closing used to race the last "lights off" messages.
+- No protocol change.
+
+### Test plan for level meters
+
+1. Play a loud track at TRIM's centre.
+   - Does the channel meter bounce in the orange, with red on the loudest peaks?
+   - Turn TRIM down a little. Does the red stop?
+2. Pull the channel fader down. Does the channel meter keep moving while the master meter falls?
+3. On the FLX6, do the CH1 and CH2 meters match the screen? Do CH3 and CH4 stay dark?
+4. Open the broadcast view and cut a deck with its fader. Does the broadcast window's master meter drop when the cut is heard in the feed, not before?
+
 ## Next candidates
 
 Rough priority order:

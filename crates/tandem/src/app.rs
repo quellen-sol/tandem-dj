@@ -2,6 +2,7 @@
 
 use crate::midi::Midi;
 use crate::output::{self, AudioOutputs, DeviceInfo};
+use crate::ui_meters::{MeterHistory, MeterView};
 use eframe::egui;
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -11,12 +12,13 @@ use std::time::{Duration, Instant};
 use tandem_core::config::{FrameRate, LibrarySort, Paths, Settings};
 use tandem_core::library::{self, LibTrack, Library, SortRow, SourceKind};
 use tandem_core::mapping::MidiOut;
+use tandem_core::meter::LevelMeters;
 use tandem_core::model::{Action, TrackId, DECKS};
 use tandem_core::protocol::TrackInfo;
 use tandem_core::render::LocalParams;
 use tandem_core::serato::SeratoCrate;
 use tandem_core::session::{Session, SessionHandle, SessionView};
-use tandem_core::time::SharedClock;
+use tandem_core::time::{local_us, SharedClock};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Source {
@@ -192,6 +194,13 @@ pub struct TandemApp {
     pub(crate) local_edit: LocalParams,
     /// When the next frame is due, at the chosen frame rate.
     next_frame: Instant,
+    /// Levels from the live lane, as the mixer shows them.
+    pub(crate) meters: Arc<LevelMeters>,
+    /// The main window's meters and held peaks.
+    pub(crate) meter_view: MeterView,
+    /// The broadcast window's: the same levels, a broadcast delay later.
+    pub(crate) bcast_meter_view: MeterView,
+    meter_history: MeterHistory,
 }
 
 impl TandemApp {
@@ -231,11 +240,11 @@ impl TandemApp {
             s.bcast_delay_us = settings.audio.broadcast_delay_ms as i64 * 1000;
             s.set_local(settings.local);
         }
-        let (snap, clock) = {
+        let (snap, clock, meters) = {
             let s = session.lock();
-            (s.snapshot_handle(), s.clock())
+            (s.snapshot_handle(), s.clock(), s.meters())
         };
-        let audio = output::start(&settings.audio, snap, clock);
+        let audio = output::start(&settings.audio, snap, clock, meters.clone());
 
         let mut midi = Midi::new(settings.tempo_range);
         if let Some(port) = settings.midi_device.clone() {
@@ -291,6 +300,10 @@ impl TandemApp {
             pending: Vec::new(),
             local_edit,
             next_frame: Instant::now(),
+            meters,
+            meter_view: MeterView::default(),
+            bcast_meter_view: MeterView::default(),
+            meter_history: MeterHistory::default(),
         }
     }
 
@@ -319,6 +332,20 @@ impl TandemApp {
         ctx.request_repaint_after(self.next_frame.saturating_duration_since(now) + ahead);
     }
 
+    /// Read the level meters for this frame. The broadcast window's are the
+    /// ones from a broadcast delay ago.
+    fn take_levels(&mut self) {
+        let now = local_us();
+        let levels = self.meters.read();
+        self.meter_view.update(&levels, now);
+        let delay = self.settings.audio.broadcast_delay_ms as i64 * 1000;
+        self.meter_history.push(now, levels, delay + 1_000_000);
+        if self.ui.broadcast_view {
+            let late = self.meter_history.at(now - delay);
+            self.bcast_meter_view.update(&late, now);
+        }
+    }
+
     pub(crate) fn mark_dirty(&mut self) {
         self.settings_dirty.get_or_insert_with(Instant::now);
     }
@@ -334,7 +361,7 @@ impl TandemApp {
             s.bcast_delay_us = self.settings.audio.broadcast_delay_ms as i64 * 1000;
             (s.snapshot_handle(), s.clock())
         };
-        self.audio = output::start(&self.settings.audio, snap, clock);
+        self.audio = output::start(&self.settings.audio, snap, clock, self.meters.clone());
         self.mark_dirty();
     }
 
@@ -590,6 +617,7 @@ impl eframe::App for TandemApp {
         }
         let view = self.session.lock().view();
         self.local_edit = view.local;
+        self.take_levels();
         self.handle_midi_queue(&view);
         self.refresh_filter(&view);
 

@@ -10,6 +10,7 @@ use crate::app::TandemApp;
 use crate::ui_decks::{
     fmt_time, keys_fit, overview, scrolling_waveform, AMBER, DECK_COLORS, GREEN, LOOP,
 };
+use crate::ui_meters::MeterView;
 use eframe::egui::{
     self, pos2, vec2, Align, Color32, Layout, Margin, Rect, RichText, Sense, Stroke,
 };
@@ -39,6 +40,7 @@ impl TandemApp {
             .with_inner_size([1280.0, 720.0])
             .with_min_inner_size([640.0, 360.0]);
         let id = egui::ViewportId::from_hash_of("tandem-broadcast");
+        let meters = self.bcast_meter_view;
         ctx.show_viewport_immediate(id, builder, |ctx, class| {
             let b = self.session.lock().broadcast_view();
             if class == egui::ViewportClass::Embedded {
@@ -48,14 +50,14 @@ impl TandemApp {
                     .open(&mut open)
                     .resizable(false)
                     .show(ctx, |ui| {
-                        ui.allocate_ui(vec2(960.0, 540.0), |ui| draw(ui, &b));
+                        ui.allocate_ui(vec2(960.0, 540.0), |ui| draw(ui, &b, &meters));
                     });
                 self.ui.broadcast_view = open;
                 return;
             }
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(BG).inner_margin(16.0))
-                .show(ctx, |ui| draw(ui, &b));
+                .show(ctx, |ui| draw(ui, &b, &meters));
             if ctx.input(|i| i.viewport().close_requested()) {
                 self.ui.broadcast_view = false;
             }
@@ -64,7 +66,7 @@ impl TandemApp {
 }
 
 /// Header, then deck A | mixer | deck B, then both scrolling waveforms.
-fn draw(ui: &mut egui::Ui, b: &BroadcastView) {
+fn draw(ui: &mut egui::Ui, b: &BroadcastView, meters: &MeterView) {
     header(ui, b);
     ui.add_space(GAP);
     let w = ui.available_width();
@@ -79,7 +81,7 @@ fn draw(ui: &mut egui::Ui, b: &BroadcastView) {
             });
         };
         cell(ui, deck_w, &|ui| deck_card(ui, 0, b));
-        cell(ui, mixer_w, &|ui| mixer(ui, b));
+        cell(ui, mixer_w, &|ui| mixer(ui, b, meters));
         cell(ui, deck_w, &|ui| deck_card(ui, 1, b));
     });
     ui.add_space(GAP);
@@ -268,9 +270,10 @@ fn deck_card(ui: &mut egui::Ui, d: usize, b: &BroadcastView) {
     overview(ui, dv, pos, col, false, h, false);
 }
 
-/// Read-only mixer: EQ and filter as bars from centre, channel faders and
-/// the crossfader, with the name of whoever last moved it.
-fn mixer(ui: &mut egui::Ui, b: &BroadcastView) {
+/// Read-only mixer: EQ and filter as bars from centre, channel faders with
+/// their level meters, the master meter between them, and the crossfader
+/// with the name of whoever last moved it.
+fn mixer(ui: &mut egui::Ui, b: &BroadcastView, meters: &MeterView) {
     ui.vertical_centered(|ui| ui.label(RichText::new("MIXER").strong().weak()));
     ui.add_space(4.0);
     let xf_h = 44.0;
@@ -279,17 +282,32 @@ fn mixer(ui: &mut egui::Ui, b: &BroadcastView) {
         vec2(ui.available_width(), strip_h),
         Layout::left_to_right(Align::Min),
         |ui| {
-            ui.columns(DECKS, |cols| {
+            let faders = ui.columns(DECKS, |cols| {
+                let mut faders = [Rect::NOTHING; DECKS];
                 for (d, ui) in cols.iter_mut().enumerate() {
-                    channel(ui, d, &b.room.decks[d]);
+                    faders[d] = channel(ui, d, &b.room.decks[d]);
                 }
+                faders
             });
+            let p = ui.painter();
+            for (d, f) in faders.iter().enumerate() {
+                let inward = if d == 0 { 1.0 } else { -1.0 };
+                let x = f.center().x + inward * 17.0;
+                let r = Rect::from_center_size(pos2(x, f.center().y), vec2(6.0, f.height()));
+                meters.channel(p, r, d);
+            }
+            let mid = (faders[0].center() + faders[1].center().to_vec2()) / 2.0;
+            meters.master(
+                p,
+                Rect::from_center_size(mid, vec2(14.0, faders[0].height())),
+            );
         },
     );
     crossfader(ui, b);
 }
 
-fn channel(ui: &mut egui::Ui, d: usize, st: &DeckState) {
+/// One channel's knobs and fader. Returns the fader's track.
+fn channel(ui: &mut egui::Ui, d: usize, st: &DeckState) -> Rect {
     let col = DECK_COLORS[d];
     ui.spacing_mut().item_spacing.y = 4.0;
     for (label, v) in [
@@ -319,6 +337,7 @@ fn channel(ui: &mut egui::Ui, d: usize, st: &DeckState) {
         ],
         Stroke::new(2.0_f32, Color32::WHITE),
     );
+    track
 }
 
 /// A knob (0.5 = centre) as a bar growing left or right from the middle.

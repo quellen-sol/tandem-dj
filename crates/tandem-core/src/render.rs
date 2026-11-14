@@ -16,6 +16,7 @@
 //! even through the time-stretcher, and needs no jump.
 
 use crate::audio::TrackAudio;
+use crate::meter::{Ballistics, LevelMeters, Levels};
 use crate::model::{DeckState, RoomState, Timeline, TrackId, DECKS};
 use crate::stretch::Stretcher;
 use serde::{Deserialize, Serialize};
@@ -781,6 +782,9 @@ pub struct Lane {
     eqg: [[f32; 3]; DECKS],
     smooth: f32,
     primed: bool,
+    /// Where this lane publishes its levels, if it's the one metered.
+    meters: Option<Arc<LevelMeters>>,
+    ballistics: Ballistics,
 }
 
 impl Lane {
@@ -799,7 +803,15 @@ impl Lane {
             // ~10 ms parameter smoothing.
             smooth: (1.0 - (-1.0 / (0.010 * sample_rate)).exp()) as f32,
             primed: false,
+            meters: None,
+            ballistics: Ballistics::new(sample_rate),
         }
+    }
+
+    /// Measure this lane's channel and master levels into `meters`.
+    pub fn with_meters(mut self, meters: Arc<LevelMeters>) -> Self {
+        self.meters = Some(meters);
+        self
     }
 
     /// Render `master.len() / 2` stereo frames whose first frame is heard at
@@ -812,6 +824,7 @@ impl Lane {
         let (mut state, mut idx) = tl.cursor(lane_t0);
         let local = snap.local;
         let us_per_frame = 1e6 / self.sr;
+        let metering = self.meters.is_some();
 
         let mut f = 0;
         while f < frames {
@@ -830,6 +843,7 @@ impl Lane {
             for d in 0..DECKS {
                 self.filt[d].update(state.decks[d].filter, self.sr);
             }
+            let mut peaks = Levels::default();
             for i in 0..n {
                 let mut m = [0.0f32; 2];
                 let mut c = [0.0f32; 2];
@@ -843,12 +857,20 @@ impl Lane {
                     let x = [x[0] * self.trim[d], x[1] * self.trim[d]];
                     let s = self.iso[d].process(x, self.eqg[d]);
                     let s = self.filt[d].run(s);
+                    if metering {
+                        let p = &mut peaks.channels[d];
+                        *p = p.max(s[0].abs()).max(s[1].abs());
+                    }
                     m[0] += s[0] * self.vol[d];
                     m[1] += s[1] * self.vol[d];
                     if local.pfl[d] {
                         c[0] += s[0];
                         c[1] += s[1];
                     }
+                }
+                if metering {
+                    peaks.master[0] = peaks.master[0].max(m[0].abs());
+                    peaks.master[1] = peaks.master[1].max(m[1].abs());
                 }
                 let tf = ts + (i as f64 * us_per_frame) as i64;
                 let click = if local.click { click_sample(tf) } else { 0.0 };
@@ -863,7 +885,13 @@ impl Lane {
                 cue[o] = soft_clip((c[0] * (1.0 - mix) + m[0] * mix) * hp + click);
                 cue[o + 1] = soft_clip((c[1] * (1.0 - mix) + m[1] * mix) * hp + click);
             }
+            if metering {
+                self.ballistics.block(&peaks, n);
+            }
             f += n;
+        }
+        if let Some(meters) = &self.meters {
+            meters.publish(&self.ballistics.levels);
         }
     }
 
@@ -979,6 +1007,61 @@ mod tests {
             44_100,
             test_signal(44_100, 10.0, 440.0),
         ))
+    }
+
+    #[test]
+    fn meters_read_channels_before_the_fader_and_the_bus_after() {
+        let a = track();
+        let peak = a.frames.iter().map(|f| f[0].unsigned_abs()).max().unwrap() as f32 / 32768.0;
+        let mut tl = Timeline::new(0);
+        let mut seq = 0;
+        let mut at = |tl: &mut Timeline, time: i64, action: Action| {
+            seq += 1;
+            tl.insert(Event {
+                time,
+                origin: 1,
+                seq,
+                action,
+            });
+        };
+        at(
+            &mut tl,
+            0,
+            Action::Load {
+                deck: 0,
+                track: a.id,
+                duration: a.duration(),
+                cue: 0.0,
+                grid: None,
+                key: -1,
+            },
+        );
+        at(&mut tl, 0, Action::Play { deck: 0 });
+        at(&mut tl, 1_000_000, Action::Volume { deck: 0, v: 0.0 });
+        let snap = snap_with(tl, a);
+        let meters = Arc::new(LevelMeters::new());
+        let mut lane = Lane::new(48_000.0, 0, LaneKind::Live).with_meters(meters.clone());
+        // The test signal kicks every half second: read just after one.
+        let render = |lane: &mut Lane, from_s: f64, to_s: f64| {
+            let n = ((to_s - from_s) * 48_000.0).round() as usize;
+            let (mut m, mut c) = (vec![0.0; n * 2], vec![0.0; n * 2]);
+            lane.render(&snap, (from_s * 1e6) as i64, &mut m, &mut c);
+        };
+        render(&mut lane, 0.0, 0.52);
+        let l = meters.read();
+        assert!(
+            (l.channels[0] - peak).abs() < 0.05 * peak,
+            "{l:?} vs {peak}"
+        );
+        assert_eq!(l.channels[1], 0.0);
+        // Fader up, crossfader in the middle.
+        let bus = peak * xfader_gain(0, 0.5);
+        assert!((l.master[0] - bus).abs() < 0.05 * bus, "{l:?} vs {bus}");
+        // Fader down: the channel still reads, the bus falls away.
+        render(&mut lane, 0.52, 2.52);
+        let l = meters.read();
+        assert!((l.channels[0] - peak).abs() < 0.05 * peak, "{l:?}");
+        assert!(l.master[0] < 0.05 * bus, "{l:?}");
     }
 
     #[test]

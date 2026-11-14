@@ -48,6 +48,7 @@ The self-test lists your audio and MIDI devices, opens your default output for h
    - **Hot cues held while paused are gated.** The deck plays from the hot cue only while you hold the pad. Let go and it snaps back to the hot cue, paused. Press PLAY while holding to keep it playing.
    - **Loops:** **IN**, **OUT** and **RELOOP/EXIT** work as in [Loops](#loops). **SHIFT + IN** is a 4-beat loop, and **CUE/LOOP CALL ◀ / ▶** halve and double the loop. Switch the pads to **BEAT LOOP** (SHIFT + BEAT JUMP) for ¼, ½, 1, 2, 4, 8, 16 and 32-beat loops. The pad of the loop that's playing lights up.
    - **Jog wheel moves the wrong way or jumps?** Tick **1/127 style** or **invert** next to it.
+   - **The channel level meters** on the FLX6, FLX4 and DDJ-400 show decks A and B on channels 1 and 2, like the meters on screen: see [Level meters](#level-meters).
 
 Mappings are saved per controller, so you only do this once. When Tandem's built-in mapping gains new controls, your saved mapping picks them up automatically. Your calibration and changes are kept.
 
@@ -89,6 +90,16 @@ Detection isn't always right. It doesn't find bars (the "1"), gradual tempo drif
 3. **DELETE** removes the section's marker. **RESET** throws away your edits and goes back to the detected grid.
 
 Your edits are saved for the track and used every time you load it. They're matched by the file's content, so moving or renaming it keeps them, but editing its tags (or re-encoding it) doesn't. They're shared with your partner live, and their booth saves them too. If a deck is synced, it keeps following: a synced deck re-locks its tempo the moment either track passes a tempo change.
+
+## Level meters
+
+The mixer has a level meter on the inside of each channel fader, and a stereo master meter between them. They read peaks in dBFS: **green** up to −9 dB, **orange** in the top 9 dB, and **red** over full scale (0 dB). The light just above a falling bar holds the loudest peak of the last second.
+
+- **Channel meters** read the channel before its fader, after TRIM, EQ and the filter, like a DJ mixer. They keep moving with the fader down, so use them to match the two decks with TRIM.
+- **The master meter** reads the mix after the faders and crossfader, before your own master level. Both of you see the same levels, whatever your speakers are set to.
+- **Red means the peaks are over full scale**, so they get soft-clipped on the way out. Loud, modern masters can do this at TRIM's centre: the EQ's crossovers shift the low end's phase against the rest, which raises an already-limited track's peaks by up to about 5 dB. Turn TRIM down a little if a channel's red light keeps coming on.
+- **On the controller,** the FLX6's five lights per channel come on at −24 and −14 dB (green), −8 and −3 dB (orange), and over 0 dB (red), the same marks as on screen. Mixer channels 3 and 4 aren't Tandem's, so their meters stay dark.
+- **The broadcast view** shows the meters too, as late as the broadcast feed.
 
 ## Play together
 
