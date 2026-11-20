@@ -1,7 +1,7 @@
 //! Library browser: sources on the left, tracks on the right.
 
 use crate::app::{lib_bpm, room_bpm, BrowseFocus, ShareDraft, Source, TandemApp};
-use crate::ui_decks::{fmt_time, DECK_COLORS};
+use crate::ui_decks::{fmt_time, DeckLayout, DECK_COLORS};
 use eframe::egui::{self, pos2, vec2, Align2, Color32, FontId, RichText, Sense};
 use tandem_core::config::SortColumn;
 use tandem_core::library::{KEY_ALL, KEY_SHARED};
@@ -25,12 +25,71 @@ struct Row {
     duration: f64,
 }
 
+/// The library's height on a window with room for it, and the least it goes.
+pub(crate) const LIBRARY_H: f32 = 330.0;
+pub(crate) const LIBRARY_MIN_H: f32 = 150.0;
+/// Below this, the two-deck view gives the library more room by swapping
+/// to compact deck panels.
+pub(crate) const LIBRARY_ROOMY_H: f32 = 180.0;
+/// The central panel's margins, above and below the decks area (and either
+/// side of it).
+pub(crate) const CENTRAL_MARGIN: f32 = 16.0;
+
+/// The library's height until the DJ drags its edge. `room` is the height
+/// the library and the decks area share, `decks_w` the decks area's width.
+/// With room, it's 330 points; on a shorter window it gives up height first,
+/// down to 180, then the two-deck view takes compact panels, which leave it
+/// more; it never goes under 150.
+pub(crate) fn library_height(room: f32, decks_w: f32, four: bool) -> f32 {
+    if !four && DeckLayout::full_fits_width(decks_w) {
+        let h = room - DeckLayout::Full.roomy_h();
+        if h >= LIBRARY_ROOMY_H {
+            return h.min(LIBRARY_H);
+        }
+    }
+    let layout = if four {
+        DeckLayout::Four
+    } else {
+        DeckLayout::Compact
+    };
+    (room - layout.roomy_h()).clamp(LIBRARY_MIN_H, LIBRARY_H)
+}
+
+/// The most the library can be dragged up to, leaving the decks area its
+/// least (waveforms included).
+pub(crate) fn library_max_height(room: f32, decks_w: f32, four: bool) -> f32 {
+    let layout = DeckLayout::pick(four, decks_w, 0.0);
+    (room - layout.least_h()).max(LIBRARY_MIN_H)
+}
+
 impl TandemApp {
     pub(crate) fn library_panel(&mut self, ctx: &egui::Context, view: &SessionView) {
-        egui::TopBottomPanel::bottom("library")
+        let id = egui::Id::new("library");
+        let avail = ctx.available_rect();
+        let (room, decks_w) = (
+            avail.height() - CENTRAL_MARGIN,
+            avail.width() - CENTRAL_MARGIN,
+        );
+        let four = self.settings.four_decks;
+        let max = library_max_height(room, decks_w, four);
+        let auto = library_height(room, decks_w, four).min(max);
+        // Until the DJ drags its edge, the library follows the window's
+        // height: egui keeps a dragged height, and otherwise starts from
+        // the default.
+        if ctx
+            .read_response(id.with("__resize"))
+            .is_some_and(|r| r.dragged())
+        {
+            self.ui.library_dragged = true;
+        }
+        if !self.ui.library_dragged {
+            ctx.data_mut(|d| d.remove::<egui::containers::panel::PanelState>(id));
+        }
+        egui::TopBottomPanel::bottom(id)
             .resizable(true)
-            .default_height(330.0)
-            .min_height(160.0)
+            .min_height(LIBRARY_MIN_H)
+            .max_height(max)
+            .default_height(auto)
             .show(ctx, |ui| {
                 let sources = egui::SidePanel::left("sources")
                     .resizable(true)

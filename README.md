@@ -145,6 +145,15 @@ The mixer has a level meter on the inside of each channel fader, and a stereo ma
 
 The room has one curve, like the curve switch on a club mixer, so changing it changes it for your partner and the stream too. Tandem remembers the curve you last picked and starts on it. When you join a room, you get the host's.
 
+## Small screens
+
+Tandem fits laptop screens, down to a 1080p laptop at 175% display scaling.
+
+- **It opens maximised** when its usual window doesn't fit the screen.
+- **On a short window the library gets less height first.** Then the two decks switch to compact panels with a shorter mixer: each channel's knobs sit beside its fader, and **🎧 LEVELS** opens your headphone and master levels.
+- **Every scrolling waveform stays on screen.** With four decks on a very short window, the deck panels and mixer scroll instead (a scroll bar shows beside them).
+- **Drag the top edge of the library** to change its height. Tandem keeps your height from then on, but the library never covers the waveforms.
+
 ## Play together
 
 1. **Get connected.** The easiest way is for both of you to install [Tailscale](https://tailscale.com) (free) and sign in. You'll each get a `100.x.y.z` address that works from anywhere. Without it, the host has to forward TCP port 47800 on their router.

@@ -102,6 +102,11 @@ pub enum Item {
     Known(TrackId),
 }
 
+/// The smallest the main window goes, in points: a 1080p laptop at 175%
+/// display scaling, maximised, is about 1097 × 540, and a 1280 × 800 one at
+/// 125% is 1024 wide.
+pub const MIN_WINDOW: [f32; 2] = [1024.0, 520.0];
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SettingsTab {
     Audio,
@@ -234,6 +239,9 @@ pub struct UiState {
     /// Decks C and D as last seen (track, playing), to notice when one
     /// gets a track or starts playing.
     pub cd_seen: [(Option<TrackId>, bool); 2],
+    /// The DJ has dragged the library's edge: keep their height instead of
+    /// following the window's.
+    pub library_dragged: bool,
 }
 
 /// Developer options: `--screenshot <file.bmp>` saves the window and exits;
@@ -245,9 +253,14 @@ pub struct UiState {
 /// with `--dev-broadcaster` joining it as a broadcaster;
 /// `--dev-late <ms>` shows moves arriving that late, to see the warnings;
 /// `--dev-cut <frame>` drops the room link at that frame, as a network
-/// failure would (no goodbye), to see the booth get back in.
+/// failure would (no goodbye), to see the booth get back in;
 /// `--dev-roll` leaves deck B's loop and holds a 1-beat loop roll on it
-/// for the last 1.5 s before the screenshot.
+/// for the last 1.5 s before the screenshot;
+/// `--window-size <W>x<H>` opens the window at that size (in points, and
+/// never maximised to fit the screen); `--zoom <f>` scales the whole UI, as
+/// Windows display scaling does (`--window-size 1920x1080 --zoom 1.5` looks
+/// like a 1080p laptop at 150%); `--dev-settings <audio|controller|general>`
+/// opens Settings on that tab.
 pub struct DevOpts {
     pub screenshot: Option<PathBuf>,
     pub shot_frame: u64,
@@ -261,6 +274,11 @@ pub struct DevOpts {
     pub search: Option<String>,
     pub broadcast_view: bool,
     pub roll: bool,
+    pub window_size: Option<[f32; 2]>,
+    pub zoom: Option<f32>,
+    pub settings: Option<String>,
+    /// The window has been checked against the screen (`fit_window`).
+    pub fitted: bool,
     pub shared: bool,
     pub demo_started: bool,
     pub frame: u64,
@@ -301,6 +319,9 @@ pub struct TandemApp {
 impl TandemApp {
     pub fn new(cc: &eframe::CreationContext<'_>, paths: Paths, dev: DevOpts) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        if let Some(z) = dev.zoom {
+            cc.egui_ctx.set_zoom_factor(z);
+        }
         let _ = paths.ensure();
         paths.clear_session_cache();
         let settings = Settings::load(&paths.settings_file);
@@ -388,6 +409,7 @@ impl TandemApp {
             grid_edit: [false; DECKS],
             broadcast_view: dev.broadcast_view,
             cd_seen: [(None, false); 2],
+            library_dragged: false,
         };
         let local_edit = settings.local;
         Self {
@@ -870,6 +892,7 @@ impl TandemApp {
 impl eframe::App for TandemApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.pace_frames(ctx);
+        self.fit_window(ctx);
         if self.settings.terms_accepted < tandem_core::terms::TERMS_VERSION
             || self.settings.name.trim().is_empty()
         {
@@ -912,12 +935,51 @@ impl eframe::App for TandemApp {
 }
 
 impl TandemApp {
+    /// On a screen too small for the window at its usual size, maximise it
+    /// once, as soon as the screen's size is known. Windows would otherwise
+    /// leave the bottom of the window (the library, and on a short screen
+    /// the waveforms too) under the taskbar or off the screen.
+    fn fit_window(&mut self, ctx: &egui::Context) {
+        if self.dev.fitted || self.dev.window_size.is_some() {
+            return;
+        }
+        let (monitor, outer, maximized) = ctx.input(|i| {
+            let v = i.viewport();
+            (v.monitor_size, v.outer_rect, v.maximized)
+        });
+        let (Some(monitor), Some(outer)) = (monitor, outer) else {
+            return;
+        };
+        self.dev.fitted = true;
+        log::info!(
+            "Window {:.0} × {:.0} at ({:.0}, {:.0}) on a {:.0} × {:.0} screen (points)",
+            outer.width(),
+            outer.height(),
+            outer.left(),
+            outer.top(),
+            monitor.x,
+            monitor.y
+        );
+        if maximized != Some(true) && !fits_on_screen(outer, monitor) {
+            log::info!("The window doesn't fit on the screen: maximising it");
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+        }
+    }
+
     fn dev_hooks(&mut self, ctx: &egui::Context, view: &SessionView) {
         self.dev.frame += 1;
         let f = self.dev.frame;
         if f == 2 {
             if let Some(q) = self.dev.search.clone() {
                 self.ui.search = q;
+            }
+            if let Some(tab) = self.dev.settings.as_deref() {
+                self.ui.show_settings = true;
+                self.ui.settings_tab = match tab {
+                    "controller" => SettingsTab::Controller,
+                    "general" => SettingsTab::General,
+                    _ => SettingsTab::Audio,
+                };
             }
         }
         if self.dev.demo {
@@ -1053,6 +1115,27 @@ impl TandemApp {
     }
 }
 
+/// The height of the Windows taskbar, at the bottom of the screen.
+const TASKBAR_H: f32 = 48.0;
+
+/// Whether a window (`outer`: title bar and borders included, in points)
+/// fits on a screen of `monitor` size, above the taskbar. Where it is only
+/// counts on the main screen, whose top left corner is (0, 0): a window
+/// that opens on another screen is checked by size alone.
+pub(crate) fn fits_on_screen(outer: egui::Rect, monitor: egui::Vec2) -> bool {
+    let room = egui::vec2(monitor.x, monitor.y - TASKBAR_H);
+    let on_main = outer.left() >= 0.0
+        && outer.top() >= 0.0
+        && outer.left() < monitor.x
+        && outer.top() < monitor.y;
+    let size = if on_main {
+        outer.max.to_vec2()
+    } else {
+        outer.size()
+    };
+    size.x <= room.x && size.y <= room.y
+}
+
 fn write_bmp(
     path: &std::path::Path,
     size: [usize; 2],
@@ -1092,6 +1175,7 @@ impl Drop for TandemApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use egui::{pos2, vec2, Rect};
     use tandem_core::config::SortColumn;
 
     fn key(source: &str, query: &str, sort: Option<LibrarySort>) -> FilterKey {
@@ -1218,5 +1302,42 @@ mod tests {
         // From a list that isn't there (a crate in a closed section).
         assert_eq!(step_source(&lists, &folder("gone"), -1), Some(&folder("b")));
         assert_eq!(step_source(&[], &Source::All, 1), None);
+    }
+
+    fn window(x: f32, y: f32, w: f32, h: f32) -> Rect {
+        Rect::from_min_size(pos2(x, y), vec2(w, h))
+    }
+
+    #[test]
+    fn usual_window_fits_big_screens() {
+        // 1440 × 930 inside, with the title bar and borders.
+        let w = |x, y| window(x, y, 1456.0, 969.0);
+        assert!(fits_on_screen(w(100.0, 60.0), vec2(2560.0, 1440.0)));
+        // A 1080p screen at 100%: fits near the top, not lower down.
+        assert!(fits_on_screen(w(26.0, 26.0), vec2(1920.0, 1080.0)));
+        assert!(!fits_on_screen(w(26.0, 100.0), vec2(1920.0, 1080.0)));
+        // 1080p at 125% and 150%, and 1366 × 768: never.
+        for screen in [
+            vec2(1536.0, 864.0),
+            vec2(1280.0, 720.0),
+            vec2(1366.0, 768.0),
+        ] {
+            assert!(!fits_on_screen(w(0.0, 0.0), screen), "{screen:?}");
+        }
+    }
+
+    #[test]
+    fn other_screens_count_by_size() {
+        // On a screen left of the main one, or below it, only the size counts.
+        let screen = vec2(2560.0, 1440.0);
+        assert!(fits_on_screen(
+            window(-2400.0, 300.0, 1456.0, 969.0),
+            screen
+        ));
+        assert!(fits_on_screen(window(300.0, 1500.0, 1456.0, 969.0), screen));
+        assert!(!fits_on_screen(
+            window(-2400.0, 300.0, 1456.0, 1400.0),
+            screen
+        ));
     }
 }

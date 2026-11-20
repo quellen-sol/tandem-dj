@@ -106,6 +106,16 @@ A move that's late anyway still lands in time with the music: the timeline puts 
 
 The UI redraws at the **Screen frame rate** setting (60 fps by default). Frames are due on a fixed beat (`TandemApp::pace_frames`), so vsync rounding a frame up to the next monitor refresh doesn't drag the average down. Input still redraws at once. Controller moves go straight from the MIDI thread to the session with their own timestamps, so they never wait for a frame. Note that egui brings a requested repaint forward by its predicted frame time (1/60 s): asking for a repaint after 16 ms means "now", which is why the UI used to run at the monitor's full rate.
 
+### Small screens
+
+The decks area and the library share the window's height by rule (`DeckLayout` in `ui_decks.rs`, `library_height` in `ui_library.rs`). At 1440 × 930 points and up nothing changes. On a shorter window:
+
+1. **The library gives way first.** Until the DJ drags its edge, its height follows the window: 330 points when there's room, less on a shorter one, never under 150. After a drag it keeps the DJ's height, but can't be dragged over the waveforms' minimum.
+2. **Then the decks.** Two decks swap their full panels for the four-deck view's compact panels, beside a short two-channel mixer: each channel's knobs beside its fader, and the booth levels behind a **🎧 LEVELS** button. They do this as soon as keeping the full panels would leave the library under 180 points, and on a window too narrow for full panels (under about 1190 points wide). Four decks squeeze in stages: thinner track overviews, then tighter panels, with the levels behind the button.
+3. **The waveforms never go under a minimum** (46 points each for two decks, 28 for four). When the controls don't fit above them even squeezed, the controls scroll, with a scroll bar in sight.
+
+Compact panels narrow their buttons on a narrow window rather than spill into the mixer, and below 1300 points wide the top bar moves the room's address and clock spread into hover text. The window opens at 1440 × 930; when that doesn't fit above the taskbar (most laptops at 125% display scaling or more), the app maximises it on its first frame (`TandemApp::fit_window`). It goes down to 1024 × 520, about a 1080p laptop at 175%. `--window-size 1280x641` and `--zoom 1.5` reproduce a small screen and display scaling on a big one.
+
 ### Level meters
 
 The mixer's meters measure the live lane of the device that plays the master output, in `Lane::render` (`meter.rs`):

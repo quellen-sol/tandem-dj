@@ -19,9 +19,51 @@ pub const DECK_COLORS: [Color32; DECKS] = [
 /// Mixer channels left to right in the four-deck view, as on a
 /// four-channel DJ mixer (and the DDJ-FLX6): C, A, B, D.
 pub(crate) const MIXER_ORDER: [usize; DECKS] = [2, 0, 1, 3];
-/// A deck panel's height in the four-deck view, and the gap between two.
+/// A compact deck panel's height (four decks, or two on a small window), and
+/// the gap between two.
 const COMPACT_H: f32 = 160.0;
 const COMPACT_GAP: f32 = 4.0;
+/// A compact panel's track overview, and the least it shrinks to when the
+/// window is short.
+const OVERVIEW_H: f32 = 26.0;
+const OVERVIEW_MIN_H: f32 = 12.0;
+/// The widest row of a compact deck panel (its loop row), at full size.
+const COMPACT_ROW_W: f32 = 410.0;
+/// A compact panel's width with that row at full size, inside its frame.
+const COMPACT_DECK_W: f32 = COMPACT_ROW_W + 12.0;
+/// The narrowest a full deck panel (two-deck view) goes: its loop row.
+const FULL_DECK_W: f32 = 432.0;
+/// The two-deck mixer's width, and the least the four-deck mixer and the
+/// short two-deck mixer narrow to so the decks beside them keep their width.
+const MIXER_W: f32 = 290.0;
+const MIXER4_W: f32 = 344.0;
+const MIXER_MIN_W: f32 = 260.0;
+/// The controls row as drawn: full two-deck panels (the mixer is their
+/// tallest part), four compact panels, two compact panels beside the short
+/// two-deck mixer. Each includes the spacing after it.
+const FULL_ROW_H: f32 = 388.0;
+const FOUR_ROW_H: f32 = 2.0 * COMPACT_H + COMPACT_GAP + 3.0;
+const COMPACT_ROW_H: f32 = 186.0;
+/// How much shorter a compact panel gets with tighter margins and rows.
+const TIGHT_SAVE: f32 = 9.0;
+/// The four-deck row squeezed as far as it goes: thin overviews, tight
+/// panels, the mixer's booth levels behind a button.
+const FOUR_ROW_MIN_H: f32 = FOUR_ROW_H - 2.0 * (OVERVIEW_H - OVERVIEW_MIN_H) - 2.0 * TIGHT_SAVE;
+/// Between the controls and the waveforms.
+const WAVE_GAP: f32 = 6.0;
+/// The top bar shows the room's address and clock spread from this width.
+const TOP_BAR_FULL_W: f32 = 1300.0;
+/// Scrolling waveform heights, two decks then four: the most they grow to,
+/// what the library leaves room for, and the least they ever get (the
+/// controls above them scroll instead).
+const WAVE_MAX_H: [f32; 2] = [90.0, 80.0];
+const WAVE_ROOMY_H: [f32; 2] = [60.0, 40.0];
+const WAVE_MIN_H: [f32; 2] = [46.0, 28.0];
+/// Waveforms shorter than this make two decks take compact panels.
+const FULL_WAVE_MIN_H: f32 = 52.0;
+/// The least height the controls row keeps (scrolled) when the library is
+/// dragged up as far as it goes.
+const CONTROLS_MIN_H: f32 = 110.0;
 pub(crate) const SYNC_BLUE: Color32 = Color32::from_rgb(40, 120, 200);
 const HOT_CUE_COLORS: [Color32; 8] = [
     Color32::from_rgb(230, 60, 60),
@@ -45,6 +87,112 @@ pub(crate) const LOOP: Color32 = Color32::from_rgb(60, 200, 150);
 const ADJUST_STEPS: [f64; 3] = [0.01, 0.1, 1.0];
 /// SLIP steps (seconds).
 const SLIP_STEPS: [f64; 3] = [0.001, 0.005, 0.025];
+
+/// How the decks area lays out its controls, from its size. Big windows get
+/// the full two-deck panels; a short or narrow one gets compact panels and
+/// the short mixer, as the four-deck view always has.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum DeckLayout {
+    /// Two decks with full panels and the two-channel mixer.
+    Full,
+    /// Two compact deck panels beside the short two-channel mixer.
+    Compact,
+    /// Four compact deck panels and the four-channel mixer.
+    Four,
+}
+
+impl DeckLayout {
+    /// The layout for a decks area of `width` × `height` points.
+    pub(crate) fn pick(four: bool, width: f32, height: f32) -> Self {
+        if four {
+            DeckLayout::Four
+        } else if Self::full_fits_width(width) && height >= DeckLayout::Full.least_full_h() {
+            DeckLayout::Full
+        } else {
+            DeckLayout::Compact
+        }
+    }
+
+    /// Whether full deck panels fit beside the mixer.
+    pub(crate) fn full_fits_width(width: f32) -> bool {
+        (width - MIXER_W - 2.0 * ITEM_GAP) / 2.0 >= FULL_DECK_W
+    }
+
+    /// How many decks (and waveforms) it shows.
+    pub(crate) fn decks(self) -> usize {
+        match self {
+            DeckLayout::Four => DECKS,
+            _ => 2,
+        }
+    }
+
+    /// Which entry of the `WAVE_*_H` tables it uses: two decks, or four.
+    fn wave_idx(self) -> usize {
+        match self {
+            DeckLayout::Four => 1,
+            _ => 0,
+        }
+    }
+
+    /// The controls row, at its natural height and squeezed.
+    fn row_h(self) -> (f32, f32) {
+        match self {
+            DeckLayout::Full => (FULL_ROW_H, FULL_ROW_H),
+            DeckLayout::Compact => (COMPACT_ROW_H, COMPACT_ROW_H),
+            DeckLayout::Four => (FOUR_ROW_H, FOUR_ROW_MIN_H),
+        }
+    }
+
+    /// The waveforms and the gaps around them, `wave` points each.
+    fn waves_h(self, wave: f32) -> f32 {
+        WAVE_GAP + self.decks() as f32 * wave + self.wave_spacing()
+    }
+
+    /// Room for the spacing between and after the waveforms.
+    fn wave_spacing(self) -> f32 {
+        8.0 + (self.decks() - 2) as f32 * 1.5 * ITEM_SPACING_Y
+    }
+
+    /// The decks area's height with the controls at their natural height
+    /// and roomy waveforms: what the library leaves when there's room.
+    pub(crate) fn roomy_h(self) -> f32 {
+        self.row_h().0 + self.waves_h(WAVE_ROOMY_H[self.wave_idx()])
+    }
+
+    /// The least height the full panels are used at.
+    fn least_full_h(self) -> f32 {
+        FULL_ROW_H + self.waves_h(FULL_WAVE_MIN_H)
+    }
+
+    /// The least height of the decks area: waveforms at their least and
+    /// a scrolled strip of controls.
+    pub(crate) fn least_h(self) -> f32 {
+        CONTROLS_MIN_H + self.waves_h(WAVE_MIN_H[self.wave_idx()])
+    }
+}
+
+/// egui's default spacing between widgets (`Spacing::item_spacing`).
+const ITEM_GAP: f32 = 8.0;
+const ITEM_SPACING_Y: f32 = 3.0;
+
+/// How a compact deck panel fits its place.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PanelFit {
+    /// The panel's height, frame included.
+    h: f32,
+    /// Its track overview's height.
+    overview_h: f32,
+    /// Its buttons' widths, from 1 (as wide as usual) down, for a narrow panel.
+    k: f32,
+    /// Tighter margins and rows, for a short window.
+    tight: bool,
+}
+
+/// How much narrower a compact panel `deck_w` wide draws its buttons, so its
+/// rows fit inside it.
+fn button_scale(deck_w: f32) -> f32 {
+    ((deck_w - 12.0) / COMPACT_ROW_W).clamp(0.7, 1.0)
+}
 
 /// Camelot-compatible: same key, relative major/minor, or one step round the wheel.
 /// Who's broadcasting this room, if anyone.
@@ -86,6 +234,16 @@ impl TandemApp {
     pub(crate) fn top_bar(&mut self, ctx: &egui::Context, view: &SessionView) {
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.add_space(4.0);
+            // On a narrow window the address and the clock spread move into
+            // hover text, so the room's status doesn't run into the buttons.
+            let narrow = ui.available_width() < TOP_BAR_FULL_W;
+            let detail = |ui: &mut egui::Ui, room: egui::Response, text: String| {
+                if narrow {
+                    room.on_hover_text(text);
+                } else {
+                    ui.label(RichText::new(text).weak());
+                }
+            };
             ui.horizontal(|ui| {
                 ui.label(RichText::new("TANDEM").strong().size(20.0).color(DECK_COLORS[0]));
                 ui.label(RichText::new(&view.me.name).weak());
@@ -101,21 +259,21 @@ impl TandemApp {
                         }
                     }
                     RoleView::Hosting { port, room } => {
-                        ui.label(RichText::new(format!("Hosting room {room}")).strong());
-                        ui.label(RichText::new(format!("port {port}")).weak());
-                        self.peer_status(ui, view);
+                        let r = ui.label(RichText::new(format!("Hosting room {room}")).strong());
+                        detail(ui, r, format!("port {port}"));
+                        self.peer_status(ui, view, narrow);
                         broadcasters(ui, view);
                         if ui.button("Leave").clicked() {
                             self.session.lock().leave();
                         }
                     }
                     RoleView::Joined { addr, room } => {
-                        ui.label(RichText::new(format!("In room {room}")).strong());
-                        ui.label(RichText::new(addr.as_str()).weak());
+                        let r = ui.label(RichText::new(format!("In room {room}")).strong());
+                        detail(ui, r, addr.clone());
                         if let Some(r) = &view.link.rejoin {
                             self.rejoin_status(ui, r, false);
                         } else {
-                            self.peer_status(ui, view);
+                            self.peer_status(ui, view, narrow);
                             broadcasters(ui, view);
                             if ui.button("Leave").clicked() {
                                 self.session.lock().leave();
@@ -123,12 +281,13 @@ impl TandemApp {
                         }
                     }
                     RoleView::Broadcasting { addr, room } => {
-                        ui.label(RichText::new(format!("📡 Broadcasting room {room}")).strong());
-                        ui.label(RichText::new(addr.as_str()).weak());
+                        let r = ui
+                            .label(RichText::new(format!("📡 Broadcasting room {room}")).strong());
+                        detail(ui, r, addr.clone());
                         if let Some(r) = &view.link.rejoin {
                             self.rejoin_status(ui, r, true);
                         } else {
-                            self.peer_status(ui, view);
+                            self.peer_status(ui, view, narrow);
                             let delay = self.bcast_delay_ms();
                             if let Some(late) = view
                                 .link
@@ -215,7 +374,9 @@ impl TandemApp {
         }
     }
 
-    fn peer_status(&mut self, ui: &mut egui::Ui, view: &SessionView) {
+    /// Your partner, the round trip and whether the room is in sync.
+    /// `narrow`: the clock spread goes in the round trip's hover text.
+    fn peer_status(&mut self, ui: &mut egui::Ui, view: &SessionView, narrow: bool) {
         let Some(peer) = &view.link.peer else {
             match &view.link.awaiting {
                 Some(name) => {
@@ -263,17 +424,25 @@ impl TandemApp {
                 ));
             return;
         }
+        let clock = view
+            .link
+            .clock_spread_us
+            .map(|spread| format!("{:.1} ms", spread as f64 / 2000.0));
         if let Some(rtt) = view.link.rtt_us {
-            let tip = if broadcasting {
+            let mut tip = if broadcasting {
                 "Time for a message to reach the host and come back. This booth plays the room a broadcast delay behind, so both DJs' moves are on time in it."
             } else {
                 "Time for a message to reach your partner and come back. Your own controls are always instant; your partner's arrive about half this late in your headphones, and exactly on time in the broadcast."
-            };
+            }
+            .to_string();
+            if let (true, Some(c)) = (narrow, &clock) {
+                tip = format!("{tip}\n\nShared clock accurate to about ±{c}.");
+            }
             ui.label(format!("{:.0} ms round trip", rtt as f64 / 1000.0))
                 .on_hover_text(tip);
         }
-        if let Some(spread) = view.link.clock_spread_us {
-            ui.label(RichText::new(format!("clock ±{:.1} ms", spread as f64 / 2000.0)).weak());
+        if let (false, Some(c)) = (narrow, clock) {
+            ui.label(RichText::new(format!("clock ±{c}")).weak());
         }
         match view.link.in_sync {
             Some(true) => {
@@ -311,40 +480,120 @@ impl TandemApp {
         });
     }
 
+    /// The decks, the mixer and the scrolling waveforms underneath. The
+    /// waveforms always keep at least `WAVE_MIN_H`: on a window too short
+    /// for the controls above them, the controls squeeze (compact panels,
+    /// thinner overviews, the booth levels behind a button) and, past that,
+    /// scroll.
     pub(crate) fn decks_area(&mut self, ui: &mut egui::Ui, view: &SessionView) {
-        if self.settings.four_decks {
-            return self.four_decks_area(ui, view);
+        let layout = DeckLayout::pick(
+            self.settings.four_decks,
+            ui.available_width(),
+            ui.available_height(),
+        );
+        let (n, w) = (layout.decks(), layout.wave_idx());
+        // Room for the controls with the waveforms at their least.
+        let room = ui.available_height() - layout.waves_h(WAVE_MIN_H[w]);
+        let (natural, least) = layout.row_h();
+        let squeeze = (natural - room).clamp(0.0, natural - least);
+        ui.scope(|ui| {
+            if room < least {
+                // A scroll bar that stays in sight, so it's clear there's more.
+                ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+            }
+            egui::ScrollArea::vertical()
+                .id_salt("deck-controls")
+                .max_height(room.max(40.0))
+                .auto_shrink([false, true])
+                .show(ui, |ui| match layout {
+                    DeckLayout::Full => self.full_row(ui, view),
+                    DeckLayout::Compact => self.compact_row(ui, view),
+                    DeckLayout::Four => self.four_row(ui, view, squeeze),
+                });
+        });
+        ui.add_space(WAVE_GAP);
+        let h = ((ui.available_height() - layout.wave_spacing()) / n as f32)
+            .clamp(WAVE_MIN_H[w], WAVE_MAX_H[w]);
+        for d in 0..n {
+            scrolling_waveform(ui, d, &view.decks[d], view.now, h, self.ui.grid_edit[d]);
         }
-        let mixer_w = 290.0;
+    }
+
+    /// Two decks with full panels, the mixer between them.
+    fn full_row(&mut self, ui: &mut egui::Ui, view: &SessionView) {
         let gap = ui.spacing().item_spacing.x;
-        let deck_w = ((ui.available_width() - mixer_w - 2.0 * gap) / 2.0).max(260.0);
+        let deck_w = ((ui.available_width() - MIXER_W - 2.0 * gap) / 2.0).max(260.0);
         let top_h = 352.0;
         ui.with_layout(Layout::left_to_right(Align::Min), |ui| {
             ui.allocate_ui_with_layout(vec2(deck_w, top_h), Layout::top_down(Align::Min), |ui| {
                 self.deck_panel(ui, 0, view)
             });
-            ui.allocate_ui_with_layout(vec2(mixer_w, top_h), Layout::top_down(Align::Min), |ui| {
-                self.mixer_panel(ui, view)
+            ui.allocate_ui_with_layout(vec2(MIXER_W, top_h), Layout::top_down(Align::Min), |ui| {
+                self.mixer_panel(ui, view, 338.0, false)
             });
             ui.allocate_ui_with_layout(vec2(deck_w, top_h), Layout::top_down(Align::Min), |ui| {
                 self.deck_panel(ui, 1, view)
             });
         });
-        ui.add_space(6.0);
-        let h = ((ui.available_height() - 8.0) / 2.0).clamp(40.0, 90.0);
-        for d in 0..2 {
-            scrolling_waveform(ui, d, &view.decks[d], view.now, h, self.ui.grid_edit[d]);
+    }
+
+    /// Two compact deck panels beside the short two-channel mixer, for a
+    /// window too short or narrow for the full panels. The panels stretch
+    /// to the mixer's height and give the room to their overviews.
+    fn compact_row(&mut self, ui: &mut egui::Ui, view: &SessionView) {
+        let gap = ui.spacing().item_spacing.x;
+        let width = ui.available_width();
+        let mixer_w = (width - 2.0 * gap - 2.0 * COMPACT_DECK_W).clamp(MIXER_MIN_W, MIXER_W);
+        let deck_w = (width - mixer_w - 2.0 * gap) / 2.0;
+        let origin = ui.available_rect_before_wrap().min;
+        // A column at x, w wide, as tall as its contents.
+        let column = |ui: &mut egui::Ui, salt: &str, x: f32, w: f32| {
+            ui.new_child(
+                egui::UiBuilder::new()
+                    .id_salt(salt)
+                    .max_rect(Rect::from_min_size(pos2(x, origin.y), vec2(w, 2000.0)))
+                    .layout(Layout::top_down(Align::Min)),
+            )
+        };
+        // The mixer first, to size the deck panels to it.
+        let mut mixer = column(ui, "mixer", origin.x + deck_w + gap, mixer_w);
+        self.mixer_compact(&mut mixer, view);
+        let row_h = mixer.min_rect().height();
+        let fit = PanelFit {
+            h: row_h,
+            overview_h: (OVERVIEW_H + row_h - COMPACT_H).clamp(OVERVIEW_H, 42.0),
+            k: button_scale(deck_w),
+            tight: false,
+        };
+        for (d, x) in [(0, origin.x), (1, origin.x + deck_w + mixer_w + 2.0 * gap)] {
+            let mut deck = column(ui, if d == 0 { "deck-a" } else { "deck-b" }, x, deck_w);
+            self.deck_panel_compact(&mut deck, d, view, fit);
         }
+        ui.allocate_rect(
+            Rect::from_min_size(origin, vec2(width, row_h)),
+            Sense::hover(),
+        );
     }
 
     /// Four decks: A over C on the left, B over D on the right, each in a
-    /// compact panel, the four-channel mixer between them, and all four
-    /// scrolling waveforms underneath.
-    fn four_decks_area(&mut self, ui: &mut egui::Ui, view: &SessionView) {
-        let mixer_w = 344.0;
+    /// compact panel, and the four-channel mixer between them. `squeeze`:
+    /// how much shorter than usual the row has to be (thinner overviews,
+    /// then tighter panels, and the booth levels behind a button).
+    fn four_row(&mut self, ui: &mut egui::Ui, view: &SessionView, squeeze: f32) {
         let gap = ui.spacing().item_spacing.x;
-        let deck_w = ((ui.available_width() - mixer_w - 2.0 * gap) / 2.0).max(240.0);
-        let top_h = 2.0 * COMPACT_H + COMPACT_GAP;
+        let width = ui.available_width();
+        let mixer_w = (width - 2.0 * gap - 2.0 * COMPACT_DECK_W).clamp(MIXER_MIN_W, MIXER4_W);
+        let deck_w = ((width - mixer_w - 2.0 * gap) / 2.0).max(240.0);
+        // Thinner overviews first, then tighter panels.
+        let thinner = squeeze.min(2.0 * (OVERVIEW_H - OVERVIEW_MIN_H));
+        let tight = squeeze > thinner;
+        let fit = PanelFit {
+            h: COMPACT_H - thinner / 2.0 - if tight { TIGHT_SAVE } else { 0.0 },
+            overview_h: OVERVIEW_H - thinner / 2.0,
+            k: button_scale(deck_w),
+            tight,
+        };
+        let top_h = 2.0 * fit.h + COMPACT_GAP;
         ui.with_layout(Layout::left_to_right(Align::Min), |ui| {
             for column in [[0, 2], [1, 3]] {
                 ui.allocate_ui_with_layout(
@@ -354,9 +603,9 @@ impl TandemApp {
                         ui.spacing_mut().item_spacing.y = COMPACT_GAP;
                         for d in column {
                             ui.allocate_ui_with_layout(
-                                vec2(deck_w, COMPACT_H),
+                                vec2(deck_w, fit.h),
                                 Layout::top_down(Align::Min),
-                                |ui| self.deck_panel_compact(ui, d, view),
+                                |ui| self.deck_panel_compact(ui, d, view, fit),
                             );
                         }
                     },
@@ -365,17 +614,11 @@ impl TandemApp {
                     ui.allocate_ui_with_layout(
                         vec2(mixer_w, top_h),
                         Layout::top_down(Align::Min),
-                        |ui| self.mixer_panel(ui, view),
+                        |ui| self.mixer_panel(ui, view, top_h - 14.0, squeeze > 0.0),
                     );
                 }
             }
         });
-        ui.add_space(6.0);
-        let spacing = ui.spacing().item_spacing.y;
-        let h = ((ui.available_height() - 8.0 - 3.0 * spacing) / 4.0).clamp(26.0, 80.0);
-        for d in 0..DECKS {
-            scrolling_waveform(ui, d, &view.decks[d], view.now, h, self.ui.grid_edit[d]);
-        }
     }
 
     fn deck_panel(&mut self, ui: &mut egui::Ui, d: usize, view: &SessionView) {
@@ -436,7 +679,7 @@ impl TandemApp {
             });
 
             ui.add_space(2.0);
-            self.loop_row(ui, deck, &st);
+            self.loop_row(ui, deck, &st, 1.0);
             ui.add_space(2.0);
             if self.ui.grid_edit[d] && st.track.is_some() {
                 self.grid_editor(ui, d, dv, pos, false);
@@ -453,16 +696,29 @@ impl TandemApp {
 
     /// A deck in the four-deck view: everything the full panel has, in
     /// fewer, tighter rows.
-    fn deck_panel_compact(&mut self, ui: &mut egui::Ui, d: usize, view: &SessionView) {
+    fn deck_panel_compact(
+        &mut self,
+        ui: &mut egui::Ui,
+        d: usize,
+        view: &SessionView,
+        fit: PanelFit,
+    ) {
         let dv = &view.decks[d];
         let st = dv.state;
         let pos = st.position_at(view.now);
         let col = DECK_COLORS[d];
         let deck = d as u8;
-        egui::Frame::group(ui.style()).show(ui, |ui| {
+        let (frame, row_gap) = if fit.tight {
+            let margin = egui::Margin::symmetric(6, 4);
+            (egui::Frame::group(ui.style()).inner_margin(margin), 2.0)
+        } else {
+            (egui::Frame::group(ui.style()), 3.0)
+        };
+        let chrome = frame.total_margin().sum().y;
+        frame.show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            ui.set_min_height(COMPACT_H - 14.0);
-            ui.spacing_mut().item_spacing.y = 3.0;
+            ui.set_min_height(fit.h - chrome);
+            ui.spacing_mut().item_spacing.y = row_gap;
             // Deck, track and artist, then the bar and GRID on the right.
             ui.horizontal(|ui| {
                 ui.label(
@@ -512,23 +768,29 @@ impl TandemApp {
                     }
                 });
             });
-            if let Some(seek) = overview(ui, dv, pos, col, self.ui.grid_edit[d], 26.0, true) {
+            let k = fit.k;
+            let grid_edit = self.ui.grid_edit[d];
+            if let Some(seek) = overview(ui, dv, pos, col, grid_edit, fit.overview_h, true) {
                 self.pending.push(Action::Seek { deck, pos: seek });
             }
             ui.horizontal(|ui| {
-                self.transport(ui, d, &st, vec2(44.0, 24.0));
-                ui.add_space(4.0);
-                ui.spacing_mut().item_spacing.x = 3.0;
-                self.hot_cue_pads(ui, d, &st, 1, vec2(24.0, 22.0));
-                ui.add_space(4.0);
-                self.sync_button(ui, d, view, vec2(44.0, 22.0));
+                self.transport(ui, d, &st, vec2(44.0 * k, 24.0));
+                ui.add_space(4.0 * k);
+                ui.spacing_mut().item_spacing.x = if k < 1.0 { 2.0 } else { 3.0 };
+                self.hot_cue_pads(ui, d, &st, 1, vec2(24.0 * k, 22.0));
+                ui.add_space(4.0 * k);
+                self.sync_button(ui, d, view, vec2(44.0 * k, 22.0));
             });
             if self.ui.grid_edit[d] && st.track.is_some() {
                 self.grid_editor(ui, d, dv, pos, true);
                 return;
             }
-            self.loop_row(ui, deck, &st);
+            self.loop_row(ui, deck, &st, k);
             ui.horizontal(|ui| {
+                if k < 1.0 {
+                    // Closer together, so the tempo slider keeps some length.
+                    ui.spacing_mut().item_spacing.x = 3.0;
+                }
                 self.key_controls(ui, d, view, true);
                 ui.add_space(4.0);
                 self.tempo_controls(ui, d, &st, true);
@@ -720,8 +982,13 @@ impl TandemApp {
         let range = (self.settings.tempo_range * 100.0) as f32;
         let mut pct = ((st.tempo - 1.0) * 100.0) as f32;
         // Room for the value, the label, reset and the two bend buttons.
-        let rest = if compact { 168.0 } else { 190.0 };
-        ui.spacing_mut().slider_width = (ui.available_width() - rest).max(60.0);
+        let gaps = 5.0 * ui.spacing().item_spacing.x;
+        let (rest, least) = if compact {
+            (128.0 + gaps, 30.0)
+        } else {
+            (150.0 + gaps, 60.0)
+        };
+        ui.spacing_mut().slider_width = (ui.available_width() - rest).max(least);
         let slider = egui::Slider::new(&mut pct, -range..=range)
             .clamping(egui::SliderClamping::Edits)
             .fixed_decimals(2)
@@ -844,14 +1111,15 @@ impl TandemApp {
     }
 
     /// LOOP IN, OUT and RELOOP/EXIT, halve and double, and beat loops.
-    fn loop_row(&mut self, ui: &mut egui::Ui, deck: u8, st: &DeckState) {
+    /// `k` < 1 narrows the buttons, for a narrow deck panel.
+    fn loop_row(&mut self, ui: &mut egui::Ui, deck: u8, st: &DeckState, k: f32) {
         let lit = LOOP.gamma_multiply(0.55);
         let off = Color32::from_gray(50);
         let h = 20.0;
         let span = st.loop_span();
         ui.add_enabled_ui(st.track.is_some(), |ui| {
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 3.0;
+                ui.spacing_mut().item_spacing.x = if k < 1.0 { 2.0 } else { 3.0 };
                 let title = RichText::new("LOOP").small().strong();
                 let r = ui.label(if st.looping { title.color(LOOP) } else { title.weak() });
                 if let Some((a, b)) = span {
@@ -865,7 +1133,7 @@ impl TandemApp {
                 let button = |text: &str, on: bool, w: f32| {
                     egui::Button::new(RichText::new(text).small().strong())
                         .fill(if on { lit } else { off })
-                        .min_size(vec2(w, h))
+                        .min_size(vec2(w * k, h))
                 };
                 // Quantize only does anything on a track with a beatgrid.
                 let quantize = self.settings.quantize_loops;
@@ -903,7 +1171,7 @@ impl TandemApp {
                 {
                     self.pending.push(Action::Reloop { deck });
                 }
-                ui.add_space(4.0);
+                ui.add_space(4.0 * k);
                 if ui
                     .add_enabled(span.is_some(), button("×½", false, 24.0))
                     .on_hover_text("Halve the loop")
@@ -918,7 +1186,7 @@ impl TandemApp {
                 {
                     self.pending.push(Action::LoopDouble { deck });
                 }
-                ui.add_space(4.0);
+                ui.add_space(4.0 * k);
                 for beats in BEAT_LOOPS {
                     let on = st.looping && st.loop_beats.is_some_and(|b| (b - beats).abs() < 1e-9);
                     let text = beats_label(beats);
@@ -985,12 +1253,14 @@ impl TandemApp {
         }
     }
 
-    fn mixer_panel(&mut self, ui: &mut egui::Ui, view: &SessionView) {
+    /// The mixer, at least `min_h` tall inside its frame. `short`: the
+    /// window is short, so the booth levels go behind a button.
+    fn mixer_panel(&mut self, ui: &mut egui::Ui, view: &SessionView, min_h: f32, short: bool) {
         let four = self.settings.four_decks;
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
+            ui.set_min_height(min_h);
             if four {
-                ui.set_min_height(2.0 * COMPACT_H + COMPACT_GAP - 14.0);
                 ui.spacing_mut().item_spacing.y = 2.0;
                 let columns = self.knob_grid(ui, view);
                 let chans: Vec<(usize, f32)> = MIXER_ORDER.iter().copied().zip(columns).collect();
@@ -1003,7 +1273,6 @@ impl TandemApp {
                     false,
                 );
             } else {
-                ui.set_min_height(338.0);
                 ui.spacing_mut().item_spacing.y = 3.0;
                 ui.vertical_centered(|ui| ui.label(RichText::new("MIXER").strong()));
                 ui.columns(2, |cols| {
@@ -1024,14 +1293,115 @@ impl TandemApp {
             }
             ui.add_space(4.0);
             self.crossfader_row(ui, view);
-            self.crossfader_curve(ui, view);
-            if four {
+            self.crossfader_curve(ui, view, short);
+            if !short {
                 ui.separator();
-                self.local_levels_compact(ui);
-            } else {
-                ui.separator();
-                self.local_levels(ui);
+                if four {
+                    self.local_levels_compact(ui);
+                } else {
+                    self.local_levels(ui);
+                }
             }
+        });
+    }
+
+    /// The two-channel mixer in less height, for a short or narrow window:
+    /// each channel's knobs beside its fader (A on the left, B on the
+    /// right) and the master meter between them, then the headphone cues
+    /// and crossfader switches, the crossfader, and its curve beside the
+    /// button for the booth levels.
+    fn mixer_compact(&mut self, ui: &mut egui::Ui, view: &SessionView) {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 2.0;
+            let (head_h, row_h, fader_w, master_w, label_w) = (15.0, 17.0, 40.0, 20.0, 34.0);
+            let block_h = head_h + KNOBS.len() as f32 * (row_h + 2.0);
+            let width = ui.available_width();
+            let block = ui
+                .allocate_exact_size(vec2(width, block_h), Sense::hover())
+                .0;
+            let knob_w = (block.width() - 2.0 * fader_w - master_w) / 2.0;
+            let text = ui.visuals().text_color();
+            for (d, &color) in DECK_COLORS.iter().enumerate().take(2) {
+                // A's knobs on the left with their names outside, B's mirrored.
+                let (outer, inner, align) = if d == 0 {
+                    (
+                        block.left(),
+                        block.left() + knob_w,
+                        egui::Align2::LEFT_CENTER,
+                    )
+                } else {
+                    (
+                        block.right(),
+                        block.right() - knob_w,
+                        egui::Align2::RIGHT_CENTER,
+                    )
+                };
+                ui.painter().text(
+                    pos2((outer + inner) / 2.0, block.top() + head_h / 2.0),
+                    egui::Align2::CENTER_CENTER,
+                    deck_letter(d),
+                    egui::FontId::proportional(14.0),
+                    color,
+                );
+                let slider_x = if d == 0 {
+                    (outer + label_w, inner)
+                } else {
+                    (inner, outer - label_w)
+                };
+                for (i, (knob, name)) in KNOBS.into_iter().enumerate() {
+                    let y = block.top() + head_h + i as f32 * (row_h + 2.0) + row_h / 2.0;
+                    ui.painter().text(
+                        pos2(outer, y),
+                        align,
+                        name,
+                        egui::FontId::proportional(10.5),
+                        text,
+                    );
+                    let cell = Rect::from_min_max(
+                        pos2(slider_x.0, y - row_h / 2.0),
+                        pos2(slider_x.1, y + row_h / 2.0),
+                    );
+                    let mut v = knob.get(&view.room.decks[d]);
+                    let resp = ui.put(cell, |ui: &mut egui::Ui| {
+                        ui.spacing_mut().slider_width = cell.width() - 4.0;
+                        ui.add(egui::Slider::new(&mut v, 0.0..=1.0).show_value(false))
+                    });
+                    let resp =
+                        resp.on_hover_text(format!("Deck {} {}", deck_letter(d), knob.tip()));
+                    self.knob_moved(d, knob, v, &resp);
+                }
+            }
+            // The faders inside the knobs, as tall as the knobs.
+            let (xa, xb) = (block.left() + knob_w + 14.0, block.right() - knob_w - 14.0);
+            self.faders(
+                ui,
+                view,
+                block,
+                &[(0, xa), (1, xb)],
+                block.center().x,
+                false,
+            );
+            // Each channel's headphone cue and crossfader switch under it.
+            let row = ui.allocate_exact_size(vec2(width, 19.0), Sense::hover()).0;
+            for (d, left) in [(0, row.left()), (1, row.right() - knob_w - fader_w)] {
+                let cell = Rect::from_min_size(pos2(left, row.top()), vec2(knob_w + fader_w, 19.0));
+                ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .max_rect(cell)
+                        .layout(Layout::left_to_right(Align::Center)),
+                    |ui| {
+                        ui.add_space(((ui.available_width() - 104.0) / 2.0).max(0.0));
+                        ui.toggle_value(&mut self.local_edit.pfl[d], "🎧 CUE")
+                            .on_hover_text("Send this deck to your headphones (your booth only)");
+                        ui.add_space(2.0);
+                        self.xf_assign(ui, d, view);
+                    },
+                );
+            }
+            ui.add_space(2.0);
+            self.crossfader_row(ui, view);
+            self.crossfader_curve(ui, view, true);
         });
     }
 
@@ -1128,9 +1498,19 @@ impl TandemApp {
         knobs.notes(ui);
     }
 
+    /// The booth levels behind a button, for a short window.
+    fn levels_button(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button(RichText::new("🎧 LEVELS").small().strong(), |ui| {
+            self.local_levels(ui)
+        })
+        .response
+        .on_hover_text("Headphones, master and broadcast levels: your booth only");
+    }
+
     /// The crossfader's curve switch. It's part of the room (one mixer, one
-    /// switch), and this booth remembers the last curve it picked.
-    fn crossfader_curve(&mut self, ui: &mut egui::Ui, view: &SessionView) {
+    /// switch), and this booth remembers the last curve it picked. With
+    /// `levels`, the booth levels' button at the end of the row.
+    fn crossfader_curve(&mut self, ui: &mut egui::Ui, view: &SessionView, levels: bool) {
         let cur = view.room.xf_curve;
         let mut picked = None;
         ui.horizontal(|ui| {
@@ -1142,7 +1522,7 @@ impl TandemApp {
             }
             egui::ComboBox::from_id_salt("xf-curve")
                 .selected_text(cur.label())
-                .width(120.0)
+                .width(if levels { 104.0 } else { 120.0 })
                 .show_ui(ui, |ui| {
                     for c in XfCurve::ALL {
                         ui.horizontal(|ui| {
@@ -1156,6 +1536,11 @@ impl TandemApp {
                 })
                 .response
                 .on_hover_text(tip);
+            if levels {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    self.levels_button(ui)
+                });
+            }
         });
         if let Some(curve) = picked {
             self.pending.push(Action::CrossfaderCurve { curve });
@@ -1323,8 +1708,9 @@ impl TandemApp {
         }
     }
 
-    /// The channel faders at their x positions (`chans`: deck, x), each with
-    /// its level meter on the inside, and the master meter at `master_x`.
+    /// A row `h` tall of channel faders at their x positions (`chans`: deck,
+    /// x), each with its level meter on the inside, and the master meter at
+    /// `master_x`.
     fn fader_row(
         &mut self,
         ui: &mut egui::Ui,
@@ -1335,6 +1721,20 @@ impl TandemApp {
         scale: bool,
     ) {
         let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::hover());
+        self.faders(ui, view, row, chans, master_x, scale);
+    }
+
+    /// The faders and meters of `fader_row`, in `row`.
+    fn faders(
+        &mut self,
+        ui: &mut egui::Ui,
+        view: &SessionView,
+        row: Rect,
+        chans: &[(usize, f32)],
+        master_x: f32,
+        scale: bool,
+    ) {
+        let h = row.height();
         let meter_h = h - 8.0;
         for &(d, x) in chans {
             let deck = d as u8;
@@ -2078,4 +2478,115 @@ pub(crate) fn scrolling_waveform(
         egui::FontId::proportional(14.0),
         col,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui_library::{
+        library_height, library_max_height, CENTRAL_MARGIN, LIBRARY_H, LIBRARY_MIN_H,
+        LIBRARY_ROOMY_H,
+    };
+
+    /// A window's inner size in points → the decks area's width and the
+    /// height the library and decks area share (inside the top bar, 36,
+    /// the status bar, 22, and the central panel's margins).
+    fn space(w: f32, h: f32) -> (f32, f32) {
+        (w - CENTRAL_MARGIN, h - 36.0 - 22.0 - CENTRAL_MARGIN)
+    }
+
+    /// The library's height, the layout, and the room its controls get with
+    /// the waveforms at their least.
+    fn plan(w: f32, h: f32, four: bool) -> (f32, DeckLayout, f32) {
+        let (decks_w, room) = space(w, h);
+        let lib = library_height(room, decks_w, four);
+        let layout = DeckLayout::pick(four, decks_w, room - lib);
+        let controls = room - lib - layout.waves_h(WAVE_MIN_H[layout.wave_idx()]);
+        (lib, layout, controls)
+    }
+
+    #[test]
+    fn big_window_keeps_its_layout() {
+        // The usual 1440 × 930 window, and bigger: the library at 330, the
+        // full panels, nothing squeezed.
+        for (w, h) in [(1440.0, 930.0), (2560.0, 1369.0)] {
+            let (lib, layout, controls) = plan(w, h, false);
+            assert_eq!((lib, layout), (LIBRARY_H, DeckLayout::Full));
+            assert!(controls >= FULL_ROW_H);
+            let (lib, layout, controls) = plan(w, h, true);
+            assert_eq!((lib, layout), (LIBRARY_H, DeckLayout::Four));
+            assert!(controls >= FOUR_ROW_H);
+        }
+    }
+
+    #[test]
+    fn laptop_screens_fit_without_scrolling() {
+        // Maximised windows: 1080p at 125%, 1366 × 768, 1080p at 150%.
+        for (w, h) in [(1536.0, 785.0), (1366.0, 689.0), (1280.0, 641.0)] {
+            for four in [false, true] {
+                let (lib, layout, controls) = plan(w, h, four);
+                assert!(lib >= LIBRARY_MIN_H, "{w}×{h} four {four}: library {lib}");
+                assert!(
+                    controls >= layout.row_h().1,
+                    "{w}×{h} {layout:?}: {controls} for the controls"
+                );
+            }
+        }
+        // 1080p at 125% keeps the full two-deck panels, with less library.
+        let (lib, layout, _) = plan(1536.0, 785.0, false);
+        assert_eq!(layout, DeckLayout::Full);
+        assert!((LIBRARY_ROOMY_H..LIBRARY_H).contains(&lib), "{lib}");
+        // Shorter ones swap to compact panels and keep a roomier library.
+        let (lib, layout, _) = plan(1280.0, 641.0, false);
+        assert_eq!(layout, DeckLayout::Compact);
+        assert!(lib > LIBRARY_ROOMY_H, "{lib}");
+    }
+
+    #[test]
+    fn smallest_window_keeps_the_waveforms() {
+        // Down to the smallest window, the waveforms get their least and the
+        // controls a (scrolled) strip; two decks still fit without scrolling.
+        for (w, h) in [(1097.0, 538.0), (MIN_W, MIN_H)] {
+            let (lib, layout, controls) = plan(w, h, false);
+            assert_eq!((lib, layout), (LIBRARY_MIN_H, DeckLayout::Compact));
+            assert!(controls >= COMPACT_ROW_H, "{w}×{h}: {controls}");
+            let (lib, _, controls) = plan(w, h, true);
+            assert_eq!(lib, LIBRARY_MIN_H);
+            assert!(controls >= CONTROLS_MIN_H, "{w}×{h}: {controls}");
+        }
+    }
+
+    const MIN_W: f32 = crate::app::MIN_WINDOW[0];
+    const MIN_H: f32 = crate::app::MIN_WINDOW[1];
+
+    #[test]
+    fn dragged_library_leaves_the_waveforms() {
+        for (w, h) in [(1440.0, 930.0), (1280.0, 641.0), (MIN_W, MIN_H)] {
+            for four in [false, true] {
+                let (decks_w, room) = space(w, h);
+                let max = library_max_height(room, decks_w, four);
+                assert!(max >= library_height(room, decks_w, four));
+                let layout = DeckLayout::pick(four, decks_w, room - max);
+                assert_ne!(layout, DeckLayout::Full);
+                let controls = room - max - layout.waves_h(WAVE_MIN_H[layout.wave_idx()]);
+                assert!(controls >= CONTROLS_MIN_H - 0.01, "{w}×{h}: {controls}");
+            }
+        }
+    }
+
+    #[test]
+    fn full_panels_need_the_width() {
+        assert!(DeckLayout::full_fits_width(space(1440.0, 930.0).0));
+        assert!(DeckLayout::full_fits_width(space(1280.0, 641.0).0));
+        assert!(!DeckLayout::full_fits_width(space(1097.0, 538.0).0));
+        // A narrow window gets compact panels even when it's tall.
+        assert_eq!(
+            DeckLayout::pick(false, space(1100.0, 0.0).0, 900.0),
+            DeckLayout::Compact
+        );
+        // Compact panels narrow their buttons rather than spill over.
+        assert_eq!(button_scale(532.0), 1.0);
+        assert!(button_scale(380.0) < 1.0);
+        assert_eq!(button_scale(100.0), 0.7);
+    }
 }

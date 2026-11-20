@@ -60,7 +60,9 @@ impl TandemApp {
                     ui.label(RichText::new(TERMS_TITLE).strong().size(17.0));
                     ui.label(RichText::new(TERMS_SUMMARY).italics());
                     ui.add_space(6.0);
-                    egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                    // Leave room below for the name, the checkbox and the button.
+                    let h = (ui.available_height() - 130.0).clamp(120.0, 300.0);
+                    egui::ScrollArea::vertical().max_height(h).show(ui, |ui| {
                         ui.label(TERMS_TEXT);
                     });
                 });
@@ -341,7 +343,7 @@ impl TandemApp {
                 ui.label(RichText::new(TERMS_SUMMARY).italics());
                 ui.separator();
                 egui::ScrollArea::vertical()
-                    .max_height(420.0)
+                    .max_height((ctx.screen_rect().height() - 220.0).clamp(150.0, 420.0))
                     .show(ui, |ui| ui.label(TERMS_TEXT));
                 ui.separator();
                 ui.label(
@@ -381,11 +383,18 @@ impl TandemApp {
                     ui.selectable_value(&mut self.ui.settings_tab, SettingsTab::General, "General");
                 });
                 ui.separator();
-                match self.ui.settings_tab {
-                    SettingsTab::Audio => self.audio_settings(ui),
-                    SettingsTab::Controller => self.controller_settings(ui),
-                    SettingsTab::General => self.general_settings(ui),
-                }
+                // On a short window the tab scrolls rather than run off
+                // the bottom of the screen.
+                let tab = self.ui.settings_tab;
+                egui::ScrollArea::vertical()
+                    .id_salt(("settings", tab as u8))
+                    .max_height((ctx.screen_rect().height() - 120.0).max(200.0))
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| match tab {
+                        SettingsTab::Audio => self.audio_settings(ui),
+                        SettingsTab::Controller => self.controller_settings(ui),
+                        SettingsTab::General => self.general_settings(ui),
+                    });
             });
         self.ui.show_settings = open;
     }
@@ -664,7 +673,8 @@ impl TandemApp {
         }
         ui.separator();
         let learning = engine.learn;
-        egui::ScrollArea::vertical().max_height(380.0).show(ui, |ui| {
+        let list_h = (ui.ctx().screen_rect().height() - 400.0).clamp(150.0, 380.0);
+        egui::ScrollArea::vertical().max_height(list_h).show(ui, |ui| {
             egui::Grid::new("mapping").num_columns(4).striped(true).show(ui, |ui| {
                 for target in Target::all() {
                     ui.label(target.label());

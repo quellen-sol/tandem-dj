@@ -65,6 +65,10 @@ fn main() {
         search: arg_after("--dev-search").map(|p| p.to_string_lossy().to_string()),
         broadcast_view: args.iter().any(|a| a == "--broadcast-view"),
         roll: args.iter().any(|a| a == "--dev-roll"),
+        window_size: arg_after("--window-size").and_then(|p| parse_size(&p.to_string_lossy())),
+        zoom: arg_after("--zoom").and_then(|p| p.to_string_lossy().parse().ok()),
+        settings: arg_after("--dev-settings").map(|p| p.to_string_lossy().to_string()),
+        fitted: false,
         shared: false,
         demo_started: false,
         frame: 0,
@@ -76,11 +80,17 @@ fn main() {
         log::error!("panic: {info}");
     }));
 
+    // Opens at 1440 × 930 where that fits; on a smaller screen the app
+    // maximises its window on the first frame (see `TandemApp::fit_window`).
+    let size = dev.window_size.unwrap_or([1440.0, 930.0]);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Tandem")
-            .with_inner_size([1440.0, 930.0])
-            .with_min_inner_size([1100.0, 700.0]),
+            .with_inner_size(size)
+            .with_min_inner_size([
+                app::MIN_WINDOW[0].min(size[0]),
+                app::MIN_WINDOW[1].min(size[1]),
+            ]),
         ..Default::default()
     };
     if let Err(e) = eframe::run_native(
@@ -90,6 +100,12 @@ fn main() {
     ) {
         log::error!("UI failed: {e}");
     }
+}
+
+/// "1280x720" → [1280, 720].
+fn parse_size(s: &str) -> Option<[f32; 2]> {
+    let (w, h) = s.split_once(['x', 'X'])?;
+    Some([w.trim().parse().ok()?, h.trim().parse().ok()?])
 }
 
 /// Let `tandem.exe --self-test` print into the terminal it was run from.
