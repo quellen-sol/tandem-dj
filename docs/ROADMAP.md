@@ -329,6 +329,13 @@ Work through these in order and note anything that fails. `tandem.log` (Settings
   - Test: on a laptop at 150% display scaling (or a window about 1280 × 640), are both waveforms moving, and do every deck control, the mixer and the library still work? Does **🎧 LEVELS** open your headphone and master levels? Switch on **4 decks**: are all four waveforms there?
 - No protocol change: v0.11.9 and v0.11.10 can share a room.
 
+### v0.11.11
+
+- **The Denon SC Live 4 maps itself, and its ROLL pads roll.** Press ROLL and hold a pad: the deck loops 1/16, 1/8, ¼ or ½ beat (top row) or 1, 2, 4 or 8 beats (bottom row) while the track runs on underneath, as on the FLX6, and the pad lights up. HOT CUE gives hot cues (SHIFT + pad clears one) and LOOP gives beat loops of ¼ to 32 beats; each side keeps its own mode, and SLICER leaves the pads as they were. SHIFT + CUE, SHIFT + SYNC, SHIFT + tempo fader, the browse press, MASTER and the headphone level work too. A hand-made SC_LIVE_4.json becomes the built-in mapping by itself, keeping its jog calibration. Not yet tried on the hardware.
+- Other controllers whose SHIFT and pad mode buttons don't change what they send can learn **SHIFT** and **Pad mode**: hold SHIFT or pick the mode before learning a control, and it does that only with SHIFT, or only in that pad mode.
+  - Test (on the SC Live 4, in computer mode before opening Tandem): press ROLL on the left and hold pad 4 on a playing deck A for a bar, then let go. Does it stutter ½ beat and carry on in time, with ROLL and the pad lit? Press HOT CUE: are the pads hot cues again, with the right side unchanged? Does SHIFT + pad clear a hot cue?
+- No protocol change: v0.11.10 and v0.11.11 can share a room.
+
 ## Next candidates
 
 Rough priority order:

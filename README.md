@@ -4,7 +4,7 @@ Back-to-back DJing with a friend, from anywhere. Two DJs in different places sha
 
 **Personal, non-commercial use only.** See [TERMS.md](TERMS.md).
 
-> **Status: v0.11.** Windows only. Rooms, four decks, BPM and key detection, beatgrid editing, sync, key lock, loops, level meters, crossfader curves, jog wheels that spin on like Serato, a broadcast view for streams, broadcaster-only booths and a ready-made DDJ-FLX6 mapping all work; this is still an early version for two people (and a broadcaster) to try. See [docs/ROADMAP.md](docs/ROADMAP.md) for what's next and a test plan.
+> **Status: v0.11.** Windows only. Rooms, four decks, BPM and key detection, beatgrid editing, sync, key lock, loops, level meters, crossfader curves, jog wheels that spin on like Serato, a broadcast view for streams, broadcaster-only booths and a ready-made DDJ-FLX6 mapping all work, and there's a ready-made Denon SC Live 4 mapping, not yet tried on the hardware; this is still an early version for two people (and a broadcaster) to try. See [docs/ROADMAP.md](docs/ROADMAP.md) for what's next and a test plan.
 
 ## How it works
 
