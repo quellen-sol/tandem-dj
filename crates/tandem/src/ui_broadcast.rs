@@ -8,20 +8,20 @@
 
 use crate::app::TandemApp;
 use crate::ui_decks::{
-    fmt_time, keys_fit, overview, scrolling_waveform, AMBER, DECK_COLORS, GREEN, LOOP,
+    fmt_time, keys_fit, overview, scrolling_waveform, AMBER, DECK_COLORS, GREEN, LOOP, MIXER_ORDER,
+    SYNC_BLUE,
 };
 use crate::ui_meters::MeterView;
 use eframe::egui::{
     self, pos2, vec2, Align, Color32, Layout, Margin, Rect, RichText, Sense, Stroke,
 };
 use tandem_core::mapping::beats_label;
-use tandem_core::model::{DeckState, DECKS};
+use tandem_core::model::{DeckState, XfSide, DECKS};
 use tandem_core::session::{deck_letter, BroadcastView};
 
 const BG: Color32 = Color32::from_gray(10);
 const CARD: Color32 = Color32::from_gray(22);
 const TRACK: Color32 = Color32::from_gray(40);
-const SYNC_BLUE: Color32 = Color32::from_rgb(40, 120, 200);
 const KEY_PURPLE: Color32 = Color32::from_rgb(110, 70, 170);
 const GAP: f32 = 12.0;
 
@@ -65,28 +65,50 @@ impl TandemApp {
     }
 }
 
-/// Header, then deck A | mixer | deck B, then both scrolling waveforms.
+/// Header, then deck A | mixer | deck B, then the scrolling waveforms.
+/// While deck C or D has a track: A over C | mixer | B over D, and four
+/// waveforms.
 fn draw(ui: &mut egui::Ui, b: &BroadcastView, meters: &MeterView) {
+    let four = b.room.decks[2..].iter().any(|d| d.track.is_some());
+    let decks = if four { DECKS } else { 2 };
     header(ui, b);
     ui.add_space(GAP);
     let w = ui.available_width();
-    let mixer_w = (w * 0.17).clamp(150.0, 230.0);
+    let mixer_w = if four {
+        (w * 0.22).clamp(190.0, 300.0)
+    } else {
+        (w * 0.17).clamp(150.0, 230.0)
+    };
     let deck_w = ((w - mixer_w - 2.0 * GAP) / 2.0).max(150.0);
-    let row_h = (ui.available_height() * 0.38).clamp(170.0, 300.0);
+    let card_h = if four {
+        (ui.available_height() * 0.27).clamp(110.0, 230.0)
+    } else {
+        (ui.available_height() * 0.38).clamp(170.0, 300.0)
+    };
+    let row_h = if four { 2.0 * card_h + GAP } else { card_h };
     ui.allocate_ui_with_layout(vec2(w, row_h), Layout::left_to_right(Align::Min), |ui| {
-        ui.spacing_mut().item_spacing.x = GAP;
-        let cell = |ui: &mut egui::Ui, w: f32, add: &dyn Fn(&mut egui::Ui)| {
-            ui.allocate_ui_with_layout(vec2(w, row_h), Layout::top_down(Align::Min), |ui| {
-                card(ui, add)
+        ui.spacing_mut().item_spacing = vec2(GAP, GAP);
+        let column = |ui: &mut egui::Ui, side: [usize; 2]| {
+            ui.allocate_ui_with_layout(vec2(deck_w, row_h), Layout::top_down(Align::Min), |ui| {
+                for &d in &side[..decks / 2] {
+                    ui.allocate_ui_with_layout(
+                        vec2(deck_w, card_h),
+                        Layout::top_down(Align::Min),
+                        |ui| card(ui, &|ui| deck_card(ui, d, b)),
+                    );
+                }
             });
         };
-        cell(ui, deck_w, &|ui| deck_card(ui, 0, b));
-        cell(ui, mixer_w, &|ui| mixer(ui, b, meters));
-        cell(ui, deck_w, &|ui| deck_card(ui, 1, b));
+        column(ui, [0, 2]);
+        ui.allocate_ui_with_layout(vec2(mixer_w, row_h), Layout::top_down(Align::Min), |ui| {
+            card(ui, &|ui| mixer(ui, b, meters, four))
+        });
+        column(ui, [1, 3]);
     });
     ui.add_space(GAP);
-    let h = ((ui.available_height() - GAP) / 2.0).max(40.0);
-    for d in 0..DECKS {
+    let n = decks as f32;
+    let h = ((ui.available_height() - (n - 1.0) * GAP) / n).max(if four { 24.0 } else { 40.0 });
+    for d in 0..decks {
         if d > 0 {
             ui.add_space(GAP);
         }
@@ -159,8 +181,10 @@ fn deck_card(ui: &mut egui::Ui, d: usize, b: &BroadcastView) {
     let pos = st.position_at(b.t);
     let col = DECK_COLORS[d];
     // Text scales with the window, so a small capture stays readable and a
-    // big one doesn't look empty.
-    let s = (ui.available_width() / 480.0).clamp(0.7, 1.4);
+    // big one doesn't look empty. A short card (four decks) scales down to fit.
+    let s = (ui.available_width() / 480.0)
+        .min((ui.available_height() - 30.0) / 120.0)
+        .clamp(0.6, 1.4);
 
     ui.horizontal(|ui| {
         let (r, _) = ui.allocate_exact_size(vec2(26.0, 26.0) * s, Sense::hover());
@@ -182,7 +206,9 @@ fn deck_card(ui: &mut egui::Ui, d: usize, b: &BroadcastView) {
             };
             chip(ui, &text, LOOP.gamma_multiply(0.7), 13.0 * s);
         }
-        if st.synced {
+        if b.room.master == Some(d as u8) {
+            chip(ui, "MASTER", SYNC_BLUE, 13.0 * s);
+        } else if st.synced {
             chip(ui, "SYNC", SYNC_BLUE, 13.0 * s);
         }
         if st.key_shift != 0 {
@@ -247,12 +273,11 @@ fn deck_card(ui: &mut egui::Ui, d: usize, b: &BroadcastView) {
             ui.add_space(8.0 * s);
         }
         if let Some(k) = st.sounding_key() {
-            let other = &b.room.decks[(d + 1) % 2];
-            let fits = other.track.is_some()
-                && other
-                    .sounding_key()
-                    .map(|o| keys_fit(k, o))
-                    .unwrap_or(false);
+            let fits = b
+                .room
+                .mix_partner(d)
+                .and_then(|p| b.room.decks[p].sounding_key())
+                .is_some_and(|o| keys_fit(k, o));
             let text = RichText::new(tandem_core::keys::camelot(k))
                 .size(big)
                 .strong();
@@ -272,54 +297,74 @@ fn deck_card(ui: &mut egui::Ui, d: usize, b: &BroadcastView) {
 
 /// Read-only mixer: EQ and filter as bars from centre, channel faders with
 /// their level meters, the master meter between them, and the crossfader
-/// with the name of whoever last moved it.
-fn mixer(ui: &mut egui::Ui, b: &BroadcastView, meters: &MeterView) {
+/// with the name of whoever last moved it. Four channels (C A B D) while
+/// decks C and D are on screen, with the knob names once, on the left.
+fn mixer(ui: &mut egui::Ui, b: &BroadcastView, meters: &MeterView, four: bool) {
+    let order: &[usize] = if four { &MIXER_ORDER } else { &[0, 1] };
     ui.vertical_centered(|ui| ui.label(RichText::new("MIXER").strong().weak()));
     ui.add_space(4.0);
     let xf_h = 44.0;
     let strip_h = (ui.available_height() - xf_h).max(60.0);
-    ui.allocate_ui_with_layout(
-        vec2(ui.available_width(), strip_h),
-        Layout::left_to_right(Align::Min),
-        |ui| {
-            let faders = ui.columns(DECKS, |cols| {
-                let mut faders = [Rect::NOTHING; DECKS];
-                for (d, ui) in cols.iter_mut().enumerate() {
-                    faders[d] = channel(ui, d, &b.room.decks[d]);
-                }
-                faders
-            });
-            let p = ui.painter();
-            for (d, f) in faders.iter().enumerate() {
-                let inward = if d == 0 { 1.0 } else { -1.0 };
-                let x = f.center().x + inward * 17.0;
-                let r = Rect::from_center_size(pos2(x, f.center().y), vec2(6.0, f.height()));
-                meters.channel(p, r, d);
-            }
-            let mid = (faders[0].center() + faders[1].center().to_vec2()) / 2.0;
-            meters.master(
-                p,
-                Rect::from_center_size(mid, vec2(14.0, faders[0].height())),
+    let (area, _) = ui.allocate_exact_size(vec2(ui.available_width(), strip_h), Sense::hover());
+    let label_w = if four { 26.0 } else { 0.0 };
+    let col_w = (area.width() - label_w) / order.len() as f32;
+    let mut faders = Vec::with_capacity(order.len());
+    for (i, &d) in order.iter().enumerate() {
+        let left = area.left() + label_w + i as f32 * col_w;
+        let rect = Rect::from_min_size(pos2(left, area.top()), vec2(col_w, area.height()))
+            .shrink2(vec2(3.0, 0.0));
+        let fader = ui
+            .scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                channel(ui, d, &b.room.decks[d], !four, b.room.xf_assign[d])
+            })
+            .inner;
+        faders.push(fader);
+    }
+    let p = ui.painter();
+    if four {
+        for (k, label) in KNOB_LABELS.iter().enumerate() {
+            let y = area.top() + 7.0 + k as f32 * 18.0;
+            p.text(
+                pos2(area.left(), y),
+                egui::Align2::LEFT_CENTER,
+                *label,
+                egui::FontId::proportional(10.0),
+                Color32::from_gray(140),
             );
-        },
+        }
+    }
+    let half = order.len() / 2;
+    let mid = (faders[half - 1].center().x + faders[half].center().x) / 2.0;
+    for (i, (&d, f)) in order.iter().zip(&faders).enumerate() {
+        let inward = if i < half { 1.0 } else { -1.0 };
+        let x = f.center().x + inward * if four { 13.0 } else { 17.0 };
+        let r = Rect::from_center_size(pos2(x, f.center().y), vec2(6.0, f.height()));
+        meters.channel(p, r, d);
+    }
+    meters.master(
+        p,
+        Rect::from_center_size(
+            pos2(mid, faders[0].center().y),
+            vec2(if four { 10.0 } else { 14.0 }, faders[0].height()),
+        ),
     );
-    crossfader(ui, b);
+    crossfader(ui, b, order);
 }
 
-/// One channel's knobs and fader. Returns the fader's track.
-fn channel(ui: &mut egui::Ui, d: usize, st: &DeckState) -> Rect {
+const KNOB_LABELS: [&str; 4] = ["HI", "MID", "LOW", "FLT"];
+
+/// One channel's knobs and fader (with its crossfader side under it while
+/// it's off its usual side). Returns the fader's track.
+fn channel(ui: &mut egui::Ui, d: usize, st: &DeckState, labels: bool, side: XfSide) -> Rect {
     let col = DECK_COLORS[d];
     ui.spacing_mut().item_spacing.y = 4.0;
-    for (label, v) in [
-        ("HI", st.eq[2]),
-        ("MID", st.eq[1]),
-        ("LOW", st.eq[0]),
-        ("FLT", st.filter),
-    ] {
-        knob_bar(ui, label, v, col);
+    let values = [st.eq[2], st.eq[1], st.eq[0], st.filter];
+    for (label, v) in KNOB_LABELS.iter().zip(values) {
+        knob_bar(ui, labels.then_some(*label), v, col);
     }
     ui.add_space(4.0);
-    let h = (ui.available_height() - 4.0).max(30.0);
+    let moved = side != XfSide::default_for(d);
+    let h = (ui.available_height() - if moved { 18.0 } else { 4.0 }).max(30.0);
     let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::hover());
     let track = Rect::from_center_size(r.center(), vec2(16.0, r.height()));
     let p = ui.painter();
@@ -337,21 +382,32 @@ fn channel(ui: &mut egui::Ui, d: usize, st: &DeckState) -> Rect {
         ],
         Stroke::new(2.0_f32, Color32::WHITE),
     );
+    if moved {
+        let text = match side {
+            XfSide::A => "◀",
+            XfSide::Thru => "THRU",
+            XfSide::B => "▶",
+        };
+        ui.vertical_centered(|ui| ui.label(RichText::new(text).small().weak()));
+    }
     track
 }
 
-/// A knob (0.5 = centre) as a bar growing left or right from the middle.
-fn knob_bar(ui: &mut egui::Ui, label: &str, v: f32, col: Color32) {
+/// A knob (0.5 = centre) as a bar growing left or right from the middle,
+/// with its name on the left if given.
+fn knob_bar(ui: &mut egui::Ui, label: Option<&str>, v: f32, col: Color32) {
     let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 14.0), Sense::hover());
     let p = ui.painter();
-    let label_w = 28.0;
-    p.text(
-        pos2(r.left(), r.center().y),
-        egui::Align2::LEFT_CENTER,
-        label,
-        egui::FontId::proportional(10.0),
-        Color32::from_gray(140),
-    );
+    let label_w = if label.is_some() { 28.0 } else { 0.0 };
+    if let Some(label) = label {
+        p.text(
+            pos2(r.left(), r.center().y),
+            egui::Align2::LEFT_CENTER,
+            label,
+            egui::FontId::proportional(10.0),
+            Color32::from_gray(140),
+        );
+    }
     let bar = Rect::from_min_max(
         pos2(r.left() + label_w, r.top() + 3.0),
         pos2(r.right(), r.bottom() - 3.0),
@@ -375,27 +431,40 @@ fn knob_bar(ui: &mut egui::Ui, label: &str, v: f32, col: Color32) {
     );
 }
 
-fn crossfader(ui: &mut egui::Ui, b: &BroadcastView) {
+/// The crossfader, with the decks on each side (of `shown`) at its ends.
+fn crossfader(ui: &mut egui::Ui, b: &BroadcastView, shown: &[usize]) {
     let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::hover());
     let p = ui.painter();
     let font = egui::FontId::proportional(13.0);
-    p.text(
-        pos2(r.left(), r.center().y),
-        egui::Align2::LEFT_CENTER,
-        "A",
-        font.clone(),
-        DECK_COLORS[0],
-    );
-    p.text(
-        pos2(r.right(), r.center().y),
-        egui::Align2::RIGHT_CENTER,
-        "B",
-        font,
-        DECK_COLORS[1],
-    );
+    let mut sides = [Vec::new(), Vec::new()];
+    for d in 0..DECKS {
+        let side = b.room.xf_assign[d];
+        if shown.contains(&d) && side != XfSide::Thru {
+            sides[(side == XfSide::B) as usize].push(d);
+        }
+    }
+    let letter_w = 9.0;
+    for (k, decks) in sides.iter().enumerate() {
+        for (i, &d) in decks.iter().enumerate() {
+            let (x, align) = if k == 0 {
+                (r.left() + i as f32 * letter_w, egui::Align2::LEFT_CENTER)
+            } else {
+                let i = decks.len() - 1 - i;
+                (r.right() - i as f32 * letter_w, egui::Align2::RIGHT_CENTER)
+            };
+            p.text(
+                pos2(x, r.center().y),
+                align,
+                deck_letter(d),
+                font.clone(),
+                DECK_COLORS[d],
+            );
+        }
+    }
+    let inset = |n: usize| 7.0 + letter_w * n.max(1) as f32;
     let track = Rect::from_min_max(
-        pos2(r.left() + 16.0, r.center().y - 2.0),
-        pos2(r.right() - 16.0, r.center().y + 2.0),
+        pos2(r.left() + inset(sides[0].len()), r.center().y - 2.0),
+        pos2(r.right() - inset(sides[1].len()), r.center().y + 2.0),
     );
     p.rect_filled(track, 2.0, TRACK);
     let x = track.left() + b.room.crossfader.clamp(0.0, 1.0) * track.width();

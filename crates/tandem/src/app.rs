@@ -13,7 +13,7 @@ use tandem_core::config::{FrameRate, LibrarySort, Paths, Settings};
 use tandem_core::library::{self, LibTrack, Library, SortRow, SourceKind};
 use tandem_core::mapping::MidiOut;
 use tandem_core::meter::LevelMeters;
-use tandem_core::model::{Action, TrackId, XfCurve, DECKS};
+use tandem_core::model::{deck_letter, Action, RoomState, TrackId, XfCurve, DECKS};
 use tandem_core::protocol::TrackInfo;
 use tandem_core::render::LocalParams;
 use tandem_core::serato::SeratoCrate;
@@ -162,11 +162,15 @@ pub struct UiState {
     pub grid_edit: [bool; DECKS],
     /// The broadcast window is open.
     pub broadcast_view: bool,
+    /// Decks C and D as last seen (track, playing), to notice when one
+    /// gets a track or starts playing.
+    pub cd_seen: [(Option<TrackId>, bool); 2],
 }
 
 /// Developer options: `--screenshot <file.bmp>` saves the window and exits;
 /// `--demo` loads the first two library tracks and starts playing (deck B
-/// synced, key-matched and on a 4-beat loop);
+/// synced, key-matched and on a 4-beat loop); `--demo4` does that on four
+/// decks (C synced and playing too, D cued and through the crossfader);
 /// `--broadcast-view` opens the broadcast window at start;
 /// `--dev-host <port>` / `--dev-join <addr>` host or join room DEVTEST,
 /// with `--dev-broadcaster` joining it as a broadcaster;
@@ -175,6 +179,7 @@ pub struct DevOpts {
     pub screenshot: Option<PathBuf>,
     pub shot_frame: u64,
     pub demo: bool,
+    pub demo4: bool,
     pub host_port: Option<u16>,
     pub join: Option<String>,
     pub join_broadcaster: bool,
@@ -301,6 +306,7 @@ impl TandemApp {
             terms_checked: false,
             grid_edit: [false; DECKS],
             broadcast_view: dev.broadcast_view,
+            cd_seen: [(None, false); 2],
         };
         let local_edit = settings.local;
         Self {
@@ -377,6 +383,35 @@ impl TandemApp {
             self.settings.audio.broadcaster_delay_ms
         } else {
             self.settings.audio.broadcast_delay_ms
+        }
+    }
+
+    /// Decks on screen: A and B, and C and D in the four-deck view.
+    pub(crate) fn shown_decks(&self) -> usize {
+        if self.settings.four_decks {
+            DECKS
+        } else {
+            2
+        }
+    }
+
+    /// Switch to the four-deck view when deck C or D gets a track or starts
+    /// playing (from this booth, the controller or your partner), so
+    /// nothing that's happening is off screen.
+    fn follow_four_decks(&mut self, room: &RoomState) {
+        for (i, d) in room.decks[2..].iter().enumerate() {
+            let seen = (d.track, d.playing);
+            let prev = std::mem::replace(&mut self.ui.cd_seen[i], seen);
+            let news = (seen.0.is_some() && seen.0 != prev.0) || (seen.1 && !prev.1);
+            // A broadcaster booth has no decks on screen to switch.
+            if news && !self.settings.four_decks && !self.audio_broadcaster {
+                self.settings.four_decks = true;
+                self.mark_dirty();
+                self.toast(format!(
+                    "Deck {} is in use: showing four decks.",
+                    deck_letter(i + 2)
+                ));
+            }
         }
     }
 
@@ -600,19 +635,23 @@ impl TandemApp {
         }
     }
 
-    /// First deck that isn't playing.
-    /// The deck to load into on double-click: a stopped one, otherwise the
-    /// one that's quieter in the mix.
+    /// The deck to load into on double-click: the first one on screen
+    /// that's stopped, otherwise the one that's quietest in the mix.
     pub(crate) fn free_deck(&self, view: &SessionView) -> Option<usize> {
-        (0..DECKS)
+        let shown = self.shown_decks();
+        (0..shown)
             .find(|d| !view.decks[*d].state.playing)
             .or_else(|| {
                 let gain = |d: usize| {
                     let room = &view.room;
                     tandem_core::render::fader_gain(room.decks[d].volume)
-                        * tandem_core::render::xfader_gain(room.xf_curve, d, room.crossfader)
+                        * tandem_core::render::xfader_gain(
+                            room.xf_curve,
+                            room.xf_assign[d],
+                            room.crossfader,
+                        )
                 };
-                (0..DECKS).min_by(|a, b| gain(*a).partial_cmp(&gain(*b)).unwrap())
+                (0..shown).min_by(|a, b| gain(*a).partial_cmp(&gain(*b)).unwrap())
             })
     }
 
@@ -687,6 +726,7 @@ impl eframe::App for TandemApp {
         let view = view;
         self.local_edit = view.local;
         self.follow_role(&view);
+        self.follow_four_decks(&view.room);
         self.take_levels();
         self.handle_midi_queue(&view);
         self.refresh_filter(&view);
@@ -717,15 +757,15 @@ impl TandemApp {
             }
         }
         if self.dev.demo {
+            let decks = if self.dev.demo4 { DECKS } else { 2 };
             if f == 120 {
-                for d in 0..DECKS {
+                for d in 0..decks {
                     if let Some(item) = self.item_at(d, view) {
                         self.load(d, item, view);
                     }
                 }
             }
-            let loaded = view
-                .decks
+            let loaded = view.decks[..decks]
                 .iter()
                 .all(|d| d.state.track.is_some() && d.audio.is_some());
             if f >= 200 && loaded && !self.dev.demo_started {
@@ -754,6 +794,23 @@ impl TandemApp {
                     deck: 1,
                     beats: 4.0,
                 });
+                if self.dev.demo4 {
+                    s.act(Action::Seek { deck: 2, pos: 30.0 });
+                    s.act(Action::Sync { deck: 2, on: true });
+                    s.act(Action::Play { deck: 2 });
+                    s.act(Action::HotCue { deck: 2, slot: 3 });
+                    s.act(Action::Volume { deck: 2, v: 0.6 });
+                    s.act(Action::Seek { deck: 3, pos: 15.0 });
+                    s.act(Action::Eq {
+                        deck: 3,
+                        band: 0,
+                        v: 0.1,
+                    });
+                    s.act(Action::XfAssign {
+                        deck: 3,
+                        side: tandem_core::model::XfSide::Thru,
+                    });
+                }
                 drop(s);
                 self.dev.frame = self.dev.shot_frame.saturating_sub(600);
             }

@@ -6,13 +6,22 @@ use eframe::egui::{self, pos2, vec2, Align, Color32, Layout, Rect, RichText, Sen
 use tandem_core::audio::PEAK_BLOCK;
 use tandem_core::grid::{BeatGrid, Marker, MAX_MARKERS};
 use tandem_core::mapping::beats_label;
-use tandem_core::model::{Action, DeckState, XfCurve, BEAT_LOOPS, DECKS};
+use tandem_core::model::{Action, DeckState, XfCurve, XfSide, BEAT_LOOPS, DECKS, HOT_CUES};
 use tandem_core::session::{deck_letter, DeckView, RoleView, SessionView, TrackStatus};
 
 pub const DECK_COLORS: [Color32; DECKS] = [
     Color32::from_rgb(255, 146, 60),
     Color32::from_rgb(70, 190, 255),
+    Color32::from_rgb(185, 130, 255),
+    Color32::from_rgb(170, 225, 70),
 ];
+/// Mixer channels left to right in the four-deck view, as on a
+/// four-channel DJ mixer (and the DDJ-FLX6): C, A, B, D.
+pub(crate) const MIXER_ORDER: [usize; DECKS] = [2, 0, 1, 3];
+/// A deck panel's height in the four-deck view, and the gap between two.
+const COMPACT_H: f32 = 160.0;
+const COMPACT_GAP: f32 = 4.0;
+pub(crate) const SYNC_BLUE: Color32 = Color32::from_rgb(40, 120, 200);
 const HOT_CUE_COLORS: [Color32; 8] = [
     Color32::from_rgb(230, 60, 60),
     Color32::from_rgb(255, 160, 40),
@@ -149,6 +158,20 @@ impl TandemApp {
                     };
                     ui.toggle_value(&mut self.ui.broadcast_view, "Broadcast view")
                         .on_hover_text(tip);
+                    // Decks C and D can't be hidden while one is playing.
+                    let busy = view.room.decks[2..].iter().any(|d| d.playing);
+                    let mut four = self.settings.four_decks;
+                    if !broadcasting {
+                        let r = ui
+                            .add_enabled(!(busy && four), egui::SelectableLabel::new(four, "4 decks"))
+                            .on_hover_text("Show decks C and D: A and C on the left, B and D on the right, and a four-channel mixer. It switches on by itself when deck C or D gets a track.")
+                            .on_disabled_hover_text("Deck C or D is playing.");
+                        if r.clicked() {
+                            four = !four;
+                            self.settings.four_decks = four;
+                            self.mark_dirty();
+                        }
+                    }
                 });
             });
             ui.add_space(2.0);
@@ -225,6 +248,9 @@ impl TandemApp {
     }
 
     pub(crate) fn decks_area(&mut self, ui: &mut egui::Ui, view: &SessionView) {
+        if self.settings.four_decks {
+            return self.four_decks_area(ui, view);
+        }
         let mixer_w = 290.0;
         let gap = ui.spacing().item_spacing.x;
         let deck_w = ((ui.available_width() - mixer_w - 2.0 * gap) / 2.0).max(260.0);
@@ -242,6 +268,47 @@ impl TandemApp {
         });
         ui.add_space(6.0);
         let h = ((ui.available_height() - 8.0) / 2.0).clamp(40.0, 90.0);
+        for d in 0..2 {
+            scrolling_waveform(ui, d, &view.decks[d], view.now, h, self.ui.grid_edit[d]);
+        }
+    }
+
+    /// Four decks: A over C on the left, B over D on the right, each in a
+    /// compact panel, the four-channel mixer between them, and all four
+    /// scrolling waveforms underneath.
+    fn four_decks_area(&mut self, ui: &mut egui::Ui, view: &SessionView) {
+        let mixer_w = 344.0;
+        let gap = ui.spacing().item_spacing.x;
+        let deck_w = ((ui.available_width() - mixer_w - 2.0 * gap) / 2.0).max(240.0);
+        let top_h = 2.0 * COMPACT_H + COMPACT_GAP;
+        ui.with_layout(Layout::left_to_right(Align::Min), |ui| {
+            for column in [[0, 2], [1, 3]] {
+                ui.allocate_ui_with_layout(
+                    vec2(deck_w, top_h),
+                    Layout::top_down(Align::Min),
+                    |ui| {
+                        ui.spacing_mut().item_spacing.y = COMPACT_GAP;
+                        for d in column {
+                            ui.allocate_ui_with_layout(
+                                vec2(deck_w, COMPACT_H),
+                                Layout::top_down(Align::Min),
+                                |ui| self.deck_panel_compact(ui, d, view),
+                            );
+                        }
+                    },
+                );
+                if column[0] == 0 {
+                    ui.allocate_ui_with_layout(
+                        vec2(mixer_w, top_h),
+                        Layout::top_down(Align::Min),
+                        |ui| self.mixer_panel(ui, view),
+                    );
+                }
+            }
+        });
+        ui.add_space(6.0);
+        let spacing = ui.spacing().item_spacing.y;
+        let h = ((ui.available_height() - 8.0 - 3.0 * spacing) / 4.0).clamp(26.0, 80.0);
         for d in 0..DECKS {
             scrolling_waveform(ui, d, &view.decks[d], view.now, h, self.ui.grid_edit[d]);
         }
@@ -273,34 +340,10 @@ impl TandemApp {
                     ui.label(RichText::new("SCRATCH").small().strong().color(AMBER));
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let editing = &mut self.ui.grid_edit[d];
-                    let fill = if *editing { MARKER.gamma_multiply(0.55) } else { Color32::from_gray(50) };
-                    if ui
-                        .add_enabled(
-                            st.track.is_some(),
-                            egui::Button::new(RichText::new("GRID").small().strong()).fill(fill),
-                        )
-                        .on_hover_text("Edit the beatgrid: set markers, ADJUST the BPM, SLIP the beats into place.")
-                        .clicked()
-                    {
-                        *editing = !*editing;
-                    }
-                    if let (Some(g), Some(_)) = (st.grid, st.track) {
-                        let (bar, beat) = g.bar_beat_at(pos);
-                        ui.monospace(RichText::new(format!("{bar}.{beat}")).strong())
-                            .on_hover_text("Bar.beat. Bar 1 is the first grid marker; the bars before it count down -1, -2…, so you can park the track a bar or two early, press play and wait for the 1.");
-                        ui.label(RichText::new("bar").small().weak());
-                    }
+                    self.grid_button(ui, d, &st, pos);
                 });
             });
-            let (title, artist) = match &dv.meta {
-                Some(m) => (m.title.clone(), m.artist.clone()),
-                None if st.track.is_some() => ("…".to_string(), String::new()),
-                None => (
-                    "Empty".to_string(),
-                    "Double-click a track in the library to load it".to_string(),
-                ),
-            };
+            let (title, artist) = track_names(dv);
             ui.add(egui::Label::new(RichText::new(title).size(17.0).strong()).truncate());
             ui.add(egui::Label::new(RichText::new(artist).weak()).truncate());
             let status = deck_status(dv, view);
@@ -309,32 +352,7 @@ impl TandemApp {
                 None => RichText::new(" ").small(),
             });
 
-            ui.horizontal(|ui| {
-                ui.monospace(RichText::new(fmt_time(pos)).size(15.0));
-                ui.monospace(RichText::new(format!("-{}", fmt_time(st.duration - pos))).weak());
-                ui.separator();
-                let bpm = st.effective_bpm_at(view.now);
-                match bpm {
-                    Some(b) => ui.monospace(RichText::new(format!("{b:.2} BPM")).size(15.0)),
-                    None if st.track.is_some() => ui.monospace(RichText::new("no beat").weak()),
-                    None => ui.monospace(RichText::new("--- BPM").weak()),
-                };
-                ui.monospace(format!("{:+.2}%", (st.tempo - 1.0) * 100.0));
-                ui.separator();
-                let other = &view.room.decks[(d + 1) % 2];
-                match st.sounding_key() {
-                    Some(k) => {
-                        let fits = other.sounding_key().map(|o| keys_fit(k, o)).unwrap_or(false);
-                        let text = RichText::new(format!("{} {}", tandem_core::keys::camelot(k), tandem_core::keys::name(k))).size(15.0).strong();
-                        ui.label(if fits { text.color(GREEN) } else { text })
-                            .on_hover_text(if fits { "Harmonically compatible with the other deck" } else { "Key (Camelot)" });
-                    }
-                    None if st.track.is_some() => {
-                        ui.monospace(RichText::new("key ?").weak());
-                    }
-                    None => {}
-                }
-            });
+            ui.horizontal(|ui| deck_readout(ui, d, view, pos, 15.0));
 
             if let Some(seek) = overview(ui, dv, pos, col, self.ui.grid_edit[d], 42.0, true) {
                 self.pending.push(Action::Seek { deck, pos: seek });
@@ -342,91 +360,11 @@ impl TandemApp {
 
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                let big = vec2(62.0, 40.0);
-                let primary = ui.input(|i| i.pointer.primary_down());
-                let cue_fill = if st.cue_preview {
-                    AMBER.gamma_multiply(0.6)
-                } else {
-                    Color32::from_gray(50)
-                };
-                let r = ui
-                    .add(
-                        egui::Button::new(RichText::new("CUE").strong().size(15.0))
-                            .min_size(big)
-                            .fill(cue_fill),
-                    )
-                    .on_hover_text("Right-click (or SHIFT + CUE): back to the start of the track.");
-                let (down, up) =
-                    self.hold(format!("cue{d}"), r.is_pointer_button_down_on() && primary);
-                if down {
-                    self.pending.push(Action::CueDown { deck });
-                }
-                if up {
-                    self.pending.push(Action::CueUp { deck });
-                }
-                if r.secondary_clicked() {
-                    self.pending.push(Action::Seek { deck, pos: 0.0 });
-                }
-                let playing = st.playing && !st.cue_preview;
-                let play_fill = if playing {
-                    GREEN.gamma_multiply(0.45)
-                } else {
-                    Color32::from_gray(50)
-                };
-                let r = ui.add(
-                    egui::Button::new(RichText::new(if playing { "⏸" } else { "▶" }).size(18.0))
-                        .min_size(big)
-                        .fill(play_fill),
-                );
-                if self
-                    .hold(format!("play{d}"), r.is_pointer_button_down_on() && primary)
-                    .0
-                {
-                    self.pending.push(if playing {
-                        Action::Pause { deck }
-                    } else {
-                        Action::Play { deck }
-                    });
-                }
+                self.transport(ui, d, &st, vec2(62.0, 40.0));
                 ui.add_space(8.0);
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing = vec2(3.0, 2.0);
-                    for row in 0..2u8 {
-                        ui.horizontal(|ui| {
-                            for slot in row * 4..row * 4 + 4 {
-                                let set = st.hot_cues[slot as usize].is_some();
-                                let fill = if set {
-                                    HOT_CUE_COLORS[slot as usize].gamma_multiply(0.7)
-                                } else {
-                                    Color32::from_gray(35)
-                                };
-                                let r = ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new(format!("{}", slot + 1)).strong(),
-                                        )
-                                        .min_size(vec2(34.0, 19.0))
-                                        .fill(fill),
-                                    )
-                                    .on_hover_text(
-                                        "Click: set / jump to hot cue. While paused, plays only as long as you hold it. Right-click: clear.",
-                                    );
-                                let (down, up) = self.hold(
-                                    format!("hc{d}-{slot}"),
-                                    r.is_pointer_button_down_on() && primary,
-                                );
-                                if down {
-                                    self.pending.push(Action::HotCue { deck, slot });
-                                }
-                                if up {
-                                    self.pending.push(Action::HotCueUp { deck, slot });
-                                }
-                                if r.secondary_clicked() {
-                                    self.pending.push(Action::ClearHotCue { deck, slot });
-                                }
-                            }
-                        });
-                    }
+                    self.hot_cue_pads(ui, d, &st, 2, vec2(34.0, 19.0));
                 });
             });
 
@@ -434,119 +372,406 @@ impl TandemApp {
             self.loop_row(ui, deck, &st);
             ui.add_space(2.0);
             if self.ui.grid_edit[d] && st.track.is_some() {
-                self.grid_editor(ui, d, dv, pos);
+                self.grid_editor(ui, d, dv, pos, false);
                 return;
             }
-            ui.horizontal(|ui| {
-                let other = view.room.decks[(d + 1) % 2];
-                let lock_fill = if st.key_lock { Color32::from_rgb(110, 70, 170) } else { Color32::from_gray(50) };
-                if ui
-                    .add(egui::Button::new(RichText::new("KEY LOCK").strong()).fill(lock_fill).min_size(vec2(72.0, 20.0)))
-                    .on_hover_text("On: changing tempo keeps the original pitch. Off: pitch follows tempo, like vinyl.")
-                    .clicked()
-                {
-                    self.pending.push(Action::KeyLock { deck, on: !st.key_lock });
-                }
-                ui.label(RichText::new("key").weak());
-                if ui.small_button("−").on_hover_text("Down a semitone").clicked() {
-                    self.pending.push(Action::KeyShift { deck, semitones: (st.key_shift - 1).max(-12) });
-                }
-                ui.monospace(format!("{:+}", st.key_shift));
-                if ui.small_button("+").on_hover_text("Up a semitone").clicked() {
-                    self.pending.push(Action::KeyShift { deck, semitones: (st.key_shift + 1).min(12) });
-                }
-                if st.key_shift != 0 && ui.small_button("reset").clicked() {
-                    self.pending.push(Action::KeyShift { deck, semitones: 0 });
-                }
-                let target = other.sounding_key();
-                let shift = match (st.key >= 0, target) {
-                    (true, Some(t)) => Some(tandem_core::keys::match_shift(st.key, t)),
-                    _ => None,
-                };
-                let r = ui
-                    .add_enabled(shift.is_some(), egui::Button::new("MATCH KEY"))
-                    .on_hover_text(match (shift, target) {
-                        (Some(s), Some(t)) => format!(
-                            "Shift this deck {s:+} semitones to sound in {} (or its relative key), matching the other deck",
-                            tandem_core::keys::camelot(t)
-                        ),
-                        _ => String::new(),
-                    })
-                    .on_disabled_hover_text("Both decks need a track with a detected key.");
-                if r.clicked() {
-                    if let Some(s) = shift {
-                        if !st.key_lock {
-                            self.pending.push(Action::KeyLock { deck, on: true });
-                        }
-                        self.pending.push(Action::KeyShift { deck, semitones: s });
-                    }
-                }
-            });
+            ui.horizontal(|ui| self.key_controls(ui, d, view, false));
             ui.add_space(2.0);
             ui.horizontal(|ui| {
-                let other = &view.room.decks[(d + 1) % 2];
-                let can_sync = st.grid.is_some() && other.grid.is_some() && other.track.is_some();
-                let sync_fill = if st.synced {
-                    Color32::from_rgb(40, 120, 200)
-                } else {
-                    Color32::from_gray(50)
-                };
-                let r = ui
-                    .add_enabled(
-                        can_sync || st.synced,
-                        egui::Button::new(RichText::new("SYNC").strong())
-                            .min_size(vec2(52.0, 20.0))
-                            .fill(sync_fill),
-                    )
-                    .on_hover_text("Match this deck's tempo and beats to the other deck, and keep their tempos locked together. Right-click (or SHIFT + SYNC): sync off, back to the deck's own BPM.")
-                    .on_disabled_hover_text("Both decks need a track with a detected beat.");
-                if r.clicked() {
-                    self.pending.push(Action::Sync { deck, on: !st.synced });
-                }
-                if r.secondary_clicked() {
-                    // Like SHIFT + SYNC: sync off, back to the deck's own BPM
-                    // (plus wherever the controller's tempo fader sits).
-                    self.pending.push(Action::Sync { deck, on: false });
-                    let tempo = self.midi.engine.lock().hardware_tempo(deck).unwrap_or(1.0);
-                    self.pending.push(Action::Tempo { deck, tempo });
-                }
-                let range = (self.settings.tempo_range * 100.0) as f32;
-                let mut pct = ((st.tempo - 1.0) * 100.0) as f32;
-                ui.spacing_mut().slider_width = (ui.available_width() - 190.0).max(80.0);
-                let r = ui.add(
-                    egui::Slider::new(&mut pct, -range..=range)
-                        .clamping(egui::SliderClamping::Edits)
-                        .fixed_decimals(2)
-                        .suffix("%")
-                        .text("tempo"),
+                self.sync_button(ui, d, view, vec2(52.0, 20.0));
+                self.tempo_controls(ui, d, &st, false);
+            });
+        });
+    }
+
+    /// A deck in the four-deck view: everything the full panel has, in
+    /// fewer, tighter rows.
+    fn deck_panel_compact(&mut self, ui: &mut egui::Ui, d: usize, view: &SessionView) {
+        let dv = &view.decks[d];
+        let st = dv.state;
+        let pos = st.position_at(view.now);
+        let col = DECK_COLORS[d];
+        let deck = d as u8;
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.set_min_height(COMPACT_H - 14.0);
+            ui.spacing_mut().item_spacing.y = 3.0;
+            // Deck, track and artist, then the bar and GRID on the right.
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("DECK {}", deck_letter(d)))
+                        .strong()
+                        .color(col),
                 );
-                if r.changed() {
-                    self.pending.push(Action::Tempo {
-                        deck,
-                        tempo: 1.0 + pct as f64 / 100.0,
-                    });
-                }
-                if ui.small_button("0").on_hover_text("Reset tempo").clicked() {
-                    self.pending.push(Action::Tempo { deck, tempo: 1.0 });
-                }
-                let primary = ui.input(|i| i.pointer.primary_down());
-                for (label, bend, key) in [("◀", -0.04, "bd"), ("▶", 0.04, "bu")] {
+                let names = ui.available_width() - 136.0;
+                ui.allocate_ui_with_layout(
+                    vec2(names.max(40.0), 18.0),
+                    Layout::left_to_right(Align::Center),
+                    |ui| {
+                        let (title, artist) = track_names(dv);
+                        let mut job = egui::text::LayoutJob::default();
+                        let font = egui::FontId::proportional(14.5);
+                        let strong = ui.visuals().strong_text_color();
+                        let weak = ui.visuals().weak_text_color();
+                        job.append(&title, 0.0, egui::TextFormat::simple(font.clone(), strong));
+                        if !artist.is_empty() {
+                            job.append(
+                                &format!("  {artist}"),
+                                0.0,
+                                egui::TextFormat::simple(font, weak),
+                            );
+                        }
+                        ui.add(egui::Label::new(job).truncate());
+                    },
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    self.grid_button(ui, d, &st, pos);
+                });
+            });
+            // Readout, then what the deck is doing (or who touched it last).
+            ui.horizontal(|ui| {
+                deck_readout(ui, d, view, pos, 13.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if let Some((s, c)) = deck_status(dv, view) {
+                        ui.add(egui::Label::new(RichText::new(s).color(c).small()).truncate());
+                    } else if st.scratching {
+                        ui.label(RichText::new("SCRATCH").small().strong().color(AMBER));
+                    } else if let Some(by) = view.name_of(st.last_touch) {
+                        let tip = format!("Last touched by {by}");
+                        ui.add(egui::Label::new(RichText::new(by).small().weak()).truncate())
+                            .on_hover_text(tip);
+                    }
+                });
+            });
+            if let Some(seek) = overview(ui, dv, pos, col, self.ui.grid_edit[d], 26.0, true) {
+                self.pending.push(Action::Seek { deck, pos: seek });
+            }
+            ui.horizontal(|ui| {
+                self.transport(ui, d, &st, vec2(44.0, 24.0));
+                ui.add_space(4.0);
+                ui.spacing_mut().item_spacing.x = 3.0;
+                self.hot_cue_pads(ui, d, &st, 1, vec2(24.0, 22.0));
+                ui.add_space(4.0);
+                self.sync_button(ui, d, view, vec2(44.0, 22.0));
+            });
+            if self.ui.grid_edit[d] && st.track.is_some() {
+                self.grid_editor(ui, d, dv, pos, true);
+                return;
+            }
+            self.loop_row(ui, deck, &st);
+            ui.horizontal(|ui| {
+                self.key_controls(ui, d, view, true);
+                ui.add_space(4.0);
+                self.tempo_controls(ui, d, &st, true);
+            });
+        });
+    }
+
+    /// GRID (opens the beatgrid editor) and the bar.beat readout, laid out
+    /// right to left.
+    fn grid_button(&mut self, ui: &mut egui::Ui, d: usize, st: &DeckState, pos: f64) {
+        let editing = &mut self.ui.grid_edit[d];
+        let fill = if *editing {
+            MARKER.gamma_multiply(0.55)
+        } else {
+            Color32::from_gray(50)
+        };
+        if ui
+            .add_enabled(
+                st.track.is_some(),
+                egui::Button::new(RichText::new("GRID").small().strong()).fill(fill),
+            )
+            .on_hover_text(
+                "Edit the beatgrid: set markers, ADJUST the BPM, SLIP the beats into place.",
+            )
+            .clicked()
+        {
+            *editing = !*editing;
+        }
+        if let (Some(g), Some(_)) = (st.grid, st.track) {
+            let (bar, beat) = g.bar_beat_at(pos);
+            ui.monospace(RichText::new(format!("{bar}.{beat}")).strong())
+                .on_hover_text("Bar.beat. Bar 1 is the first grid marker; the bars before it count down -1, -2…, so you can park the track a bar or two early, press play and wait for the 1.");
+            ui.label(RichText::new("bar").small().weak());
+        }
+    }
+
+    /// CUE (hold from a pause to preview; right-click back to the start)
+    /// and PLAY/PAUSE.
+    fn transport(&mut self, ui: &mut egui::Ui, d: usize, st: &DeckState, size: egui::Vec2) {
+        let deck = d as u8;
+        let primary = ui.input(|i| i.pointer.primary_down());
+        let text = size.y * 0.38;
+        let cue_fill = if st.cue_preview {
+            AMBER.gamma_multiply(0.6)
+        } else {
+            Color32::from_gray(50)
+        };
+        let r = ui
+            .add(
+                egui::Button::new(RichText::new("CUE").strong().size(text))
+                    .min_size(size)
+                    .fill(cue_fill),
+            )
+            .on_hover_text("Right-click (or SHIFT + CUE): back to the start of the track.");
+        let (down, up) = self.hold(format!("cue{d}"), r.is_pointer_button_down_on() && primary);
+        if down {
+            self.pending.push(Action::CueDown { deck });
+        }
+        if up {
+            self.pending.push(Action::CueUp { deck });
+        }
+        if r.secondary_clicked() {
+            self.pending.push(Action::Seek { deck, pos: 0.0 });
+        }
+        let playing = st.playing && !st.cue_preview;
+        let play_fill = if playing {
+            GREEN.gamma_multiply(0.45)
+        } else {
+            Color32::from_gray(50)
+        };
+        let r = ui.add(
+            egui::Button::new(RichText::new(if playing { "⏸" } else { "▶" }).size(size.y * 0.45))
+                .min_size(size)
+                .fill(play_fill),
+        );
+        if self
+            .hold(format!("play{d}"), r.is_pointer_button_down_on() && primary)
+            .0
+        {
+            self.pending.push(if playing {
+                Action::Pause { deck }
+            } else {
+                Action::Play { deck }
+            });
+        }
+    }
+
+    /// The eight hot cue pads, in one row or two.
+    fn hot_cue_pads(
+        &mut self,
+        ui: &mut egui::Ui,
+        d: usize,
+        st: &DeckState,
+        rows: u8,
+        size: egui::Vec2,
+    ) {
+        let deck = d as u8;
+        let primary = ui.input(|i| i.pointer.primary_down());
+        let per_row = HOT_CUES as u8 / rows;
+        for row in 0..rows {
+            ui.horizontal(|ui| {
+                for slot in row * per_row..(row + 1) * per_row {
+                    let set = st.hot_cues[slot as usize].is_some();
+                    let fill = if set {
+                        HOT_CUE_COLORS[slot as usize].gamma_multiply(0.7)
+                    } else {
+                        Color32::from_gray(35)
+                    };
                     let r = ui
-                        .add(egui::Button::new(label).min_size(vec2(26.0, 20.0)))
-                        .on_hover_text("Hold to pitch-bend");
-                    let (down, up) = self.hold(
-                        format!("{key}{d}"),
-                        r.is_pointer_button_down_on() && primary,
-                    );
+                        .add(
+                            egui::Button::new(RichText::new(format!("{}", slot + 1)).strong())
+                                .min_size(size)
+                                .fill(fill),
+                        )
+                        .on_hover_text(
+                            "Click: set / jump to hot cue. While paused, plays only as long as you hold it. Right-click: clear.",
+                        );
+                    let (down, up) =
+                        self.hold(format!("hc{d}-{slot}"), r.is_pointer_button_down_on() && primary);
                     if down {
-                        self.pending.push(Action::Bend { deck, bend });
+                        self.pending.push(Action::HotCue { deck, slot });
                     }
                     if up {
-                        self.pending.push(Action::Bend { deck, bend: 0.0 });
+                        self.pending.push(Action::HotCueUp { deck, slot });
+                    }
+                    if r.secondary_clicked() {
+                        self.pending.push(Action::ClearHotCue { deck, slot });
                     }
                 }
             });
-        });
+        }
+    }
+
+    /// SYNC, and MASTER on the deck the synced decks follow.
+    fn sync_button(&mut self, ui: &mut egui::Ui, d: usize, view: &SessionView, size: egui::Vec2) {
+        let deck = d as u8;
+        let room = &view.room;
+        let st = &room.decks[d];
+        let target = room.sync_target(d);
+        let sync_fill = if st.synced {
+            SYNC_BLUE
+        } else {
+            Color32::from_gray(50)
+        };
+        let tip = match target {
+            _ if st.synced && room.master == Some(deck) => "SYNC is on, and this deck is the master: the synced decks follow its tempo and beats. Right-click (or SHIFT + SYNC): sync off, back to the deck's own BPM.".to_string(),
+            Some(t) if st.synced && room.master == Some(t as u8) => format!(
+                "Synced to deck {}, the master: this deck follows its tempo and beats. Right-click (or SHIFT + SYNC): sync off, back to the deck's own BPM.",
+                deck_letter(t)
+            ),
+            Some(t) => format!(
+                "Match this deck's tempo and beats to deck {}, and keep them locked while SYNC is on. Right-click (or SHIFT + SYNC): sync off, back to the deck's own BPM.",
+                deck_letter(t)
+            ),
+            None => "Right-click (or SHIFT + SYNC): sync off, back to the deck's own BPM.".into(),
+        };
+        let r = ui
+            .add_enabled(
+                room.can_sync(d) || st.synced,
+                egui::Button::new(RichText::new("SYNC").strong())
+                    .min_size(size)
+                    .fill(sync_fill),
+            )
+            .on_hover_text(tip)
+            .on_disabled_hover_text("This deck and another one need a track with a detected beat.");
+        if r.clicked() {
+            self.pending.push(Action::Sync {
+                deck,
+                on: !st.synced,
+            });
+        }
+        if r.secondary_clicked() {
+            // Like SHIFT + SYNC: sync off, back to the deck's own BPM
+            // (plus wherever the controller's tempo fader sits).
+            self.pending.push(Action::Sync { deck, on: false });
+            let tempo = self.midi.engine.lock().hardware_tempo(deck).unwrap_or(1.0);
+            self.pending.push(Action::Tempo { deck, tempo });
+        }
+        if room.master == Some(deck) {
+            ui.label(RichText::new("MASTER").small().strong().color(SYNC_BLUE.gamma_multiply(1.6)))
+                .on_hover_text("The synced decks follow this deck's tempo and beats. When it stops or loads a new track, a synced deck that's playing takes over.");
+        }
+    }
+
+    /// The tempo slider (filling the row), reset, and pitch bend. Compact:
+    /// without the "tempo" label.
+    fn tempo_controls(&mut self, ui: &mut egui::Ui, d: usize, st: &DeckState, compact: bool) {
+        let deck = d as u8;
+        let range = (self.settings.tempo_range * 100.0) as f32;
+        let mut pct = ((st.tempo - 1.0) * 100.0) as f32;
+        // Room for the value, the label, reset and the two bend buttons.
+        let rest = if compact { 168.0 } else { 190.0 };
+        ui.spacing_mut().slider_width = (ui.available_width() - rest).max(60.0);
+        let slider = egui::Slider::new(&mut pct, -range..=range)
+            .clamping(egui::SliderClamping::Edits)
+            .fixed_decimals(2)
+            .suffix("%");
+        let r = ui
+            .add(if compact {
+                slider
+            } else {
+                slider.text("tempo")
+            })
+            .on_hover_text("Tempo");
+        if r.changed() {
+            self.pending.push(Action::Tempo {
+                deck,
+                tempo: 1.0 + pct as f64 / 100.0,
+            });
+        }
+        if ui.small_button("0").on_hover_text("Reset tempo").clicked() {
+            self.pending.push(Action::Tempo { deck, tempo: 1.0 });
+        }
+        let primary = ui.input(|i| i.pointer.primary_down());
+        for (label, bend, key) in [("◀", -0.04, "bd"), ("▶", 0.04, "bu")] {
+            let r = ui
+                .add(egui::Button::new(label).min_size(vec2(26.0, 20.0)))
+                .on_hover_text("Hold to pitch-bend");
+            let (down, up) = self.hold(
+                format!("{key}{d}"),
+                r.is_pointer_button_down_on() && primary,
+            );
+            if down {
+                self.pending.push(Action::Bend { deck, bend });
+            }
+            if up {
+                self.pending.push(Action::Bend { deck, bend: 0.0 });
+            }
+        }
+    }
+
+    /// KEY LOCK, key shift and MATCH KEY (against the deck this one is
+    /// mixed with: see `RoomState::mix_partner`).
+    fn key_controls(&mut self, ui: &mut egui::Ui, d: usize, view: &SessionView, compact: bool) {
+        let deck = d as u8;
+        let st = view.room.decks[d];
+        let partner = view.room.mix_partner(d);
+        let lock_fill = if st.key_lock {
+            Color32::from_rgb(110, 70, 170)
+        } else {
+            Color32::from_gray(50)
+        };
+        let lock = if compact {
+            egui::Button::new(RichText::new("KEY LOCK").small().strong()).fill(lock_fill)
+        } else {
+            egui::Button::new(RichText::new("KEY LOCK").strong())
+                .fill(lock_fill)
+                .min_size(vec2(72.0, 20.0))
+        };
+        if ui
+            .add(lock)
+            .on_hover_text("On: changing tempo keeps the original pitch. Off: pitch follows tempo, like vinyl.")
+            .clicked()
+        {
+            self.pending.push(Action::KeyLock { deck, on: !st.key_lock });
+        }
+        if !compact {
+            ui.label(RichText::new("key").weak());
+        }
+        if ui
+            .small_button("−")
+            .on_hover_text("Down a semitone")
+            .clicked()
+        {
+            self.pending.push(Action::KeyShift {
+                deck,
+                semitones: (st.key_shift - 1).max(-12),
+            });
+        }
+        ui.monospace(format!("{:+}", st.key_shift));
+        if ui
+            .small_button("+")
+            .on_hover_text("Up a semitone")
+            .clicked()
+        {
+            self.pending.push(Action::KeyShift {
+                deck,
+                semitones: (st.key_shift + 1).min(12),
+            });
+        }
+        if !compact && st.key_shift != 0 && ui.small_button("reset").clicked() {
+            self.pending.push(Action::KeyShift { deck, semitones: 0 });
+        }
+        let target = partner.and_then(|p| view.room.decks[p].sounding_key());
+        let shift = match (st.key >= 0, target) {
+            (true, Some(t)) => Some(tandem_core::keys::match_shift(st.key, t)),
+            _ => None,
+        };
+        let label = if compact {
+            RichText::new("MATCH").small().strong()
+        } else {
+            RichText::new("MATCH KEY")
+        };
+        let r = ui
+            .add_enabled(shift.is_some(), egui::Button::new(label))
+            .on_hover_text(match (shift, target, partner) {
+                (Some(s), Some(t), Some(p)) => format!(
+                    "Shift this deck {s:+} semitones to sound in {} (or its relative key), matching deck {}",
+                    tandem_core::keys::camelot(t),
+                    deck_letter(p)
+                ),
+                _ => String::new(),
+            })
+            .on_disabled_hover_text("This deck and the one it's mixed with need a track with a detected key.");
+        if r.clicked() {
+            if let Some(s) = shift {
+                if !st.key_lock {
+                    self.pending.push(Action::KeyLock { deck, on: true });
+                }
+                self.pending.push(Action::KeyShift { deck, semitones: s });
+            }
+        }
     }
 
     /// LOOP IN, OUT and RELOOP/EXIT, halve and double, and beat loops.
@@ -630,133 +855,46 @@ impl TandemApp {
         });
     }
 
-    /// Beatgrid editing, in place of the key and tempo rows. Every edit acts
+    /// Beatgrid editing, in place of the key and tempo rows (in a compact
+    /// panel, in place of the loop row too, in two rows). Every edit acts
     /// on the section under the playhead (from its marker to the next), so
     /// fixing one part of a track never moves another.
-    fn grid_editor(&mut self, ui: &mut egui::Ui, d: usize, dv: &DeckView, pos: f64) {
+    fn grid_editor(&mut self, ui: &mut egui::Ui, d: usize, dv: &DeckView, pos: f64, compact: bool) {
         let st = dv.state;
         let Some(track) = st.track else { return };
         let grid = st.grid;
         let i = grid.map(|g| g.section(pos)).unwrap_or(0);
-        let mut new: Option<Option<BeatGrid>> = None;
-        let mut reset = false;
-        let small = vec2(30.0, 18.0);
+        let mut edit = GridEdit::default();
         ui.spacing_mut().item_spacing = vec2(3.0, 3.0);
-
-        ui.horizontal(|ui| {
-            let r = ui
-                .add(
-                    egui::Button::new(RichText::new("SET").strong())
-                        .fill(MARKER.gamma_multiply(0.6))
-                        .min_size(vec2(46.0, 20.0)),
-                )
-                .on_hover_text(
-                    "Put a marker right where the playhead is, on the first beat of a bar (the 1). \
-                     The first marker is bar 1.\n\nOn a detected grid, the first SET moves the whole grid \
-                     to line up here. After that, SET adds a marker (for a tempo change), or moves the \
-                     marker within half a beat of the playhead.",
-                );
-            if r.clicked() {
-                let bpm = dv.meta.as_ref().and_then(|m| m.bpm).map(|b| b as f64).unwrap_or(120.0);
-                let g = match grid {
-                    Some(g) => g.set_marker(pos),
-                    None => BeatGrid::from_markers(&[Marker { pos, bpm }], true),
-                };
-                match g {
-                    Some(g) => new = Some(Some(g)),
-                    None => self.toast(format!("A beatgrid can have at most {MAX_MARKERS} markers.")),
-                }
-            }
-            let markers = grid.map(|g| g.markers().len()).unwrap_or(0);
-            if ui
-                .add_enabled(markers > 1, egui::Button::new("DELETE").min_size(vec2(0.0, 20.0)))
-                .on_hover_text("Remove this section's marker (the bright one on the waveform). The section before takes over.")
-                .on_disabled_hover_text("A grid keeps at least one marker. RESET goes back to the detected grid.")
-                .clicked()
-            {
-                new = grid.and_then(|g| g.remove_marker(i)).map(Some);
-            }
-            let edited = grid.map(|g| g.edited).unwrap_or(false);
-            if ui
-                .add_enabled(edited, egui::Button::new("RESET").min_size(vec2(0.0, 20.0)))
-                .on_hover_text("Throw away your edits and go back to the grid Tandem detected.")
-                .clicked()
-            {
-                reset = true;
-            }
-            ui.separator();
-            match grid {
-                Some(_) if markers > 1 => {
-                    ui.label(RichText::new(format!("marker {} of {markers}", i + 1)).small().weak());
-                }
-                Some(g) if !g.edited => {
-                    ui.label(RichText::new("detected grid").small().weak());
-                }
-                Some(_) => {}
-                None => {
-                    ui.label(RichText::new("no beat found: SET starts a grid here").small().weak());
-                }
-            }
-        });
-
-        ui.add_enabled_ui(grid.is_some(), |ui| {
+        if compact {
             ui.horizontal(|ui| {
-                ui.add_sized(vec2(44.0, 18.0), egui::Label::new(RichText::new("ADJUST").small().strong()))
-                    .on_hover_text("Stretch this section's grid to the track's tempo. Its marker stays put; beats further from it move more.");
-                let mut adjust = |ui: &mut egui::Ui, label: &str, delta: f64| {
-                    let r = ui
-                        .add(egui::Button::new(label).min_size(small))
-                        .on_hover_text(format!("{delta:+} BPM"));
-                    if r.clicked() {
-                        new = grid.map(|g| Some(g.adjust(i, delta)));
-                    }
-                };
-                for step in ADJUST_STEPS.iter().rev() {
-                    adjust(ui, &format!("−{}", step_label(*step)), -step);
-                }
-                let bpm = grid.map(|g| g.markers()[i].bpm).unwrap_or(0.0);
-                ui.add_sized(
-                    vec2(54.0, 18.0),
-                    egui::Label::new(RichText::new(format!("{bpm:.2}")).monospace().strong()),
-                )
-                .on_hover_text("This section's BPM (before the tempo fader)");
-                for step in ADJUST_STEPS {
-                    adjust(ui, &format!("+{}", step_label(step)), step);
-                }
-                ui.add_space(4.0);
-                for (label, factor, tip) in [("½", 0.5, "Half the BPM"), ("×2", 2.0, "Double the BPM")] {
-                    if ui.add(egui::Button::new(label).min_size(vec2(24.0, 18.0))).on_hover_text(tip).clicked() {
-                        new = grid.map(|g| Some(g.scale(i, factor)));
-                    }
-                }
+                grid_set_buttons(ui, dv, pos, &mut edit);
+                ui.separator();
+                ui.add_enabled_ui(grid.is_some(), |ui| grid_adjust(ui, grid, i, &mut edit));
             });
             ui.horizontal(|ui| {
-                ui.add_sized(vec2(44.0, 18.0), egui::Label::new(RichText::new("SLIP").small().strong()))
-                    .on_hover_text("Slide this section's beats earlier or later, without changing the BPM.");
-                for (k, step) in SLIP_STEPS.iter().enumerate().rev() {
-                    let r = ui
-                        .add(egui::Button::new("◀".repeat(k + 1)).min_size(small))
-                        .on_hover_text(format!("{:.0} ms earlier", step * 1000.0));
-                    if r.clicked() {
-                        new = grid.map(|g| Some(g.slip(i, -step)));
-                    }
-                }
-                ui.add_space(6.0);
-                for (k, step) in SLIP_STEPS.iter().enumerate() {
-                    let r = ui
-                        .add(egui::Button::new("▶".repeat(k + 1)).min_size(small))
-                        .on_hover_text(format!("{:.0} ms later", step * 1000.0));
-                    if r.clicked() {
-                        new = grid.map(|g| Some(g.slip(i, *step)));
-                    }
-                }
+                ui.add_enabled_ui(grid.is_some(), |ui| grid_slip(ui, grid, i, &mut edit));
+                ui.separator();
+                grid_status(ui, grid, i);
             });
-        });
-
-        if reset {
+        } else {
+            ui.horizontal(|ui| {
+                grid_set_buttons(ui, dv, pos, &mut edit);
+                ui.separator();
+                grid_status(ui, grid, i);
+            });
+            ui.add_enabled_ui(grid.is_some(), |ui| {
+                ui.horizontal(|ui| grid_adjust(ui, grid, i, &mut edit));
+                ui.horizontal(|ui| grid_slip(ui, grid, i, &mut edit));
+            });
+        }
+        if let Some(msg) = edit.toast {
+            self.toast(msg);
+        }
+        if edit.reset {
             self.session.lock().reset_grid(d);
         }
-        if let Some(g) = new {
+        if let Some(g) = edit.new {
             self.pending.push(Action::SetGrid {
                 deck: d as u8,
                 track,
@@ -766,58 +904,140 @@ impl TandemApp {
     }
 
     fn mixer_panel(&mut self, ui: &mut egui::Ui, view: &SessionView) {
+        let four = self.settings.four_decks;
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            ui.set_min_height(338.0);
-            ui.spacing_mut().item_spacing.y = 3.0;
-            ui.vertical_centered(|ui| ui.label(RichText::new("MIXER").strong()));
-            ui.columns(DECKS, |cols| {
-                for (d, ui) in cols.iter_mut().enumerate() {
-                    self.channel_strip(ui, d, view);
-                }
-            });
-            self.fader_row(ui, view);
-            ui.add_space(4.0);
-            let mut xf = view.room.crossfader;
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("A").color(DECK_COLORS[0]).strong());
-                ui.spacing_mut().slider_width = ui.available_width() - 24.0;
-                let r = ui.add(egui::Slider::new(&mut xf, 0.0..=1.0).show_value(false));
-                if r.changed() {
-                    self.pending.push(Action::Crossfader { v: xf });
-                }
-                if r.double_clicked() {
-                    self.pending.push(Action::Crossfader { v: 0.5 });
-                }
-                ui.label(RichText::new("B").color(DECK_COLORS[1]).strong());
-            });
-            self.crossfader_curve(ui, view);
-            ui.separator();
-            ui.label(RichText::new("Your booth only").small().weak());
-            ui.spacing_mut().slider_width = 130.0;
-            ui.add(
-                egui::Slider::new(&mut self.local_edit.cue_mix, 0.0..=1.0)
-                    .show_value(false)
-                    .text("phones: cue ↔ master"),
-            );
-            ui.add(
-                egui::Slider::new(&mut self.local_edit.hp_level, 0.0..=1.0)
-                    .show_value(false)
-                    .text("phones level"),
-            );
-            ui.add(
-                egui::Slider::new(&mut self.local_edit.master_level, 0.0..=1.0)
-                    .show_value(false)
-                    .text("master level"),
-            );
-            if self.settings.audio.broadcast.is_some() {
-                ui.add(
-                    egui::Slider::new(&mut self.local_edit.bcast_level, 0.0..=1.0)
-                        .show_value(false)
-                        .text("broadcast level"),
+            if four {
+                ui.set_min_height(2.0 * COMPACT_H + COMPACT_GAP - 14.0);
+                ui.spacing_mut().item_spacing.y = 2.0;
+                let columns = self.knob_grid(ui, view);
+                let chans: Vec<(usize, f32)> = MIXER_ORDER.iter().copied().zip(columns).collect();
+                self.fader_row(
+                    ui,
+                    view,
+                    &chans,
+                    62.0,
+                    (columns[1] + columns[2]) / 2.0,
+                    false,
+                );
+            } else {
+                ui.set_min_height(338.0);
+                ui.spacing_mut().item_spacing.y = 3.0;
+                ui.vertical_centered(|ui| ui.label(RichText::new("MIXER").strong()));
+                ui.columns(2, |cols| {
+                    for (d, ui) in cols.iter_mut().enumerate() {
+                        self.channel_strip(ui, d, view);
+                    }
+                });
+                let row = ui.available_rect_before_wrap();
+                let x = |f: f32| row.left() + row.width() * f;
+                self.fader_row(
+                    ui,
+                    view,
+                    &[(0, x(0.25)), (1, x(0.75))],
+                    84.0,
+                    row.center().x + 8.0,
+                    true,
                 );
             }
+            ui.add_space(4.0);
+            self.crossfader_row(ui, view);
+            self.crossfader_curve(ui, view);
+            if four {
+                ui.separator();
+                self.local_levels_compact(ui);
+            } else {
+                ui.separator();
+                self.local_levels(ui);
+            }
         });
+    }
+
+    /// The crossfader, with the decks on each side named at its ends.
+    fn crossfader_row(&mut self, ui: &mut egui::Ui, view: &SessionView) {
+        let shown = self.shown_decks();
+        let side = |s: XfSide| -> Vec<usize> {
+            (0..shown)
+                .filter(|&d| view.room.xf_assign[d] == s)
+                .collect()
+        };
+        let (left, right) = (side(XfSide::A), side(XfSide::B));
+        let mut xf = view.room.crossfader;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 3.0;
+            side_letters(ui, &left);
+            let right_w = 10.0 * right.len().max(1) as f32 + 6.0;
+            ui.spacing_mut().slider_width = (ui.available_width() - right_w).max(40.0);
+            let r = ui
+                .add(egui::Slider::new(&mut xf, 0.0..=1.0).show_value(false))
+                .on_hover_text("Crossfader. Double-click to centre it. Each channel's ◀ • ▶ switch puts it on a side, or through.");
+            if r.changed() {
+                self.pending.push(Action::Crossfader { v: xf });
+            }
+            if r.double_clicked() {
+                self.pending.push(Action::Crossfader { v: 0.5 });
+            }
+            side_letters(ui, &right);
+        });
+    }
+
+    /// Headphone mix and level, master and broadcast level.
+    fn local_levels(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("Your booth only").small().weak());
+        ui.spacing_mut().slider_width = 130.0;
+        ui.add(
+            egui::Slider::new(&mut self.local_edit.cue_mix, 0.0..=1.0)
+                .show_value(false)
+                .text("phones: cue ↔ master"),
+        );
+        ui.add(
+            egui::Slider::new(&mut self.local_edit.hp_level, 0.0..=1.0)
+                .show_value(false)
+                .text("phones level"),
+        );
+        ui.add(
+            egui::Slider::new(&mut self.local_edit.master_level, 0.0..=1.0)
+                .show_value(false)
+                .text("master level"),
+        );
+        if self.settings.audio.broadcast.is_some() {
+            ui.add(
+                egui::Slider::new(&mut self.local_edit.bcast_level, 0.0..=1.0)
+                    .show_value(false)
+                    .text("broadcast level"),
+            );
+        }
+    }
+
+    /// The same, two to a row, for the four-deck mixer.
+    fn local_levels_compact(&mut self, ui: &mut egui::Ui) {
+        let tip = "Your booth only";
+        ui.spacing_mut().slider_width = 64.0;
+        let bcast = self.settings.audio.broadcast.is_some();
+        let l = &mut self.local_edit;
+        egui::Grid::new("local-levels")
+            .num_columns(4)
+            .spacing(vec2(6.0, 2.0))
+            .show(ui, |ui| {
+                ui.label(RichText::new("phones mix").small())
+                    .on_hover_text(tip);
+                ui.add(egui::Slider::new(&mut l.cue_mix, 0.0..=1.0).show_value(false))
+                    .on_hover_text("Headphones: cue (left) ↔ master (right). Your booth only.");
+                ui.label(RichText::new("level").small()).on_hover_text(tip);
+                ui.add(egui::Slider::new(&mut l.hp_level, 0.0..=1.0).show_value(false))
+                    .on_hover_text("Headphone level. Your booth only.");
+                ui.end_row();
+                ui.label(RichText::new("master").small()).on_hover_text(tip);
+                ui.add(egui::Slider::new(&mut l.master_level, 0.0..=1.0).show_value(false))
+                    .on_hover_text("Master level. Your booth only.");
+                if bcast {
+                    ui.label(RichText::new("broadcast").small())
+                        .on_hover_text(tip);
+                    ui.add(egui::Slider::new(&mut l.bcast_level, 0.0..=1.0).show_value(false))
+                        .on_hover_text("Broadcast level. Your booth only.");
+                }
+                ui.end_row();
+            });
     }
 
     /// The crossfader's curve switch. It's part of the room (one mixer, one
@@ -856,9 +1076,9 @@ impl TandemApp {
         }
     }
 
+    /// One channel of the two-deck mixer.
     fn channel_strip(&mut self, ui: &mut egui::Ui, d: usize, view: &SessionView) {
         let st = view.room.decks[d];
-        let deck = d as u8;
         ui.vertical_centered(|ui| {
             ui.label(
                 RichText::new(deck_letter(d).to_string())
@@ -866,64 +1086,170 @@ impl TandemApp {
                     .color(DECK_COLORS[d]),
             );
             ui.spacing_mut().slider_width = 70.0;
-            let mut trim = st.trim;
-            let r = ui
-                .add(
-                    egui::Slider::new(&mut trim, 0.0..=1.0)
-                        .show_value(false)
-                        .text("TRIM"),
-                )
-                .on_hover_text("Double-click to reset");
-            if r.changed() {
-                self.pending.push(Action::Trim { deck, v: trim });
-            }
-            if r.double_clicked() {
-                self.pending.push(Action::Trim { deck, v: 0.5 });
-            }
-            for (band, name) in [(2u8, "HI"), (1, "MID"), (0, "LOW")] {
-                let mut v = st.eq[band as usize];
+            for (knob, name) in KNOBS {
+                let mut v = knob.get(&st);
                 let r = ui
                     .add(
                         egui::Slider::new(&mut v, 0.0..=1.0)
                             .show_value(false)
                             .text(name),
                     )
-                    .on_hover_text("Double-click to reset");
-                if r.changed() {
-                    self.pending.push(Action::Eq { deck, band, v });
-                }
-                if r.double_clicked() {
-                    self.pending.push(Action::Eq { deck, band, v: 0.5 });
-                }
+                    .on_hover_text(knob.tip());
+                self.knob_moved(d, knob, v, &r);
             }
-            let mut filt = st.filter;
-            let r = ui
-                .add(
-                    egui::Slider::new(&mut filt, 0.0..=1.0)
-                        .show_value(false)
-                        .text("FILTER"),
-                )
-                .on_hover_text("Left: low-pass. Right: high-pass. Double-click to reset.");
-            if r.changed() {
-                self.pending.push(Action::Filter { deck, v: filt });
-            }
-            if r.double_clicked() {
-                self.pending.push(Action::Filter { deck, v: 0.5 });
-            }
-            ui.toggle_value(&mut self.local_edit.pfl[d], "🎧 CUE")
-                .on_hover_text("Send this deck to your headphones (your booth only)");
+            ui.horizontal(|ui| {
+                ui.add_space(((ui.available_width() - 108.0) / 2.0).max(0.0));
+                ui.toggle_value(&mut self.local_edit.pfl[d], "🎧 CUE")
+                    .on_hover_text("Send this deck to your headphones (your booth only)");
+                ui.add_space(4.0);
+                self.xf_assign(ui, d, view);
+            });
         });
     }
 
-    /// The channel faders, each with its level meter on the inside, and the
-    /// master meter between them.
-    fn fader_row(&mut self, ui: &mut egui::Ui, view: &SessionView) {
-        let h = 84.0;
+    /// The four-deck mixer's knobs: a row each for TRIM, HI, MID, LOW and
+    /// FILTER, a column per channel (C A B D) under its letter, then the
+    /// headphone cues and crossfader switches. Returns each column's
+    /// centre, for the faders.
+    fn knob_grid(&mut self, ui: &mut egui::Ui, view: &SessionView) -> [f32; DECKS] {
+        let label_w = 32.0;
+        let full = ui.available_rect_before_wrap();
+        let col_w = (full.width() - label_w) / DECKS as f32;
+        let x: [f32; DECKS] =
+            std::array::from_fn(|i| full.left() + label_w + (i as f32 + 0.5) * col_w);
+        let row = |ui: &mut egui::Ui, h: f32| {
+            ui.allocate_exact_size(vec2(full.width(), h), Sense::hover())
+                .0
+        };
+        let r = row(ui, 15.0);
+        for (i, &d) in MIXER_ORDER.iter().enumerate() {
+            ui.painter().text(
+                pos2(x[i], r.center().y),
+                egui::Align2::CENTER_CENTER,
+                deck_letter(d),
+                egui::FontId::proportional(14.0),
+                DECK_COLORS[d],
+            );
+        }
+        for (knob, name) in KNOBS {
+            let r = row(ui, 17.0);
+            ui.painter().text(
+                pos2(r.left(), r.center().y),
+                egui::Align2::LEFT_CENTER,
+                name,
+                egui::FontId::proportional(10.5),
+                ui.visuals().text_color(),
+            );
+            for (i, &d) in MIXER_ORDER.iter().enumerate() {
+                let mut v = knob.get(&view.room.decks[d]);
+                let cell =
+                    Rect::from_center_size(pos2(x[i], r.center().y), vec2(col_w - 8.0, r.height()));
+                let resp = ui.put(cell, |ui: &mut egui::Ui| {
+                    ui.spacing_mut().slider_width = col_w - 10.0;
+                    ui.add(egui::Slider::new(&mut v, 0.0..=1.0).show_value(false))
+                });
+                let resp = resp.on_hover_text(format!("Deck {} {}", deck_letter(d), knob.tip()));
+                self.knob_moved(d, knob, v, &resp);
+            }
+        }
+        let r = row(ui, 19.0);
+        for (i, &d) in MIXER_ORDER.iter().enumerate() {
+            let cell =
+                Rect::from_center_size(pos2(x[i], r.center().y), vec2(col_w - 6.0, r.height()));
+            ui.put(cell, |ui: &mut egui::Ui| {
+                ui.toggle_value(&mut self.local_edit.pfl[d], "🎧 CUE")
+                    .on_hover_text(format!(
+                        "Send deck {} to your headphones (your booth only)",
+                        deck_letter(d)
+                    ))
+            });
+        }
+        let r = row(ui, 17.0);
+        for (i, &d) in MIXER_ORDER.iter().enumerate() {
+            let cell = Rect::from_center_size(pos2(x[i], r.center().y), vec2(50.0, r.height()));
+            ui.scope_builder(
+                egui::UiBuilder::new()
+                    .max_rect(cell)
+                    .layout(Layout::left_to_right(Align::Center)),
+                |ui| self.xf_assign(ui, d, view),
+            );
+        }
+        x
+    }
+
+    /// The channel's crossfader assign switch: the left side, through (off
+    /// the crossfader), or the right side.
+    fn xf_assign(&mut self, ui: &mut egui::Ui, d: usize, view: &SessionView) {
+        let cur = view.room.xf_assign[d];
+        let letter = deck_letter(d);
+        ui.spacing_mut().item_spacing.x = 1.0;
+        ui.spacing_mut().button_padding = vec2(3.0, 0.0);
+        for side in XfSide::ALL {
+            let (label, tip) = match side {
+                XfSide::A => ("◀", format!("Deck {letter} on the crossfader's left side")),
+                XfSide::Thru => (
+                    "•",
+                    format!("Deck {letter} through: the crossfader doesn't change its level"),
+                ),
+                XfSide::B => ("▶", format!("Deck {letter} on the crossfader's right side")),
+            };
+            let on = side == cur;
+            let fill = if on {
+                DECK_COLORS[d].gamma_multiply(0.45)
+            } else {
+                Color32::from_gray(38)
+            };
+            let mut tip = tip;
+            if view.link.peer.is_some() {
+                tip.push_str(". Part of the room: it changes for your partner too.");
+            }
+            let r = ui
+                .add(
+                    egui::Button::new(RichText::new(label).small().strong())
+                        .fill(fill)
+                        .min_size(vec2(15.0, 15.0)),
+                )
+                .on_hover_text(tip);
+            if r.clicked() && !on {
+                self.pending.push(Action::XfAssign {
+                    deck: d as u8,
+                    side,
+                });
+            }
+        }
+    }
+
+    /// A knob (slider) that was moved, or double-clicked back to centre.
+    fn knob_moved(&mut self, d: usize, knob: Knob, v: f32, r: &egui::Response) {
+        let deck = d as u8;
+        let set = |v: f32| match knob {
+            Knob::Trim => Action::Trim { deck, v },
+            Knob::Eq(band) => Action::Eq { deck, band, v },
+            Knob::Filter => Action::Filter { deck, v },
+        };
+        if r.changed() {
+            self.pending.push(set(v));
+        }
+        if r.double_clicked() {
+            self.pending.push(set(0.5));
+        }
+    }
+
+    /// The channel faders at their x positions (`chans`: deck, x), each with
+    /// its level meter on the inside, and the master meter at `master_x`.
+    fn fader_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        view: &SessionView,
+        chans: &[(usize, f32)],
+        h: f32,
+        master_x: f32,
+        scale: bool,
+    ) {
         let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::hover());
         let meter_h = h - 8.0;
-        for d in 0..DECKS {
+        for &(d, x) in chans {
             let deck = d as u8;
-            let x = row.left() + row.width() * (0.25 + 0.5 * d as f32);
             let mut v = view.room.decks[d].volume;
             let fader = Rect::from_center_size(pos2(x, row.center().y), vec2(24.0, h));
             let r = ui.put(fader, |ui: &mut egui::Ui| {
@@ -937,7 +1263,7 @@ impl TandemApp {
             if r.changed() {
                 self.pending.push(Action::Volume { deck, v });
             }
-            let inward = if d == 0 { 1.0 } else { -1.0 };
+            let inward = if x < master_x { 1.0 } else { -1.0 };
             let meter =
                 Rect::from_center_size(pos2(x + inward * 20.0, row.center().y), vec2(7.0, meter_h));
             self.meter_view.channel(ui.painter(), meter, d);
@@ -947,12 +1273,11 @@ impl TandemApp {
                     deck_letter(d)
                 ));
         }
-        let master = Rect::from_center_size(
-            pos2(row.center().x + 8.0, row.center().y),
-            vec2(16.0, meter_h),
-        );
+        let master = Rect::from_center_size(pos2(master_x, row.center().y), vec2(16.0, meter_h));
         self.meter_view.master(ui.painter(), master);
-        ui_meters::scale(ui.painter(), master, master.left() - 3.0, 9.0);
+        if scale {
+            ui_meters::scale(ui.painter(), master, master.left() - 3.0, 9.0);
+        }
         ui.interact(master, ui.id().with("master-meter"), Sense::hover())
             .on_hover_text(
                 "Master level: the mix after the faders and crossfader, before your master level. Red: over full scale.",
@@ -960,7 +1285,54 @@ impl TandemApp {
     }
 }
 
-/// "1", ".1", ".01" for an ADJUST step.
+/// The knobs on a mixer channel, top to bottom.
+#[derive(Clone, Copy)]
+enum Knob {
+    Trim,
+    /// EQ band: 0 low, 1 mid, 2 high.
+    Eq(u8),
+    Filter,
+}
+
+const KNOBS: [(Knob, &str); 5] = [
+    (Knob::Trim, "TRIM"),
+    (Knob::Eq(2), "HI"),
+    (Knob::Eq(1), "MID"),
+    (Knob::Eq(0), "LOW"),
+    (Knob::Filter, "FILTER"),
+];
+
+impl Knob {
+    fn get(self, st: &DeckState) -> f32 {
+        match self {
+            Knob::Trim => st.trim,
+            Knob::Eq(band) => st.eq[band as usize],
+            Knob::Filter => st.filter,
+        }
+    }
+
+    fn tip(self) -> &'static str {
+        match self {
+            Knob::Filter => "Left: low-pass. Right: high-pass. Double-click to reset.",
+            _ => "Double-click to reset",
+        }
+    }
+}
+
+/// Deck letters in their colours (the decks on one side of the crossfader).
+fn side_letters(ui: &mut egui::Ui, decks: &[usize]) {
+    if decks.is_empty() {
+        ui.label(RichText::new("–").weak());
+    }
+    for &d in decks {
+        ui.label(
+            RichText::new(deck_letter(d).to_string())
+                .color(DECK_COLORS[d])
+                .strong(),
+        );
+    }
+}
+
 /// A small picture of a crossfader curve: each deck's volume (up) across
 /// the fader's travel (left to right), in its deck colour.
 fn curve_icon(ui: &mut egui::Ui, curve: XfCurve) -> egui::Response {
@@ -973,11 +1345,11 @@ fn curve_icon(ui: &mut egui::Ui, curve: XfCurve) -> egui::Response {
         egui::StrokeKind::Inside,
     );
     let inner = rect.shrink(2.5);
-    for (d, &color) in DECK_COLORS.iter().enumerate() {
+    for (side, color) in [(XfSide::A, DECK_COLORS[0]), (XfSide::B, DECK_COLORS[1])] {
         let pts: Vec<egui::Pos2> = (0..=48)
             .map(|i| {
                 let x = i as f32 / 48.0;
-                let g = tandem_core::render::xfader_gain(curve, d, x);
+                let g = tandem_core::render::xfader_gain(curve, side, x);
                 pos2(
                     inner.left() + x * inner.width(),
                     inner.bottom() - g * inner.height(),
@@ -989,9 +1361,216 @@ fn curve_icon(ui: &mut egui::Ui, curve: XfCurve) -> egui::Response {
     r
 }
 
+/// "1", ".1", ".01" for an ADJUST step.
 fn step_label(step: f64) -> String {
     let s = format!("{step}");
     s.strip_prefix('0').unwrap_or(&s).to_string()
+}
+
+/// What the grid editor's buttons asked for this frame.
+#[derive(Default)]
+struct GridEdit {
+    /// A new grid for the deck (`Some(None)`: no beat).
+    new: Option<Option<BeatGrid>>,
+    reset: bool,
+    toast: Option<String>,
+}
+
+/// SET, DELETE and RESET.
+fn grid_set_buttons(ui: &mut egui::Ui, dv: &DeckView, pos: f64, edit: &mut GridEdit) {
+    let grid = dv.state.grid;
+    let i = grid.map(|g| g.section(pos)).unwrap_or(0);
+    let r = ui
+        .add(
+            egui::Button::new(RichText::new("SET").strong())
+                .fill(MARKER.gamma_multiply(0.6))
+                .min_size(vec2(46.0, 20.0)),
+        )
+        .on_hover_text(
+            "Put a marker right where the playhead is, on the first beat of a bar (the 1). \
+             The first marker is bar 1.\n\nOn a detected grid, the first SET moves the whole grid \
+             to line up here. After that, SET adds a marker (for a tempo change), or moves the \
+             marker within half a beat of the playhead.",
+        );
+    if r.clicked() {
+        let bpm = dv
+            .meta
+            .as_ref()
+            .and_then(|m| m.bpm)
+            .map(|b| b as f64)
+            .unwrap_or(120.0);
+        let g = match grid {
+            Some(g) => g.set_marker(pos),
+            None => BeatGrid::from_markers(&[Marker { pos, bpm }], true),
+        };
+        match g {
+            Some(g) => edit.new = Some(Some(g)),
+            None => {
+                edit.toast = Some(format!(
+                    "A beatgrid can have at most {MAX_MARKERS} markers."
+                ))
+            }
+        }
+    }
+    let markers = grid.map(|g| g.markers().len()).unwrap_or(0);
+    if ui
+        .add_enabled(markers > 1, egui::Button::new("DELETE").min_size(vec2(0.0, 20.0)))
+        .on_hover_text("Remove this section's marker (the bright one on the waveform). The section before takes over.")
+        .on_disabled_hover_text("A grid keeps at least one marker. RESET goes back to the detected grid.")
+        .clicked()
+    {
+        edit.new = grid.and_then(|g| g.remove_marker(i)).map(Some);
+    }
+    let edited = grid.map(|g| g.edited).unwrap_or(false);
+    if ui
+        .add_enabled(edited, egui::Button::new("RESET").min_size(vec2(0.0, 20.0)))
+        .on_hover_text("Throw away your edits and go back to the grid Tandem detected.")
+        .clicked()
+    {
+        edit.reset = true;
+    }
+}
+
+/// Which marker the playhead is under, or what kind of grid this is.
+fn grid_status(ui: &mut egui::Ui, grid: Option<BeatGrid>, i: usize) {
+    let markers = grid.map(|g| g.markers().len()).unwrap_or(0);
+    match grid {
+        Some(_) if markers > 1 => {
+            ui.label(
+                RichText::new(format!("marker {} of {markers}", i + 1))
+                    .small()
+                    .weak(),
+            );
+        }
+        Some(g) if !g.edited => {
+            ui.label(RichText::new("detected grid").small().weak());
+        }
+        Some(_) => {}
+        None => {
+            ui.label(
+                RichText::new("no beat found: SET starts a grid here")
+                    .small()
+                    .weak(),
+            );
+        }
+    }
+}
+
+/// ADJUST: stretch section `i` by small steps, or halve or double it.
+fn grid_adjust(ui: &mut egui::Ui, grid: Option<BeatGrid>, i: usize, edit: &mut GridEdit) {
+    let small = vec2(30.0, 18.0);
+    ui.add_sized(vec2(44.0, 18.0), egui::Label::new(RichText::new("ADJUST").small().strong()))
+        .on_hover_text("Stretch this section's grid to the track's tempo. Its marker stays put; beats further from it move more.");
+    let mut adjust = |ui: &mut egui::Ui, label: &str, delta: f64| {
+        let r = ui
+            .add(egui::Button::new(label).min_size(small))
+            .on_hover_text(format!("{delta:+} BPM"));
+        if r.clicked() {
+            edit.new = grid.map(|g| Some(g.adjust(i, delta)));
+        }
+    };
+    for step in ADJUST_STEPS.iter().rev() {
+        adjust(ui, &format!("−{}", step_label(*step)), -step);
+    }
+    let bpm = grid.map(|g| g.markers()[i].bpm).unwrap_or(0.0);
+    ui.add_sized(
+        vec2(54.0, 18.0),
+        egui::Label::new(RichText::new(format!("{bpm:.2}")).monospace().strong()),
+    )
+    .on_hover_text("This section's BPM (before the tempo fader)");
+    for step in ADJUST_STEPS {
+        adjust(ui, &format!("+{}", step_label(step)), step);
+    }
+    ui.add_space(4.0);
+    for (label, factor, tip) in [("½", 0.5, "Half the BPM"), ("×2", 2.0, "Double the BPM")] {
+        if ui
+            .add(egui::Button::new(label).min_size(vec2(24.0, 18.0)))
+            .on_hover_text(tip)
+            .clicked()
+        {
+            edit.new = grid.map(|g| Some(g.scale(i, factor)));
+        }
+    }
+}
+
+/// SLIP: slide section `i`'s beats earlier or later.
+fn grid_slip(ui: &mut egui::Ui, grid: Option<BeatGrid>, i: usize, edit: &mut GridEdit) {
+    let small = vec2(30.0, 18.0);
+    ui.add_sized(
+        vec2(44.0, 18.0),
+        egui::Label::new(RichText::new("SLIP").small().strong()),
+    )
+    .on_hover_text("Slide this section's beats earlier or later, without changing the BPM.");
+    for (k, step) in SLIP_STEPS.iter().enumerate().rev() {
+        let r = ui
+            .add(egui::Button::new("◀".repeat(k + 1)).min_size(small))
+            .on_hover_text(format!("{:.0} ms earlier", step * 1000.0));
+        if r.clicked() {
+            edit.new = grid.map(|g| Some(g.slip(i, -step)));
+        }
+    }
+    ui.add_space(6.0);
+    for (k, step) in SLIP_STEPS.iter().enumerate() {
+        let r = ui
+            .add(egui::Button::new("▶".repeat(k + 1)).min_size(small))
+            .on_hover_text(format!("{:.0} ms later", step * 1000.0));
+        if r.clicked() {
+            edit.new = grid.map(|g| Some(g.slip(i, *step)));
+        }
+    }
+}
+
+/// A deck's title and artist (or what to show while there's none).
+fn track_names(dv: &DeckView) -> (String, String) {
+    match &dv.meta {
+        Some(m) => (m.title.clone(), m.artist.clone()),
+        None if dv.state.track.is_some() => ("…".to_string(), String::new()),
+        None => (
+            "Empty".to_string(),
+            "Double-click a track in the library to load it".to_string(),
+        ),
+    }
+}
+
+/// Time, time left, BPM, tempo and key (green when it fits the key of the
+/// deck it's mixed with).
+fn deck_readout(ui: &mut egui::Ui, d: usize, view: &SessionView, pos: f64, size: f32) {
+    let st = &view.room.decks[d];
+    ui.monospace(RichText::new(fmt_time(pos)).size(size));
+    ui.monospace(RichText::new(format!("-{}", fmt_time(st.duration - pos))).weak());
+    ui.separator();
+    match st.effective_bpm_at(view.now) {
+        Some(b) => ui.monospace(RichText::new(format!("{b:.2} BPM")).size(size)),
+        None if st.track.is_some() => ui.monospace(RichText::new("no beat").weak()),
+        None => ui.monospace(RichText::new("--- BPM").weak()),
+    };
+    ui.monospace(format!("{:+.2}%", (st.tempo - 1.0) * 100.0));
+    ui.separator();
+    let partner = view.room.mix_partner(d);
+    match st.sounding_key() {
+        Some(k) => {
+            let fits = partner
+                .and_then(|p| view.room.decks[p].sounding_key())
+                .is_some_and(|o| keys_fit(k, o));
+            let text = RichText::new(format!(
+                "{} {}",
+                tandem_core::keys::camelot(k),
+                tandem_core::keys::name(k)
+            ))
+            .size(size)
+            .strong();
+            let tip = match partner {
+                Some(p) if fits => format!("Harmonically compatible with deck {}", deck_letter(p)),
+                _ => "Key (Camelot)".to_string(),
+            };
+            ui.label(if fits { text.color(GREEN) } else { text })
+                .on_hover_text(tip);
+        }
+        None if st.track.is_some() => {
+            ui.monospace(RichText::new("key ?").weak());
+        }
+        None => {}
+    }
 }
 
 fn deck_status(dv: &DeckView, view: &SessionView) -> Option<(String, Color32)> {

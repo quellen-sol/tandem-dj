@@ -237,6 +237,35 @@ Work through these in order and note anything that fails. `tandem.log` (Settings
 6. Check TIMING on the broadcaster during the set, and while a DJ loads a track it doesn't have. Does it stay green? If it turns amber, does the raise button fix it?
 7. Close Tandem on the host. Does the broadcaster go quiet and say it's no longer broadcasting?
 
+## Round 11 (v0.11): four decks
+
+- **Decks C and D.** Every room has four decks. **4 decks** in the top bar shows them: A over C on the left, B over D on the right, a four-channel mixer (C A B D) between them, and four scrolling waveforms. It switches on by itself when deck C or D gets a track or starts playing, from either booth.
+- **Sync master.** Synced decks follow one master deck, shown as **MASTER**. A tempo change on any synced deck, or the master, carries them all. When the master stops or loads a new track, a synced deck that's playing takes over, so the stopped deck can be prepared without dragging the one you're hearing.
+- **Crossfader assign** (◀ • ▶) on every channel: left, through or right. A and C start on the left, B and D on the right. Part of the room, like the curve.
+- **DDJ-FLX6:** decks 3 and 4 drive C and D, and mixer channels 3 and 4 and their level meters are mapped. Saved FLX6 mappings move their deck 3 and 4 controls over by themselves, keeping jog calibration and custom controls.
+- **Broadcast view** shows decks C and D while either has a track, and so does a broadcaster booth's DECKS list.
+- Settings saved by older versions keep working (headphone cues included).
+- Protocol version 10: v0.11 can't share a room with v0.10 or earlier, so every booth (broadcasters too) needs v0.11.
+
+### Test plan for four decks
+
+1. Load tracks onto C and D (library **Load to**, right-click, or the FLX6's DECK 3/4 and LOAD).
+   - Does the four-deck view come on by itself?
+   - Do C and D play, loop, hot cue and scratch like A and B?
+2. Sync B to A, then C, then D.
+   - Does A show MASTER, and do all three follow it?
+   - Move C's tempo fader: do A, B and D all move with it?
+3. Stop A while B is playing synced. Does B become the master? Load a new track on A and move its tempo: does B stay put?
+4. Put D on THRU (•) and move the crossfader. Does D stay at the same level? Do the crossfader's end letters change?
+5. On the FLX6: switch the left side to deck 3.
+   - Do the pads, loop buttons, jog and tempo fader drive C, and do C's lights show?
+   - Do mixer channels 3 and 4 move C and D, with their meters lit?
+   - Switch back to deck 1: does the tempo fader pick up without a jump?
+6. In a room: load and play deck D on one PC.
+   - Does the other PC switch to four decks and play it too?
+   - Does the broadcast window show C and D, on a DJ's PC and on a broadcaster's?
+7. Switch **4 decks** off with C and D stopped. Are A and B back to the big layout?
+
 ## Next candidates
 
 Rough priority order:
@@ -250,4 +279,4 @@ Rough priority order:
 7. **Recording** the broadcast lane to WAV.
 8. **Effects:** beat FX (echo, reverb) on the FLX6's FX section.
 9. **Encrypted transport** (QUIC/TLS) and an optional relay server, so neither DJ needs Tailscale or port forwarding.
-10. **Four decks.**
+10. **Crossfader assign from the controller**, for controllers with assign switches, and a MASTER button to pick the sync master by hand.

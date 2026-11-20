@@ -75,8 +75,11 @@ impl TandemApp {
         ui.add_space(12.0);
 
         section(ui, "DECKS", |ui| {
+            // Decks C and D only while they're in use.
             for d in 0..DECKS {
-                deck_row(ui, d, view);
+                if d < 2 || view.decks[d].state.track.is_some() {
+                    deck_row(ui, d, view);
+                }
             }
             ui.add_space(4.0);
             ui.label(

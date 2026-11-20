@@ -131,11 +131,13 @@ Edits (SET, DELETE, ADJUST, SLIP, ½/×2, RESET) are worked out in the UI from t
 
 Grids are boxed inside `Action` (which is therefore `Clone`, not `Copy`) so the common events stay small. `DeckState` keeps its grid inline, so the state stays `Copy` and the audio threads never allocate.
 
-**Sync through tempo changes.** A synced deck's tempo is matched to the other deck's BPM *at the playhead*. When a playing deck reaches a marker where its BPM changes, the lock has to be redone at that exact moment. The host (or a booth on its own) looks ahead every maintenance tick and schedules a `Relock` event for the moment the deck reaches the marker; if it missed one, it sends a `Relock` straight away. A `Relock` recomputes the lock from the state when it's applied, so a spare one does nothing. Jumps (seek, hot cue, cue, jog) into a section with another tempo, and grid edits, relock as part of applying that event.
+**Sync through tempo changes.** A synced deck's tempo is matched to the master's BPM *at the playhead* (see [Four decks and the sync master](#four-decks-and-the-sync-master)). When a playing deck reaches a marker where its BPM changes, the lock has to be redone at that exact moment. The host (or a booth on its own) looks ahead every maintenance tick and schedules a `Relock` event for the moment the deck reaches the marker; if it missed one, it sends a `Relock` straight away. A `Relock` recomputes the lock from the state when it's applied, so a spare one does nothing. Jumps (seek, hot cue, cue, jog) into a section with another tempo, and grid edits, relock as part of applying that event.
 
 ### Crossfader curve
 
-The curve is part of the room, like the curve switch on a club mixer. A `CrossfaderCurve` event sets it for both booths, and the broadcast lane switches at the moment it changed. `render::xfader_gain` gives each deck's gain. Deck B's curve is deck A's, mirrored.
+The curve is part of the room, like the curve switch on a club mixer. A `CrossfaderCurve` event sets it for both booths, and the broadcast lane switches at the moment it changed. `render::xfader_gain` gives a channel's gain from its side of the crossfader. Side B's curve is side A's, mirrored.
+
+Each channel also has an assign switch (`RoomState::xf_assign`, set by `XfAssign`): side A (left), side B (right), or THRU, where the crossfader leaves it alone. Decks A and C start on side A, B and D on side B.
 
 | Curve | Each deck in the middle | Shape |
 |---|---|---|
@@ -146,13 +148,27 @@ The curve is part of the room, like the curve switch on a club mixer. A `Crossfa
 
 Each booth remembers the last curve it picked (`Settings::crossfader_curve`) and starts a session on it. Joining a room takes the host's.
 
+### Four decks and the sync master
+
+The room always has four decks (`model::DECKS`); whether C and D are on screen is each booth's own view. With more than two decks, "sync to the other deck" needs a reference, so the room has a **sync master** (`RoomState::master`), as in rekordbox and Serato:
+
+- **Joining.** `Sync` on deck x syncs it to `sync_target(x)`: the master, or when there's none (or x is the master) another deck with a beatgrid, ranked synced and playing, synced, playing, any, the deck across the crossfader (A and B, C and D) first on ties. If there was no master, that deck becomes it.
+- **The sync group** is the synced decks plus the master. A `Tempo` change on any deck in the group locks every other member to it (`follow_tempo`). When a deck's own BPM changes (a tempo section, a grid edit, a jump), the synced decks follow it if it's the master, and a synced deck re-locks to the master (`relock`).
+- **Handover.** After every event, `settle_master` clears the master when no deck is synced. A master that isn't playing (or has lost its track or grid) hands over to a synced deck that is. Holding CUE or a hot cue from a pause is only a preview: it neither keeps nor takes the master. Loading a new track on the master, or ejecting it, gives up the master, so a stopped deck can be prepared without dragging the one you're hearing.
+- **Keys** are compared with `mix_partner(x)`: the master, otherwise a deck that's playing, otherwise any deck with a track, across the crossfader first.
+
+All of this is a pure function of the events, so both booths always agree on the master, and it's part of the digest. With two decks it behaves as before, except for the handover: once the master stops, its tempo fader no longer drags the synced deck.
+
+On the DDJ-FLX6, decks 3 and 4 send on MIDI channels 3 and 4 and drive decks C and D. Until preset version 6 they drove A and B; `Mapping::upgrade_from` moves every saved binding that still does exactly that to C or D, and adds mixer channels 3 and 4 and their meters, leaving bindings the DJ changed alone.
+
 ### Local vs shared
 
 | Shared (in the timeline) | Local (this booth only) |
 |---|---|
 | decks: load, play, cue, hot cues, loops, tempo, bend, nudge, beatgrids | headphone cue (PFL) per deck |
-| channel faders, EQ, crossfader and its curve | headphone mix and level |
-| | master and broadcast levels, sync click |
+| channel faders, EQ, crossfader, its curve and the assign switches | headphone mix and level |
+| the sync master | master and broadcast levels, sync click |
+| | showing decks C and D |
 
 ### Tracks
 

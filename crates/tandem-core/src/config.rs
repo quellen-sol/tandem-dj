@@ -131,6 +131,8 @@ pub struct Settings {
     /// The crossfader curve this booth last picked. It starts every session
     /// on it; joining a room takes the host's curve instead.
     pub crossfader_curve: XfCurve,
+    /// Show decks C and D (they also show whenever one has a track).
+    pub four_decks: bool,
 }
 
 impl Default for Settings {
@@ -150,6 +152,7 @@ impl Default for Settings {
             library_sort: None,
             frame_rate: FrameRate::default(),
             crossfader_curve: XfCurve::default(),
+            four_decks: false,
         }
     }
 }
@@ -329,6 +332,20 @@ mod tests {
         let s: Settings = serde_json::from_str(old).unwrap();
         assert_eq!(s.audio.broadcast_delay_ms, 700);
         assert_eq!(s.audio.broadcaster_delay_ms, 1000);
+    }
+
+    #[test]
+    fn settings_saved_with_two_decks_still_load() {
+        // v0.8: two headphone cues. A strict four-deck array would fail to
+        // load and throw every setting away.
+        let old: Settings = serde_json::from_str(
+            r#"{"name":"Alice","terms_accepted":1,"local":{"pfl":[false,true],"cue_mix":0.5}}"#,
+        )
+        .unwrap();
+        assert_eq!((old.name.as_str(), old.terms_accepted), ("Alice", 1));
+        assert_eq!(old.local.pfl, [false, true, false, false]);
+        assert_eq!(old.local.cue_mix, 0.5);
+        assert!(!old.four_decks);
     }
 
     #[test]

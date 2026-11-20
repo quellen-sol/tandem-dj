@@ -10,7 +10,7 @@
 //! fader works *relatively* (see [`MidiEngine::tempo_fader`]).
 
 use crate::meter::{to_db, Levels};
-use crate::model::{Action, RoomState, BEAT_LOOPS, DECKS};
+use crate::model::{deck_letter, Action, RoomState, BEAT_LOOPS, DECKS};
 use crate::render::LocalParams;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -152,7 +152,7 @@ pub enum Target {
 
 impl Target {
     pub fn label(&self) -> String {
-        let deck = |d: u8| if d == 0 { "A" } else { "B" };
+        let deck = |d: u8| deck_letter(d as usize);
         match *self {
             Target::Play { deck: d } => format!("Deck {} · Play/Pause", deck(d)),
             Target::Cue { deck: d } => format!("Deck {} · Cue", deck(d)),
@@ -198,6 +198,55 @@ impl Target {
             Target::CueMix => "Headphone cue/master mix".into(),
             Target::Browse => "Library browse encoder".into(),
         }
+    }
+
+    /// The deck this control acts on, if it's a deck's (or channel's).
+    pub fn deck(&self) -> Option<u8> {
+        let mut t = *self;
+        t.with_deck_checked(None)
+    }
+
+    /// The same control on deck `d` (controls with no deck are unchanged).
+    pub fn with_deck(&self, d: u8) -> Target {
+        let mut t = *self;
+        t.with_deck_checked(Some(d));
+        t
+    }
+
+    /// Reads the deck, and sets it to `set` if given.
+    fn with_deck_checked(&mut self, set: Option<u8>) -> Option<u8> {
+        use Target::*;
+        let deck = match self {
+            Play { deck }
+            | Cue { deck }
+            | BackToStart { deck }
+            | Sync { deck }
+            | SyncOff { deck }
+            | HotCue { deck, .. }
+            | HotCueClear { deck, .. }
+            | LoopIn { deck }
+            | LoopOut { deck }
+            | Reloop { deck }
+            | LoopHalve { deck }
+            | LoopDouble { deck }
+            | BeatLoop { deck, .. }
+            | Tempo { deck }
+            | Volume { deck }
+            | Eq { deck, .. }
+            | Trim { deck }
+            | Filter { deck }
+            | Pfl { deck }
+            | Jog { deck }
+            | JogTouch { deck }
+            | BendDown { deck }
+            | BendUp { deck }
+            | Load { deck } => deck,
+            Crossfader | CueMix | Browse => return None,
+        };
+        if let Some(d) = set {
+            *deck = d;
+        }
+        Some(*deck)
     }
 
     pub fn kind(&self) -> TargetKind {
@@ -347,7 +396,10 @@ pub struct Mapping {
 }
 
 /// Bump when built-in presets gain controls; saved mappings pick them up.
-pub const PRESET_VERSION: u32 = 6;
+pub const PRESET_VERSION: u32 = 7;
+/// Up to this preset version, four-deck controllers drove Tandem's two
+/// decks: decks 1 and 3 drove A, decks 2 and 4 drove B.
+const LAST_TWO_DECK_PRESET: u32 = 6;
 
 impl Mapping {
     pub fn empty(device: &str) -> Self {
@@ -381,6 +433,9 @@ impl Mapping {
             return 0;
         }
         let mut added = 0;
+        if self.preset_version <= LAST_TWO_DECK_PRESET {
+            added += self.unfold_decks(preset);
+        }
         for b in &preset.bindings {
             let trigger_used = self.bindings.iter().any(|x| x.trigger == b.trigger);
             if !trigger_used {
@@ -388,12 +443,39 @@ impl Mapping {
                 added += 1;
             }
         }
-        if self.meters.is_empty() {
-            self.meters = preset.meters.clone();
-            added += self.meters.len();
+        for m in &preset.meters {
+            if !self
+                .meters
+                .iter()
+                .any(|x| (x.channel, x.cc) == (m.channel, m.cc))
+            {
+                self.meters.push(*m);
+                added += 1;
+            }
         }
         self.preset_version = preset.preset_version;
         added
+    }
+
+    /// A four-deck controller's decks 3 and 4 used to drive Tandem's decks
+    /// A and B. Point every binding still doing exactly that at deck C or D,
+    /// as the preset now does. Bindings the DJ changed are left alone.
+    /// Returns how many moved.
+    fn unfold_decks(&mut self, preset: &Mapping) -> usize {
+        let mut moved = 0;
+        for b in &mut self.bindings {
+            let Some(p) = preset.bindings.iter().find(|p| p.trigger == b.trigger) else {
+                continue;
+            };
+            let (Some(old), Some(new)) = (b.target.deck(), p.target.deck()) else {
+                continue;
+            };
+            if new >= 2 && old == new - 2 && b.target.with_deck(new) == p.target {
+                b.target = p.target;
+                moved += 1;
+            }
+        }
+        moved
     }
 
     fn bind(&mut self, trigger: Trigger, target: Target) -> &mut Binding {
@@ -1210,11 +1292,12 @@ pub fn builtin_preset(port_name: &str) -> Option<Mapping> {
     }
 }
 
-/// Pioneer DDJ layout (DDJ-400 / FLX4 / FLX6 generation). Deck N uses MIDI
-/// channel N; the mixer and browser use channel 7; performance pads use
-/// channel 8 (deck 1), 10 (deck 2), 12 (deck 3), 14 (deck 4), with SHIFT on
-/// the next channel up. On 4-deck controllers decks 1 and 3 drive Tandem's
-/// deck A and decks 2 and 4 drive deck B, whichever the DECK button selects.
+/// Pioneer DDJ layout (DDJ-400 / FLX4 / FLX6 generation). Deck N and mixer
+/// channel N use MIDI channel N; the crossfader, filters and browser use
+/// channel 7; performance pads use channel 8 (deck 1), 10 (deck 2), 12
+/// (deck 3), 14 (deck 4), with SHIFT on the next channel up. Decks 1–4
+/// drive Tandem's decks A–D: on a four-deck controller, the DECK buttons
+/// pick which one each side plays.
 ///
 /// The pads send a different note range in each pad mode: HOT CUE 0x00,
 /// PAD FX1 0x10, BEAT JUMP 0x20, SAMPLER 0x30, and with SHIFT + the mode
@@ -1225,9 +1308,9 @@ fn pioneer_ddj(device: &str, name: &str, hw_decks: u8, ticks_per_rev: f32) -> Ma
     m.preset = Some(name.to_string());
     m.preset_version = PRESET_VERSION;
     m.jog_ticks_per_rev = Some(ticks_per_rev);
-    for hw in 0..hw_decks {
+    for hw in 0..hw_decks.min(DECKS as u8) {
         let ch = hw;
-        let deck = hw % 2;
+        let deck = hw;
         m.bind(Trigger::note(ch, 0x0B), Target::Play { deck });
         m.bind(Trigger::note(ch, 0x0C), Target::Cue { deck });
         m.bind(Trigger::note(ch, 0x48), Target::BackToStart { deck });
@@ -1247,17 +1330,20 @@ fn pioneer_ddj(device: &str, name: &str, hw_decks: u8, ticks_per_rev: f32) -> Ma
         m.bind(Trigger::note(ch, 0x4C), Target::BeatLoop { deck, size: 4 });
         m.bind(Trigger::note(ch, 0x51), Target::LoopHalve { deck });
         m.bind(Trigger::note(ch, 0x53), Target::LoopDouble { deck });
-        // The mixer has its own strip per channel: only channels 1 and 2
-        // are Tandem's two decks. Channels 3/4 are left alone.
-        if hw < 2 {
-            m.bind(Trigger::note(ch, 0x54), Target::Pfl { deck });
-            m.bind(Trigger::cc(ch, 0x13), Target::Volume { deck });
-            m.bind(Trigger::cc(ch, 0x04), Target::Trim { deck });
-            m.bind(Trigger::cc(ch, 0x07), Target::Eq { deck, band: 2 });
-            m.bind(Trigger::cc(ch, 0x0B), Target::Eq { deck, band: 1 });
-            m.bind(Trigger::cc(ch, 0x0F), Target::Eq { deck, band: 0 });
-            m.bind(Trigger::cc(6, 0x17 + hw), Target::Filter { deck });
-        }
+        // Mixer channel N is deck N's channel.
+        m.bind(Trigger::note(ch, 0x54), Target::Pfl { deck });
+        m.bind(Trigger::cc(ch, 0x13), Target::Volume { deck });
+        m.bind(Trigger::cc(ch, 0x04), Target::Trim { deck });
+        m.bind(Trigger::cc(ch, 0x07), Target::Eq { deck, band: 2 });
+        m.bind(Trigger::cc(ch, 0x0B), Target::Eq { deck, band: 1 });
+        m.bind(Trigger::cc(ch, 0x0F), Target::Eq { deck, band: 0 });
+        m.bind(Trigger::cc(6, 0x17 + hw), Target::Filter { deck });
+        // Its level meter.
+        m.meters.push(MeterLight {
+            channel: ch,
+            cc: 0x02,
+            deck,
+        });
         let pads = 7 + 2 * hw;
         for slot in 0..8u8 {
             m.bind(Trigger::note(pads, slot), Target::HotCue { deck, slot });
@@ -1271,14 +1357,6 @@ fn pioneer_ddj(device: &str, name: &str, hw_decks: u8, ticks_per_rev: f32) -> Ma
                 Target::BeatLoop { deck, size: slot },
             );
         }
-    }
-    // Channel level meters: channels 1 and 2 show decks A and B.
-    for deck in 0..2u8 {
-        m.meters.push(MeterLight {
-            channel: deck,
-            cc: 0x02,
-            deck,
-        });
     }
     m.bind(Trigger::cc(6, 0x1F), Target::Crossfader);
     m.bind(Trigger::cc(6, 0x0C), Target::CueMix);
@@ -1411,14 +1489,24 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(e.flush(None).is_empty());
-        // Deck 3 on the FLX6 drives deck A too. Let go a while after the
-        // hand stopped: no spin.
-        let out = e.handle_at(&[0x82, 0x36, 0], 100_000, &room, &local);
+        // Let go a while after the hand stopped: no spin.
+        let out = e.handle_at(&[0x80, 0x36, 0], 100_000, &room, &local);
         assert_eq!(
             out,
             vec![MidiOut::Action(Action::JogTouch {
                 deck: 0,
                 down: false,
+                spin: 0.0,
+            })]
+        );
+        // Deck 3 on the FLX6 is deck C.
+        room.decks[2].track = Some(crate::model::TrackId([2; 32]));
+        let out = e.handle(&[0x92, 0x36, 127], &room, &local);
+        assert_eq!(
+            out,
+            vec![MidiOut::Action(Action::JogTouch {
+                deck: 2,
+                down: true,
                 spin: 0.0,
             })]
         );
@@ -1558,22 +1646,121 @@ mod tests {
     }
 
     #[test]
-    fn flx6_mixer_channels_3_and_4_are_not_decks() {
+    fn flx6_decks_and_mixer_channels_3_and_4_are_decks_c_and_d() {
         let m = pioneer_ddj("DDJ-FLX6", "test", 4, 2048.0);
-        let bound = |t: Trigger| m.bindings.iter().any(|b| b.trigger == t);
-        assert!(bound(Trigger::note(0, 0x54)));
-        assert!(
-            !bound(Trigger::note(2, 0x54)),
-            "channel 3 headphone cue must not drive deck A"
+        let target = |t: Trigger| m.bindings.iter().find(|b| b.trigger == t).map(|b| b.target);
+        assert_eq!(
+            target(Trigger::note(2, 0x0B)),
+            Some(Target::Play { deck: 2 })
         );
-        assert!(
-            !bound(Trigger::cc(2, 0x13)),
-            "channel 3 fader must not drive deck A"
+        assert_eq!(
+            target(Trigger::note(3, 0x0B)),
+            Some(Target::Play { deck: 3 })
         );
-        assert!(
-            bound(Trigger::note(2, 0x0B)),
-            "deck 3 play still drives deck A"
+        assert_eq!(
+            target(Trigger::note(2, 0x54)),
+            Some(Target::Pfl { deck: 2 })
         );
+        assert_eq!(
+            target(Trigger::cc(3, 0x13)),
+            Some(Target::Volume { deck: 3 })
+        );
+        assert_eq!(
+            target(Trigger::cc(6, 0x19)),
+            Some(Target::Filter { deck: 2 })
+        );
+        assert_eq!(
+            target(Trigger::note(6, 0x49)),
+            Some(Target::Load { deck: 3 })
+        );
+        assert_eq!(
+            target(Trigger::note(11, 0x00)),
+            Some(Target::HotCue { deck: 2, slot: 0 }),
+            "deck 3's pads"
+        );
+        // Every deck control, on all four decks.
+        for d in 0..4 {
+            let n = m
+                .bindings
+                .iter()
+                .filter(|b| b.target.deck() == Some(d))
+                .count();
+            assert_eq!(
+                n,
+                m.bindings
+                    .iter()
+                    .filter(|b| b.target.deck() == Some(0))
+                    .count()
+            );
+        }
+        // A two-deck controller only has A and B.
+        let small = pioneer_ddj("DDJ-FLX4", "test", 2, 720.0);
+        assert!(small
+            .bindings
+            .iter()
+            .all(|b| b.target.deck().is_none_or(|d| d < 2)));
+    }
+
+    /// The FLX6 mapping as preset version 6 (Tandem v0.8) saved it: decks 3
+    /// and 4 drove A and B, and mixer channels 3 and 4 weren't mapped.
+    fn flx6_v6() -> Mapping {
+        let mut m = pioneer_ddj("DDJ-FLX6", "Pioneer DDJ-FLX6", 4, 2048.0);
+        m.preset_version = 6;
+        let mixer = |t: &Target| {
+            matches!(
+                t,
+                Target::Pfl { .. }
+                    | Target::Volume { .. }
+                    | Target::Trim { .. }
+                    | Target::Eq { .. }
+                    | Target::Filter { .. }
+            )
+        };
+        m.bindings
+            .retain(|b| !(b.target.deck().is_some_and(|d| d >= 2) && mixer(&b.target)));
+        for b in &mut m.bindings {
+            if let Some(d) = b.target.deck() {
+                b.target = b.target.with_deck(d % 2);
+            }
+        }
+        m.meters.retain(|l| l.deck < 2);
+        m
+    }
+
+    #[test]
+    fn saved_v6_mappings_move_decks_3_and_4_to_c_and_d() {
+        let preset = pioneer_ddj("DDJ-FLX6", "Pioneer DDJ-FLX6", 4, 2048.0);
+        let mut saved = flx6_v6();
+        saved.jog_ticks_per_rev = Some(6387.0);
+        // The DJ put deck 3's first pad on PLAY: that stays as it is.
+        let custom = Trigger::note(11, 0x00);
+        saved.bindings.retain(|b| b.trigger != custom);
+        saved.bind(custom, Target::Play { deck: 0 });
+        let moved_and_added = saved.upgrade_from(&preset);
+        // 41 controls on each of decks 3 and 4 (less the custom pad) move;
+        // 7 mixer controls on each of channels 3 and 4, and their meters, are new.
+        assert_eq!(moved_and_added, 2 * 41 - 1 + 2 * 7 + 2);
+        assert_eq!(saved.preset_version, PRESET_VERSION);
+        assert_eq!(saved.jog_ticks_per_rev, Some(6387.0));
+        assert_eq!(saved.meters, preset.meters);
+        let mut want: Vec<_> = preset
+            .bindings
+            .iter()
+            .filter(|b| b.trigger != custom)
+            .map(|b| (b.trigger, b.target))
+            .chain([(custom, Target::Play { deck: 0 })])
+            .collect();
+        let mut got: Vec<_> = saved
+            .bindings
+            .iter()
+            .map(|b| (b.trigger, b.target))
+            .collect();
+        let key = |x: &(Trigger, Target)| format!("{x:?}");
+        want.sort_by_key(key);
+        got.sort_by_key(key);
+        assert_eq!(got, want);
+        // Saved again, it's left alone.
+        assert_eq!(saved.upgrade_from(&preset), 0);
     }
 
     #[test]
@@ -1760,11 +1947,11 @@ mod tests {
         let mut e = MidiEngine::new(pioneer_ddj("DDJ-FLX6", "test", 4, 2048.0), 0.08);
         let (room, local) = (RoomState::default(), LocalParams::default());
         let act = |a| vec![MidiOut::Action(a)];
-        // SHIFT + CUE (deck 2, and deck 4 on the same Tandem deck): back to the start.
-        let start = || act(Action::Seek { deck: 1, pos: 0.0 });
-        assert_eq!(e.handle(&[0x91, 0x48, 127], &room, &local), start());
+        // SHIFT + CUE on deck 2, and on deck 4: back to the start.
+        let start = |deck| act(Action::Seek { deck, pos: 0.0 });
+        assert_eq!(e.handle(&[0x91, 0x48, 127], &room, &local), start(1));
         assert!(e.handle(&[0x91, 0x48, 0], &room, &local).is_empty());
-        assert_eq!(e.handle(&[0x93, 0x48, 127], &room, &local), start());
+        assert_eq!(e.handle(&[0x93, 0x48, 127], &room, &local), start(3));
         // Pads report their release too, for gated hot cues.
         assert_eq!(
             e.handle(&[0x97, 0x02, 127], &room, &local),
@@ -1874,7 +2061,7 @@ mod tests {
         json.as_object_mut().unwrap().remove("meters");
         let mut saved: Mapping = serde_json::from_value(json).unwrap();
         assert!(saved.meters.is_empty());
-        assert_eq!(saved.upgrade_from(&preset), 2);
+        assert_eq!(saved.upgrade_from(&preset), 4);
         assert_eq!(saved.meters, preset.meters);
         assert_eq!(saved.bindings.len(), preset.bindings.len());
     }
@@ -1884,14 +2071,23 @@ mod tests {
         let e = MidiEngine::new(pioneer_ddj("DDJ-FLX6", "test", 4, 2048.0), 0.08);
         let db = |db: f32| 10f32.powf(db / 20.0);
         let levels = Levels {
-            channels: [db(-6.0), 0.0],
+            channels: [db(-6.0), 0.0, db(-20.0), db(1.0)],
             master: [db(-3.0); 2],
         };
         let out = e.meters(&levels);
-        // Mixer channels 1 and 2 only: channels 3 and 4 aren't Tandem's.
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[0], ((0xB0, 0x02), pioneer_meter_value(db(-6.0))));
-        assert_eq!(out[1], ((0xB1, 0x02), 0));
+        // Mixer channels 1–4 show decks A–D.
+        assert_eq!(
+            out,
+            vec![
+                ((0xB0, 0x02), pioneer_meter_value(db(-6.0))),
+                ((0xB1, 0x02), 0),
+                ((0xB2, 0x02), pioneer_meter_value(db(-20.0))),
+                ((0xB3, 0x02), 127),
+            ]
+        );
+        // A two-deck controller has two.
+        let e = MidiEngine::new(pioneer_ddj("DDJ-FLX4", "test", 2, 720.0), 0.08);
+        assert_eq!(e.meters(&levels).len(), 2);
         // The FLX6's lights come on at 37–40, 65–69, 85–88, 101–106 and
         // 119 (measured): count them at a level.
         let lights = |db_fs: f32| {
@@ -1946,17 +2142,15 @@ mod tests {
         room.decks[0].loop_out = Some(12.0);
         room.decks[0].looping = true;
         room.decks[0].loop_beats = Some(4.0);
-        for k in [
-            (0x90, 0x10),
-            (0x90, 0x11),
-            (0x90, 0x4D),
-            (0x97, 0x64),
-            (0x9B, 0x64),
-        ] {
+        for k in [(0x90, 0x10), (0x90, 0x11), (0x90, 0x4D), (0x97, 0x64)] {
             assert_eq!(on(&room, k), Some(true), "{k:02X?}");
         }
         assert_eq!(on(&room, (0x97, 0x63)), Some(false));
         assert_eq!(on(&room, (0x99, 0x64)), Some(false), "deck B");
+        assert_eq!(on(&room, (0x9B, 0x64)), Some(false), "deck C");
+        room.decks[2] = room.decks[0];
+        assert_eq!(on(&room, (0x9B, 0x64)), Some(true), "deck C");
+        assert_eq!(on(&room, (0x92, 0x4D)), Some(true), "deck C");
         // Left the loop: all off.
         room.decks[0].looping = false;
         for k in [(0x90, 0x10), (0x90, 0x11), (0x90, 0x4D), (0x97, 0x64)] {

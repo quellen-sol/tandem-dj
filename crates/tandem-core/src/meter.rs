@@ -138,7 +138,7 @@ mod tests {
         let m = LevelMeters::new();
         assert_eq!(m.read(), Levels::default());
         let l = Levels {
-            channels: [0.25, 0.5],
+            channels: [0.25, 0.5, 0.125, 0.0625],
             master: [0.75, 1.0],
         };
         m.publish(&l);

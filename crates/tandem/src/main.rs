@@ -55,7 +55,8 @@ fn main() {
         shot_frame: arg_after("--shot-frame")
             .and_then(|p| p.to_string_lossy().parse().ok())
             .unwrap_or(330),
-        demo: args.iter().any(|a| a == "--demo"),
+        demo: args.iter().any(|a| a == "--demo" || a == "--demo4"),
+        demo4: args.iter().any(|a| a == "--demo4"),
         host_port: arg_after("--dev-host").and_then(|p| p.to_string_lossy().parse().ok()),
         join: arg_after("--dev-join").map(|p| p.to_string_lossy().to_string()),
         join_broadcaster: args.iter().any(|a| a == "--dev-broadcaster"),

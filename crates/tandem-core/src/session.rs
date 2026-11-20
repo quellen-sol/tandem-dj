@@ -13,6 +13,7 @@ use crate::config::{sanitize_file_name, unique_path, Paths};
 use crate::grid::BeatGrid;
 use crate::library::{self, Library};
 use crate::meter::LevelMeters;
+pub use crate::model::deck_letter;
 use crate::model::{Action, DeckState, Event, RoomState, Timeline, TrackId, DECKS};
 use crate::net::PeerConn;
 use crate::protocol::{Msg, PeerInfo, ShareOffer, TrackInfo};
@@ -1655,8 +1656,7 @@ impl Session {
             let d = &room.decks[c];
             let watched = (d.track, d.gen, d.bpm_at(now));
             let prev = std::mem::replace(&mut self.grid_watch[c], watched);
-            let other = &room.decks[(c + 1) % DECKS];
-            if quiet || !(d.synced || other.synced) || !d.playing {
+            if quiet || !room.in_sync_group(c) || !d.playing {
                 continue;
             }
             let deck = c as u8;
@@ -1823,10 +1823,6 @@ fn load_action(deck: usize, info: &TrackInfo) -> Action {
         grid: info.grid.map(Box::new),
         key: info.key.unwrap_or(-1),
     }
-}
-
-pub fn deck_letter(d: usize) -> char {
-    (b'A' + d as u8) as char
 }
 
 #[cfg(test)]

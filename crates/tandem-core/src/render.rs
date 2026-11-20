@@ -17,9 +17,9 @@
 
 use crate::audio::TrackAudio;
 use crate::meter::{Ballistics, LevelMeters, Levels};
-use crate::model::{DeckState, RoomState, Timeline, TrackId, XfCurve, DECKS};
+use crate::model::{DeckState, RoomState, Timeline, TrackId, XfCurve, XfSide, DECKS};
 use crate::stretch::Stretcher;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::sync::Arc;
 
 /// Settings that belong to one booth and are never shared: your headphones
@@ -27,6 +27,8 @@ use std::sync::Arc;
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LocalParams {
+    /// Headphone cue per deck.
+    #[serde(deserialize_with = "pfl_any_length")]
     pub pfl: [bool; DECKS],
     /// Headphone mix: 0 = cue only, 1 = master only.
     pub cue_mix: f32,
@@ -48,6 +50,14 @@ impl Default for LocalParams {
             click: false,
         }
     }
+}
+
+/// Headphone cues from a settings file saved with any number of decks
+/// (v0.8 and earlier had two): missing decks are off, extra ones dropped.
+/// A strict array would fail to load, and with it every other setting.
+fn pfl_any_length<'de, D: Deserializer<'de>>(d: D) -> Result<[bool; DECKS], D::Error> {
+    let v = Vec::<bool>::deserialize(d)?;
+    Ok(std::array::from_fn(|i| v.get(i).copied().unwrap_or(false)))
 }
 
 /// Everything an audio callback needs, swapped in atomically by the session.
@@ -756,16 +766,17 @@ pub fn fader_gain(v: f32) -> f32 {
 /// far end (3%, about 2 mm on a 60 mm crossfader).
 const SCRATCH_CUT: f32 = 0.03;
 
-/// Crossfader gain for `deck` at position `x` (0 = full deck A, 1 = full
-/// deck B) on `curve`. Deck B's curve is deck A's, mirrored.
-pub fn xfader_gain(curve: XfCurve, deck: usize, x: f32) -> f32 {
+/// Crossfader gain for a channel on `side` with the crossfader at `x`
+/// (0 = full left, side A; 1 = full right, side B) on `curve`. Side B's
+/// curve is side A's, mirrored. A channel set to THRU ignores the crossfader.
+pub fn xfader_gain(curve: XfCurve, side: XfSide, x: f32) -> f32 {
     let x = x.clamp(0.0, 1.0);
-    // How far the fader is from this deck's end, and from the other end
-    // (each exact at the ends, so a deck is fully cut there).
-    let (away, left) = if deck == 0 {
-        (x, 1.0 - x)
-    } else {
-        (1.0 - x, x)
+    // How far the fader is from this side's end, and from the other end
+    // (each exact at the ends, so a channel is fully cut there).
+    let (away, left) = match side {
+        XfSide::A => (x, 1.0 - x),
+        XfSide::B => (1.0 - x, x),
+        XfSide::Thru => return 1.0,
     };
     // Quarter-cosine fade from full (t <= 0) to silent (t >= 1).
     let fade = |t: f32| {
@@ -943,7 +954,8 @@ impl Lane {
         let mut trim = [1.0; DECKS];
         for d in 0..DECKS {
             let st = &state.decks[d];
-            vol[d] = fader_gain(st.volume) * xfader_gain(state.xf_curve, d, state.crossfader);
+            vol[d] = fader_gain(st.volume)
+                * xfader_gain(state.xf_curve, state.xf_assign[d], state.crossfader);
             trim[d] = trim_gain(st.trim);
             for b in 0..3 {
                 eq[d][b] = eq_gain(st.eq[b]);
@@ -1081,7 +1093,7 @@ mod tests {
         );
         assert_eq!(l.channels[1], 0.0);
         // Fader up, crossfader in the middle.
-        let bus = peak * xfader_gain(XfCurve::ConstantPower, 0, 0.5);
+        let bus = peak * xfader_gain(XfCurve::ConstantPower, XfSide::A, 0.5);
         assert!((l.master[0] - bus).abs() < 0.05 * bus, "{l:?} vs {bus}");
         // Fader down: the channel still reads, the bus falls away.
         render(&mut lane, 0.52, 2.52);
@@ -1093,7 +1105,8 @@ mod tests {
     #[test]
     fn crossfader_curves() {
         use XfCurve::*;
-        let g = xfader_gain;
+        // Side A is deck 0 here, side B deck 1.
+        let g = |c, d: usize, x| xfader_gain(c, [XfSide::A, XfSide::B][d], x);
         for c in XfCurve::ALL {
             // Each end is one deck alone, at full volume.
             assert_eq!((g(c, 0, 0.0), g(c, 1, 0.0)), (1.0, 0.0), "{c:?}");
@@ -1133,11 +1146,17 @@ mod tests {
     /// RMS out of a lane with deck A playing alone, the crossfader at `x`
     /// on `curve`.
     fn lone_deck_level(curve: XfCurve, x: f32) -> f32 {
+        deck_level(0, None, curve, x)
+    }
+
+    /// RMS out of a lane with `deck` playing alone (moved to `side` of the
+    /// crossfader, if given), the crossfader at `x` on `curve`.
+    fn deck_level(deck: u8, side: Option<XfSide>, curve: XfCurve, x: f32) -> f32 {
         let a = track();
         let mut tl = Timeline::new(0);
-        let actions = [
+        let mut actions = vec![
             Action::Load {
-                deck: 0,
+                deck,
                 track: a.id,
                 duration: a.duration(),
                 cue: 0.0,
@@ -1146,8 +1165,11 @@ mod tests {
             },
             Action::CrossfaderCurve { curve },
             Action::Crossfader { v: x },
-            Action::Play { deck: 0 },
+            Action::Play { deck },
         ];
+        if let Some(side) = side {
+            actions.push(Action::XfAssign { deck, side });
+        }
         for (i, action) in actions.into_iter().enumerate() {
             tl.insert(Event {
                 time: 0,
@@ -1162,6 +1184,46 @@ mod tests {
         let (mut m, mut c) = (vec![0.0; n * 2], vec![0.0; n * 2]);
         lane.render(&snap, 500_000, &mut m, &mut c);
         (m.iter().map(|v| v * v).sum::<f32>() / m.len() as f32).sqrt()
+    }
+
+    #[test]
+    fn every_deck_plays_on_its_crossfader_side() {
+        let full = deck_level(0, None, XfCurve::Linear, 0.0);
+        assert!(full > 0.05, "silence");
+        let close = |a: f32, b: f32| (a - b).abs() < 0.02 * full;
+        // A and C start on the left, B and D on the right.
+        for deck in 0..DECKS as u8 {
+            let (near, far) = if deck % 2 == 0 {
+                (0.0, 1.0)
+            } else {
+                (1.0, 0.0)
+            };
+            let level = |x| deck_level(deck, None, XfCurve::Linear, x);
+            assert!(close(level(near), full), "deck {deck} at its own end");
+            assert!(level(far) < 1e-4, "deck {deck} at the far end");
+            assert!(close(level(0.5), 0.5 * full), "deck {deck} in the middle");
+        }
+        // Moved across, deck C follows the right side; through, it ignores
+        // the crossfader.
+        assert!(deck_level(2, Some(XfSide::B), XfCurve::Linear, 0.0) < 1e-4);
+        assert!(close(
+            deck_level(2, Some(XfSide::B), XfCurve::Linear, 1.0),
+            full
+        ));
+        for x in [0.0, 0.5, 1.0] {
+            let thru = deck_level(2, Some(XfSide::Thru), XfCurve::Scratch, x);
+            assert!(close(thru, full), "THRU at {x}: {thru} vs {full}");
+        }
+    }
+
+    #[test]
+    fn old_settings_keep_their_headphone_cues() {
+        let p: LocalParams =
+            serde_json::from_str(r#"{"pfl": [true, false], "cue_mix": 0.25}"#).unwrap();
+        assert_eq!(p.pfl, [true, false, false, false]);
+        assert_eq!(p.cue_mix, 0.25);
+        let back: LocalParams = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        assert_eq!(back, p);
     }
 
     #[test]

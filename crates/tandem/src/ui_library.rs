@@ -1,7 +1,7 @@
 //! Library browser: sources on the left, tracks on the right.
 
 use crate::app::{lib_bpm, room_bpm, ShareDraft, Source, TandemApp};
-use crate::ui_decks::fmt_time;
+use crate::ui_decks::{fmt_time, DECK_COLORS};
 use eframe::egui::{self, pos2, vec2, Align2, Color32, FontId, RichText, Sense};
 use tandem_core::config::SortColumn;
 use tandem_core::library::{KEY_ALL, KEY_SHARED};
@@ -198,6 +198,7 @@ impl TandemApp {
     }
 
     fn tracks(&mut self, ui: &mut egui::Ui, view: &SessionView) {
+        let shown = self.shown_decks();
         let src = self.ui.source.clone();
         let key = src.key();
         let (scanning, error, all_paths, bytes) = {
@@ -220,13 +221,24 @@ impl TandemApp {
                     .hint_text("🔍 Search title or artist")
                     .desired_width(220.0),
             );
-            for d in 0..2 {
-                if ui.button(format!("Load to {}", deck_letter(d))).clicked() {
+            ui.label("Load to");
+            let spacing = ui.spacing().item_spacing.x;
+            ui.spacing_mut().item_spacing.x = 3.0;
+            for (d, &color) in DECK_COLORS.iter().enumerate().take(shown) {
+                let letter = RichText::new(deck_letter(d).to_string())
+                    .strong()
+                    .color(color);
+                if ui
+                    .add(egui::Button::new(letter).min_size(vec2(24.0, 0.0)))
+                    .on_hover_text(format!("Load the selected track onto deck {}", deck_letter(d)))
+                    .clicked()
+                {
                     if let Some(item) = self.item_at(self.ui.sel_index, view) {
                         self.load(d, item, view);
                     }
                 }
             }
+            ui.spacing_mut().item_spacing.x = spacing;
             if !matches!(src, Source::Room) {
                 let can = view.link.peer.is_some()
                     && !all_paths.is_empty()
@@ -481,7 +493,7 @@ impl TandemApp {
                     double = Some(i);
                 }
                 resp.context_menu(|ui| {
-                    for d in 0..2 {
+                    for d in 0..shown {
                         if ui
                             .button(format!("Load to deck {}", deck_letter(d)))
                             .clicked()
