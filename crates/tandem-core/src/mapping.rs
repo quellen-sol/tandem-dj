@@ -147,7 +147,14 @@ pub enum Target {
     },
     Crossfader,
     CueMix,
+    /// Turning the browse knob: moves through the tracks, or through the
+    /// lists on the left when they have the knob.
     Browse,
+    /// Pressing the browse knob: gives the knob to the lists on the left,
+    /// or back to the tracks.
+    BrowsePress,
+    /// BACK: gives the browse knob to the lists on the left.
+    BrowseBack,
 }
 
 impl Target {
@@ -197,6 +204,8 @@ impl Target {
             Target::Crossfader => "Crossfader".into(),
             Target::CueMix => "Headphone cue/master mix".into(),
             Target::Browse => "Library browse encoder".into(),
+            Target::BrowsePress => "Library browse press (lists ↔ tracks)".into(),
+            Target::BrowseBack => "Library back (to the lists)".into(),
         }
     }
 
@@ -241,7 +250,7 @@ impl Target {
             | BendDown { deck }
             | BendUp { deck }
             | Load { deck } => deck,
-            Crossfader | CueMix | Browse => return None,
+            Crossfader | CueMix | Browse | BrowsePress | BrowseBack => return None,
         };
         if let Some(d) = set {
             *deck = d;
@@ -308,6 +317,8 @@ impl Target {
         v.push(Target::Crossfader);
         v.push(Target::CueMix);
         v.push(Target::Browse);
+        v.push(Target::BrowsePress);
+        v.push(Target::BrowseBack);
         v
     }
 }
@@ -396,7 +407,7 @@ pub struct Mapping {
 }
 
 /// Bump when built-in presets gain controls; saved mappings pick them up.
-pub const PRESET_VERSION: u32 = 7;
+pub const PRESET_VERSION: u32 = 8;
 /// Up to this preset version, four-deck controllers drove Tandem's two
 /// decks: decks 1 and 3 drove A, decks 2 and 4 drove B.
 const LAST_TWO_DECK_PRESET: u32 = 6;
@@ -542,6 +553,8 @@ pub enum MidiOut {
     TogglePfl(u8),
     CueMix(f32),
     Browse(i32),
+    BrowsePress,
+    BrowseBack,
     LoadSelected(u8),
     Learned(Binding),
 }
@@ -904,6 +917,8 @@ impl MidiEngine {
                     bend: if down { BEND } else { 0.0 },
                 })),
                 Target::Load { deck } if down => out.push(MidiOut::LoadSelected(deck)),
+                Target::BrowsePress if down => out.push(MidiOut::BrowsePress),
+                Target::BrowseBack if down => out.push(MidiOut::BrowseBack),
                 _ => {}
             }
         }
@@ -1360,7 +1375,12 @@ fn pioneer_ddj(device: &str, name: &str, hw_decks: u8, ticks_per_rev: f32) -> Ma
     }
     m.bind(Trigger::cc(6, 0x1F), Target::Crossfader);
     m.bind(Trigger::cc(6, 0x0C), Target::CueMix);
+    // Browse section (Pioneer's DDJ-FLX6 MIDI list): turning the knob,
+    // pressing it, and BACK. SHIFT + press/BACK (0x42, 0x66) and VIEW
+    // (0x7A, 0x67, 0x68) are left alone.
     m.bind(Trigger::cc(6, 0x40), Target::Browse).rel = RelMode::TwosComplement;
+    m.bind(Trigger::note(6, 0x41), Target::BrowsePress);
+    m.bind(Trigger::note(6, 0x65), Target::BrowseBack);
     m
 }
 
@@ -2064,6 +2084,101 @@ mod tests {
         assert_eq!(saved.upgrade_from(&preset), 4);
         assert_eq!(saved.meters, preset.meters);
         assert_eq!(saved.bindings.len(), preset.bindings.len());
+    }
+
+    #[test]
+    fn flx6_browse_section() {
+        // Messages from Pioneer's DDJ-FLX6 MIDI list, section 4 (BROWSE),
+        // all on MIDI channel 7.
+        let mut e = MidiEngine::new(pioneer_ddj("DDJ-FLX6", "test", 4, 2048.0), 0.08);
+        let (room, local) = (RoomState::default(), LocalParams::default());
+        let mut h = |msg: [u8; 3]| e.handle(&msg, &room, &local);
+        // Turning: 1/127 style.
+        assert_eq!(h([0xB6, 0x40, 0x01]), vec![MidiOut::Browse(1)]);
+        assert_eq!(h([0xB6, 0x40, 0x03]), vec![MidiOut::Browse(3)]);
+        assert_eq!(h([0xB6, 0x40, 0x7F]), vec![MidiOut::Browse(-1)]);
+        // Pressing the knob, and BACK; their releases do nothing.
+        assert_eq!(h([0x96, 0x41, 0x7F]), vec![MidiOut::BrowsePress]);
+        assert!(h([0x96, 0x41, 0x00]).is_empty());
+        assert!(h([0x86, 0x41, 0x00]).is_empty());
+        assert_eq!(h([0x96, 0x65, 0x7F]), vec![MidiOut::BrowseBack]);
+        assert!(h([0x96, 0x65, 0x00]).is_empty());
+        // LOAD still loads the selected track, on all four decks.
+        for deck in 0..4 {
+            assert_eq!(
+                h([0x96, 0x46 + deck, 0x7F]),
+                vec![MidiOut::LoadSelected(deck)]
+            );
+        }
+        // Left alone: SHIFT + turn, SHIFT + press, SHIFT + BACK, VIEW.
+        for msg in [
+            [0xB6, 0x64, 0x01],
+            [0x96, 0x42, 0x7F],
+            [0x96, 0x66, 0x7F],
+            [0x96, 0x7A, 0x7F],
+            [0x96, 0x67, 0x7F],
+            [0x96, 0x68, 0x7F],
+        ] {
+            assert!(h(msg).is_empty(), "{msg:02X?}");
+        }
+    }
+
+    #[test]
+    fn saved_v7_mappings_gain_the_browse_press_and_back() {
+        let preset = pioneer_ddj("DDJ-FLX6", "Pioneer DDJ-FLX6", 4, 2048.0);
+        let new = |t: &Target| matches!(t, Target::BrowsePress | Target::BrowseBack);
+        let mut saved = preset.clone();
+        saved.preset_version = 7;
+        saved.jog_ticks_per_rev = Some(6387.0);
+        saved.bindings.retain(|b| !new(&b.target));
+        assert_eq!(saved.upgrade_from(&preset), 2);
+        assert_eq!(saved.bindings.len(), preset.bindings.len());
+        assert_eq!(saved.jog_ticks_per_rev, Some(6387.0));
+        let mut e = MidiEngine::new(saved, 0.08);
+        let (room, local) = (RoomState::default(), LocalParams::default());
+        assert_eq!(
+            e.handle(&[0x96, 0x41, 0x7F], &room, &local),
+            vec![MidiOut::BrowsePress]
+        );
+        assert_eq!(
+            e.handle(&[0x96, 0x65, 0x7F], &room, &local),
+            vec![MidiOut::BrowseBack]
+        );
+
+        // A DJ who had put BACK on something else keeps it.
+        let mut saved = preset.clone();
+        saved.preset_version = 7;
+        saved.bindings.retain(|b| !new(&b.target));
+        saved.bind(Trigger::note(6, 0x65), Target::Play { deck: 0 });
+        assert_eq!(saved.upgrade_from(&preset), 1);
+        let back: Vec<_> = saved
+            .bindings
+            .iter()
+            .filter(|b| b.trigger == Trigger::note(6, 0x65))
+            .map(|b| b.target)
+            .collect();
+        assert_eq!(back, vec![Target::Play { deck: 0 }]);
+    }
+
+    #[test]
+    fn browse_press_and_back_can_be_learned() {
+        // A Denon SC Live 4 (user mapping): browse push is note 0x06 on
+        // channel 16.
+        let mut e = engine();
+        let (room, local) = (RoomState::default(), LocalParams::default());
+        assert!(Target::all().contains(&Target::BrowsePress));
+        assert!(Target::all().contains(&Target::BrowseBack));
+        e.learn = Some(Target::BrowsePress);
+        let out = e.handle(&[0x9F, 0x06, 0x7F], &room, &local);
+        assert!(
+            matches!(&out[..], [MidiOut::Learned(b)] if b.trigger == Trigger::note(15, 0x06)),
+            "{out:?}"
+        );
+        assert!(e.handle(&[0x8F, 0x06, 0x00], &room, &local).is_empty());
+        assert_eq!(
+            e.handle(&[0x9F, 0x06, 0x7F], &room, &local),
+            vec![MidiOut::BrowsePress]
+        );
     }
 
     #[test]

@@ -49,6 +49,7 @@ The self-test lists your audio and MIDI devices, opens your default output for h
    - **SHIFT + CUE** (or right-clicking CUE) jumps back to the start of the track.
    - **Hot cues held while paused are gated.** The deck plays from the hot cue only while you hold the pad. Let go and it snaps back to the hot cue, paused. Press PLAY while holding to keep it playing.
    - **Loops:** **IN**, **OUT** and **RELOOP/EXIT** work as in [Loops](#loops). **SHIFT + IN** is a 4-beat loop, and **CUE/LOOP CALL ◀ / ▶** halve and double the loop. Switch the pads to **BEAT LOOP** (SHIFT + BEAT JUMP) for ¼, ½, 1, 2, 4, 8, 16 and 32-beat loops. The pad of the loop that's playing lights up.
+   - **Browsing:** the browse knob moves through the tracks. Press it to move through the lists on the left instead (All Music, This room, your folders and Serato crates): each list's tracks show as you turn. Press it again to go back into the tracks, pick one and press LOAD. **BACK** also takes the knob to the lists. A blue outline shows which side the knob is on. Clicking a list with the mouse puts the knob back on its tracks, and closing the SERATO CRATES section makes the knob skip the crates. On other controllers, learn **Library browse press** and **Library back**.
    - **Jog wheel moves the wrong way or jumps?** Tick **1/127 style** or **invert** next to it.
    - **The channel level meters** on the FLX6, FLX4 and DDJ-400 show each channel's deck, like the meters on screen: see [Level meters](#level-meters).
 

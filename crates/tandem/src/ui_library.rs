@@ -1,11 +1,21 @@
 //! Library browser: sources on the left, tracks on the right.
 
-use crate::app::{lib_bpm, room_bpm, ShareDraft, Source, TandemApp};
+use crate::app::{lib_bpm, room_bpm, BrowseFocus, ShareDraft, Source, TandemApp};
 use crate::ui_decks::{fmt_time, DECK_COLORS};
 use eframe::egui::{self, pos2, vec2, Align2, Color32, FontId, RichText, Sense};
 use tandem_core::config::SortColumn;
 use tandem_core::library::{KEY_ALL, KEY_SHARED};
 use tandem_core::session::{deck_letter, SessionView, ShareState, TransferState};
+
+/// The outline round the side of the library the browse knob moves through.
+const KNOB_FOCUS: Color32 = Color32::from_rgb(70, 130, 210);
+
+/// Scroll the source list to `r` if the knob just moved there.
+fn follow(r: &egui::Response, on: bool) {
+    if on {
+        r.scroll_to_me_animation(None, egui::style::ScrollAnimation::none());
+    }
+}
 
 struct Row {
     title: String,
@@ -22,11 +32,26 @@ impl TandemApp {
             .default_height(330.0)
             .min_height(160.0)
             .show(ctx, |ui| {
-                egui::SidePanel::left("sources")
+                let sources = egui::SidePanel::left("sources")
                     .resizable(true)
                     .default_width(250.0)
-                    .show_inside(ui, |ui| self.sources(ui, view));
-                egui::CentralPanel::default().show_inside(ui, |ui| self.tracks(ui, view));
+                    .show_inside(ui, |ui| self.sources(ui, view))
+                    .response
+                    .rect;
+                let tracks = egui::CentralPanel::default()
+                    .show_inside(ui, |ui| self.tracks(ui, view))
+                    .response
+                    .rect;
+                let focus = match self.ui.browse_focus {
+                    BrowseFocus::Sources => sources,
+                    BrowseFocus::Tracks => tracks,
+                };
+                ui.painter().rect_stroke(
+                    focus.shrink(1.0),
+                    3.0,
+                    egui::Stroke::new(1.5_f32, KNOB_FOCUS),
+                    egui::StrokeKind::Inside,
+                );
             });
     }
 
@@ -35,29 +60,27 @@ impl TandemApp {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let mut pick: Option<Source> = None;
+                let knob = std::mem::take(&mut self.ui.scroll_to_source);
                 let all_label = match self.library.lock().lists.get(KEY_ALL) {
                     Some(l) if !l.scanning || !l.tracks.is_empty() => {
                         format!("🎶 All Music ({})", l.tracks.len())
                     }
                     _ => "🎶 All Music".to_string(),
                 };
-                if ui
-                    .selectable_label(self.ui.source == Source::All, all_label)
-                    .on_hover_text(
-                        "Every track in your folders, Shared with me and your Serato crates",
-                    )
-                    .clicked()
-                {
+                let on = self.ui.source == Source::All;
+                let r = ui.selectable_label(on, all_label).on_hover_text(
+                    "Every track in your folders, Shared with me and your Serato crates",
+                );
+                follow(&r, on && knob);
+                if r.clicked() {
                     pick = Some(Source::All);
                 }
-                if ui
-                    .selectable_label(
-                        self.ui.source == Source::Room,
-                        format!("🎵 This room ({})", view.room_tracks.len()),
-                    )
-                    .on_hover_text("Every track loaded in this session")
-                    .clicked()
-                {
+                let on = self.ui.source == Source::Room;
+                let r = ui
+                    .selectable_label(on, format!("🎵 This room ({})", view.room_tracks.len()))
+                    .on_hover_text("Every track loaded in this session");
+                follow(&r, on && knob);
+                if r.clicked() {
                     pick = Some(Source::Room);
                 }
                 let receiving = view
@@ -73,10 +96,10 @@ impl TandemApp {
                 } else {
                     "⬇ Shared with me".to_string()
                 };
-                if ui
-                    .selectable_label(self.ui.source == Source::Shared, shared_label)
-                    .clicked()
-                {
+                let on = self.ui.source == Source::Shared;
+                let r = ui.selectable_label(on, shared_label);
+                follow(&r, on && knob);
+                if r.clicked() {
                     pick = Some(Source::Shared);
                 }
 
@@ -89,14 +112,12 @@ impl TandemApp {
                             .file_name()
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_else(|| f.display().to_string());
-                        if ui
-                            .selectable_label(
-                                self.ui.source == Source::Folder(f.clone()),
-                                format!("📁 {name}"),
-                            )
-                            .on_hover_text(f.display().to_string())
-                            .clicked()
-                        {
+                        let on = self.ui.source == Source::Folder(f.clone());
+                        let r = ui
+                            .selectable_label(on, format!("📁 {name}"))
+                            .on_hover_text(f.display().to_string());
+                        follow(&r, on && knob);
+                        if r.clicked() {
                             pick = Some(Source::Folder(f.clone()));
                         }
                         if ui
@@ -119,11 +140,12 @@ impl TandemApp {
 
                 ui.add_space(6.0);
                 let crates = self.library.lock().crates.clone();
-                egui::CollapsingHeader::new(
+                let section = egui::CollapsingHeader::new(
                     RichText::new(format!("SERATO CRATES ({})", crates.len()))
                         .small()
                         .weak(),
                 )
+                .id_salt("serato crates")
                 .default_open(true)
                 .show(ui, |ui| {
                     if crates.is_empty() {
@@ -138,10 +160,9 @@ impl TandemApp {
                     for c in crates {
                         let selected =
                             matches!(&self.ui.source, Source::Crate(x) if x.file == c.file);
-                        if ui
-                            .selectable_label(selected, format!("🗂 {}", c.name))
-                            .clicked()
-                        {
+                        let r = ui.selectable_label(selected, format!("🗂 {}", c.name));
+                        follow(&r, selected && knob);
+                        if r.clicked() {
                             pick = Some(Source::Crate(c.clone()));
                         }
                     }
@@ -152,6 +173,8 @@ impl TandemApp {
                         tandem_core::library::refresh_all(&self.library);
                     }
                 });
+                // The knob only moves through crates you can see.
+                self.ui.crates_open = section.body_returned.is_some();
 
                 if !view.transfers.is_empty() {
                     ui.add_space(6.0);
@@ -192,7 +215,10 @@ impl TandemApp {
                     self.remove_folder(&dir);
                 }
                 if let Some(src) = pick {
+                    // Picking a list goes into it, like pressing the knob
+                    // on it: the knob moves through its tracks.
                     self.set_source(src);
+                    self.ui.browse_focus = BrowseFocus::Tracks;
                 }
             });
     }
@@ -446,7 +472,12 @@ impl TandemApp {
                 let p = ui.painter_at(rect);
                 let selected = i == self.ui.sel_index;
                 if selected {
-                    p.rect_filled(rect, 2.0, Color32::from_rgb(60, 70, 95));
+                    // Dimmer while the knob is on the lists.
+                    let fill = match self.ui.browse_focus {
+                        BrowseFocus::Tracks => Color32::from_rgb(60, 70, 95),
+                        BrowseFocus::Sources => Color32::from_rgb(46, 50, 62),
+                    };
+                    p.rect_filled(rect, 2.0, fill);
                 } else if resp.hovered() {
                     p.rect_filled(rect, 2.0, Color32::from_gray(38));
                 } else if i % 2 == 1 {
@@ -506,6 +537,9 @@ impl TandemApp {
             }
         });
         drop(lib);
+        if clicked.is_some() || double.is_some() || menu_load.is_some() {
+            self.ui.browse_focus = BrowseFocus::Tracks;
+        }
         if let Some(i) = clicked {
             self.ui.sel_index = i;
         }

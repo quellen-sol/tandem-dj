@@ -161,6 +161,10 @@ All of this is a pure function of the events, so both booths always agree on the
 
 On the DDJ-FLX6, decks 3 and 4 send on MIDI channels 3 and 4 and drive decks C and D. Until preset version 6 they drove A and B; `Mapping::upgrade_from` moves every saved binding that still does exactly that to C or D, and adds mixer channels 3 and 4 and their meters, leaving bindings the DJ changed alone.
 
+### Browsing the library from a controller
+
+The browse knob moves through either the tracks of the list on show or the lists on the left (`BrowseFocus` in `app.rs`). Pressing it switches between them, BACK goes to the lists, and a blue outline marks the side it's on. Turning through the lists shows each one's tracks straight away, like Serato and rekordbox. It doesn't rescan crates or All Music on the way, since All Music walks every folder; pressing the knob to go into one rescans it, as clicking it does. Crates are skipped while their section is closed. Clicking a list goes into it, so the knob goes back to its tracks; that keeps the old habit of picking a list with the mouse and a track with the knob. Turn, press and BACK reach the UI as `MidiOut`s, never as room events, so a booth's browsing never goes on the wire.
+
 ### Local vs shared
 
 | Shared (in the timeline) | Local (this booth only) |

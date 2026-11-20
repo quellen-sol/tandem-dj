@@ -65,6 +65,36 @@ impl Source {
     }
 }
 
+/// Which side of the library the controller's browse knob moves through.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BrowseFocus {
+    /// The lists on the left: All Music, this room, folders, crates…
+    Sources,
+    /// The tracks of the list on show.
+    #[default]
+    Tracks,
+}
+
+/// The list `delta` browse-knob ticks away from `current` in `lists`,
+/// stopping at either end; `None` if that's where it already is. From a
+/// list that isn't there (a crate in a closed section), it goes to the
+/// last one.
+pub fn step_source<'a>(lists: &'a [Source], current: &Source, delta: i32) -> Option<&'a Source> {
+    let key = current.key();
+    let at = lists.iter().position(|s| s.key() == key);
+    let last = lists.len().checked_sub(1)?;
+    let to = match at {
+        Some(at) => (at as i64 + delta as i64).clamp(0, last as i64) as usize,
+        None => last,
+    };
+    (Some(to) != at).then(|| &lists[to])
+}
+
+/// Lists rescanned every time they're picked: Serato may have changed them.
+fn rescanned(source: &Source) -> bool {
+    matches!(source, Source::Crate(_) | Source::All)
+}
+
 #[derive(Clone, Debug)]
 pub enum Item {
     File(PathBuf),
@@ -143,6 +173,14 @@ pub struct UiState {
     pub scroll_to_sel: bool,
     pub filtered: Vec<usize>,
     pub filter_key: Option<FilterKey>,
+    /// What the browse knob moves through.
+    pub browse_focus: BrowseFocus,
+    /// Bring the list on show into view on the left (the knob moved).
+    pub scroll_to_source: bool,
+    /// The knob has shown another list since it went to the lists.
+    pub source_browsed: bool,
+    /// The Serato crates section was open last frame.
+    pub crates_open: bool,
     pub show_settings: bool,
     pub settings_tab: SettingsTab,
     pub show_terms: bool,
@@ -289,6 +327,10 @@ impl TandemApp {
             scroll_to_sel: false,
             filtered: Vec::new(),
             filter_key: None,
+            browse_focus: BrowseFocus::Tracks,
+            scroll_to_source: false,
+            source_browsed: false,
+            crates_open: true,
             show_settings: false,
             settings_tab: SettingsTab::Audio,
             show_terms: false,
@@ -469,16 +511,85 @@ impl TandemApp {
     /// Show a list. Crates and All Music are rescanned every time, since
     /// Serato may have changed them.
     pub(crate) fn set_source(&mut self, source: Source) {
+        let rescan = rescanned(&source);
+        self.show_source(source, rescan);
+    }
+
+    /// Show a list from the top, scanning it if it hasn't been yet (or
+    /// again, if `rescan`).
+    fn show_source(&mut self, source: Source, rescan: bool) {
         if let Some(kind) = source.kind() {
             let key = source.key();
-            let needs_scan = !self.library.lock().lists.contains_key(&key)
-                || matches!(source, Source::Crate(_) | Source::All);
-            if needs_scan {
+            if rescan || !self.library.lock().lists.contains_key(&key) {
                 library::scan(&self.library, key, kind);
             }
         }
         self.ui.source = source;
         self.ui.sel_index = 0;
+        self.ui.scroll_to_sel = true;
+    }
+
+    /// The lists the browse knob moves through, top to bottom as on screen.
+    /// Crates only while their section is open.
+    fn knob_sources(&self) -> Vec<Source> {
+        let mut lists = vec![Source::All, Source::Room, Source::Shared];
+        let folders = self.settings.library_folders.iter().cloned();
+        lists.extend(folders.map(Source::Folder));
+        if self.ui.crates_open {
+            let crates = self.library.lock().crates.clone();
+            lists.extend(crates.into_iter().map(Source::Crate));
+        }
+        lists
+    }
+
+    /// The browse knob turned: move through the tracks, or through the
+    /// lists, showing each one's tracks on the way. Lists shown this way
+    /// aren't rescanned yet; pressing the knob to go into one does that.
+    fn browse(&mut self, delta: i32) {
+        match self.ui.browse_focus {
+            BrowseFocus::Tracks => {
+                let n = self.ui.filtered.len();
+                if n > 0 {
+                    self.ui.sel_index =
+                        (self.ui.sel_index as i64 + delta as i64).clamp(0, n as i64 - 1) as usize;
+                    self.ui.scroll_to_sel = true;
+                }
+            }
+            BrowseFocus::Sources => {
+                let lists = self.knob_sources();
+                if let Some(next) = step_source(&lists, &self.ui.source, delta) {
+                    self.show_source(next.clone(), false);
+                    self.ui.source_browsed = true;
+                }
+                self.ui.scroll_to_source = true;
+            }
+        }
+    }
+
+    /// Pressing the browse knob: go into the list on show, or back out to
+    /// the lists.
+    fn browse_press(&mut self) {
+        match self.ui.browse_focus {
+            BrowseFocus::Sources => {
+                if std::mem::take(&mut self.ui.source_browsed) && rescanned(&self.ui.source) {
+                    if let Some(kind) = self.ui.source.kind() {
+                        library::scan(&self.library, self.ui.source.key(), kind);
+                    }
+                }
+                self.ui.browse_focus = BrowseFocus::Tracks;
+                self.ui.scroll_to_sel = true;
+            }
+            BrowseFocus::Tracks => self.browse_back(),
+        }
+    }
+
+    /// BACK: the knob goes to the lists, starting at the one on show.
+    fn browse_back(&mut self) {
+        if self.ui.browse_focus != BrowseFocus::Sources {
+            self.ui.browse_focus = BrowseFocus::Sources;
+            self.ui.source_browsed = false;
+        }
+        self.ui.scroll_to_source = true;
     }
 
     pub(crate) fn add_folder(&mut self, dir: PathBuf) {
@@ -659,15 +770,9 @@ impl TandemApp {
         let outs: Vec<MidiOut> = std::mem::take(&mut *self.midi.ui_queue.lock());
         for o in outs {
             match o {
-                MidiOut::Browse(delta) => {
-                    let n = self.ui.filtered.len();
-                    if n > 0 {
-                        self.ui.sel_index = (self.ui.sel_index as i64 + delta as i64)
-                            .clamp(0, n as i64 - 1)
-                            as usize;
-                        self.ui.scroll_to_sel = true;
-                    }
-                }
+                MidiOut::Browse(delta) => self.browse(delta),
+                MidiOut::BrowsePress => self.browse_press(),
+                MidiOut::BrowseBack => self.browse_back(),
                 MidiOut::LoadSelected(deck) => {
                     if let Some(item) = self.item_at(self.ui.sel_index, view) {
                         self.load(deck as usize, item, view);
@@ -905,5 +1010,34 @@ impl Drop for TandemApp {
         self.library.lock().save_cache();
         self.midi.disconnect();
         self.paths.clear_session_cache();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_knob_steps_through_the_lists_and_stops_at_the_ends() {
+        let folder = |n: &str| Source::Folder(PathBuf::from(n));
+        let lists = vec![
+            Source::All,
+            Source::Room,
+            Source::Shared,
+            folder("a"),
+            folder("b"),
+        ];
+        assert_eq!(step_source(&lists, &Source::All, 1), Some(&Source::Room));
+        assert_eq!(step_source(&lists, &Source::Room, 2), Some(&folder("a")));
+        assert_eq!(step_source(&lists, &folder("a"), -3), Some(&Source::All));
+        // A fast turn stops at the ends.
+        assert_eq!(step_source(&lists, &Source::Room, 9), Some(&folder("b")));
+        assert_eq!(step_source(&lists, &Source::Room, -9), Some(&Source::All));
+        // Already at the end: nothing to change.
+        assert_eq!(step_source(&lists, &folder("b"), 1), None);
+        assert_eq!(step_source(&lists, &Source::All, -1), None);
+        // From a list that isn't there (a crate in a closed section).
+        assert_eq!(step_source(&lists, &folder("gone"), -1), Some(&folder("b")));
+        assert_eq!(step_source(&[], &Source::All, 1), None);
     }
 }
