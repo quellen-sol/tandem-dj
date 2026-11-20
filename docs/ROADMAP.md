@@ -302,13 +302,19 @@ Work through these in order and note anything that fails. `tandem.log` (Settings
   - Test: in a room, unplug the joining PC's network for about 30 seconds, then plug it back in. Does it say **Reconnecting to …**, then get back in within a few seconds with its decks following the host's?
 - No protocol change: v0.11.5 and v0.11.6 can share a room, but only a v0.11.6 booth rejoins by itself, and a v0.11.5 host takes a booth back only after its old connection times out (15 s).
 
+### v0.11.7
+
+- **Loop rolls on the DDJ-FLX6's BEAT JUMP pads.** Hold a pad and the deck loops 1/16, 1/8, ¼ or ½ beat (top row) or 1, 2, 4 or 8 beats (bottom row) while the track runs on underneath, shown as a dashed line on the waveform. Let go and it carries on from that line, exactly where the track would have been, still on the beat. Press another pad while holding one to switch size; the pad that's rolling lights up. Rolls work over a loop (letting go comes back into it), on synced decks and while scratching, and your partner and the stream hear them exactly as you do. Saved FLX6 mappings pick up the pads by themselves (the FLX4 and DDJ-400 too).
+  - Test: switch deck A's pads to BEAT JUMP and, on a playing deck, hold pad 4 (½ beat) for a few bars, then let go. Does the track carry on in time, as if it had never rolled? Hold pad 5 (1 beat), press pad 4 and let it go again: does it go ½ beat, then back to 1 beat?
+- Protocol version 12: v0.11.7 can't share a room with earlier versions, so every booth needs v0.11.7.
+
 ## Next candidates
 
 Rough priority order:
 
 1. **Automatic downbeats (bars)** in the detected beatgrid, plus quantize for hot cues and play (loop IN/OUT are quantized). Grids already have bars; for now you set bar 1 by hand.
 2. **Beatgrid editing from the controller**, and placing markers by clicking the waveform.
-3. **More loop tools:** BEAT JUMP pads, slip mode and loop rolls, and fine-adjusting IN/OUT with the jog wheel.
+3. **More loop tools:** beat jump, slip mode for scratching and hot cues (loop rolls are done), and fine-adjusting IN/OUT with the jog wheel.
 4. **Lower UI CPU:** redraw waveforms only when they change (the frame rate cap is done).
 5. **Serato cue points and loops** from the Markers2 tag.
 6. **Lower-latency audio:** WASAPI exclusive mode or ASIO.
