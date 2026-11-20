@@ -633,7 +633,7 @@ impl TandemApp {
             );
         }
         ui.label(
-            RichText::new("Click Learn, then press or move the control on your controller. Faders pick up once they reach the current value, so you never jump over your partner. Tempo faders never wait: when SYNC has moved the tempo they move it relatively (SHIFT + SYNC puts the deck back on the fader). SHIFT + tempo fader moves the fader but not the tempo, so you can slide it back and keep going.")
+            RichText::new("Click Learn, then press or move the control on your controller. If your SHIFT or pad mode buttons are mapped here, hold SHIFT or pick the pad mode first: the control then does it only with SHIFT, or only in that pad mode. Faders pick up once they reach the current value, so you never jump over your partner. Tempo faders never wait: when SYNC has moved the tempo they move it relatively (SHIFT + SYNC puts the deck back on the fader). SHIFT + tempo fader moves the fader but not the tempo, so you can slide it back and keep going.")
                 .small()
                 .weak(),
         );
@@ -680,7 +680,7 @@ impl TandemApp {
                     ui.label(target.label());
                     let binding = engine.mapping.bindings.iter().position(|b| b.target == target);
                     match binding {
-                        Some(i) => ui.monospace(engine.mapping.bindings[i].trigger.label()),
+                        Some(i) => ui.monospace(engine.mapping.bindings[i].label()),
                         None => ui.label(RichText::new("-").weak()),
                     };
                     ui.horizontal(|ui| {

@@ -1,6 +1,10 @@
 //! MIDI controller mapping ("MIDI learn"), built-in presets, soft takeover
 //! and LED feedback.
 //!
+//! A binding can need SHIFT held, or its deck's pads in a given pad mode, for
+//! controllers that tell neither in their messages (see [`Target::Shift`]
+//! and [`PadMode`]).
+//!
 //! Each DJ maps their own controller; mappings are local files and never
 //! shared. Because two people control one mixer, absolute controls (faders,
 //! knobs) use *soft takeover*: once the room value has been changed, your
@@ -52,6 +56,31 @@ impl Trigger {
             MidiKind::Note => format!("Note {:#04x} · ch {}", self.number, self.channel + 1),
             MidiKind::Cc => format!("CC {:#04x} · ch {}", self.number, self.channel + 1),
             MidiKind::PitchBend => format!("Pitch bend · ch {}", self.channel + 1),
+        }
+    }
+}
+
+/// What a deck's pads do, on a controller whose pads send the same notes in
+/// every pad mode (the Denon SC Live 4). Its pad mode buttons are bound to
+/// [`Target::PadMode`], and each pad has a binding per mode, marked with
+/// [`Binding::mode`]. Controllers whose pads send other notes in each mode
+/// (Pioneer) don't need it. Every deck starts on hot cues.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PadMode {
+    #[default]
+    HotCues,
+    BeatLoops,
+    Rolls,
+}
+
+impl PadMode {
+    pub const ALL: [PadMode; 3] = [PadMode::HotCues, PadMode::BeatLoops, PadMode::Rolls];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            PadMode::HotCues => "hot cues",
+            PadMode::BeatLoops => "beat loops",
+            PadMode::Rolls => "rolls",
         }
     }
 }
@@ -123,7 +152,8 @@ pub enum Target {
         deck: u8,
     },
     /// The tempo fader moved with SHIFT held: the fader moves, the tempo
-    /// doesn't (for controllers that send another message with SHIFT).
+    /// doesn't (for controllers that send another message with SHIFT, or
+    /// as a SHIFT + binding with [`Target::Shift`]).
     TempoShift {
         deck: u8,
     },
@@ -172,6 +202,17 @@ pub enum Target {
     BrowsePress,
     /// BACK: gives the browse knob to the lists on the left.
     BrowseBack,
+    /// A pad mode button: from now on the deck's pads do what their
+    /// bindings for this mode say (see [`PadMode`]).
+    PadMode {
+        deck: u8,
+        mode: PadMode,
+    },
+    /// A SHIFT button that sends a message of its own and doesn't change
+    /// what the other controls send: while it's held, a control's SHIFT +
+    /// bindings ([`Binding::shift`]) replace its others. Any SHIFT bound to
+    /// it shifts the whole controller.
+    Shift,
 }
 
 impl Target {
@@ -231,6 +272,10 @@ impl Target {
             Target::Browse => "Library browse encoder".into(),
             Target::BrowsePress => "Library browse press (lists ↔ tracks)".into(),
             Target::BrowseBack => "Library back (to the lists)".into(),
+            Target::PadMode { deck: d, mode } => {
+                format!("Deck {} · Pad mode: {}", deck(d), mode.label())
+            }
+            Target::Shift => "SHIFT (for SHIFT + controls)".into(),
         }
     }
 
@@ -276,9 +321,10 @@ impl Target {
             | JogTouch { deck }
             | BendDown { deck }
             | BendUp { deck }
-            | Load { deck } => deck,
+            | Load { deck }
+            | PadMode { deck, .. } => deck,
             Crossfader | CueMix | HeadphoneLevel | MasterLevel | Browse | BrowsePress
-            | BrowseBack => return None,
+            | BrowseBack | Shift => return None,
         };
         if let Some(d) = set {
             *deck = d;
@@ -311,6 +357,22 @@ impl Target {
         self.kind() == TargetKind::Relative
     }
 
+    /// Something the pads do, so its binding can depend on the pad mode.
+    pub fn is_pad(&self) -> bool {
+        matches!(
+            self,
+            Target::HotCue { .. }
+                | Target::HotCueClear { .. }
+                | Target::BeatLoop { .. }
+                | Target::Roll { .. }
+        )
+    }
+
+    /// SHIFT or a pad mode button: changes what other controls do.
+    pub fn is_modifier(&self) -> bool {
+        matches!(self, Target::Shift | Target::PadMode { .. })
+    }
+
     /// Every mappable target, in the order the mapping screen shows them.
     pub fn all() -> Vec<Target> {
         let mut v = Vec::new();
@@ -334,6 +396,9 @@ impl Target {
             for size in 0..ROLLS.len() as u8 {
                 v.push(Target::Roll { deck: d, size });
             }
+            for mode in PadMode::ALL {
+                v.push(Target::PadMode { deck: d, mode });
+            }
             v.push(Target::Load { deck: d });
             v.push(Target::JogTouch { deck: d });
             v.push(Target::Jog { deck: d });
@@ -356,6 +421,7 @@ impl Target {
         v.push(Target::Browse);
         v.push(Target::BrowsePress);
         v.push(Target::BrowseBack);
+        v.push(Target::Shift);
         v
     }
 }
@@ -399,6 +465,42 @@ pub struct Binding {
     pub invert: bool,
     #[serde(default)]
     pub rel: RelMode,
+    /// SHIFT + this control: only while a [`Target::Shift`] button is held.
+    /// Then it replaces the control's bindings without SHIFT; a control
+    /// with no SHIFT + binding does the same with SHIFT held.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub shift: bool,
+    /// Only while the target's deck is in this pad mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<PadMode>,
+    /// What its light is sent, lit and unlit, instead of 127 and 0 (Denon
+    /// buttons are dim at 1, and their pads take a colour number).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub light: Option<(u8, u8)>,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+impl Binding {
+    /// Whether both can answer the same message: the same button or knob,
+    /// both with SHIFT or both without, and in a pad mode they share.
+    fn overlaps(&self, other: &Binding) -> bool {
+        self.trigger == other.trigger
+            && self.shift == other.shift
+            && (self.mode.is_none() || other.mode.is_none() || self.mode == other.mode)
+    }
+
+    /// The control, and what else it needs: "SHIFT + Note 0x0f · ch 5 (pad
+    /// mode: rolls)".
+    pub fn label(&self) -> String {
+        let shift = if self.shift { "SHIFT + " } else { "" };
+        match self.mode {
+            Some(m) => format!("{shift}{} (pad mode: {})", self.trigger.label(), m.label()),
+            None => format!("{shift}{}", self.trigger.label()),
+        }
+    }
 }
 
 /// A level meter on the controller: a control change whose value sets how
@@ -479,8 +581,9 @@ impl Mapping {
 
     /// A mapping saved from an older built-in preset: add the controls the
     /// preset has gained since (only on buttons/knobs the user hasn't bound
-    /// to something else) and its level meters, keeping calibration and
-    /// customisations. Returns how many controls were added.
+    /// to something else, with or without SHIFT and in the same pad mode)
+    /// and its level meters, keeping calibration and customisations.
+    /// Returns how many controls were added.
     pub fn upgrade_from(&mut self, preset: &Mapping) -> usize {
         if self.preset.is_none() || self.preset_version >= preset.preset_version {
             return 0;
@@ -490,7 +593,7 @@ impl Mapping {
             added += self.unfold_decks(preset);
         }
         for b in &preset.bindings {
-            let trigger_used = self.bindings.iter().any(|x| x.trigger == b.trigger);
+            let trigger_used = self.bindings.iter().any(|x| x.overlaps(b));
             if !trigger_used {
                 self.bindings.push(b.clone());
                 added += 1;
@@ -508,6 +611,60 @@ impl Mapping {
         }
         self.preset_version = preset.preset_version;
         added
+    }
+
+    /// A mapping made before Tandem had a built-in preset for this
+    /// controller (learned, or written by hand, like the first Denon SC
+    /// Live 4 mapping), when at least half its bindings are the preset's:
+    /// it becomes the preset, so it picks up the preset's controls now and
+    /// later. It keeps the jog calibration and settings, and its invert and
+    /// encoder style on the preset's controls. A button or knob it binds to
+    /// something the preset doesn't keeps all its bindings as they were,
+    /// instead of the preset's. Returns whether it did.
+    pub fn adopt(&mut self, preset: &Mapping) -> bool {
+        if self.preset.is_some() || preset.preset.is_none() || self.bindings.is_empty() {
+            return false;
+        }
+        let same = |a: &Binding, b: &Binding| a.trigger == b.trigger && a.target == b.target;
+        let known = |b: &Binding| preset.bindings.iter().any(|p| same(p, b));
+        if self.bindings.iter().filter(|b| known(b)).count() * 2 < self.bindings.len() {
+            return false;
+        }
+        let own: HashSet<Trigger> = self
+            .bindings
+            .iter()
+            .filter(|b| !known(b))
+            .map(|b| b.trigger)
+            .collect();
+        let mut bindings: Vec<Binding> = preset
+            .bindings
+            .iter()
+            .filter(|p| !own.contains(&p.trigger))
+            .map(|p| {
+                let mut p = p.clone();
+                if let Some(b) = self.bindings.iter().find(|b| same(b, &p)) {
+                    p.invert = b.invert;
+                    p.rel = b.rel;
+                }
+                p
+            })
+            .collect();
+        bindings.extend(
+            self.bindings
+                .iter()
+                .filter(|b| own.contains(&b.trigger))
+                .cloned(),
+        );
+        *self = Mapping {
+            device: std::mem::take(&mut self.device),
+            bindings,
+            jog_sensitivity: self.jog_sensitivity,
+            scratch_sensitivity: self.scratch_sensitivity,
+            jog_ticks_per_rev: self.jog_ticks_per_rev.or(preset.jog_ticks_per_rev),
+            vinyl: self.vinyl,
+            ..preset.clone()
+        };
+        true
     }
 
     /// A four-deck controller's decks 3 and 4 used to drive Tandem's decks
@@ -537,6 +694,9 @@ impl Mapping {
             target,
             invert: false,
             rel: RelMode::Offset64,
+            shift: false,
+            mode: None,
+            light: None,
         });
         self.bindings.last_mut().unwrap()
     }
@@ -714,6 +874,14 @@ pub struct MidiEngine {
     free: [Option<(i64, i64)>; DECKS],
     /// Roll pads held, per deck, the latest last (sizes, see [`ROLLS`]).
     rolls: [Vec<u8>; DECKS],
+    /// Each deck's pad mode, set by [`Target::PadMode`] buttons.
+    pad_modes: [PadMode; DECKS],
+    /// [`Target::Shift`] buttons held.
+    shift: HashSet<Trigger>,
+    /// Buttons held, and what pressing them did: letting go goes to the
+    /// same targets, even if SHIFT or the pad mode changed in between (a
+    /// roll always ends when its pad is let go).
+    held: HashMap<Trigger, Vec<Target>>,
 }
 
 const BEND: f64 = 0.04;
@@ -751,7 +919,78 @@ impl MidiEngine {
             hand: std::array::from_fn(|_| VecDeque::new()),
             free: [None; DECKS],
             rolls: std::array::from_fn(|_| Vec::new()),
+            pad_modes: [PadMode::default(); DECKS],
+            shift: HashSet::new(),
+            held: HashMap::new(),
         }
+    }
+
+    /// Use another mapping (a controller just connected): nothing held,
+    /// every deck's pads on hot cues.
+    pub fn load(&mut self, mapping: Mapping) {
+        self.mapping = mapping;
+        self.learn = None;
+        self.pad_modes = [PadMode::default(); DECKS];
+        self.shift.clear();
+        self.held.clear();
+    }
+
+    /// Deck `deck`'s pad mode.
+    pub fn pad_mode(&self, deck: u8) -> PadMode {
+        self.pad_modes
+            .get(deck as usize)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// True while a [`Target::Shift`] button is held.
+    pub fn shift_held(&self) -> bool {
+        !self.shift.is_empty()
+    }
+
+    /// Whether a binding's pad mode, if it has one, is its deck's.
+    fn in_mode(&self, b: &Binding) -> bool {
+        match (b.mode, b.target.deck()) {
+            (Some(mode), Some(deck)) => self.pad_mode(deck) == mode,
+            _ => true,
+        }
+    }
+
+    /// The bindings a message on `trig` drives now: those whose deck is in
+    /// their pad mode, and while SHIFT is held, the SHIFT + ones if the
+    /// control has any (otherwise SHIFT doesn't change what it does).
+    fn active(&self, trig: Trigger) -> Vec<Binding> {
+        let shift = self.shift_held();
+        let mut v: Vec<Binding> = self
+            .mapping
+            .bindings
+            .iter()
+            .filter(|b| b.trigger == trig && (shift || !b.shift) && self.in_mode(b))
+            .cloned()
+            .collect();
+        if shift && v.iter().any(|b| b.shift) {
+            v.retain(|b| b.shift);
+        }
+        v
+    }
+
+    /// While learning, SHIFT and the pad mode buttons keep working, so the
+    /// DJ can hold SHIFT or pick the pad mode for the control being learned
+    /// (unless one of them is what's being learned).
+    fn modifier_message(&self, raw: RawMidi, learning: Target) -> bool {
+        let trig = match raw {
+            RawMidi::NoteOn { ch, note, .. } | RawMidi::NoteOff { ch, note } => {
+                Trigger::note(ch, note)
+            }
+            RawMidi::Cc { ch, cc, .. } => Trigger::cc(ch, cc),
+            RawMidi::PitchBend { .. } => return false,
+        };
+        !learning.is_modifier()
+            && self
+                .mapping
+                .bindings
+                .iter()
+                .any(|b| b.trigger == trig && b.target.is_modifier())
     }
 
     /// Called every few milliseconds by the controller thread. Turns the
@@ -860,7 +1099,7 @@ impl MidiEngine {
         };
         self.last_message = Some(raw.label());
 
-        if let Some(target) = self.learn {
+        if let Some(target) = self.learn.filter(|&t| !self.modifier_message(raw, t)) {
             // Only accept a message that suits the target: a fader can't be
             // learned from a button press, a jog not from its touch sensor.
             let trigger = self.learn_trigger(raw, target.kind());
@@ -878,11 +1117,24 @@ impl MidiEngine {
             } else {
                 RelMode::Offset64
             };
+            // Learned with SHIFT held, it's SHIFT + the control. A pad on a
+            // deck with pad mode buttons works in the mode the deck is in.
+            let mode = target.deck().filter(|&d| {
+                target.is_pad()
+                    && self
+                        .mapping
+                        .bindings
+                        .iter()
+                        .any(|b| matches!(b.target, Target::PadMode { deck, .. } if deck == d))
+            });
             let binding = Binding {
                 trigger,
                 target,
                 invert: false,
                 rel,
+                shift: self.shift_held() && target != Target::Shift,
+                mode: mode.map(|d| self.pad_mode(d)),
+                light: None,
             };
             self.mapping.bindings.retain(|b| b.target != target);
             self.mapping.bindings.push(binding.clone());
@@ -938,13 +1190,13 @@ impl MidiEngine {
     }
 
     fn button(&mut self, trig: Trigger, down: bool, room: &RoomState, out: &mut Vec<MidiOut>) {
-        let targets: Vec<Target> = self
-            .mapping
-            .bindings
-            .iter()
-            .filter(|b| b.trigger == trig)
-            .map(|b| b.target)
-            .collect();
+        let targets: Vec<Target> = match (down, self.held.remove(&trig)) {
+            (false, Some(pressed)) => pressed,
+            _ => self.active(trig).iter().map(|b| b.target).collect(),
+        };
+        if down {
+            self.held.insert(trig, targets.clone());
+        }
         for target in targets {
             match target {
                 Target::Play { deck } if down => {
@@ -1050,6 +1302,18 @@ impl MidiEngine {
                 Target::Load { deck } if down => out.push(MidiOut::LoadSelected(deck)),
                 Target::BrowsePress if down => out.push(MidiOut::BrowsePress),
                 Target::BrowseBack if down => out.push(MidiOut::BrowseBack),
+                Target::PadMode { deck, mode } if down => {
+                    if let Some(m) = self.pad_modes.get_mut(deck as usize) {
+                        *m = mode;
+                    }
+                }
+                Target::Shift => {
+                    if down {
+                        self.shift.insert(trig);
+                    } else {
+                        self.shift.remove(&trig);
+                    }
+                }
                 _ => {}
             }
         }
@@ -1130,13 +1394,8 @@ impl MidiEngine {
         local: &LocalParams,
         out: &mut Vec<MidiOut>,
     ) {
-        let bindings: Vec<Binding> = self
-            .mapping
-            .bindings
-            .iter()
-            .filter(|b| b.trigger == trig)
-            .cloned()
-            .collect();
+        let bindings = self.active(trig);
+        let mut pressed = false;
         for b in &bindings {
             match b.target.kind() {
                 TargetKind::Relative => {
@@ -1188,8 +1447,12 @@ impl MidiEngine {
                     }
                 }
                 TargetKind::Button => {
-                    // A button sent as CC (127 press / 0 release).
-                    self.button(trig, raw7.map(|r| r >= 64).unwrap_or(v >= 0.5), room, out);
+                    // A button sent as CC (127 press / 0 release), once
+                    // for all its bindings.
+                    if !std::mem::replace(&mut pressed, true) {
+                        let down = raw7.map(|r| r >= 64).unwrap_or(v >= 0.5);
+                        self.button(trig, down, room, out);
+                    }
                 }
                 TargetKind::Absolute => {
                     if self.card.sets(b.target) {
@@ -1375,53 +1638,93 @@ impl MidiEngine {
 
     /// Desired state of every light we can drive: (status, note) -> on.
     pub fn leds(&self, room: &RoomState, local: &LocalParams) -> Vec<((u8, u8), bool)> {
-        let mut out: Vec<((u8, u8), bool)> = Vec::new();
+        self.light_states(room, local)
+            .into_iter()
+            .map(|(key, on, _)| (key, on))
+            .collect()
+    }
+
+    /// What to send every light we can drive: (status, note) -> value
+    /// (127 lit and 0 unlit, unless the binding says otherwise).
+    pub fn lights(&self, room: &RoomState, local: &LocalParams) -> Vec<((u8, u8), u8)> {
+        self.light_states(room, local)
+            .into_iter()
+            .map(|(key, _, value)| (key, value))
+            .collect()
+    }
+
+    /// Every light: (status, note), whether it's lit, and its value. A
+    /// control's lights show what it does without SHIFT, and a pad shows
+    /// its binding for the deck's pad mode (off if it has none).
+    fn light_states(&self, room: &RoomState, local: &LocalParams) -> Vec<((u8, u8), bool, u8)> {
+        let mut out: Vec<((u8, u8), bool, u8)> = Vec::new();
+        // Lights with a binding in use: the first one sets the light, and a
+        // later one only to light it.
+        let mut in_use = HashSet::new();
         for b in &self.mapping.bindings {
-            if b.trigger.kind != MidiKind::Note {
+            if b.trigger.kind != MidiKind::Note || b.shift {
                 continue;
             }
-            let on = match b.target {
-                Target::Play { deck } => {
-                    let d = &room.decks[deck as usize];
-                    d.playing && !d.cue_preview
-                }
-                Target::Cue { deck } => {
-                    let d = &room.decks[deck as usize];
-                    d.track.is_some() && (!d.playing || d.cue_preview)
-                }
-                Target::HotCue { deck, slot } => {
-                    room.decks[deck as usize].hot_cues[slot as usize].is_some()
-                }
-                Target::Sync { deck } => room.decks[deck as usize].synced,
-                Target::Pfl { deck } => local.pfl[deck as usize],
-                // Lit while looping; LOOP IN also while it waits for LOOP OUT.
-                Target::LoopIn { deck } => {
-                    let d = &room.decks[deck as usize];
-                    d.looping || (d.loop_in.is_some() && d.loop_out.is_none())
-                }
-                Target::LoopOut { deck } | Target::Reloop { deck } => {
-                    room.decks[deck as usize].looping
-                }
-                // The pad of the beat loop that's playing.
-                Target::BeatLoop { deck, size } => {
-                    let d = &room.decks[deck as usize];
-                    d.looping
-                        && d.loop_beats
-                            .is_some_and(|b| (b - beat_loop_beats(size)).abs() < 1e-9)
-                }
-                // The pad of the roll that's held.
-                Target::Roll { deck, size } => room.decks[deck as usize]
-                    .roll
-                    .is_some_and(|r| (r.beats - roll_beats(size)).abs() < 1e-9),
-                _ => continue,
+            let Some(on) = self.lit(b.target, room, local) else {
+                continue;
             };
             let key = (0x90 | b.trigger.channel, b.trigger.number);
-            match out.iter_mut().find(|(k, _)| *k == key) {
-                Some(e) => e.1 |= on,
-                None => out.push((key, on)),
+            let i = match out.iter().position(|l| l.0 == key) {
+                Some(i) => i,
+                None => {
+                    out.push((key, false, 0));
+                    out.len() - 1
+                }
+            };
+            if !self.in_mode(b) {
+                continue;
+            }
+            let (lit, unlit) = b.light.unwrap_or((0x7F, 0x00));
+            if in_use.insert(key) || (on && !out[i].1) {
+                out[i] = (key, on, if on { lit } else { unlit });
             }
         }
         out
+    }
+
+    /// Whether a control's light is lit, if it has one.
+    fn lit(&self, target: Target, room: &RoomState, local: &LocalParams) -> Option<bool> {
+        Some(match target {
+            Target::Play { deck } => {
+                let d = &room.decks[deck as usize];
+                d.playing && !d.cue_preview
+            }
+            Target::Cue { deck } => {
+                let d = &room.decks[deck as usize];
+                d.track.is_some() && (!d.playing || d.cue_preview)
+            }
+            Target::HotCue { deck, slot } => {
+                room.decks[deck as usize].hot_cues[slot as usize].is_some()
+            }
+            Target::Sync { deck } => room.decks[deck as usize].synced,
+            Target::Pfl { deck } => local.pfl[deck as usize],
+            // Lit while looping; LOOP IN also while it waits for LOOP OUT.
+            Target::LoopIn { deck } => {
+                let d = &room.decks[deck as usize];
+                d.looping || (d.loop_in.is_some() && d.loop_out.is_none())
+            }
+            Target::LoopOut { deck } | Target::Reloop { deck } => room.decks[deck as usize].looping,
+            // The pad of the beat loop that's playing.
+            Target::BeatLoop { deck, size } => {
+                let d = &room.decks[deck as usize];
+                d.looping
+                    && d.loop_beats
+                        .is_some_and(|b| (b - beat_loop_beats(size)).abs() < 1e-9)
+            }
+            // The pad of the roll that's held.
+            Target::Roll { deck, size } => room.decks[deck as usize]
+                .roll
+                .is_some_and(|r| (r.beats - roll_beats(size)).abs() < 1e-9),
+            // The deck's pad mode, and SHIFT while it's held.
+            Target::PadMode { deck, mode } => self.pad_mode(deck) == mode,
+            Target::Shift => self.shift_held(),
+            _ => return None,
+        })
     }
 
     /// Desired value of every level meter: (status, CC) -> value.
@@ -1496,7 +1799,10 @@ pub fn mapping_key(port_name: &str) -> String {
 /// A ready-made mapping for controllers we know, if this port is one.
 pub fn builtin_preset(port_name: &str) -> Option<Mapping> {
     let n = port_name.to_uppercase();
-    if n.contains("DDJ-FLX6") {
+    let letters: String = n.chars().filter(|c| c.is_alphanumeric()).collect();
+    if letters.contains("SCLIVE4") {
+        Some(denon_sc_live_4(port_name))
+    } else if n.contains("DDJ-FLX6") {
         Some(ddj_flx6(port_name))
     } else if n.contains("DDJ-FLX4") || n.contains("DDJ-400") {
         Some(pioneer_ddj(
@@ -1604,6 +1910,112 @@ fn pioneer_ddj(device: &str, name: &str, hw_decks: u8, ticks_per_rev: f32) -> Ma
     m.bind(Trigger::cc(6, 0x40), Target::Browse).rel = RelMode::TwosComplement;
     m.bind(Trigger::note(6, 0x41), Target::BrowsePress);
     m.bind(Trigger::note(6, 0x65), Target::BrowseBack);
+    m
+}
+
+/// Lights on Denon controllers: buttons are dim at 1 and lit at 127.
+const DENON_BUTTON: Option<(u8, u8)> = Some((127, 1));
+/// Denon pads take a colour number, two bits each of red, green and blue
+/// (red 48, green 12, blue 3, white 63, off 0). The hot cue pads light in
+/// the colours the hot cues have on screen: red, orange, yellow, green,
+/// cyan, blue, purple and pink.
+const DENON_HOT_CUES: [u8; 8] = [48, 56, 60, 12, 15, 3, 35, 51];
+/// Beat loop pads: white while playing, otherwise dark green.
+const DENON_BEAT_LOOP_PAD: Option<(u8, u8)> = Some((63, 4));
+/// Roll pads: white while held, otherwise dark violet.
+const DENON_ROLL_PAD: Option<(u8, u8)> = Some((63, 17));
+
+/// Denon SC Live 4, in computer mode. Denon publishes no MIDI list for it:
+/// this comes from two Traktor mappings for it and Mixxx's Denon Prime 4
+/// mapping (the same family and messages), and hasn't been tried on the
+/// unit yet. The left side sends on MIDI channel 5 and drives deck A, the
+/// right side channel 6 and deck B (its DECK 3/4 button only switches a
+/// layer in software, so C and D aren't on it); mixer channels 1 and 2 are
+/// A and B's, and the browse section, crossfader, MASTER and the headphone
+/// knobs are on channel 16.
+///
+/// The pads send notes 0x0F–0x16 in every pad mode, and SHIFT doesn't
+/// change what anything sends, so Tandem keeps track of both: SHIFT (note
+/// 0x1C on either side) is [`Target::Shift`], and the pad mode buttons HOT
+/// CUE (0x0B), LOOP (0x0C) and ROLL (0x0D) are [`Target::PadMode`]: hot
+/// cues (SHIFT + pad clears one), beat loops of ¼ to 32 beats, and loop
+/// rolls of 1/16 to 8 beats. SLICER (0x0E) is left alone: Tandem has no
+/// slicer, so pressing it keeps the pads as they were.
+fn denon_sc_live_4(device: &str) -> Mapping {
+    let mut m = Mapping::empty(device);
+    m.preset = Some("Denon SC Live 4".to_string());
+    m.preset_version = PRESET_VERSION;
+    // Mixxx's Prime 4 mapping counts 1000 a turn; calibrate to be sure.
+    m.jog_ticks_per_rev = Some(1000.0);
+    for side in 0..2u8 {
+        let ch = 4 + side;
+        let deck = side;
+        m.bind(Trigger::note(ch, 0x1C), Target::Shift).light = DENON_BUTTON;
+        m.bind(Trigger::note(ch, 0x0A), Target::Play { deck }).light = DENON_BUTTON;
+        m.bind(Trigger::note(ch, 0x09), Target::Cue { deck }).light = DENON_BUTTON;
+        m.bind(Trigger::note(ch, 0x09), Target::BackToStart { deck })
+            .shift = true;
+        m.bind(Trigger::note(ch, 0x08), Target::Sync { deck }).light = DENON_BUTTON;
+        m.bind(Trigger::note(ch, 0x08), Target::SyncOff { deck })
+            .shift = true;
+        m.bind(Trigger::note(ch, 0x21), Target::JogTouch { deck });
+        m.bind(Trigger::cc(ch, 0x36), Target::Jog { deck }).rel = RelMode::TwosComplement;
+        m.bind(Trigger::note(ch, 0x1D), Target::BendDown { deck });
+        m.bind(Trigger::note(ch, 0x1E), Target::BendUp { deck });
+        // The pitch fader's coarse half (its fine half, CC 0x4B, isn't on
+        // CC 0x1F + 32, so Tandem reads it as 7-bit). Its value rises
+        // towards +, as on Pioneers.
+        m.bind(Trigger::cc(ch, 0x1F), Target::Tempo { deck });
+        m.bind(Trigger::cc(ch, 0x1F), Target::TempoShift { deck })
+            .shift = true;
+        m.bind(Trigger::note(15, 0x01 + side), Target::Load { deck });
+        // Loop section: IN, OUT, and pushing the loop knob makes a 4-beat
+        // loop (Engine's auto loop).
+        m.bind(Trigger::note(ch, 0x25), Target::LoopIn { deck })
+            .light = DENON_BUTTON;
+        m.bind(Trigger::note(ch, 0x26), Target::LoopOut { deck })
+            .light = DENON_BUTTON;
+        m.bind(Trigger::note(ch, 0x27), Target::BeatLoop { deck, size: 4 });
+        // Mixer channel 1 or 2.
+        let mx = side;
+        m.bind(Trigger::cc(mx, 0x03), Target::Trim { deck });
+        m.bind(Trigger::cc(mx, 0x04), Target::Eq { deck, band: 2 });
+        m.bind(Trigger::cc(mx, 0x06), Target::Eq { deck, band: 1 });
+        m.bind(Trigger::cc(mx, 0x08), Target::Eq { deck, band: 0 });
+        m.bind(Trigger::cc(mx, 0x0B), Target::Filter { deck });
+        m.bind(Trigger::cc(mx, 0x0E), Target::Volume { deck });
+        m.bind(Trigger::note(mx, 0x0D), Target::Pfl { deck }).light = DENON_BUTTON;
+        // Pad mode buttons, and the pads in each mode.
+        for (note, mode) in [
+            (0x0B, PadMode::HotCues),
+            (0x0C, PadMode::BeatLoops),
+            (0x0D, PadMode::Rolls),
+        ] {
+            m.bind(Trigger::note(ch, note), Target::PadMode { deck, mode })
+                .light = DENON_BUTTON;
+        }
+        for i in 0..8u8 {
+            let pad = Trigger::note(ch, 0x0F + i);
+            let b = m.bind(pad, Target::HotCue { deck, slot: i });
+            b.mode = Some(PadMode::HotCues);
+            b.light = Some((DENON_HOT_CUES[i as usize], 0));
+            let b = m.bind(pad, Target::HotCueClear { deck, slot: i });
+            b.mode = Some(PadMode::HotCues);
+            b.shift = true;
+            let b = m.bind(pad, Target::BeatLoop { deck, size: i });
+            b.mode = Some(PadMode::BeatLoops);
+            b.light = DENON_BEAT_LOOP_PAD;
+            let b = m.bind(pad, Target::Roll { deck, size: i });
+            b.mode = Some(PadMode::Rolls);
+            b.light = DENON_ROLL_PAD;
+        }
+    }
+    m.bind(Trigger::cc(15, 0x0E), Target::Crossfader);
+    m.bind(Trigger::cc(15, 0x12), Target::CueMix);
+    m.bind(Trigger::cc(15, 0x14), Target::MasterLevel);
+    m.bind(Trigger::cc(15, 0x13), Target::HeadphoneLevel);
+    m.bind(Trigger::cc(15, 0x05), Target::Browse).rel = RelMode::TwosComplement;
+    m.bind(Trigger::note(15, 0x06), Target::BrowsePress);
     m
 }
 
@@ -3208,5 +3620,440 @@ mod tests {
         assert_eq!(mapping_key("Mixtrack Pro FX"), "Mixtrack_Pro_FX");
         assert!(builtin_preset("DDJ-FLX6").is_some());
         assert!(builtin_preset("Mixtrack Pro FX").is_none());
+        for port in ["SC LIVE 4", "2- SC LIVE 4", "SC Live 4 MIDI"] {
+            let p = builtin_preset(port).expect(port);
+            assert_eq!(p.preset.as_deref(), Some("Denon SC Live 4"));
+        }
+        assert_eq!(mapping_key("2- SC LIVE 4"), "SC_LIVE_4");
+        assert!(builtin_preset("SC LIVE 2").is_none());
+    }
+
+    fn sc_live_4() -> MidiEngine {
+        MidiEngine::new(builtin_preset("SC LIVE 4").unwrap(), 0.08)
+    }
+
+    /// Plays SC Live 4 messages; the left side sends on MIDI channel 5
+    /// (0x94 note on, 0xB4 CC) and the right side on channel 6.
+    fn send(e: &mut MidiEngine, msg: [u8; 3]) -> Vec<MidiOut> {
+        e.handle(&msg, &RoomState::default(), &LocalParams::default())
+    }
+
+    fn act(a: Action) -> Vec<MidiOut> {
+        vec![MidiOut::Action(a)]
+    }
+
+    fn roll(deck: u8, beats: f64, on: bool) -> Vec<MidiOut> {
+        act(Action::Roll { deck, beats, on })
+    }
+
+    /// Presses and lets go of a button (Denon lets go with velocity 0).
+    fn tap(e: &mut MidiEngine, status: u8, note: u8) -> Vec<MidiOut> {
+        let mut out = send(e, [status, note, 0x7F]);
+        out.extend(send(e, [status, note, 0x00]));
+        out
+    }
+
+    #[test]
+    fn sc_live_4_roll_mode_pads_roll() {
+        let mut e = sc_live_4();
+        // Every deck starts on hot cues.
+        assert_eq!(
+            tap(&mut e, 0x94, 0x0F),
+            [
+                MidiOut::Action(Action::HotCue { deck: 0, slot: 0 }),
+                MidiOut::Action(Action::HotCueUp { deck: 0, slot: 0 }),
+            ]
+        );
+        // ROLL (note 0x0D) on the left: its pads roll 1/16 to 8 beats
+        // while held.
+        assert!(tap(&mut e, 0x94, 0x0D).is_empty());
+        assert_eq!(e.pad_mode(0), PadMode::Rolls);
+        for (i, beats) in ROLLS.iter().enumerate() {
+            let pad = 0x0F + i as u8;
+            assert_eq!(
+                send(&mut e, [0x94, pad, 0x7F]),
+                roll(0, *beats, true),
+                "pad {}",
+                i + 1
+            );
+            assert_eq!(send(&mut e, [0x94, pad, 0x00]), roll(0, *beats, false));
+        }
+        // Two pads held: the latest rolls, and letting go of it goes back
+        // to the other one's size. A note off lets go too.
+        assert_eq!(send(&mut e, [0x94, 0x12, 0x7F]), roll(0, 0.5, true));
+        assert_eq!(send(&mut e, [0x94, 0x11, 0x7F]), roll(0, 0.25, true));
+        assert_eq!(send(&mut e, [0x94, 0x11, 0x00]), roll(0, 0.5, true));
+        assert_eq!(send(&mut e, [0x84, 0x12, 0x40]), roll(0, 0.5, false));
+        // The right side keeps its own mode: still hot cues.
+        assert_eq!(e.pad_mode(1), PadMode::HotCues);
+        assert_eq!(
+            send(&mut e, [0x95, 0x0F, 0x7F]),
+            act(Action::HotCue { deck: 1, slot: 0 })
+        );
+        send(&mut e, [0x95, 0x0F, 0x00]);
+        // ROLL on the right rolls deck B.
+        tap(&mut e, 0x95, 0x0D);
+        assert_eq!(send(&mut e, [0x95, 0x16, 0x7F]), roll(1, 8.0, true));
+        assert_eq!(send(&mut e, [0x95, 0x16, 0x00]), roll(1, 8.0, false));
+        // LOOP on the left: beat loops of ¼ to 32 beats.
+        tap(&mut e, 0x94, 0x0C);
+        assert_eq!(e.pad_mode(0), PadMode::BeatLoops);
+        for (i, beats) in BEAT_LOOPS.iter().enumerate() {
+            let pad = 0x0F + i as u8;
+            let beats = *beats;
+            assert_eq!(
+                tap(&mut e, 0x94, pad),
+                act(Action::BeatLoop { deck: 0, beats })
+            );
+        }
+        // SLICER isn't mapped: the pads stay as they were.
+        assert!(tap(&mut e, 0x94, 0x0E).is_empty());
+        assert_eq!(e.pad_mode(0), PadMode::BeatLoops);
+        // HOT CUE: hot cues again; the right side still rolls.
+        tap(&mut e, 0x94, 0x0B);
+        assert_eq!(
+            send(&mut e, [0x94, 0x16, 0x7F]),
+            act(Action::HotCue { deck: 0, slot: 7 })
+        );
+        assert_eq!(send(&mut e, [0x95, 0x12, 0x7F]), roll(1, 0.5, true));
+    }
+
+    #[test]
+    fn sc_live_4_shift() {
+        let mut e = sc_live_4();
+        // SHIFT on either side shifts the whole controller: SHIFT + pad
+        // clears the hot cue, and its release does nothing.
+        assert!(send(&mut e, [0x94, 0x1C, 0x7F]).is_empty());
+        assert!(e.shift_held());
+        assert_eq!(
+            send(&mut e, [0x95, 0x10, 0x7F]),
+            act(Action::ClearHotCue { deck: 1, slot: 1 })
+        );
+        assert!(send(&mut e, [0x95, 0x10, 0x00]).is_empty());
+        // SHIFT + CUE goes back to the start, SHIFT + SYNC turns sync off.
+        assert_eq!(
+            tap(&mut e, 0x94, 0x09),
+            act(Action::Seek { deck: 0, pos: 0.0 })
+        );
+        assert_eq!(
+            tap(&mut e, 0x94, 0x08)[0],
+            MidiOut::Action(Action::Sync { deck: 0, on: false })
+        );
+        // A control with no SHIFT binding does the same with SHIFT held.
+        assert_eq!(tap(&mut e, 0x94, 0x0A), act(Action::Play { deck: 0 }));
+        tap(&mut e, 0x94, 0x0D);
+        assert_eq!(tap(&mut e, 0x94, 0x0F).len(), 2, "SHIFT + pad still rolls");
+        // Both SHIFTs held and one let go: still shifted.
+        send(&mut e, [0x95, 0x1C, 0x7F]);
+        send(&mut e, [0x94, 0x1C, 0x00]);
+        assert!(e.shift_held());
+        send(&mut e, [0x95, 0x1C, 0x00]);
+        assert!(!e.shift_held());
+        assert_eq!(
+            send(&mut e, [0x95, 0x10, 0x7F]),
+            act(Action::HotCue { deck: 1, slot: 1 })
+        );
+        assert_eq!(
+            send(&mut e, [0x94, 0x09, 0x7F]),
+            act(Action::CueDown { deck: 0 })
+        );
+    }
+
+    #[test]
+    fn sc_live_4_shift_tempo_moves_the_fader_not_the_tempo() {
+        let mut e = sc_live_4();
+        let mut room = RoomState::default();
+        let local = LocalParams::default();
+        let at = |v: u8| 1.0 + ((v as f32 / 127.0) as f64 - 0.5) * 0.16;
+        let tempo = |out: Vec<MidiOut>| match out[..] {
+            [MidiOut::Action(Action::Tempo { deck: 0, tempo })] => tempo,
+            ref other => panic!("{other:?}"),
+        };
+        room.decks[0].tempo = tempo(e.handle(&[0xB4, 0x1F, 96], &room, &local));
+        assert!((room.decks[0].tempo - at(96)).abs() < 1e-9);
+        // SHIFT + fader back to the centre: the tempo stays.
+        e.handle(&[0x94, 0x1C, 0x7F], &room, &local);
+        assert!(e.handle(&[0xB4, 0x1F, 64], &room, &local).is_empty());
+        e.handle(&[0x94, 0x1C, 0x00], &room, &local);
+        // Then up again: the tempo goes on from where it was.
+        let next = tempo(e.handle(&[0xB4, 0x1F, 72], &room, &local));
+        let want = at(96) + at(72) - at(64);
+        assert!((next - want).abs() < 1e-9, "{next} vs {want}");
+    }
+
+    #[test]
+    fn letting_go_goes_where_pressing_went() {
+        let mut e = sc_live_4();
+        // A roll held while switching to HOT CUE still ends when let go.
+        tap(&mut e, 0x94, 0x0D);
+        assert_eq!(send(&mut e, [0x94, 0x13, 0x7F]), roll(0, 1.0, true));
+        tap(&mut e, 0x94, 0x0B);
+        assert_eq!(send(&mut e, [0x94, 0x13, 0x00]), roll(0, 1.0, false));
+        // SHIFT + pad, SHIFT let go first: the pad's release isn't a hot
+        // cue's.
+        send(&mut e, [0x94, 0x1C, 0x7F]);
+        assert_eq!(
+            send(&mut e, [0x94, 0x0F, 0x7F]),
+            act(Action::ClearHotCue { deck: 0, slot: 0 })
+        );
+        send(&mut e, [0x94, 0x1C, 0x00]);
+        assert!(send(&mut e, [0x94, 0x0F, 0x00]).is_empty());
+        // And a hot cue held while SHIFT goes down is let go as a hot cue.
+        assert_eq!(
+            send(&mut e, [0x94, 0x0F, 0x7F]),
+            act(Action::HotCue { deck: 0, slot: 0 })
+        );
+        send(&mut e, [0x94, 0x1C, 0x7F]);
+        assert_eq!(
+            send(&mut e, [0x94, 0x0F, 0x00]),
+            act(Action::HotCueUp { deck: 0, slot: 0 })
+        );
+    }
+
+    #[test]
+    fn sc_live_4_lights() {
+        let mut e = sc_live_4();
+        let local = LocalParams::default();
+        let mut room = RoomState::default();
+        room.decks[0].hot_cues[2] = Some(1.0);
+        let light = |e: &MidiEngine, room: &RoomState, k: (u8, u8)| {
+            let lights = e.lights(room, &local);
+            lights.iter().find(|(kk, _)| *kk == k).map(|x| x.1)
+        };
+        // HOT CUE lit, LOOP and ROLL dim; SLICER left alone.
+        assert_eq!(light(&e, &room, (0x94, 0x0B)), Some(127));
+        assert_eq!(light(&e, &room, (0x94, 0x0C)), Some(1));
+        assert_eq!(light(&e, &room, (0x94, 0x0D)), Some(1));
+        assert_eq!(light(&e, &room, (0x94, 0x0E)), None);
+        // Hot cue pads: a set one in its colour (3: yellow), empty ones off.
+        assert_eq!(light(&e, &room, (0x94, 0x11)), Some(60));
+        assert_eq!(light(&e, &room, (0x94, 0x0F)), Some(0));
+        // Buttons are dim, not off; nothing is sent to the jog or bends.
+        for k in [(0x94, 0x0A), (0x94, 0x09), (0x94, 0x1C), (0x90, 0x0D)] {
+            assert_eq!(light(&e, &room, k), Some(1), "{k:02X?}");
+        }
+        for k in [(0x94, 0x21), (0x94, 0x1D), (0x94, 0x1E)] {
+            assert_eq!(light(&e, &room, k), None, "{k:02X?}");
+        }
+        // ROLL on the left: its button lit, its pads dark violet; the right
+        // side's lights don't change.
+        tap(&mut e, 0x94, 0x0D);
+        assert_eq!(light(&e, &room, (0x94, 0x0D)), Some(127));
+        assert_eq!(light(&e, &room, (0x94, 0x0B)), Some(1));
+        assert_eq!(light(&e, &room, (0x94, 0x11)), Some(17));
+        assert_eq!(light(&e, &room, (0x95, 0x0B)), Some(127));
+        assert_eq!(light(&e, &room, (0x95, 0x0F)), Some(0));
+        // The held roll's pad lights white.
+        room.decks[0] = crate::model::DeckState {
+            track: Some(crate::model::TrackId([1; 32])),
+            duration: 100.0,
+            playing: true,
+            ..Default::default()
+        };
+        room.apply(&crate::model::Event {
+            time: 1_000_000,
+            origin: 1,
+            seq: 1,
+            action: Action::Roll {
+                deck: 0,
+                beats: 0.5,
+                on: true,
+            },
+        });
+        assert_eq!(light(&e, &room, (0x94, 0x12)), Some(63), "pad 4: ½ beat");
+        assert_eq!(light(&e, &room, (0x94, 0x13)), Some(17));
+        let leds = e.leds(&room, &local);
+        assert!(leds.contains(&((0x94, 0x12), true)));
+        assert!(leds.contains(&((0x94, 0x13), false)));
+        // LOOP: beat loop pads dark green.
+        tap(&mut e, 0x94, 0x0C);
+        assert_eq!(light(&e, &room, (0x94, 0x12)), Some(4));
+        // SHIFT lights both SHIFT buttons while held.
+        send(&mut e, [0x95, 0x1C, 0x7F]);
+        assert_eq!(light(&e, &room, (0x94, 0x1C)), Some(127));
+        assert_eq!(light(&e, &room, (0x95, 0x1C)), Some(127));
+    }
+
+    #[test]
+    fn learning_with_shift_and_pad_modes() {
+        let mut e = sc_live_4();
+        let learned = |out: Vec<MidiOut>| match &out[..] {
+            [MidiOut::Learned(b)] => b.clone(),
+            other => panic!("{other:?}"),
+        };
+        // Learning deck A's ½-beat roll: ROLL picks the pad mode and isn't
+        // learned, and the pad is learned for that mode.
+        e.learn = Some(Target::Roll { deck: 0, size: 3 });
+        assert!(tap(&mut e, 0x94, 0x0D).is_empty());
+        assert_eq!(e.learn, Some(Target::Roll { deck: 0, size: 3 }));
+        let b = learned(send(&mut e, [0x94, 0x16, 0x7F]));
+        assert_eq!(b.trigger, Trigger::note(4, 0x16));
+        assert_eq!((b.mode, b.shift), (Some(PadMode::Rolls), false));
+        assert_eq!(b.label(), "Note 0x16 · ch 5 (pad mode: rolls)");
+        assert!(send(&mut e, [0x94, 0x16, 0x00]).is_empty());
+        // Learning with SHIFT held: SHIFT + the pad, in HOT CUE mode.
+        tap(&mut e, 0x94, 0x0B);
+        e.learn = Some(Target::HotCueClear { deck: 0, slot: 0 });
+        assert!(send(&mut e, [0x94, 0x1C, 0x7F]).is_empty());
+        let b = learned(send(&mut e, [0x94, 0x0F, 0x7F]));
+        assert_eq!((b.mode, b.shift), (Some(PadMode::HotCues), true));
+        assert_eq!(b.label(), "SHIFT + Note 0x0f · ch 5 (pad mode: hot cues)");
+        send(&mut e, [0x94, 0x0F, 0x00]);
+        send(&mut e, [0x94, 0x1C, 0x00]);
+        // Controls that aren't pads work in every pad mode.
+        tap(&mut e, 0x94, 0x0D);
+        e.learn = Some(Target::Reloop { deck: 0 });
+        let b = learned(send(&mut e, [0x94, 0x28, 0x7F]));
+        assert_eq!((b.mode, b.shift), (None, false));
+        // SHIFT and the pad mode buttons can be learned themselves.
+        e.learn = Some(Target::Shift);
+        let b = learned(send(&mut e, [0x94, 0x1C, 0x7F]));
+        assert_eq!((b.target, b.shift), (Target::Shift, false));
+        e.learn = Some(Target::PadMode {
+            deck: 1,
+            mode: PadMode::BeatLoops,
+        });
+        assert_eq!(
+            learned(send(&mut e, [0x95, 0x0E, 0x7F])).trigger,
+            Trigger::note(5, 0x0E)
+        );
+        send(&mut e, [0x95, 0x0E, 0x00]);
+        assert_eq!(tap(&mut e, 0x95, 0x0E), []);
+        assert_eq!(e.pad_mode(1), PadMode::BeatLoops);
+        // A controller without pad mode buttons learns pads as before.
+        let mut e = engine();
+        e.learn = Some(Target::Roll { deck: 0, size: 0 });
+        let b = learned(send(&mut e, [0x97, 0x20, 0x7F]));
+        assert_eq!((b.mode, b.shift), (None, false));
+    }
+
+    /// The SC Live 4 mapping written by hand on 2026-11-14 (Tandem had no
+    /// preset for it), as a friend installed it in their mappings folder.
+    const SC_LIVE_4_FILE: &str = include_str!("../testdata/SC_LIVE_4.json");
+
+    #[test]
+    fn hand_written_sc_live_4_mapping_becomes_the_preset() {
+        let saved: Mapping = serde_json::from_str(SC_LIVE_4_FILE).unwrap();
+        assert_eq!(saved.preset, None);
+        assert_eq!(saved.bindings.len(), 57);
+        assert!(saved
+            .bindings
+            .iter()
+            .all(|b| !b.shift && b.mode.is_none() && b.light.is_none()));
+        // As it was: hot cues in every pad mode.
+        let mut e = MidiEngine::new(saved.clone(), 0.08);
+        tap(&mut e, 0x94, 0x0D);
+        assert_eq!(
+            send(&mut e, [0x94, 0x0F, 0x7F]),
+            act(Action::HotCue { deck: 0, slot: 0 })
+        );
+        // Untouched, it becomes the preset exactly.
+        let preset = builtin_preset(&saved.device).expect("a preset for SC LIVE 4");
+        let mut m = saved.clone();
+        assert!(m.adopt(&preset));
+        assert_eq!(m, preset);
+        assert_eq!(m.upgrade_from(&preset), 0);
+        assert!(!m.adopt(&preset), "only once");
+        // Calibrated, with the jog inverted, and with RELOOP learned onto
+        // deck B's pad 8 (where hot cue 8 stays).
+        let mut m = saved.clone();
+        m.jog_ticks_per_rev = Some(1012.0);
+        m.scratch_sensitivity = 1.5;
+        m.vinyl = false;
+        let jog = Trigger::cc(4, 0x36);
+        m.bindings
+            .iter_mut()
+            .find(|b| b.trigger == jog)
+            .unwrap()
+            .invert = true;
+        let pad8 = Trigger::note(5, 0x16);
+        m.bind(pad8, Target::Reloop { deck: 1 });
+        assert!(m.adopt(&preset));
+        assert_eq!(m.preset.as_deref(), Some("Denon SC Live 4"));
+        assert_eq!(m.preset_version, PRESET_VERSION);
+        assert_eq!(m.jog_ticks_per_rev, Some(1012.0));
+        assert_eq!((m.scratch_sensitivity, m.vinyl), (1.5, false));
+        let at = |m: &Mapping, t: Trigger| {
+            m.bindings
+                .iter()
+                .filter(|b| b.trigger == t)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let jogs = at(&m, jog);
+        assert!(jogs[0].invert && jogs[0].rel == RelMode::TwosComplement);
+        let pad8_bindings: Vec<Target> = at(&m, pad8).iter().map(|b| b.target).collect();
+        assert_eq!(
+            pad8_bindings,
+            [
+                Target::HotCue { deck: 1, slot: 7 },
+                Target::Reloop { deck: 1 }
+            ]
+        );
+        assert_eq!(m.bindings.len(), preset.bindings.len() - 4 + 2);
+        // Saved and loaded again, it's the same, and deck A's pads roll.
+        let json = serde_json::to_vec_pretty(&m).unwrap();
+        let m: Mapping = serde_json::from_slice(&json).unwrap();
+        let mut e = MidiEngine::new(m, 0.08);
+        tap(&mut e, 0x94, 0x0D);
+        assert_eq!(send(&mut e, [0x94, 0x12, 0x7F]), roll(0, 0.5, true));
+        assert_eq!(send(&mut e, [0x94, 0x12, 0x00]), roll(0, 0.5, false));
+    }
+
+    #[test]
+    fn saved_sc_live_4_mappings_gain_new_pad_modes() {
+        // As if a later preset added the ROLL pads: saved mappings gain
+        // them on every pad, even though the pads already do hot cues and
+        // beat loops in the other modes...
+        let preset = builtin_preset("SC LIVE 4").unwrap();
+        let rolls = |b: &Binding| b.mode == Some(PadMode::Rolls);
+        let mut saved = preset.clone();
+        saved.preset_version = PRESET_VERSION - 1;
+        saved.bindings.retain(|b| !rolls(b));
+        // ...but not on a pad the DJ learned a control onto (it works in
+        // every mode), or one they learned a roll onto themselves.
+        saved.bind(Trigger::note(5, 0x16), Target::Reloop { deck: 1 });
+        saved
+            .bind(Trigger::note(4, 0x0F), Target::Roll { deck: 0, size: 7 })
+            .mode = Some(PadMode::Rolls);
+        assert_eq!(saved.upgrade_from(&preset), 16 - 2);
+        let mut e = MidiEngine::new(saved, 0.08);
+        tap(&mut e, 0x94, 0x0D);
+        assert_eq!(send(&mut e, [0x94, 0x0F, 0x7F]), roll(0, 8.0, true));
+        assert_eq!(send(&mut e, [0x94, 0x10, 0x7F]), roll(0, 0.125, true));
+        tap(&mut e, 0x95, 0x0D);
+        assert_eq!(
+            send(&mut e, [0x95, 0x16, 0x7F]),
+            act(Action::Reloop { deck: 1 })
+        );
+    }
+
+    #[test]
+    fn only_mappings_mostly_like_the_preset_are_adopted() {
+        let preset = builtin_preset("SC LIVE 4").unwrap();
+        // Learned by hand for some other layout: one of three is the preset's.
+        let mut m = Mapping::empty("SC LIVE 4");
+        m.bind(Trigger::note(4, 0x0A), Target::Play { deck: 0 });
+        m.bind(Trigger::note(4, 0x09), Target::Play { deck: 1 });
+        m.bind(Trigger::note(4, 0x08), Target::Cue { deck: 1 });
+        let before = m.clone();
+        assert!(!m.adopt(&preset));
+        assert_eq!(m, before);
+        // Nothing learned yet, or already a preset's: left alone.
+        assert!(!Mapping::empty("SC LIVE 4").adopt(&preset));
+        let mut flx = pioneer_ddj("DDJ-FLX6", "Pioneer DDJ-FLX6", 4, 2048.0);
+        assert!(!flx.adopt(&builtin_preset("DDJ-FLX6").unwrap()));
+    }
+
+    #[test]
+    fn shift_pad_modes_and_lights_are_saved() {
+        let preset = builtin_preset("SC LIVE 4").unwrap();
+        let json = serde_json::to_string(&preset).unwrap();
+        assert_eq!(serde_json::from_str::<Mapping>(&json).unwrap(), preset);
+        // Bindings that need none of them are saved as before.
+        let flx = serde_json::to_string(&pioneer_ddj("DDJ-FLX6", "test", 4, 2048.0)).unwrap();
+        for field in ["\"shift\"", "\"mode\"", "\"light\""] {
+            assert!(!flx.contains(field), "{field}");
+        }
     }
 }

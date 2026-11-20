@@ -100,11 +100,21 @@ impl Midi {
             .and_then(|b| serde_json::from_slice(&b).ok());
         let mapping = match saved {
             Some(mut m) => {
-                // Pick up controls added to the built-in preset since this was saved.
                 if let Some(p) = builtin_preset(port_name) {
+                    // A mapping made before the built-in one existed becomes it.
+                    let adopted = m.adopt(&p);
+                    if adopted {
+                        log::info!(
+                            "MIDI: your mapping now follows the built-in {} mapping",
+                            p.preset.clone().unwrap_or_default()
+                        );
+                    }
+                    // Pick up controls added to the built-in preset since this was saved.
                     let added = m.upgrade_from(&p);
                     if added > 0 {
                         log::info!("MIDI: added {added} new controls from the built-in mapping");
+                    }
+                    if adopted || added > 0 {
                         if let Ok(b) = serde_json::to_vec_pretty(&m) {
                             let _ = std::fs::write(Self::mapping_path(mappings_dir, port_name), b);
                         }
@@ -128,11 +138,7 @@ impl Midi {
                 None => Mapping::empty(port_name),
             },
         };
-        {
-            let mut e = self.engine.lock();
-            e.mapping = mapping;
-            e.learn = None;
-        }
+        self.engine.lock().load(mapping);
         let mut input = MidiInput::new("tandem")?;
         input.ignore(Ignore::All);
         let port = input
@@ -214,7 +220,7 @@ fn controller_loop(
     stop: Arc<AtomicBool>,
     pioneer: bool,
 ) {
-    let mut sent: HashMap<(u8, u8), bool> = HashMap::new();
+    let mut sent: HashMap<(u8, u8), u8> = HashMap::new();
     let mut sent_meters: HashMap<(u8, u8), u8> = HashMap::new();
     let mut last_keepalive = Instant::now() - Duration::from_secs(1);
     let mut last_slow = Instant::now();
@@ -250,14 +256,14 @@ fn controller_loop(
                     (s.latest(), s.local)
                 };
                 let levels = meters.read();
-                let (leds, values) = {
+                let (lights, values) = {
                     let e = engine.lock();
-                    (e.leds(&room, &local), e.meters(&levels))
+                    (e.lights(&room, &local), e.meters(&levels))
                 };
-                for (key, on) in leds {
-                    if sent.get(&key) != Some(&on) {
-                        let _ = o.send(&[key.0, key.1, if on { 0x7F } else { 0x00 }]);
-                        sent.insert(key, on);
+                for (key, v) in lights {
+                    if sent.get(&key) != Some(&v) {
+                        let _ = o.send(&[key.0, key.1, v]);
+                        sent.insert(key, v);
                     }
                 }
                 for (key, v) in values {
@@ -271,8 +277,8 @@ fn controller_loop(
         std::thread::sleep(Duration::from_millis(5));
     }
     if let Some(o) = out.as_mut() {
-        for (key, on) in sent {
-            if on {
+        for (key, v) in sent {
+            if v > 0 {
                 let _ = o.send(&[key.0, key.1, 0x00]);
             }
         }

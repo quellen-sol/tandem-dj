@@ -59,7 +59,7 @@ A loop that appears or changes under audio the head has already read makes the h
 
 ### Loop rolls
 
-A loop roll is a beat loop that plays only while its pad is held, while the track runs on underneath (slip), so letting go carries on exactly where the track would have been. On Pioneer controllers the BEAT JUMP pads roll 1/16 to 8 beats (`model::ROLLS`, top row short to long).
+A loop roll is a beat loop that plays only while its pad is held, while the track runs on underneath (slip), so letting go carries on exactly where the track would have been. On Pioneer controllers the BEAT JUMP pads roll 1/16 to 8 beats (`model::ROLLS`, top row short to long), and on the Denon SC Live 4 the pads in ROLL pad mode.
 
 - **State.** `DeckState::roll` holds the roll's loop and the *slip position*, where the track underneath was at a moment (`slip_time`, `slip_pos`). The deck's playhead goes round the roll (`active_loop` is the roll while one is held), so read heads, waveforms and the relock schedule treat it like any loop. The track underneath moves at the deck's play speed and goes round the ordinary loop if one plays (`slip_position_at`). `reanchor` moves both, so tempo, bend and sync changes carry the track underneath too. It's all in the events, so both booths and the broadcast hear the same roll.
 - **Starting.** `Roll { on: true }` on a playing deck starts on the grid at the playhead, like a beat loop (`grid_loop`), so the playhead doesn't move. Another size while one is held keeps the in point and puts the playhead at the point in the new roll that the track underneath is at, `in + (slip − in) mod length`, so the roll stays in step with the track. A paused deck doesn't roll.
@@ -68,7 +68,7 @@ A loop roll is a beat loop that plays only while its pad is held, while the trac
 - **Over a loop.** The ordinary loop stays set and the track underneath keeps going round it. A roll can be longer than the loop. Letting go comes back into the loop wherever the track has got to.
 - **Sync.** The beat phase is the track's underneath (`beat_phase` reads the slip position), so SYNC pressed under a roll lines up the track, and a synced deck is back on the beat after any roll, even a 1/16 stutter. A whole-beat roll also sounds on the beat while it plays.
 
-Mapping: `Target::Roll { deck, size }` is one target per pad, pressed and let go, so controllers whose pads send the same notes in every pad mode can use it too. Preset version 10 puts the Pioneer BEAT JUMP pads (notes 0x20–0x27 on the pad channels) on it, and saved mappings pick them up unless the DJ learned something else onto those pads.
+Mapping: `Target::Roll { deck, size }` is one target per pad, pressed and let go, so controllers whose pads send the same notes in every pad mode can use it too. Preset version 10 puts the Pioneer BEAT JUMP pads (notes 0x20–0x27 on the pad channels) on it, and saved mappings pick them up unless the DJ learned something else onto those pads. The SC Live 4's pads send the same notes in every mode, so its roll pads are bindings for the ROLL pad mode (see [SHIFT and pad modes](#shift-and-pad-modes-tracked-by-tandem)).
 
 ### Spinning records
 
@@ -200,7 +200,21 @@ Faders and knobs use soft takeover (`mapping.rs`), but the tempo fader can't: SY
 
 All of this runs in the booth whose controller it is; the room only sees the `Tempo` actions it sends. So it works the same on synced decks (the sync group follows them like any tempo change) and when the partner moves the same deck: the next move starts from wherever the deck is.
 
-A controller that sends the same message with SHIFT held (the Denon SC Live 4) can't use `TempoShift`: that needs SHIFT tracked in software, as a modifier for other bindings.
+On a controller that sends the same message with SHIFT held (the Denon SC Live 4), `TempoShift` is a SHIFT + binding on the fader's own message (see below).
+
+### SHIFT and pad modes tracked by Tandem
+
+Pioneer controllers send other messages with SHIFT held and in each pad mode, so a binding is just a message and what it does. The Denon SC Live 4 doesn't: its pads send notes 0x0F–0x16 in every pad mode, and SHIFT changes nothing anything sends. So a binding can also need SHIFT, or a pad mode (`mapping.rs`):
+
+- **SHIFT.** The `MidiEngine` keeps track of the buttons bound to `Target::Shift` (either side's shifts the whole controller, as in Engine OS). A binding marked `shift` works only while one is held, and then replaces the control's other bindings; a control with none does the same with SHIFT held. On the SC Live 4 that's SHIFT + pad (clear the hot cue), SHIFT + CUE, SHIFT + SYNC and SHIFT + tempo fader.
+- **Pad modes.** Buttons bound to `Target::PadMode { deck, mode }` set the deck's `PadMode`: hot cues (the start), beat loops or rolls. A binding with a `mode` works only while its target's deck is in that mode, so each pad has a binding per mode and each side keeps its own. A mode button that isn't bound (the SC Live 4's SLICER) leaves the pads as they were.
+- **Letting go** goes to whatever pressing did (`MidiEngine::held`), so a roll ends when its pad is let go even if the mode or SHIFT changed in between, and SHIFT let go before the pad doesn't turn a cleared hot cue into a hot cue release.
+- **Lights** show what a control does without SHIFT, and a pad shows its binding for the deck's mode (off if it has none). A binding's `light` gives the values sent lit and unlit, instead of 127 and 0: Denon buttons are dim at 1 and lit at 127, and their pads take a colour number, two bits each of red, green and blue. The SC Live 4's hot cue pads light in the hot cues' on-screen colours, a held roll pad white.
+- **Learning** with SHIFT held learns SHIFT + the control. A pad target (hot cue, clear, beat loop or roll) learned on a deck that has pad mode buttons works only in the mode the deck is in. SHIFT and the mode buttons keep working while learning, so the DJ sets them first.
+
+All of it happens in the booth whose controller it is: the room only sees the actions it sends.
+
+The SC Live 4's built-in mapping comes from two Traktor mappings for it and Mixxx's Denon Prime 4 mapping (Denon publishes no MIDI list), and is matched by its port name. Its first mapping was a file written by hand, with no preset. `Mapping::adopt` turns a mapping like that, made before its controller had a preset, into the preset when at least half its bindings are the preset's: it keeps the jog calibration and settings, invert and encoder style, and a button or knob bound to something the preset doesn't keeps its bindings as they were. When a preset gains controls, `Mapping::upgrade_from` adds each one unless the saved mapping already answers that message: the same button or knob, with SHIFT or without as in the preset, in a pad mode they share. So a later pad mode reaches saved SC Live 4 mappings too.
 
 ### Loading onto a deck
 

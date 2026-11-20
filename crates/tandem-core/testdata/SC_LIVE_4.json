@@ -1,0 +1,774 @@
+{
+  "device": "SC LIVE 4",
+  "bindings": [
+    {
+      "trigger": {
+        "kind": "Note",
+        "channel": 4,
+        "number": 10
+      },
+      "target": {
+        "t": "Play",
+        "deck": 0
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Note",
+        "channel": 4,
+        "number": 9
+      },
+      "target": {
+        "t": "Cue",
+        "deck": 0
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Note",
+        "channel": 4,
+        "number": 8
+      },
+      "target": {
+        "t": "Sync",
+        "deck": 0
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Note",
+        "channel": 4,
+        "number": 15
+      },
+      "target": {
+        "t": "HotCue",
+        "deck": 0,
+        "slot": 0
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Note",
+        "channel": 4,
+        "number": 16
+      },
+      "target": {
+        "t": "HotCue",
+        "deck": 0,
+        "slot": 1
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Note",
+        "channel": 4,
+        "number": 17
+      },
+      "target": {
+        "t": "HotCue",
+        "deck": 0,
+        "slot": 2
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Note",
+        "channel": 4,
+        "number": 18
+      },
+      "target": {
+        "t": "HotCue",
+        "deck": 0,
+        "slot": 3
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Note",
+        "channel": 4,
+        "number": 19
+      },
+      "target": {
+        "t": "HotCue",
+        "deck": 0,
+        "slot": 4
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Note",
+        "channel": 4,
+        "number": 20
+      },
+      "target": {
+        "t": "HotCue",
+        "deck": 0,
+        "slot": 5
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Note",
+        "channel": 4,
+        "number": 21
+      },
+      "target": {
+        "t": "HotCue",
+        "deck": 0,
+        "slot": 6
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Note",
+        "channel": 4,
+        "number": 22
+      },
+      "target": {
+        "t": "HotCue",
+        "deck": 0,
+        "slot": 7
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Note",
+        "channel": 4,
+        "number": 37
+      },
+      "target": {
+        "t": "LoopIn",
+        "deck": 0
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Note",
+        "channel": 4,
+        "number": 38
+      },
+      "target": {
+        "t": "LoopOut",
+        "deck": 0
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Note",
+        "channel": 4,
+        "number": 39
+      },
+      "target": {
+        "t": "BeatLoop",
+        "deck": 0,
+        "size": 4
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Note",
+        "channel": 15,
+        "number": 1
+      },
+      "target": {
+        "t": "Load",
+        "deck": 0
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Note",
+        "channel": 4,
+        "number": 33
+      },
+      "target": {
+        "t": "JogTouch",
+        "deck": 0
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Cc",
+        "channel": 4,
+        "number": 54
+      },
+      "target": {
+        "t": "Jog",
+        "deck": 0
+      },
+      "invert": false,
+      "rel": "TwosComplement"
+    },
+    {
+      "trigger": {
+        "kind": "Note",
+        "channel": 4,
+        "number": 29
+      },
+      "target": {
+        "t": "BendDown",
+        "deck": 0
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Note",
+        "channel": 4,
+        "number": 30
+      },
+      "target": {
+        "t": "BendUp",
+        "deck": 0
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Cc",
+        "channel": 4,
+        "number": 31
+      },
+      "target": {
+        "t": "Tempo",
+        "deck": 0
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Cc",
+        "channel": 0,
+        "number": 3
+      },
+      "target": {
+        "t": "Trim",
+        "deck": 0
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Cc",
+        "channel": 0,
+        "number": 4
+      },
+      "target": {
+        "t": "Eq",
+        "deck": 0,
+        "band": 2
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Cc",
+        "channel": 0,
+        "number": 6
+      },
+      "target": {
+        "t": "Eq",
+        "deck": 0,
+        "band": 1
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Cc",
+        "channel": 0,
+        "number": 8
+      },
+      "target": {
+        "t": "Eq",
+        "deck": 0,
+        "band": 0
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Cc",
+        "channel": 0,
+        "number": 11
+      },
+      "target": {
+        "t": "Filter",
+        "deck": 0
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Cc",
+        "channel": 0,
+        "number": 14
+      },
+      "target": {
+        "t": "Volume",
+        "deck": 0
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Note",
+        "channel": 0,
+        "number": 13
+      },
+      "target": {
+        "t": "Pfl",
+        "deck": 0
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Note",
+        "channel": 5,
+        "number": 10
+      },
+      "target": {
+        "t": "Play",
+        "deck": 1
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Note",
+        "channel": 5,
+        "number": 9
+      },
+      "target": {
+        "t": "Cue",
+        "deck": 1
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Note",
+        "channel": 5,
+        "number": 8
+      },
+      "target": {
+        "t": "Sync",
+        "deck": 1
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Note",
+        "channel": 5,
+        "number": 15
+      },
+      "target": {
+        "t": "HotCue",
+        "deck": 1,
+        "slot": 0
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Note",
+        "channel": 5,
+        "number": 16
+      },
+      "target": {
+        "t": "HotCue",
+        "deck": 1,
+        "slot": 1
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Note",
+        "channel": 5,
+        "number": 17
+      },
+      "target": {
+        "t": "HotCue",
+        "deck": 1,
+        "slot": 2
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Note",
+        "channel": 5,
+        "number": 18
+      },
+      "target": {
+        "t": "HotCue",
+        "deck": 1,
+        "slot": 3
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Note",
+        "channel": 5,
+        "number": 19
+      },
+      "target": {
+        "t": "HotCue",
+        "deck": 1,
+        "slot": 4
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Note",
+        "channel": 5,
+        "number": 20
+      },
+      "target": {
+        "t": "HotCue",
+        "deck": 1,
+        "slot": 5
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Note",
+        "channel": 5,
+        "number": 21
+      },
+      "target": {
+        "t": "HotCue",
+        "deck": 1,
+        "slot": 6
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Note",
+        "channel": 5,
+        "number": 22
+      },
+      "target": {
+        "t": "HotCue",
+        "deck": 1,
+        "slot": 7
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Note",
+        "channel": 5,
+        "number": 37
+      },
+      "target": {
+        "t": "LoopIn",
+        "deck": 1
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Note",
+        "channel": 5,
+        "number": 38
+      },
+      "target": {
+        "t": "LoopOut",
+        "deck": 1
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Note",
+        "channel": 5,
+        "number": 39
+      },
+      "target": {
+        "t": "BeatLoop",
+        "deck": 1,
+        "size": 4
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Note",
+        "channel": 15,
+        "number": 2
+      },
+      "target": {
+        "t": "Load",
+        "deck": 1
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Note",
+        "channel": 5,
+        "number": 33
+      },
+      "target": {
+        "t": "JogTouch",
+        "deck": 1
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Cc",
+        "channel": 5,
+        "number": 54
+      },
+      "target": {
+        "t": "Jog",
+        "deck": 1
+      },
+      "invert": false,
+      "rel": "TwosComplement"
+    },
+    {
+      "trigger": {
+        "kind": "Note",
+        "channel": 5,
+        "number": 29
+      },
+      "target": {
+        "t": "BendDown",
+        "deck": 1
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Note",
+        "channel": 5,
+        "number": 30
+      },
+      "target": {
+        "t": "BendUp",
+        "deck": 1
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Cc",
+        "channel": 5,
+        "number": 31
+      },
+      "target": {
+        "t": "Tempo",
+        "deck": 1
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Cc",
+        "channel": 1,
+        "number": 3
+      },
+      "target": {
+        "t": "Trim",
+        "deck": 1
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Cc",
+        "channel": 1,
+        "number": 4
+      },
+      "target": {
+        "t": "Eq",
+        "deck": 1,
+        "band": 2
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Cc",
+        "channel": 1,
+        "number": 6
+      },
+      "target": {
+        "t": "Eq",
+        "deck": 1,
+        "band": 1
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Cc",
+        "channel": 1,
+        "number": 8
+      },
+      "target": {
+        "t": "Eq",
+        "deck": 1,
+        "band": 0
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Cc",
+        "channel": 1,
+        "number": 11
+      },
+      "target": {
+        "t": "Filter",
+        "deck": 1
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Cc",
+        "channel": 1,
+        "number": 14
+      },
+      "target": {
+        "t": "Volume",
+        "deck": 1
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Note",
+        "channel": 1,
+        "number": 13
+      },
+      "target": {
+        "t": "Pfl",
+        "deck": 1
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Cc",
+        "channel": 15,
+        "number": 14
+      },
+      "target": {
+        "t": "Crossfader"
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Cc",
+        "channel": 15,
+        "number": 18
+      },
+      "target": {
+        "t": "CueMix"
+      },
+      "invert": false,
+      "rel": "Offset64"
+    },
+    {
+      "trigger": {
+        "kind": "Cc",
+        "channel": 15,
+        "number": 5
+      },
+      "target": {
+        "t": "Browse"
+      },
+      "invert": false,
+      "rel": "TwosComplement"
+    }
+  ],
+  "jog_sensitivity": 1.0,
+  "scratch_sensitivity": 1.0,
+  "jog_ticks_per_rev": 1000.0,
+  "vinyl": true,
+  "preset": null,
+  "preset_version": 0,
+  "meters": []
+}
