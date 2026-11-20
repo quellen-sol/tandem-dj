@@ -1823,6 +1823,49 @@ mod tests {
     }
 
     #[test]
+    fn loop_rolls_go_round_and_let_go_onto_the_track() {
+        let a = sine_track();
+        let roll = |beats, on| Action::Roll { deck: 0, beats, on };
+        let natural = 2.0 * std::f32::consts::PI * 207.25 / 44_100.0 * 16_000.0 / 32_768.0;
+        let (plain, _) = render_loop(&a, false, &[], 4.5);
+        for key_lock in [false, true] {
+            let (out, syncs) = render_loop(
+                &a,
+                key_lock,
+                &[
+                    // Let go before it has gone round: nothing to hear.
+                    (1_234_000, roll(1.0, true)),
+                    (1_400_000, roll(1.0, false)),
+                    // ½ beat, then ¼ from the same start (in step: no jump),
+                    // then let go onto the track.
+                    (2_100_000, roll(0.5, true)),
+                    (2_600_000, roll(0.25, true)),
+                    (3_300_000, roll(0.25, false)),
+                ],
+                4.5,
+            );
+            if key_lock {
+                continue;
+            }
+            // Playing, and letting go: the only hard syncs.
+            assert!(syncs <= 2, "{syncs} hard syncs");
+            let at = |s: f64| (s * 44_100.0) as usize;
+            let step = max_step(&out[..at(3.29)], 4410);
+            assert!(step < natural * 1.6, "click while rolling: {step}");
+            // Before the first roll went round, and after letting go, it's
+            // the track as if it had never rolled.
+            let same = |from: f64, to: f64| {
+                (at(from)..at(to))
+                    .map(|i| (out[i] - plain[i]).abs())
+                    .fold(0.0, f32::max)
+            };
+            assert!(same(0.5, 2.1) < 2e-3, "{}", same(0.5, 2.1));
+            assert!(same(3.4, 4.5) < 2e-3, "{}", same(3.4, 4.5));
+            assert!(same(2.4, 3.2) > 0.1, "rolling sounds different");
+        }
+    }
+
+    #[test]
     fn stream_clock_smooths_jitter() {
         let mut sc = StreamClock::new(48_000.0);
         let mut t_true = 1_000_000.0f64;

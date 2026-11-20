@@ -245,6 +245,8 @@ pub struct UiState {
 /// `--dev-late <ms>` shows moves arriving that late, to see the warnings;
 /// `--dev-cut <frame>` drops the room link at that frame, as a network
 /// failure would (no goodbye), to see the booth get back in.
+/// `--dev-roll` leaves deck B's loop and holds a 1-beat loop roll on it
+/// for the last 1.5 s before the screenshot.
 pub struct DevOpts {
     pub screenshot: Option<PathBuf>,
     pub shot_frame: u64,
@@ -257,6 +259,7 @@ pub struct DevOpts {
     pub cut_frame: Option<u64>,
     pub search: Option<String>,
     pub broadcast_view: bool,
+    pub roll: bool,
     pub shared: bool,
     pub demo_started: bool,
     pub frame: u64,
@@ -979,6 +982,18 @@ impl TandemApp {
             self.session
                 .lock()
                 .offer_share("Friday warm-up".into(), paths);
+        }
+        if self.dev.demo && self.dev.roll && self.dev.demo_started {
+            if f == self.dev.shot_frame.saturating_sub(120) && view.room.decks[1].looping {
+                self.session.lock().act(Action::Reloop { deck: 1 });
+            }
+            if f == self.dev.shot_frame.saturating_sub(90) {
+                self.session.lock().act(Action::Roll {
+                    deck: 1,
+                    beats: 1.0,
+                    on: true,
+                });
+            }
         }
         if self.dev.demo && self.dev.demo_started && f == self.dev.shot_frame.saturating_sub(40) {
             if let Some(item) = self.item_at(2, view) {

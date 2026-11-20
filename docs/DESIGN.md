@@ -57,6 +57,19 @@ Read heads go round loops by themselves. They read the track through the loop: f
 
 A loop that appears or changes under audio the head has already read makes the head hard-sync with the usual 2 ms crossfade. That happens with LOOP OUT pressed at the playhead, a partner's loop arriving a little late, and always with a stretched head, because the stretcher reads ahead.
 
+### Loop rolls
+
+A loop roll is a beat loop that plays only while its pad is held, while the track runs on underneath (slip), so letting go carries on exactly where the track would have been. On Pioneer controllers the BEAT JUMP pads roll 1/16 to 8 beats (`model::ROLLS`, top row short to long).
+
+- **State.** `DeckState::roll` holds the roll's loop and the *slip position*, where the track underneath was at a moment (`slip_time`, `slip_pos`). The deck's playhead goes round the roll (`active_loop` is the roll while one is held), so read heads, waveforms and the relock schedule treat it like any loop. The track underneath moves at the deck's play speed and goes round the ordinary loop if one plays (`slip_position_at`). `reanchor` moves both, so tempo, bend and sync changes carry the track underneath too. It's all in the events, so both booths and the broadcast hear the same roll.
+- **Starting.** `Roll { on: true }` on a playing deck starts on the grid at the playhead, like a beat loop (`grid_loop`), so the playhead doesn't move. Another size while one is held keeps the in point and puts the playhead at the point in the new roll that the track underneath is at, `in + (slip − in) mod length`, so the roll stays in step with the track. A paused deck doesn't roll.
+- **Letting go.** `Roll { on: false }` with the size that's rolling puts the playhead on the track underneath (`end_roll`). Before the roll has gone round, the two agree to the last bit and nothing jumps; otherwise it's a jump (a `gen` bump, so a 2 ms crossfade). Letting go of another size does nothing. The controller keeps track of which roll pads are held (`MidiEngine::roll_pad`): letting go of the latest of two sends the other one's size, so its roll comes back.
+- **What lets go first.** A jump (seek, CUE, a hot cue jump, the end of a preview, a load), PAUSE and every loop control end the roll, then apply, so a quantized LOOP IN or OUT snaps where the track has got to, not where the roll is. Tempo, bend, SYNC, the mixer and scratching carry on under it. Scratching and its nudges move only the playhead, so the track keeps running underneath, like slip scratching.
+- **Over a loop.** The ordinary loop stays set and the track underneath keeps going round it. A roll can be longer than the loop. Letting go comes back into the loop wherever the track has got to.
+- **Sync.** The beat phase is the track's underneath (`beat_phase` reads the slip position), so SYNC pressed under a roll lines up the track, and a synced deck is back on the beat after any roll, even a 1/16 stutter. A whole-beat roll also sounds on the beat while it plays.
+
+Mapping: `Target::Roll { deck, size }` is one target per pad, pressed and let go, so controllers whose pads send the same notes in every pad mode can use it too. Preset version 10 puts the Pioneer BEAT JUMP pads (notes 0x20–0x27 on the pad channels) on it, and saved mappings pick them up unless the DJ learned something else onto those pads.
+
 ### Spinning records
 
 Let go of the jog platter mid-spin (vinyl mode) and the record runs on and slows down, as in Serato. On the DDJ-FLX6 a hard backspin leaves the hand at about 5–6× normal speed. After the hand leaves, the platter itself keeps turning for 0.3–0.9 s, and even a still hand flicks it about 400 ticks as it lifts off.
@@ -183,7 +196,7 @@ A controller that sends the same message with SHIFT held (the Denon SC Live 4) c
 
 | Shared (in the timeline) | Local (this booth only) |
 |---|---|
-| decks: load, play, cue, hot cues, loops, tempo, bend, nudge, beatgrids | headphone cue (PFL) per deck |
+| decks: load, play, cue, hot cues, loops and loop rolls, tempo, bend, nudge, beatgrids | headphone cue (PFL) per deck |
 | channel faders, EQ, crossfader, its curve and the assign switches | headphone mix and level |
 | the sync master | master and broadcast levels, sync click |
 | | showing decks C and D |

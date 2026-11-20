@@ -51,6 +51,7 @@ The self-test lists your audio and MIDI devices, opens your default output for h
    - **SHIFT + CUE** (or right-clicking CUE) jumps back to the start of the track.
    - **Hot cues held while paused are gated.** The deck plays from the hot cue only while you hold the pad. Let go and it snaps back to the hot cue, paused. Press PLAY while holding to keep it playing.
    - **Loops:** **IN**, **OUT** and **RELOOP/EXIT** work as in [Loops](#loops). **SHIFT + IN** is a 4-beat loop, and **CUE/LOOP CALL ◀ / ▶** halve and double the loop. Switch the pads to **BEAT LOOP** (SHIFT + BEAT JUMP) for ¼, ½, 1, 2, 4, 8, 16 and 32-beat loops. The pad of the loop that's playing lights up.
+   - **Loop rolls:** switch the pads to **BEAT JUMP**. Hold a pad and the deck loops 1/16, 1/8, ¼ or ½ beat (top row) or 1, 2, 4 or 8 beats (bottom row) while the track runs on underneath. Let go and it carries on where the track has got to, as if it had never rolled. See [Loops](#loops).
    - **Browsing:** the browse knob moves through the tracks. Press it to move through the lists on the left instead (All Music, This room, your folders and Serato crates): each list's tracks show as you turn. Press it again to go back into the tracks, pick one and press LOAD. **BACK** also takes the knob to the lists. A blue outline shows which side the knob is on. Clicking a list with the mouse puts the knob back on its tracks, and closing the SERATO CRATES section makes the knob skip the crates. On other controllers, learn **Library browse press** and **Library back**.
    - **Jog wheel moves the wrong way or jumps?** Tick **1/127 style** or **invert** next to it.
    - **The channel level meters** on the FLX6, FLX4 and DDJ-400 show each channel's deck, like the meters on screen: see [Level meters](#level-meters).
@@ -83,6 +84,9 @@ Each deck has a **LOOP** row, and the controller's loop buttons and BEAT LOOP pa
 - **Beat loops (¼ to 32 beats)** start on the beat the playhead is in, so they're always on the beat. A ¼-beat loop is the quarter of the beat the playhead is in. Press the same size again to leave the loop. Another size resizes the loop, keeping its start. Without a beatgrid, a beat loop starts at the playhead, at 120 BPM.
 - **×½ / ×2** halve and double the loop, keeping its start.
 - **Jumping outside the loop** (a hot cue, CUE, clicking the overview) leaves it. RELOOP still brings it back.
+- **Loop rolls** (the BEAT JUMP pads on the FLX6) loop only while you hold the pad, and the track runs on underneath, shown as a dashed line on the waveform. Let go and playback carries on from that line, exactly where the track would have been, still on the beat. A roll starts on the beat the playhead is in, like a beat loop. Press another roll pad while holding one to switch size: the roll keeps its start and stays in step with the track. Let go of it and the first pad's roll comes back.
+  - Rolls only work on a playing deck. PAUSE, a jump (CUE, a hot cue, a seek) or any loop button lets go of the roll first. Tempo, SYNC and the mixer carry on under it, and scratching moves what you hear while the track runs on.
+  - **Over a loop,** the loop keeps going round underneath, and letting go of the roll comes back into it.
 - **SYNC keeps working.** A synced deck stays on the beat while it loops. Leaving a loop shorter than a beat puts it back on the beat.
 - The loop shows as a green band on the waveforms. Going round is seamless, with no click at the join, and your partner hears it exactly as you do.
 
@@ -202,7 +206,7 @@ Host in one window and join `127.0.0.1` from the other.
 
 - **Decks and DJs:** 4 decks, 2 DJs per room, plus up to 4 broadcasters. There's one sync master: you can't sync two groups of decks to two different tempos.
 - **Beatgrids:** detection finds big, steady tempo changes but not gradual drifts, and doesn't find bars (the "1"). Some tracks come out at half or double time (87 instead of 174, say): **½** and **×2** under GRID fix that. Set markers by hand for both: see [Fixing a beatgrid](#fixing-a-beatgrid). A grid can have up to 32 markers, and every bar is 4 beats. Hot cues and play aren't snapped to the beat, except on a synced deck (loops are: see [Loops](#loops)). Quantized loops count bars from the beat you press IN on, not from the grid's bar 1.
-- **Loops:** no slip mode or loop rolls, no fine-adjusting IN/OUT with the jog wheel, and loops aren't saved with the track.
+- **Loops:** loop rolls are the only slip feature (no slip mode for scratching, hot cues or loops), there's no beat jump (the FLX6's BEAT JUMP pads roll), no fine-adjusting IN/OUT with the jog wheel, and loops aren't saved with the track.
 - **Keys:** detection is good but not perfect: on a test library it matched reference tools on about 3 tracks in 4, and most misses were a compatible neighbour (the relative major/minor, or one step round the Camelot wheel). A track gets one key, even if it changes key part-way through.
 - **Mixer:** no effects. EQ is a 3-band isolator, plus a filter and trim per channel.
 - **Controllers:** MIDI only. Controllers that only speak HID aren't supported.

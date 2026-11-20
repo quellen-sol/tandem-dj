@@ -199,7 +199,10 @@ fn deck_card(ui: &mut egui::Ui, d: usize, b: &BroadcastView) {
         if let Some((label, fill)) = deck_state(st, pos) {
             chip(ui, label, fill, 13.0 * s);
         }
-        if st.looping {
+        if let Some(r) = st.roll {
+            let text = format!("ROLL {}", beats_label(r.beats));
+            chip(ui, &text, LOOP.gamma_multiply(0.7), 13.0 * s);
+        } else if st.looping {
             let text = match st.loop_beats {
                 Some(n) => format!("LOOP {}", beats_label(n)),
                 None => "LOOP".to_string(),

@@ -11,7 +11,7 @@
 //! *relatively* (see [`MidiEngine::tempo_fader`]).
 
 use crate::meter::{to_db, Levels};
-use crate::model::{deck_letter, Action, RoomState, BEAT_LOOPS, DECKS};
+use crate::model::{deck_letter, Action, RoomState, BEAT_LOOPS, DECKS, ROLLS};
 use crate::render::LocalParams;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -112,6 +112,13 @@ pub enum Target {
         deck: u8,
         size: u8,
     },
+    /// A loop roll of [`ROLLS`]`[size]` beats (1/16 to 8) while held: one
+    /// per pad, so pads that send the same notes in every pad mode can use
+    /// them too.
+    Roll {
+        deck: u8,
+        size: u8,
+    },
     Tempo {
         deck: u8,
     },
@@ -190,6 +197,9 @@ impl Target {
                     beats_label(beat_loop_beats(size))
                 )
             }
+            Target::Roll { deck: d, size } => {
+                format!("Deck {} · Roll {}", deck(d), beats_label(roll_beats(size)))
+            }
             Target::Tempo { deck: d } => format!("Deck {} · Tempo fader", deck(d)),
             Target::TempoShift { deck: d } => {
                 format!("Deck {} · SHIFT + tempo fader (tempo stays)", deck(d))
@@ -248,6 +258,7 @@ impl Target {
             | LoopHalve { deck }
             | LoopDouble { deck }
             | BeatLoop { deck, .. }
+            | Roll { deck, .. }
             | Tempo { deck }
             | TempoShift { deck }
             | Volume { deck }
@@ -311,6 +322,9 @@ impl Target {
             for size in 0..BEAT_LOOPS.len() as u8 {
                 v.push(Target::BeatLoop { deck: d, size });
             }
+            for size in 0..ROLLS.len() as u8 {
+                v.push(Target::Roll { deck: d, size });
+            }
             v.push(Target::Load { deck: d });
             v.push(Target::JogTouch { deck: d });
             v.push(Target::Jog { deck: d });
@@ -338,6 +352,11 @@ impl Target {
 /// Beats in beat loop `size` (an index into [`BEAT_LOOPS`]).
 pub fn beat_loop_beats(size: u8) -> f64 {
     BEAT_LOOPS[(size as usize).min(BEAT_LOOPS.len() - 1)]
+}
+
+/// Beats in loop roll `size` (an index into [`ROLLS`]).
+pub fn roll_beats(size: u8) -> f64 {
+    ROLLS[(size as usize).min(ROLLS.len() - 1)]
 }
 
 /// "¼", "½", "1", "16"… for a loop length in beats.
@@ -419,7 +438,7 @@ pub struct Mapping {
 }
 
 /// Bump when built-in presets gain controls; saved mappings pick them up.
-pub const PRESET_VERSION: u32 = 9;
+pub const PRESET_VERSION: u32 = 10;
 /// Up to this preset version, four-deck controllers drove Tandem's two
 /// decks: decks 1 and 3 drove A, decks 2 and 4 drove B.
 const LAST_TWO_DECK_PRESET: u32 = 6;
@@ -610,6 +629,8 @@ pub struct MidiEngine {
     /// Per deck, after the hand let go of the platter: (when, last tick
     /// since). The platter turns on by itself for a moment.
     free: [Option<(i64, i64)>; DECKS],
+    /// Roll pads held, per deck, the latest last (sizes, see [`ROLLS`]).
+    rolls: [Vec<u8>; DECKS],
 }
 
 const BEND: f64 = 0.04;
@@ -645,6 +666,7 @@ impl MidiEngine {
             now: 0,
             hand: std::array::from_fn(|_| VecDeque::new()),
             free: [None; DECKS],
+            rolls: std::array::from_fn(|_| Vec::new()),
         }
     }
 
@@ -903,6 +925,11 @@ impl MidiEngine {
                         beats: beat_loop_beats(size),
                     }))
                 }
+                Target::Roll { deck, size } => {
+                    if let Some(a) = self.roll_pad(deck, size, down) {
+                        out.push(MidiOut::Action(a));
+                    }
+                }
                 Target::Pfl { deck } if down => out.push(MidiOut::TogglePfl(deck)),
                 Target::JogTouch { deck } => {
                     let d = deck as usize;
@@ -942,6 +969,32 @@ impl MidiEngine {
                 _ => {}
             }
         }
+    }
+
+    /// A roll pad pressed or let go. The latest pad held rolls: letting go
+    /// of it while another is still held goes back to that one's size, and
+    /// letting go of one that isn't rolling does nothing.
+    fn roll_pad(&mut self, deck: u8, size: u8, down: bool) -> Option<Action> {
+        let held = self.rolls.get_mut(deck as usize)?;
+        let roll = |size: u8, on: bool| Action::Roll {
+            deck,
+            beats: roll_beats(size),
+            on,
+        };
+        if down {
+            held.retain(|&s| s != size);
+            held.push(size);
+            return Some(roll(size, true));
+        }
+        if held.last() != Some(&size) {
+            held.retain(|&s| s != size);
+            return None;
+        }
+        held.pop();
+        Some(match held.last() {
+            Some(&back) => roll(back, true),
+            None => roll(size, false),
+        })
     }
 
     /// Remember scratch movement, to know how fast the hand let go.
@@ -1260,6 +1313,10 @@ impl MidiEngine {
                         && d.loop_beats
                             .is_some_and(|b| (b - beat_loop_beats(size)).abs() < 1e-9)
                 }
+                // The pad of the roll that's held.
+                Target::Roll { deck, size } => room.decks[deck as usize]
+                    .roll
+                    .is_some_and(|r| (r.beats - roll_beats(size)).abs() < 1e-9),
                 _ => continue,
             };
             let key = (0x90 | b.trigger.channel, b.trigger.number);
@@ -1368,7 +1425,8 @@ pub fn builtin_preset(port_name: &str) -> Option<Mapping> {
 /// The pads send a different note range in each pad mode: HOT CUE 0x00,
 /// PAD FX1 0x10, BEAT JUMP 0x20, SAMPLER 0x30, and with SHIFT + the mode
 /// button KEYBOARD 0x40, PAD FX2 0x50, BEAT LOOP 0x60, KEY SHIFT 0x70
-/// (recorded from a DDJ-FLX6).
+/// (recorded from a DDJ-FLX6). Tandem has no beat jump: the BEAT JUMP pads
+/// roll.
 fn pioneer_ddj(device: &str, name: &str, hw_decks: u8, ticks_per_rev: f32) -> Mapping {
     let mut m = Mapping::empty(device);
     m.preset = Some(name.to_string());
@@ -1423,6 +1481,12 @@ fn pioneer_ddj(device: &str, name: &str, hw_decks: u8, ticks_per_rev: f32) -> Ma
             m.bind(
                 Trigger::note(pads, 0x60 + slot),
                 Target::BeatLoop { deck, size: slot },
+            );
+            // BEAT JUMP pad mode: loop rolls while held, 1/16 to ½ beat on
+            // the top row and 1 to 8 beats on the bottom.
+            m.bind(
+                Trigger::note(pads, 0x20 + slot),
+                Target::Roll { deck, size: slot },
             );
         }
     }
@@ -1791,9 +1855,10 @@ mod tests {
         };
         m.bindings
             .retain(|b| !(b.target.deck().is_some_and(|d| d >= 2) && mixer(&b.target)));
-        // SHIFT + TEMPO came with preset version 9.
+        // SHIFT + TEMPO came with preset version 9, and the roll pads
+        // with 10.
         m.bindings
-            .retain(|b| !matches!(b.target, Target::TempoShift { .. }));
+            .retain(|b| !matches!(b.target, Target::TempoShift { .. } | Target::Roll { .. }));
         for b in &mut m.bindings {
             if let Some(d) = b.target.deck() {
                 b.target = b.target.with_deck(d % 2);
@@ -1815,8 +1880,8 @@ mod tests {
         let moved_and_added = saved.upgrade_from(&preset);
         // 41 controls on each of decks 3 and 4 (less the custom pad) move;
         // 7 mixer controls on each of channels 3 and 4, and their meters, are
-        // new, and so is SHIFT + TEMPO on all four decks.
-        assert_eq!(moved_and_added, 2 * 41 - 1 + 2 * 7 + 2 + 4);
+        // new, and so are SHIFT + TEMPO and 8 roll pads on all four decks.
+        assert_eq!(moved_and_added, 2 * 41 - 1 + 2 * 7 + 2 + 4 + 4 * 8);
         assert_eq!(saved.preset_version, PRESET_VERSION);
         assert_eq!(saved.jog_ticks_per_rev, Some(6387.0));
         assert_eq!(saved.meters, preset.meters);
@@ -2410,13 +2475,15 @@ mod tests {
                 })
             );
         }
-        // Left alone: SHIFT + OUT, SHIFT + RELOOP/EXIT, SHIFT + ◀/▶, BEAT JUMP pads.
+        // Left alone: SHIFT + OUT, SHIFT + RELOOP/EXIT, SHIFT + ◀/▶, and
+        // SHIFT + BEAT JUMP pads.
         for msg in [
             [0x90, 0x77, 0x7F],
             [0x90, 0x50, 0x7F],
             [0x90, 0x61, 0x7F],
             [0x90, 0x62, 0x7F],
-            [0x97, 0x20, 0x7F],
+            [0x98, 0x20, 0x7F],
+            [0x9E, 0x27, 0x7F],
         ] {
             assert!(press(msg).is_empty(), "{msg:02X?}");
         }
@@ -2428,6 +2495,149 @@ mod tests {
                 deck: 0,
                 quantize: false
             })
+        );
+    }
+
+    #[test]
+    fn flx6_beat_jump_pads_roll_while_held() {
+        // Pioneer's MIDI list: BEAT JUMP pads 1–8 send notes 0x20–0x27 on
+        // the pad channel (8, 10, 12, 14 for decks 1–4), 0x7F pressed and
+        // 0x00 let go.
+        let mut e = MidiEngine::new(pioneer_ddj("DDJ-FLX6", "test", 4, 2048.0), 0.08);
+        let (room, local) = (RoomState::default(), LocalParams::default());
+        let roll = |deck, beats, on| vec![MidiOut::Action(Action::Roll { deck, beats, on })];
+        for (deck, status) in [(0u8, 0x97u8), (1, 0x99), (2, 0x9B), (3, 0x9D)] {
+            for (i, beats) in ROLLS.iter().enumerate() {
+                let pad = 0x20 + i as u8;
+                assert_eq!(
+                    e.handle(&[status, pad, 0x7F], &room, &local),
+                    roll(deck, *beats, true),
+                    "deck {deck} pad {}",
+                    i + 1
+                );
+                assert_eq!(
+                    e.handle(&[status, pad, 0x00], &room, &local),
+                    roll(deck, *beats, false)
+                );
+            }
+        }
+        assert_eq!(ROLLS[0], 1.0 / 16.0, "top row, short to long");
+        assert_eq!(ROLLS[7], 8.0);
+        // Two pads held: the latest rolls, and letting go of it goes back
+        // to the other one's size.
+        let half = [0x97, 0x23, 0x7F];
+        let quarter = [0x97, 0x22, 0x7F];
+        let up = |m: [u8; 3]| [m[0], m[1], 0];
+        assert_eq!(e.handle(&half, &room, &local), roll(0, 0.5, true));
+        assert_eq!(e.handle(&quarter, &room, &local), roll(0, 0.25, true));
+        assert_eq!(e.handle(&up(quarter), &room, &local), roll(0, 0.5, true));
+        assert_eq!(e.handle(&up(half), &room, &local), roll(0, 0.5, false));
+        // Let go of the earlier one first: the latest keeps rolling.
+        assert_eq!(e.handle(&half, &room, &local), roll(0, 0.5, true));
+        assert_eq!(e.handle(&quarter, &room, &local), roll(0, 0.25, true));
+        assert!(e.handle(&up(half), &room, &local).is_empty());
+        assert_eq!(e.handle(&up(quarter), &room, &local), roll(0, 0.25, false));
+        // A note-off message lets go too; a release never pressed does nothing.
+        assert_eq!(
+            e.handle(&[0x99, 0x24, 0x7F], &room, &local),
+            roll(1, 1.0, true)
+        );
+        assert_eq!(
+            e.handle(&[0x89, 0x24, 0x40], &room, &local),
+            roll(1, 1.0, false)
+        );
+        assert!(e.handle(&[0x89, 0x24, 0x40], &room, &local).is_empty());
+    }
+
+    #[test]
+    fn roll_pads_light_while_held() {
+        let e = MidiEngine::new(pioneer_ddj("DDJ-FLX6", "test", 4, 2048.0), 0.08);
+        let mut room = RoomState::default();
+        let on = |room: &RoomState, k: (u8, u8)| {
+            let leds = e.leds(room, &LocalParams::default());
+            leds.iter().find(|(kk, _)| *kk == k).map(|x| x.1)
+        };
+        room.decks[0] = crate::model::DeckState {
+            track: Some(crate::model::TrackId([1; 32])),
+            duration: 100.0,
+            playing: true,
+            ..Default::default()
+        };
+        room.apply(&crate::model::Event {
+            time: 1_000_000,
+            origin: 1,
+            seq: 1,
+            action: Action::Roll {
+                deck: 0,
+                beats: 0.5,
+                on: true,
+            },
+        });
+        assert!(room.decks[0].roll.is_some());
+        assert_eq!(on(&room, (0x97, 0x23)), Some(true), "pad 4: ½ beat");
+        for k in [(0x97, 0x22), (0x97, 0x24), (0x99, 0x23), (0x9B, 0x23)] {
+            assert_eq!(on(&room, k), Some(false), "{k:02X?}");
+        }
+        room.decks[0].roll = None;
+        assert_eq!(on(&room, (0x97, 0x23)), Some(false));
+    }
+
+    #[test]
+    fn saved_v7_v8_and_v9_mappings_gain_the_roll_pads() {
+        let preset = pioneer_ddj("DDJ-FLX6", "Pioneer DDJ-FLX6", 4, 2048.0);
+        let rolls = |t: &Target| matches!(t, Target::Roll { .. });
+        let shift_tempo = |t: &Target| matches!(t, Target::TempoShift { .. });
+        let browse = |t: &Target| matches!(t, Target::BrowsePress | Target::BrowseBack);
+        // Saved by preset 9 (v0.11.5 and v0.11.6): just the roll pads are
+        // new. Preset 8: SHIFT + TEMPO on all four decks too. Preset 7: and
+        // the browse knob's press and BACK.
+        for (version, added) in [(9, 32), (8, 32 + 4), (7, 32 + 4 + 2)] {
+            let mut saved = preset.clone();
+            saved.preset_version = version;
+            saved.jog_ticks_per_rev = Some(6387.0);
+            saved.bindings.retain(|b| {
+                !rolls(&b.target)
+                    && (version > 8 || !shift_tempo(&b.target))
+                    && (version > 7 || !browse(&b.target))
+            });
+            // The DJ learned deck 2's BEAT JUMP pad 8 onto PLAY: that stays.
+            let custom = Trigger::note(9, 0x27);
+            saved.bind(custom, Target::Play { deck: 1 });
+            assert_eq!(saved.upgrade_from(&preset), added - 1, "preset {version}");
+            assert_eq!(saved.preset_version, PRESET_VERSION);
+            assert_eq!(saved.jog_ticks_per_rev, Some(6387.0));
+            assert_eq!(saved.bindings.len(), preset.bindings.len());
+            let at = |t: Trigger| {
+                saved
+                    .bindings
+                    .iter()
+                    .filter(|b| b.trigger == t)
+                    .map(|b| b.target)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(at(custom), [Target::Play { deck: 1 }]);
+            assert_eq!(
+                at(Trigger::note(13, 0x20)),
+                [Target::Roll { deck: 3, size: 0 }]
+            );
+            assert_eq!(saved.upgrade_from(&preset), 0, "only once");
+            // And they roll.
+            let mut e = MidiEngine::new(saved, 0.08);
+            let (room, local) = (RoomState::default(), LocalParams::default());
+            assert_eq!(
+                e.handle(&[0x97, 0x23, 0x7F], &room, &local),
+                vec![MidiOut::Action(Action::Roll {
+                    deck: 0,
+                    beats: 0.5,
+                    on: true
+                })]
+            );
+        }
+        // Two-deck Pioneers get them on A and B.
+        let small = pioneer_ddj("DDJ-FLX4", "test", 2, 720.0);
+        assert_eq!(
+            small.bindings.iter().filter(|b| rolls(&b.target)).count(),
+            16
         );
     }
 
@@ -2656,6 +2866,12 @@ mod tests {
     fn beat_loop_labels() {
         let labels: Vec<String> = BEAT_LOOPS.iter().map(|b| beats_label(*b)).collect();
         assert_eq!(labels, ["¼", "½", "1", "2", "4", "8", "16", "32"]);
+        let labels: Vec<String> = ROLLS.iter().map(|b| beats_label(*b)).collect();
+        assert_eq!(labels, ["1/16", "1/8", "¼", "½", "1", "2", "4", "8"]);
+        assert_eq!(
+            Target::Roll { deck: 1, size: 0 }.label(),
+            "Deck B · Roll 1/16"
+        );
         assert_eq!(beats_label(0.125), "1/8");
         assert_eq!(beats_label(64.0), "64");
     }

@@ -403,6 +403,9 @@ impl TandemApp {
                 if st.scratching {
                     ui.label(RichText::new("SCRATCH").small().strong().color(AMBER));
                 }
+                if let Some(r) = st.roll {
+                    roll_label(ui, r.beats);
+                }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     self.grid_button(ui, d, &st, pos);
                 });
@@ -498,6 +501,8 @@ impl TandemApp {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if let Some((s, c)) = deck_status(dv, view) {
                         ui.add(egui::Label::new(RichText::new(s).color(c).small()).truncate());
+                    } else if let Some(r) = st.roll {
+                        roll_label(ui, r.beats);
                     } else if st.scratching {
                         ui.label(RichText::new("SCRATCH").small().strong().color(AMBER));
                     } else if let Some(by) = view.name_of(st.last_touch) {
@@ -1759,8 +1764,20 @@ pub(crate) fn overview(
     None
 }
 
+/// "ROLL ½" while a loop roll is held (the BEAT JUMP pads on a DDJ-FLX6).
+fn roll_label(ui: &mut egui::Ui, beats: f64) {
+    ui.label(
+        RichText::new(format!("ROLL {}", beats_label(beats)))
+            .small()
+            .strong()
+            .color(LOOP),
+    )
+    .on_hover_text("A loop roll is held: it loops while the pad is held, and the track runs on underneath (the dashed line on the waveform). Let go and it carries on from there.");
+}
+
 /// The loop on a waveform: a band from loop in to loop out (bright while
-/// looping), or just the in point while LOOP IN waits for LOOP OUT.
+/// looping), or just the in point while LOOP IN waits for LOOP OUT. A loop
+/// roll is a bright band of its own, over a dimmed loop.
 fn loop_band(p: &egui::Painter, rect: egui::Rect, st: &DeckState, x_of: impl Fn(f64) -> f32) {
     let edge = |x: f32, c: Color32| {
         if rect.x_range().contains(x) {
@@ -1770,28 +1787,37 @@ fn loop_band(p: &egui::Painter, rect: egui::Rect, st: &DeckState, x_of: impl Fn(
             );
         }
     };
-    match (st.loop_span(), st.loop_in) {
-        (Some((a, b)), _) => {
-            let c = if st.looping {
-                LOOP
-            } else {
-                LOOP.gamma_multiply(0.45)
-            };
-            let band =
-                egui::Rect::from_min_max(pos2(x_of(a), rect.top()), pos2(x_of(b), rect.bottom()))
-                    .intersect(rect);
-            if band.width() > 0.0 {
-                p.rect_filled(
-                    band,
-                    0.0,
-                    c.gamma_multiply(if st.looping { 0.22 } else { 0.1 }),
-                );
-            }
-            edge(x_of(a), c);
-            edge(x_of(b), c);
+    let band = |a: f64, b: f64, lit: bool| {
+        let c = if lit { LOOP } else { LOOP.gamma_multiply(0.45) };
+        let r = egui::Rect::from_min_max(pos2(x_of(a), rect.top()), pos2(x_of(b), rect.bottom()))
+            .intersect(rect);
+        if r.width() > 0.0 {
+            p.rect_filled(r, 0.0, c.gamma_multiply(if lit { 0.22 } else { 0.1 }));
         }
+        edge(x_of(a), c);
+        edge(x_of(b), c);
+    };
+    let rolling = st.roll_span();
+    match (st.loop_span(), st.loop_in) {
+        (Some((a, b)), _) => band(a, b, st.looping && rolling.is_none()),
         (None, Some(a)) => edge(x_of(a), LOOP),
         _ => {}
+    }
+    if let Some((a, b)) = rolling {
+        band(a, b, true);
+    }
+}
+
+/// Under a loop roll, a dashed line where the track has got to underneath:
+/// where it carries on when the roll is let go.
+fn slip_line(p: &egui::Painter, rect: egui::Rect, x: f32) {
+    if rect.x_range().contains(x) {
+        p.extend(egui::Shape::dashed_line(
+            &[pos2(x, rect.top()), pos2(x, rect.bottom())],
+            Stroke::new(2.0_f32, Color32::WHITE.gamma_multiply(0.85)),
+            5.0,
+            3.0,
+        ));
     }
 }
 
@@ -1930,6 +1956,9 @@ pub(crate) fn scrolling_waveform(
                 [pos2(cx, rect.top()), pos2(cx, rect.bottom())],
                 Stroke::new(1.0_f32, Color32::WHITE.gamma_multiply(0.5)),
             );
+        }
+        if st.roll.is_some() {
+            slip_line(&p, rect, x_of(st.slip_position_at(now)));
         }
     }
     p.line_segment(

@@ -945,6 +945,17 @@ mod tests {
                 && digests_match(&alice, &carol)
         });
 
+        // Alice holds a loop roll through it all: it's room state.
+        alice.lock().act(Action::Roll {
+            deck: 0,
+            beats: 1.0,
+            on: true,
+        });
+        wait_for("everyone to hear the roll", Duration::from_secs(5), || {
+            bob.lock().latest().decks[0].roll.is_some()
+                && carol.lock().latest().decks[0].roll.is_some()
+        });
+
         relay.blackhole();
         wait_for("Bob and Carol to notice", Duration::from_secs(5), || {
             rejoining(&bob) && rejoining(&carol)
@@ -978,7 +989,9 @@ mod tests {
             );
             assert_eq!(b.latest().crossfader, 0.8);
             assert_eq!(b.track_status(id), Some(TrackStatus::Ready));
+            assert!(b.latest().decks[0].roll.is_some(), "Bob lost the roll");
         }
+        assert!(carol.lock().latest().decks[0].roll.is_some());
         assert!(digests_match(&alice, &bob), "Bob's room differs");
         assert!(digests_match(&alice, &carol), "Carol's room differs");
         let r = alice.lock().roster();

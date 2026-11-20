@@ -64,6 +64,7 @@ fn main() {
         cut_frame: arg_after("--dev-cut").and_then(|p| p.to_string_lossy().parse().ok()),
         search: arg_after("--dev-search").map(|p| p.to_string_lossy().to_string()),
         broadcast_view: args.iter().any(|a| a == "--broadcast-view"),
+        roll: args.iter().any(|a| a == "--dev-roll"),
         shared: false,
         demo_started: false,
         frame: 0,

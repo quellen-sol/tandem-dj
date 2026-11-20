@@ -17,6 +17,9 @@ pub const DECKS: usize = 4;
 pub const HOT_CUES: usize = 8;
 /// Beat loop sizes (in beats) on the pads and buttons: ¼ to 32.
 pub const BEAT_LOOPS: [f64; 8] = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0];
+/// Loop roll sizes (in beats) on the roll pads, short to long: 1/16 to ½
+/// on the top row and 1 to 8 on the bottom, as on Pioneer's roll pads.
+pub const ROLLS: [f64; 8] = [0.0625, 0.125, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0];
 /// Shortest loop (seconds): LOOP OUT closer than this to LOOP IN does
 /// nothing, and halving stops here.
 pub const MIN_LOOP: f64 = 0.01;
@@ -158,6 +161,10 @@ pub struct DeckState {
     /// and halving or doubling them). None for loops set by hand.
     #[serde(default)]
     pub loop_beats: Option<f64>,
+    /// A loop roll is held: the playhead goes round the roll, while the
+    /// track runs on underneath (see [`Roll`]).
+    #[serde(default)]
+    pub roll: Option<Roll>,
     /// Bumped on every discontinuity (load, play, pause, jump). The renderer
     /// hard-syncs when it changes and smoothly chases otherwise.
     pub gen: u64,
@@ -194,10 +201,30 @@ impl Default for DeckState {
             loop_out: None,
             looping: false,
             loop_beats: None,
+            roll: None,
             gen: 0,
             last_touch: 0,
         }
     }
+}
+
+/// A loop roll (a slip loop): a beat loop that plays only while its pad is
+/// held. The deck's playhead goes round it, and the track runs on
+/// underneath at the deck's speed, so letting go carries on exactly where
+/// the track would have been without the roll.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Roll {
+    /// The size held, in beats (one of [`ROLLS`], or any size from the UI).
+    pub beats: f64,
+    /// The roll's loop, on the grid: `loop_in..loop_out` (seconds).
+    pub loop_in: f64,
+    pub loop_out: f64,
+    /// Shared time (us) at which the track underneath was at `slip_pos`.
+    pub slip_time: i64,
+    /// Where the track underneath was at `slip_time` (seconds). It moves at
+    /// the deck's play speed, and goes round the deck's ordinary loop if
+    /// one is playing.
+    pub slip_pos: f64,
 }
 
 impl DeckState {
@@ -213,6 +240,23 @@ impl DeckState {
         }
         let p = self.anchor_pos + self.motion(t).0;
         self.wrap(p).clamp(0.0, self.duration.max(0.0))
+    }
+
+    /// Where the track is at shared time `t`: while a loop roll is held,
+    /// where it has got to underneath the roll (and where playback carries
+    /// on when the roll ends); otherwise the playhead.
+    pub fn slip_position_at(&self, t: i64) -> f64 {
+        let Some(r) = self.roll else {
+            return self.position_at(t);
+        };
+        if self.track.is_none() {
+            return 0.0;
+        }
+        // Written like `motion`, so before the roll first goes round, the
+        // track underneath and the playhead agree to the last bit.
+        let dt = (t - r.slip_time) as f64 * 1e-6;
+        let p = r.slip_pos + dt * self.rest_speed();
+        wrap_in(self.ordinary_loop(), p).clamp(0.0, self.duration.max(0.0))
     }
 
     /// The speed the playhead moves at when nobody is holding the record:
@@ -259,8 +303,22 @@ impl DeckState {
         }
     }
 
-    /// The loop the playhead is going round, `(in, out)`.
+    /// The loop the playhead is going round, `(in, out)`: a loop roll
+    /// while one is held, otherwise the loop while looping.
     pub fn active_loop(&self) -> Option<(f64, f64)> {
+        self.roll_span().or_else(|| self.ordinary_loop())
+    }
+
+    /// The loop roll being held, `(in, out)`.
+    pub fn roll_span(&self) -> Option<(f64, f64)> {
+        self.roll
+            .map(|r| (r.loop_in, r.loop_out))
+            .filter(|&(a, b)| b > a)
+    }
+
+    /// The ordinary loop while looping (under a roll, the track goes round
+    /// it underneath).
+    fn ordinary_loop(&self) -> Option<(f64, f64)> {
         self.loop_span().filter(|_| self.looping)
     }
 
@@ -268,10 +326,7 @@ impl DeckState {
     /// has gone round the loop. Positions before the loop are left alone (a
     /// playhead there walks into the loop and gets caught).
     fn wrap(&self, p: f64) -> f64 {
-        match self.active_loop() {
-            Some((a, b)) if p >= b => a + (p - a).rem_euclid(b - a),
-            _ => p,
-        }
+        wrap_in(self.active_loop(), p)
     }
 
     /// Length of one beat (seconds) at `pos`, from the grid.
@@ -330,10 +385,11 @@ impl DeckState {
     }
 
     /// Position within the beat (0..1) at time `t`, counting beats `mult`
-    /// times as fast (0.5 = half time).
+    /// times as fast (0.5 = half time). Under a loop roll it's the track
+    /// underneath that counts, since that's where the deck carries on.
     fn beat_phase(&self, mult: f64, t: i64) -> f64 {
         self.grid
-            .map(|g| g.phase(self.position_at(t), mult))
+            .map(|g| g.phase(self.slip_position_at(t), mult))
             .unwrap_or(0.0)
     }
 
@@ -373,10 +429,54 @@ impl DeckState {
 
     fn reanchor(&mut self, t: i64) {
         let (_, speed, spinning) = self.motion(t);
+        let slip = self.slip_position_at(t);
         self.anchor_pos = self.position_at(t);
         self.anchor_time = t;
         // A spinning record keeps its momentum through whatever changed.
         self.spin = spinning.then_some(speed);
+        // So does the track running on under a roll.
+        if let Some(r) = &mut self.roll {
+            r.slip_pos = slip;
+            r.slip_time = t;
+        }
+    }
+
+    /// A loop `beats` long on the grid around position `p` (from `p`, at
+    /// 120 BPM, without a grid), moved up into the track if it would start
+    /// before it and cut short at its end: `(in, out, whole)`, `whole` false
+    /// if the end cut it short. None if that leaves less than [`MIN_LOOP`].
+    fn grid_loop(&self, p: f64, beats: f64) -> Option<(f64, f64, bool)> {
+        let (mut a, mut b) = match self.grid {
+            Some(g) => g.beat_loop(p, beats),
+            None => (p, p + beats * NO_GRID_BEAT),
+        };
+        if a < 0.0 {
+            // Starts before the track: move it up to the first slice that
+            // starts inside it.
+            let step = (b - a) * beats.min(1.0) / beats;
+            let shift = (-a / step).ceil() * step;
+            a += shift;
+            b += shift;
+        }
+        let end = b.min(self.duration);
+        (end - a >= MIN_LOOP).then_some((a, end, end == b))
+    }
+
+    /// Let go of a loop roll: playback carries on from where the track has
+    /// got to underneath. Seamless if the roll hasn't gone round yet.
+    fn end_roll(&mut self, t: i64) {
+        if self.roll.is_none() {
+            return;
+        }
+        let heard = self.position_at(t);
+        let p = self.slip_position_at(t);
+        self.roll = None;
+        self.anchor_pos = p;
+        self.anchor_time = t;
+        if (p - heard).abs() > 1e-6 || self.spin.is_some() {
+            self.spin = None;
+            self.gen += 1;
+        }
     }
 
     fn clear_loop(&mut self) {
@@ -387,16 +487,28 @@ impl DeckState {
     }
 
     /// Keep a looping deck's anchor inside its loop (anything that moved it
-    /// to or past the out point has gone round the loop).
+    /// to or past the out point has gone round the loop), and the track
+    /// under a roll inside the ordinary loop.
     fn settle_loop(&mut self) {
         if self.looping && self.loop_span().is_none() {
             self.looping = false;
         }
-        if let Some((a, b)) = self.active_loop() {
-            if self.anchor_pos >= b {
-                self.anchor_pos = a + (self.anchor_pos - a).rem_euclid(b - a);
-            }
+        if self.roll.is_some() && self.roll_span().is_none() {
+            self.roll = None;
         }
+        self.anchor_pos = wrap_in(self.active_loop(), self.anchor_pos);
+        let ordinary = self.ordinary_loop();
+        if let Some(r) = &mut self.roll {
+            r.slip_pos = wrap_in(ordinary, r.slip_pos);
+        }
+    }
+}
+
+/// Position `p` gone round loop `lp` (if at or past its out point).
+fn wrap_in(lp: Option<(f64, f64)>, p: f64) -> f64 {
+    match lp {
+        Some((a, b)) if p >= b => a + (p - a).rem_euclid(b - a),
+        _ => p,
     }
 }
 
@@ -642,6 +754,18 @@ pub enum Action {
     LoopDouble {
         deck: u8,
     },
+    /// A loop roll pad pressed (`on`) or let go. While held, `beats` beats
+    /// loop on the grid from the beat the playhead is in (like a beat loop),
+    /// and the track runs on underneath; letting go carries on where the
+    /// track has got to. Another size while one is held switches to it,
+    /// from the same in point, staying in step with the track underneath.
+    /// Only on a playing deck. Letting go of a size that isn't the one
+    /// rolling does nothing.
+    Roll {
+        deck: u8,
+        beats: f64,
+        on: bool,
+    },
     Seek {
         deck: u8,
         pos: f64,
@@ -721,6 +845,7 @@ impl Action {
             | BeatLoop { deck, .. }
             | LoopHalve { deck }
             | LoopDouble { deck }
+            | Roll { deck, .. }
             | Seek { deck, .. }
             | Tempo { deck, .. }
             | Bend { deck, .. }
@@ -894,6 +1019,8 @@ impl RoomState {
         }
         let was_playing = self.decks[deck].playing;
         let was_looping = self.decks[deck].looping;
+        // A jump, PAUSE or any loop control lets go of a loop roll first.
+        let lets_go = lets_go_of_roll(&ev.action, &self.decks[deck]);
         // Only a load needs the whole previous deck (and DeckState is big).
         let before = matches!(ev.action, Action::Load { .. }).then(|| self.decks[deck]);
         // Moves the playhead to somewhere chosen (a cue, a seek): if that's
@@ -907,6 +1034,7 @@ impl RoomState {
                 | Action::CueUp { .. }
         );
         let jumps = lands
+            || lets_go
             || matches!(
                 ev.action,
                 Action::Nudge { .. }
@@ -915,12 +1043,16 @@ impl RoomState {
                     | Action::Reloop { .. }
                     | Action::BeatLoop { .. }
                     | Action::LoopHalve { .. }
+                    | Action::Roll { .. }
             );
         let bpm_before = if jumps {
             self.decks[deck].bpm_at(t)
         } else {
             None
         };
+        if lets_go {
+            self.decks[deck].end_roll(t);
+        }
         self.apply_deck(deck, ev);
         if lands {
             let d = &mut self.decks[deck];
@@ -1053,6 +1185,10 @@ impl RoomState {
         let shift = diff * 60.0 / beat_bpm;
         if shift.abs() > 0.0005 {
             d.anchor_pos = (d.anchor_pos + shift).clamp(0.0, d.duration);
+            // Under a roll, the phase is the track's underneath: both move.
+            if let Some(r) = &mut d.roll {
+                r.slip_pos = (r.slip_pos + shift).clamp(0.0, d.duration);
+            }
             d.gen += 1;
         }
         true
@@ -1356,28 +1492,56 @@ impl RoomState {
                         }
                     }
                     None => {
-                        let p = d.position_at(t);
-                        let (mut a, mut b) = match d.grid {
-                            Some(g) => g.beat_loop(p, beats),
-                            None => (p, p + beats * NO_GRID_BEAT),
-                        };
-                        if a < 0.0 {
-                            // Starts before the track: move it up to the
-                            // first slice that starts inside it.
-                            let step = (b - a) * beats.min(1.0) / beats;
-                            let shift = (-a / step).ceil() * step;
-                            a += shift;
-                            b += shift;
-                        }
-                        let end = b.min(d.duration);
-                        if end - a >= MIN_LOOP {
+                        if let Some((a, end, whole)) = d.grid_loop(d.position_at(t), beats) {
                             d.reanchor(t);
                             d.loop_in = Some(a);
                             d.loop_out = Some(end);
                             d.looping = true;
-                            d.loop_beats = (end == b).then_some(beats);
+                            d.loop_beats = whole.then_some(beats);
                         }
                     }
+                }
+            }
+            Action::Roll { beats, on, .. } => {
+                let same = d.roll.is_some_and(|r| (r.beats - beats).abs() < 1e-9);
+                if !on {
+                    if same {
+                        d.end_roll(t);
+                    }
+                    return;
+                }
+                if same
+                    || d.track.is_none()
+                    || !d.playing
+                    || !(beats > 0.0 && beats <= MAX_LOOP_BEATS)
+                {
+                    return;
+                }
+                // A new roll starts on the grid at the playhead; another
+                // size from the held roll's in point.
+                let from = d.roll.map_or_else(|| d.position_at(t), |r| r.loop_in);
+                let Some((a, b, _)) = d.grid_loop(from, beats) else {
+                    return;
+                };
+                d.reanchor(t);
+                let heard = d.anchor_pos;
+                let (slip_pos, now) = match d.roll {
+                    // Switching: the same point in the roll as the track
+                    // underneath, so it stays in step with it.
+                    Some(r) => (r.slip_pos, a + (r.slip_pos - a).rem_euclid(b - a)),
+                    None => (heard, heard),
+                };
+                d.roll = Some(Roll {
+                    beats,
+                    loop_in: a,
+                    loop_out: b,
+                    slip_time: t,
+                    slip_pos,
+                });
+                if (now - heard).abs() > 1e-6 {
+                    d.anchor_pos = now;
+                    d.spin = None;
+                    d.gen += 1;
                 }
             }
             Action::LoopHalve { .. } | Action::LoopDouble { .. } => {
@@ -1409,6 +1573,7 @@ impl RoomState {
                 d.reanchor(t);
                 d.bend = bend.clamp(-0.5, 0.5);
             }
+            // Under a roll, only what's heard moves: the track runs on.
             Action::Nudge { delta, .. } => {
                 if d.track.is_some() {
                     d.reanchor(t);
@@ -1502,6 +1667,17 @@ impl RoomState {
             h.f64(d.loop_out.unwrap_or(-1.0));
             h.u64(d.looping as u64);
             h.f64(d.loop_beats.unwrap_or(-1.0));
+            match d.roll {
+                Some(r) => {
+                    h.u64(1);
+                    h.f64(r.beats);
+                    h.f64(r.loop_in);
+                    h.f64(r.loop_out);
+                    h.u64(r.slip_time as u64);
+                    h.f64(r.slip_pos);
+                }
+                None => h.u64(0),
+            }
             h.u64(d.gen);
         }
         h.u64(self.crossfader.to_bits() as u64);
@@ -1536,6 +1712,35 @@ impl Fnv {
 
 fn no_key() -> i8 {
     -1
+}
+
+/// Whether `action` lets go of a loop roll held on deck `d` before it
+/// applies: anything that jumps (a seek, a hot cue, CUE, the end of a
+/// preview, loading), PAUSE, and every loop control. What's left (tempo,
+/// bend, sync, scratching, the mixer) carries on under the roll.
+fn lets_go_of_roll(action: &Action, d: &DeckState) -> bool {
+    if d.roll.is_none() {
+        return false;
+    }
+    match *action {
+        Action::Load { .. }
+        | Action::Eject { .. }
+        | Action::Pause { .. }
+        | Action::CueDown { .. }
+        | Action::Seek { .. }
+        | Action::LoopIn { .. }
+        | Action::LoopOut { .. }
+        | Action::Reloop { .. }
+        | Action::BeatLoop { .. }
+        | Action::LoopHalve { .. }
+        | Action::LoopDouble { .. } => true,
+        // Jumping to a hot cue; setting one doesn't jump.
+        Action::HotCue { slot, .. } => d.hot_cues.get(slot as usize).is_some_and(|h| h.is_some()),
+        // Ending a preview from a pause jumps back.
+        Action::CueUp { .. } => d.cue_preview && d.preview_slot.is_none(),
+        Action::HotCueUp { slot, .. } => d.cue_preview && d.preview_slot == Some(slot),
+        _ => false,
+    }
 }
 
 /// Has a track with a beatgrid, so it can sync or be synced to.
@@ -3250,5 +3455,414 @@ mod tests {
         let d = s.decks[0];
         assert!(d.playing && !d.cue_preview);
         assert!((d.position_at(7_000_000) - 33.0).abs() < 1e-9);
+    }
+
+    fn roll(deck: u8, beats: f64, on: bool) -> Action {
+        Action::Roll { deck, beats, on }
+    }
+
+    fn slip(s: &RoomState, deck: usize, t: i64) -> f64 {
+        s.decks[deck].slip_position_at(t)
+    }
+
+    #[test]
+    fn a_roll_loops_while_held_and_lets_go_where_the_track_has_got_to() {
+        let mut s = RoomState::default();
+        let mut seq = 0;
+        let mut go = |s: &mut RoomState, t: i64, a: Action| {
+            seq += 1;
+            s.apply(&ev(t, 1, seq, a));
+        };
+        // 120 BPM, beats every 0.5 s from 0.
+        go(&mut s, 0, grid_load(0, 1, 120.0, 0.0));
+        go(&mut s, 0, Action::Play { deck: 0 });
+        // A ½-beat roll: the half of the beat the playhead is in.
+        go(&mut s, 5_300_000, roll(0, 0.5, true));
+        let d = s.decks[0];
+        assert_eq!(d.active_loop(), Some((5.25, 5.5)));
+        assert_eq!(d.loop_span(), None, "not an ordinary loop");
+        assert!(close(at(&s, 0, 5_450_000), 5.45));
+        assert!(close(at(&s, 0, 5_600_000), 5.35));
+        assert!(close(at(&s, 0, 6_900_000), 5.4));
+        // Underneath, the track runs on.
+        assert!(close(slip(&s, 0, 6_900_000), 6.9));
+        // Letting go: on from where the track has got to.
+        let gen = s.decks[0].gen;
+        go(&mut s, 7_100_000, roll(0, 0.5, false));
+        let d = s.decks[0];
+        assert!(d.roll.is_none() && d.playing && d.gen > gen);
+        assert!(close(at(&s, 0, 7_100_000), 7.1));
+        assert!(close(at(&s, 0, 9_000_000), 9.0));
+        // Let go before it has gone round: seamless, not even a jump.
+        go(&mut s, 10_100_000, roll(0, 4.0, true));
+        assert_eq!(s.decks[0].active_loop(), Some((10.0, 12.0)));
+        let gen = s.decks[0].gen;
+        go(&mut s, 11_500_000, roll(0, 4.0, false));
+        assert_eq!(s.decks[0].gen, gen);
+        assert!(close(at(&s, 0, 12_500_000), 12.5));
+        // A tempo change carries the track underneath too.
+        go(&mut s, 20_100_000, roll(0, 1.0, true));
+        go(
+            &mut s,
+            20_200_000,
+            Action::Tempo {
+                deck: 0,
+                tempo: 1.1,
+            },
+        );
+        assert_eq!(s.decks[0].active_loop(), Some((20.0, 20.5)));
+        assert!(close(at(&s, 0, 21_200_000), 20.3));
+        go(&mut s, 21_200_000, roll(0, 1.0, false));
+        assert!(close(at(&s, 0, 21_200_000), 21.3));
+        assert!(close(at(&s, 0, 22_200_000), 22.4));
+    }
+
+    #[test]
+    fn switching_roll_sizes_keeps_the_track_running_underneath() {
+        let mut s = RoomState::default();
+        let mut seq = 0;
+        let mut go = |s: &mut RoomState, t: i64, a: Action| {
+            seq += 1;
+            s.apply(&ev(t, 1, seq, a));
+        };
+        go(&mut s, 0, grid_load(0, 1, 120.0, 0.0));
+        go(&mut s, 0, Action::Play { deck: 0 });
+        go(&mut s, 5_300_000, roll(0, 1.0, true));
+        assert_eq!(s.decks[0].active_loop(), Some((5.0, 5.5)));
+        assert!(close(at(&s, 0, 5_900_000), 5.4));
+        // A shorter size: from the same in point, at the point in it the
+        // track underneath is at (0.9 s after the in point, 0.15 into ½).
+        go(&mut s, 5_900_000, roll(0, 0.5, true));
+        assert_eq!(s.decks[0].active_loop(), Some((5.0, 5.25)));
+        assert!(close(at(&s, 0, 5_900_000), 5.15));
+        assert!(close(at(&s, 0, 6_050_000), 5.05));
+        for t in [6_000_123, 6_040_000, 6_087_000] {
+            let lag = (slip(&s, 0, t) - at(&s, 0, t)).rem_euclid(0.25);
+            assert!(lag < 1e-6 || 0.25 - lag < 1e-6, "out of step at {t}: {lag}");
+        }
+        go(&mut s, 6_100_000, roll(0, 0.25, true));
+        assert_eq!(s.decks[0].active_loop(), Some((5.0, 5.125)));
+        assert!(close(at(&s, 0, 6_100_000), 5.1));
+        // Pressing it again changes nothing, nor does letting go of a size
+        // that isn't rolling.
+        let held = s.decks[0].roll;
+        go(&mut s, 6_200_000, roll(0, 0.25, true));
+        go(&mut s, 6_200_000, roll(0, 1.0, false));
+        assert_eq!(s.decks[0].roll, held);
+        // Back up to 2 beats: from the beat the roll starts on, in step.
+        go(&mut s, 6_300_000, roll(0, 2.0, true));
+        assert_eq!(s.decks[0].active_loop(), Some((5.0, 6.0)));
+        assert!(close(at(&s, 0, 6_300_000), 5.3));
+        // Let go: the track, as if it had never rolled.
+        go(&mut s, 7_000_000, roll(0, 2.0, false));
+        assert!(s.decks[0].roll.is_none());
+        assert!(close(at(&s, 0, 7_000_000), 7.0));
+        assert!(close(at(&s, 0, 8_000_000), 8.0));
+    }
+
+    #[test]
+    fn a_roll_over_a_loop_comes_back_to_the_loop() {
+        let mut s = RoomState::default();
+        let mut seq = 0;
+        let mut go = |s: &mut RoomState, t: i64, a: Action| {
+            seq += 1;
+            s.apply(&ev(t, 1, seq, a));
+        };
+        go(&mut s, 0, grid_load(0, 1, 120.0, 0.0));
+        go(&mut s, 0, Action::Play { deck: 0 });
+        go(
+            &mut s,
+            5_300_000,
+            Action::BeatLoop {
+                deck: 0,
+                beats: 4.0,
+            },
+        );
+        assert!(close(at(&s, 0, 8_000_000), 6.0));
+        // A 1-beat roll inside the 4-beat loop.
+        go(&mut s, 8_000_000, roll(0, 1.0, true));
+        let d = s.decks[0];
+        assert_eq!(d.active_loop(), Some((6.0, 6.5)));
+        assert_eq!(d.loop_span(), Some((5.0, 7.0)));
+        assert!(d.looping && d.loop_beats == Some(4.0));
+        assert!(close(at(&s, 0, 9_200_000), 6.2));
+        // Underneath, the loop goes round as usual (7.2 is 5.2).
+        assert!(close(slip(&s, 0, 9_200_000), 5.2));
+        go(&mut s, 9_200_000, roll(0, 1.0, false));
+        let d = s.decks[0];
+        assert_eq!(d.active_loop(), Some((5.0, 7.0)));
+        assert!(close(at(&s, 0, 9_200_000), 5.2));
+        assert!(close(at(&s, 0, 10_000_000), 6.0));
+        // A roll longer than the loop plays on past the loop's end, while
+        // the track underneath goes round the loop.
+        go(&mut s, 12_000_000, roll(0, 8.0, true));
+        assert_eq!(s.decks[0].active_loop(), Some((6.0, 10.0)));
+        assert!(close(at(&s, 0, 13_500_000), 7.5));
+        go(&mut s, 13_500_000, roll(0, 8.0, false));
+        assert!(s.decks[0].looping);
+        assert!(close(at(&s, 0, 13_500_000), 5.5));
+        // EXIT under a roll: back in the loop, then out of it.
+        go(&mut s, 14_000_000, roll(0, 0.25, true));
+        go(&mut s, 14_600_000, Action::Reloop { deck: 0 });
+        let d = s.decks[0];
+        assert!(d.roll.is_none() && !d.looping);
+        assert!(close(at(&s, 0, 14_600_000), 6.6));
+        assert!(close(at(&s, 0, 15_600_000), 7.6));
+    }
+
+    #[test]
+    fn rolls_need_a_playing_deck_and_jumps_let_go_of_them() {
+        let mut s = RoomState::default();
+        let mut seq = 0;
+        let mut go = |s: &mut RoomState, t: i64, a: Action| {
+            seq += 1;
+            s.apply(&ev(t, 1, seq, a));
+        };
+        go(&mut s, 0, grid_load(0, 1, 120.0, 0.0));
+        // Paused: nothing to roll.
+        go(&mut s, 0, roll(0, 1.0, true));
+        assert!(s.decks[0].roll.is_none());
+        go(&mut s, 0, Action::Play { deck: 0 });
+        // PAUSE lets go: the deck stops where the track has got to.
+        go(&mut s, 2_100_000, roll(0, 0.5, true));
+        go(&mut s, 2_600_000, Action::Pause { deck: 0 });
+        let d = s.decks[0];
+        assert!(!d.playing && d.roll.is_none());
+        assert!(close(at(&s, 0, 9_000_000), 2.6));
+        go(&mut s, 3_000_000, Action::Play { deck: 0 });
+        // Scratching under a roll moves what's heard; the track runs on.
+        go(&mut s, 4_000_000, roll(0, 1.0, true));
+        assert_eq!(s.decks[0].active_loop(), Some((3.5, 4.0)));
+        go(
+            &mut s,
+            4_100_000,
+            Action::JogTouch {
+                deck: 0,
+                down: true,
+                spin: 0.0,
+            },
+        );
+        go(
+            &mut s,
+            4_200_000,
+            Action::Nudge {
+                deck: 0,
+                delta: -0.3,
+            },
+        );
+        assert!(s.decks[0].roll.is_some());
+        assert!(close(at(&s, 0, 4_500_000), 3.4));
+        assert!(close(slip(&s, 0, 4_500_000), 4.1));
+        go(
+            &mut s,
+            4_600_000,
+            Action::JogTouch {
+                deck: 0,
+                down: false,
+                spin: 0.0,
+            },
+        );
+        assert!(close(at(&s, 0, 4_700_000), 3.5));
+        assert!(close(slip(&s, 0, 4_700_000), 4.3));
+        go(&mut s, 4_800_000, roll(0, 1.0, false));
+        assert!(close(at(&s, 0, 4_800_000), 4.4));
+        // Setting a hot cue under a roll keeps rolling; jumping to one lets go.
+        go(&mut s, 6_000_000, roll(0, 1.0, true));
+        go(&mut s, 6_100_000, Action::HotCue { deck: 0, slot: 0 });
+        assert!(s.decks[0].roll.is_some());
+        assert!(close(s.decks[0].hot_cues[0].unwrap(), 5.7));
+        go(&mut s, 6_300_000, Action::HotCue { deck: 0, slot: 0 });
+        assert!(s.decks[0].roll.is_none());
+        assert!(close(at(&s, 0, 6_300_000), 5.7));
+        // A loop control lets go first: LOOP IN marks where the track is.
+        go(&mut s, 7_000_000, roll(0, 0.25, true));
+        go(&mut s, 7_500_000, loop_in(false));
+        let d = s.decks[0];
+        assert!(d.roll.is_none());
+        assert!(close(d.loop_in.unwrap(), 6.9));
+        assert!(close(at(&s, 0, 7_500_000), 6.9));
+        // Loading another track forgets the roll.
+        go(&mut s, 8_000_000, roll(0, 0.25, true));
+        go(&mut s, 8_100_000, grid_load(0, 2, 120.0, 0.0));
+        assert!(s.decks[0].roll.is_none());
+    }
+
+    #[test]
+    fn rolls_and_quantized_loops() {
+        // Beats at 0.25 s, 0.75 s … (120 BPM), playing from 0:00.
+        let mut s = playing_on_grid(0.25);
+        let mut seq = 10;
+        let mut go = |s: &mut RoomState, t: i64, a: Action| {
+            seq += 1;
+            s.apply(&ev(t, 1, seq, a));
+        };
+        // A quantized LOOP IN under a roll lets go first, and snaps where
+        // the track has got to (10.9 s: the beat at 10.75), not where the
+        // roll is (10.275 s, nearest 10.25).
+        go(&mut s, 10_300_000, roll(0, 0.25, true));
+        assert_eq!(s.decks[0].active_loop(), Some((10.25, 10.375)));
+        assert!(close(at(&s, 0, 10_900_000), 10.275));
+        go(&mut s, 10_900_000, loop_in(true));
+        assert!(s.decks[0].roll.is_none());
+        assert_eq!(s.decks[0].loop_in, Some(10.75));
+        // OUT 4.4 beats later: a quantized 1-bar loop.
+        go(&mut s, 12_950_000, loop_out(true));
+        assert_eq!(s.decks[0].active_loop(), Some((10.75, 12.75)));
+        assert_eq!(s.decks[0].loop_beats, Some(4.0));
+        // A roll over it comes back into it, on the beat.
+        go(&mut s, 13_000_000, roll(0, 1.0, true));
+        assert_eq!(s.decks[0].active_loop(), Some((10.75, 11.25)));
+        assert!(close(at(&s, 0, 14_600_000), 11.1));
+        assert!(close(slip(&s, 0, 14_600_000), 12.6));
+        go(&mut s, 14_600_000, roll(0, 1.0, false));
+        let d = s.decks[0];
+        assert_eq!(d.active_loop(), Some((10.75, 12.75)));
+        assert_eq!(d.loop_beats, Some(4.0));
+        assert!(close(at(&s, 0, 15_000_000), 11.0));
+        // A quantized OUT under a roll lets go first too: the track is 2.5
+        // beats into the loop, so the loop becomes 2 beats, and the track
+        // (past its new end) has gone round it.
+        go(&mut s, 15_500_000, roll(0, 0.5, true));
+        assert_eq!(s.decks[0].active_loop(), Some((11.5, 11.75)));
+        go(&mut s, 16_000_000, loop_out(true));
+        let d = s.decks[0];
+        assert!(d.roll.is_none());
+        assert_eq!(d.active_loop(), Some((10.75, 11.75)));
+        assert_eq!(d.loop_beats, Some(2.0));
+        assert!(close(at(&s, 0, 16_000_000), 11.0));
+    }
+
+    /// Phase difference (beats, -0.5..0.5) between what decks A and B
+    /// sound like at time t (under a roll, not the track underneath).
+    fn heard_offset(s: &RoomState, t: i64) -> f64 {
+        let phase = |d: &DeckState| d.grid.unwrap().phase(d.position_at(t), 1.0);
+        let d = phase(&s.decks[0]) - phase(&s.decks[1]);
+        d - d.round()
+    }
+
+    #[test]
+    fn a_rolling_synced_deck_comes_back_on_the_beat() {
+        let base = [
+            grid_load(0, 1, 128.0, 0.1),
+            grid_load(1, 2, 124.0, 0.37),
+            Action::Play { deck: 0 },
+            Action::Play { deck: 1 },
+        ];
+        let mut tl = Timeline::new(0);
+        let mut plain = Timeline::new(0);
+        let mut seq = 0;
+        for a in base {
+            seq += 1;
+            tl.insert(ev(0, 1, seq, a.clone()));
+            plain.insert(ev(0, 1, seq, a));
+        }
+        seq += 1;
+        tl.insert(ev(1_000_000, 1, seq, Action::Sync { deck: 1, on: true }));
+        plain.insert(ev(1_000_000, 1, seq, Action::Sync { deck: 1, on: true }));
+        let mut go = |tl: &mut Timeline, t: i64, a: Action| {
+            seq += 1;
+            tl.insert(ev(t, 1, seq, a));
+        };
+        // A whole-beat roll sounds on the beat while it plays.
+        go(&mut tl, 2_345_000, roll(1, 1.0, true));
+        for t in [2_400_000, 3_000_000, 3_777_000] {
+            assert!(heard_offset(&tl.state_at(t), t).abs() < 1e-6, "at {t}");
+        }
+        // Down to 1/16 (a stutter), then let go: back on the beat, exactly
+        // where the deck would be if it had never rolled.
+        go(&mut tl, 4_000_000, roll(1, 0.0625, true));
+        let t = 4_321_000;
+        let s = tl.state_at(t);
+        let (a, b) = s.decks[1].roll_span().unwrap();
+        assert!(a <= at(&s, 1, t) && at(&s, 1, t) < b && b - a < 0.031);
+        go(&mut tl, 5_000_000, roll(1, 0.0625, false));
+        for t in [5_000_000, 9_000_000] {
+            let s = tl.state_at(t);
+            assert!(heard_offset(&s, t).abs() < 1e-6, "at {t}");
+            assert!((at(&s, 1, t) - at(&plain.state_at(t), 1, t)).abs() < 1e-9);
+        }
+        // SYNC pressed under a roll lines up the track underneath.
+        go(&mut tl, 10_000_000, Action::Sync { deck: 1, on: false });
+        go(
+            &mut tl,
+            10_000_000,
+            Action::Tempo {
+                deck: 1,
+                tempo: 1.05,
+            },
+        );
+        go(&mut tl, 11_000_000, roll(1, 0.25, true));
+        go(&mut tl, 11_500_000, Action::Sync { deck: 1, on: true });
+        assert!(tl.state_at(11_600_000).decks[1].roll.is_some());
+        go(&mut tl, 12_400_000, roll(1, 0.25, false));
+        let t = 14_000_000;
+        assert!(heard_offset(&tl.state_at(t), t).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rolls_converge_regardless_of_arrival_order() {
+        let mut events = vec![
+            ev(0, 1, 1, grid_load(0, 1, 126.0, 0.2)),
+            ev(0, 2, 1, grid_load(1, 2, 124.0, 0.1)),
+            ev(100_000, 1, 2, Action::Play { deck: 0 }),
+            ev(150_000, 2, 2, Action::Play { deck: 1 }),
+            ev(400_000, 2, 3, Action::Sync { deck: 1, on: true }),
+            ev(
+                900_000,
+                1,
+                3,
+                Action::BeatLoop {
+                    deck: 0,
+                    beats: 4.0,
+                },
+            ),
+            ev(1_200_000, 1, 4, roll(0, 0.5, true)),
+            ev(1_300_000, 2, 4, roll(1, 1.0, true)),
+            ev(1_700_000, 1, 5, roll(0, 0.125, true)),
+            ev(
+                1_900_000,
+                2,
+                5,
+                Action::Tempo {
+                    deck: 1,
+                    tempo: 1.02,
+                },
+            ),
+            ev(2_100_000, 1, 6, roll(0, 0.5, false)),
+            ev(2_300_000, 1, 7, roll(0, 0.125, false)),
+            ev(2_600_000, 2, 6, roll(1, 1.0, false)),
+            ev(3_000_000, 1, 8, roll(0, 2.0, true)),
+            ev(3_400_000, 1, 9, Action::Pause { deck: 0 }),
+        ];
+        let mut a = Timeline::new(0);
+        for e in &events {
+            a.insert(e.clone());
+        }
+        let rolls = |s: &RoomState| s.decks.map(|d| d.roll.map(|r| r.beats));
+        assert_eq!(rolls(&a.state_at(1_500_000))[..2], [Some(0.5), Some(1.0)]);
+        assert_eq!(rolls(&a.state_at(2_200_000))[..2], [Some(0.125), Some(1.0)]);
+        assert_eq!(rolls(&a.state_at(2_400_000))[..2], [None, Some(1.0)]);
+        assert_eq!(rolls(&a.state_at(9_000_000))[..2], [None, None]);
+        // Sent whole (a resync), the rolls come out the same.
+        let wire: Timeline = serde_json::from_str(&serde_json::to_string(&a).unwrap()).unwrap();
+        for t in [1_500_000, 2_200_000, 3_200_000] {
+            assert_eq!(rolls(&a.state_at(t)), rolls(&wire.state_at(t)), "at {t}");
+        }
+        for seed in 0..8 {
+            fastrand::Rng::with_seed(seed).shuffle(&mut events);
+            let mut b = Timeline::new(0);
+            for e in &events {
+                b.insert(e.clone());
+            }
+            for t in [
+                0, 1_250_000, 1_800_000, 2_200_000, 2_700_000, 3_200_000, 9_000_000,
+            ] {
+                assert_eq!(a.state_at(t).digest(), b.state_at(t).digest(), "at {t}");
+            }
+        }
+        let e = ev(1, 2, 3, roll(1, 0.0625, true));
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains(r#""a":"Roll""#), "{json}");
+        assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), e);
     }
 }
