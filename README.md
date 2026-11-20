@@ -56,6 +56,7 @@ Mappings are saved per controller, so you only do this once. When Tandem's built
 ## BPM, sync and keys
 
 - **Analyze BPM** (library toolbar) works out the tempo, beatgrid and musical key of every track in the list from its audio, in the background. BPM and key tags in the files aren't used. Each track is only analysed once, and tracks are also analysed when you load them. A grid you've edited always wins over analysis.
+  - **Cancel**, beside the progress, stops it once the tracks it's working on are done. Tracks already analysed keep their BPM and key, and **Analyze BPM** carries on with the rest.
   - When a new version of Tandem detects better, its results from older versions are dropped: press **Analyze BPM** again on your lists. Grids you've edited are kept.
   - A track that changes tempo part-way through gets a grid section for each tempo, if the change is big and holds for at least half a minute.
 - **Beat markers** run along the top of each scrolling waveform.

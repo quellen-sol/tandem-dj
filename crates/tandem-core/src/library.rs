@@ -279,14 +279,27 @@ pub struct Library {
     cache_path: PathBuf,
     cache_dirty: bool,
     size_index: HashMap<u64, Vec<PathBuf>>,
-    /// Background BPM analysis: (list key, done, total).
-    pub analyzing: Option<(String, usize, usize)>,
+    /// Background BPM analysis, while one runs.
+    pub analyzing: Option<Analyzing>,
     /// Folders whose untagged files are named "Title - Artist".
     title_first_dirs: HashSet<PathBuf>,
     /// Beatgrids edited by hand, by content hash.
     user_grids: HashMap<TrackId, BeatGrid>,
     grids_path: PathBuf,
     grids_dirty: bool,
+}
+
+/// A background BPM analysis ([`analyze_list`]) in progress.
+#[derive(Clone, Debug)]
+pub struct Analyzing {
+    /// The list it was started on.
+    pub key: String,
+    /// Tracks finished so far, of `total`.
+    pub done: usize,
+    pub total: usize,
+    /// Cancelled ([`cancel_analysis`]): the workers stop after the tracks
+    /// they're on, and `analyzing` clears when they have.
+    pub stopping: bool,
 }
 
 pub const KEY_SHARED: &str = "shared";
@@ -836,13 +849,21 @@ pub fn analyze_list(lib: &Arc<Mutex<Library>>, key: &str) {
     }
     let total = todo.len();
     log::info!("Analysing BPM for {total} tracks…");
-    lib.lock().analyzing = Some((key.to_string(), 0, total));
+    lib.lock().analyzing = Some(Analyzing {
+        key: key.to_string(),
+        done: 0,
+        total,
+        stopping: false,
+    });
     let queue = Arc::new(Mutex::new(todo));
     let workers = Arc::new(std::sync::atomic::AtomicUsize::new(2));
     for _ in 0..2 {
         let (lib, queue, workers) = (lib.clone(), queue.clone(), workers.clone());
         std::thread::spawn(move || {
             loop {
+                if analysis_stopping(&lib) {
+                    break;
+                }
                 let Some(path) = queue.lock().pop() else {
                     break;
                 };
@@ -850,6 +871,8 @@ pub fn analyze_list(lib: &Arc<Mutex<Library>>, key: &str) {
                     // Make sure the file has a cache entry to hold the result.
                     let _ = hash_path(&lib, &path);
                     match crate::audio::decode_file(&path, TrackId([0; 32])) {
+                        // Cancelled while decoding: leave this one for next time.
+                        Ok(_) if analysis_stopping(&lib) => break,
                         Ok(a) => {
                             let _ = analysis_for(&lib, &path, &a);
                         }
@@ -860,17 +883,37 @@ pub fn analyze_list(lib: &Arc<Mutex<Library>>, key: &str) {
                     }
                 }
                 if let Some(a) = lib.lock().analyzing.as_mut() {
-                    a.1 += 1;
+                    a.done += 1;
                 }
             }
             if workers.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
                 let mut l = lib.lock();
-                l.analyzing = None;
+                match l.analyzing.take() {
+                    Some(a) if a.stopping => {
+                        log::info!(
+                            "BPM analysis cancelled after {} of {} tracks",
+                            a.done,
+                            a.total
+                        )
+                    }
+                    _ => log::info!("BPM analysis finished"),
+                }
                 l.save_cache();
-                log::info!("BPM analysis finished");
             }
         });
     }
+}
+
+/// Stop the background BPM analysis, if one is running. Tracks already done
+/// keep their results; the rest are left for the next [`analyze_list`].
+pub fn cancel_analysis(lib: &Arc<Mutex<Library>>) {
+    if let Some(a) = lib.lock().analyzing.as_mut() {
+        a.stopping = true;
+    }
+}
+
+fn analysis_stopping(lib: &Arc<Mutex<Library>>) -> bool {
+    lib.lock().analyzing.as_ref().is_none_or(|a| a.stopping)
 }
 
 /// Content hash of a file, using the cache when the file hasn't changed.
@@ -1044,6 +1087,67 @@ mod tests {
         let id = hash_file(&wav).unwrap();
         assert_eq!(find_by_hash(&lib, id, t.size), Some(wav.clone()));
         assert_eq!(find_by_hash(&lib, TrackId([7; 32]), t.size), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cancelled_analysis_stops_early_and_carries_on_later() {
+        let dir = std::env::temp_dir().join(format!("tandem-cancel-test-{}", fastrand::u64(..)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let signal = crate::audio::test_signal(44_100, 8.0, 330.0);
+        let n = 12;
+        for i in 0..n {
+            let p = dir.join(format!("Artist - Song {i}.wav"));
+            crate::audio::write_wav(&p, 44_100, &signal).unwrap();
+        }
+        let lib = Arc::new(Mutex::new(Library::new(
+            dir.join("shared"),
+            dir.join("cache.json"),
+        )));
+        let key = folder_key(&dir);
+        let wait_for = |done: &dyn Fn(&Library) -> bool| {
+            for _ in 0..6000 {
+                if done(&lib.lock()) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!("timed out");
+        };
+        scan(&lib, key.clone(), SourceKind::Folder(dir.clone()));
+        wait_for(&|l| !l.lists[&key].scanning);
+        let paths: Vec<PathBuf> = lib.lock().lists[&key]
+            .tracks
+            .iter()
+            .map(|t| t.path.clone())
+            .collect();
+        assert_eq!(paths.len(), n);
+        let analysed = || {
+            paths
+                .iter()
+                .filter(|p| is_analyzed(&lib, p) && key_known(&lib, p).is_some())
+                .count()
+        };
+
+        analyze_list(&lib, &key);
+        cancel_analysis(&lib);
+        assert!(lib.lock().analyzing.as_ref().is_some_and(|a| a.stopping));
+        // Starting again while it stops does nothing.
+        analyze_list(&lib, &key);
+        assert!(lib.lock().analyzing.as_ref().is_some_and(|a| a.stopping));
+        wait_for(&|l| l.analyzing.is_none());
+        // Only the tracks the two workers were on when it was cancelled.
+        let first = analysed();
+        assert!(first <= 2, "{first} tracks analysed after cancelling");
+
+        // Analyze BPM again carries on with the rest.
+        analyze_list(&lib, &key);
+        assert_eq!(
+            lib.lock().analyzing.as_ref().map(|a| a.total),
+            Some(n - first)
+        );
+        wait_for(&|l| l.analyzing.is_none());
+        assert_eq!(analysed(), n);
         let _ = std::fs::remove_dir_all(dir);
     }
 

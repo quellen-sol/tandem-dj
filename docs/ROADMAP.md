@@ -183,6 +183,11 @@ Work through these in order and note anything that fails. `tandem.log` (Settings
    - Does the other PC's CURVE follow?
    - Does the broadcast recording change at the same moment?
 
+### v0.8.1
+
+- **Cancel for Analyze BPM.** A **Cancel** button beside "Analysing BPM 12/300" stops the analysis once the tracks it's working on are done; it says "Stopping analysis…" until then. Tracks already analysed keep their BPM and key, and pressing **Analyze BPM** again carries on with the rest.
+- No protocol change: v0.8.0 and v0.8.1 can share a room.
+
 ## Next candidates
 
 Rough priority order:

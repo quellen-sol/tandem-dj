@@ -256,9 +256,22 @@ impl TandemApp {
             }
             let analyzing = self.library.lock().analyzing.clone();
             match analyzing {
-                Some((_, done, total)) => {
+                Some(a) if a.stopping => {
                     ui.spinner();
-                    ui.label(RichText::new(format!("Analysing BPM {done}/{total}")).weak());
+                    ui.label(RichText::new("Stopping analysis…").weak());
+                }
+                Some(a) => {
+                    ui.spinner();
+                    ui.label(
+                        RichText::new(format!("Analysing BPM {}/{}", a.done, a.total)).weak(),
+                    );
+                    if ui
+                        .button("Cancel")
+                        .on_hover_text("Stop analysing. Tracks already done keep their BPM and key; Analyze BPM carries on from where it stopped.")
+                        .clicked()
+                    {
+                        tandem_core::library::cancel_analysis(&self.library);
+                    }
                 }
                 None if !matches!(src, Source::Room) && !scanning && !all_paths.is_empty() => {
                     if ui
