@@ -342,6 +342,13 @@ Work through these in order and note anything that fails. `tandem.log` (Settings
   - Test: load a track your partner doesn't have. While their deck says **Receiving this track… N%**, unplug the joining PC's network for 20 seconds. Does it say paused, then carry on from about where it stopped once the PC is back, with the deck coming in playing in time?
 - No protocol change: v0.11.11 and v0.11.12 can share a room, but a transfer with a v0.11.11 or older booth starts over.
 
+### v0.11.13
+
+- **Resumed transfers no longer stall on Windows after a connection goes quiet.** When the link went silent (Wi-Fi gone, rather than the connection closing) and the booth got back in, the old transfer could stay stuck on its dead connection for 30 seconds, and the resumed one waited behind it: the joining DJ's download could stall for up to half a minute, and the host could give up on the joining DJ's track until the link next dropped. Now the resumed transfer takes over at once and the stuck one can't touch the file. A stuck upload also no longer shows as failed in the transfers list while the resumed one carries on.
+- v0.11.12's build was never published (its Windows tests failed on this), so v0.11.13 is the first build with resumable transfers: see the v0.11.12 notes above.
+  - Test: as for v0.11.12, but turn off the joining PC's Wi-Fi for 20 seconds instead of unplugging the cable. Does the track carry on within a few seconds of it reconnecting, on both PCs?
+- No protocol change: v0.11.12 and v0.11.13 can share a room.
+
 ## Next candidates
 
 Rough priority order:
