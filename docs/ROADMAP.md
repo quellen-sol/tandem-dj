@@ -336,6 +336,12 @@ Work through these in order and note anything that fails. `tandem.log` (Settings
   - Test (on the SC Live 4, in computer mode before opening Tandem): press ROLL on the left and hold pad 4 on a playing deck A for a bar, then let go. Does it stutter ½ beat and carry on in time, with ROLL and the pad lit? Press HOT CUE: are the pads hot cues again, with the right side unchanged? Does SHIFT + pad clear a hot cue?
 - No protocol change: v0.11.10 and v0.11.11 can share a room.
 
+### v0.11.12
+
+- **A track on its way carries on after the connection drops.** If the link drops while a track is being sent (either way, or to a broadcaster), the transfer pauses instead of failing, and the deck says **paused at N% until the link is back**. Once you're back together it carries on from there (**resumed at N%**) instead of starting over, and the deck that was waiting comes in exactly where the room is. Shares carry on too.
+  - Test: load a track your partner doesn't have. While their deck says **Receiving this track… N%**, unplug the joining PC's network for 20 seconds. Does it say paused, then carry on from about where it stopped once the PC is back, with the deck coming in playing in time?
+- No protocol change: v0.11.11 and v0.11.12 can share a room, but a transfer with a v0.11.11 or older booth starts over.
+
 ## Next candidates
 
 Rough priority order:
