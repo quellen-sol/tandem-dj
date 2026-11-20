@@ -37,6 +37,22 @@ const ADJUST_STEPS: [f64; 3] = [0.01, 0.1, 1.0];
 const SLIP_STEPS: [f64; 3] = [0.001, 0.005, 0.025];
 
 /// Camelot-compatible: same key, relative major/minor, or one step round the wheel.
+/// Who's broadcasting this room, if anyone.
+fn broadcasters(ui: &mut egui::Ui, view: &SessionView) {
+    let names: Vec<&str> = view
+        .link
+        .roster
+        .broadcasters
+        .iter()
+        .map(|p| p.name.as_str())
+        .collect();
+    if names.is_empty() {
+        return;
+    }
+    ui.label(RichText::new(format!("📡 {}", names.join(", "))).weak())
+        .on_hover_text("Broadcasting this room: they see and hear the set as the stream does, and can't change anything.");
+}
+
 pub(crate) fn keys_fit(a: i8, b: i8) -> bool {
     let (ca, cb) = (tandem_core::keys::camelot(a), tandem_core::keys::camelot(b));
     let split = |c: &str| {
@@ -78,6 +94,7 @@ impl TandemApp {
                         ui.label(RichText::new(format!("Hosting room {room}")).strong());
                         ui.label(RichText::new(format!("port {port}")).weak());
                         self.peer_status(ui, view);
+                        broadcasters(ui, view);
                         if ui.button("Leave").clicked() {
                             self.session.lock().leave();
                         }
@@ -86,11 +103,33 @@ impl TandemApp {
                         ui.label(RichText::new(format!("In room {room}")).strong());
                         ui.label(RichText::new(addr.as_str()).weak());
                         self.peer_status(ui, view);
+                        broadcasters(ui, view);
+                        if ui.button("Leave").clicked() {
+                            self.session.lock().leave();
+                        }
+                    }
+                    RoleView::Broadcasting { addr, room } => {
+                        ui.label(RichText::new(format!("📡 Broadcasting room {room}")).strong());
+                        ui.label(RichText::new(addr.as_str()).weak());
+                        self.peer_status(ui, view);
+                        let delay = self.bcast_delay_ms();
+                        if let Some(late) = view
+                            .link
+                            .late_us
+                            .filter(|&l| crate::ui_broadcaster::late_warning(l, delay))
+                        {
+                            ui.label(
+                                RichText::new(format!("⚠ moves {:.0} ms late", late as f64 / 1000.0))
+                                    .color(AMBER),
+                            )
+                            .on_hover_text(format!("The DJs' moves are getting here too close to the {delay} ms broadcast delay, so some land late on the stream. TIMING, in this window, can raise the delay."));
+                        }
                         if ui.button("Leave").clicked() {
                             self.session.lock().leave();
                         }
                     }
                 }
+                let broadcasting = matches!(view.link.role, RoleView::Broadcasting { .. });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui.button("⚙ Settings").clicked() {
                         self.ui.show_settings = !self.ui.show_settings;
@@ -98,11 +137,18 @@ impl TandemApp {
                     if ui.button("Terms").clicked() {
                         self.ui.show_terms = true;
                     }
-                    ui.toggle_value(&mut self.local_edit.click, "Sync click")
-                        .on_hover_text("A metronome on the shared room clock. Both booths click at the same instant: put two laptops side by side to hear how well they're synced.");
+                    if !broadcasting {
+                        ui.toggle_value(&mut self.local_edit.click, "Sync click")
+                            .on_hover_text("A metronome on the shared room clock. Both booths click at the same instant: put two laptops side by side to hear how well they're synced.");
+                    }
                     let delay = self.settings.audio.broadcast_delay_ms;
+                    let tip = if broadcasting {
+                        "The window to share or capture for your stream: the decks and mixer exactly as this booth plays them, so the picture matches the sound.".to_string()
+                    } else {
+                        format!("A second window for your stream: the decks and mixer as the broadcast feed plays them, {delay} ms behind the room, so the picture matches the sound. Share or capture that window, and take the sound from the broadcast feed (Settings → Audio).")
+                    };
                     ui.toggle_value(&mut self.ui.broadcast_view, "Broadcast view")
-                        .on_hover_text(format!("A second window for your stream: the decks and mixer as the broadcast feed plays them, {delay} ms behind the room, so the picture matches the sound. Share or capture that window, and take the sound from the broadcast feed (Settings → Audio)."));
+                        .on_hover_text(tip);
                 });
             });
             ui.add_space(2.0);
@@ -114,12 +160,30 @@ impl TandemApp {
             ui.label(RichText::new("Waiting for your partner to join…").color(AMBER));
             return;
         };
+        let broadcasting = matches!(view.link.role, RoleView::Broadcasting { .. });
         let (dot, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
         ui.painter().circle_filled(dot.center(), 4.0, GREEN);
-        ui.label(RichText::new(&peer.name).color(GREEN).strong());
+        let name = if broadcasting {
+            let djs: Vec<&str> = view
+                .link
+                .roster
+                .djs
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect();
+            djs.join(" b2b ")
+        } else {
+            peer.name.clone()
+        };
+        ui.label(RichText::new(name).color(GREEN).strong());
         if let Some(rtt) = view.link.rtt_us {
+            let tip = if broadcasting {
+                "Time for a message to reach the host and come back. This booth plays the room a broadcast delay behind, so both DJs' moves are on time in it."
+            } else {
+                "Time for a message to reach your partner and come back. Your own controls are always instant; your partner's arrive about half this late in your headphones, and exactly on time in the broadcast."
+            };
             ui.label(format!("{:.0} ms round trip", rtt as f64 / 1000.0))
-                .on_hover_text("Time for a message to reach your partner and come back. Your own controls are always instant; your partner's arrive about half this late in your headphones, and exactly on time in the broadcast.");
+                .on_hover_text(tip);
         }
         if let Some(spread) = view.link.clock_spread_us {
             ui.label(RichText::new(format!("clock ±{:.1} ms", spread as f64 / 2000.0)).weak());

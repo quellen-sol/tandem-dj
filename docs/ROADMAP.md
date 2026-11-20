@@ -208,6 +208,35 @@ Work through these in order and note anything that fails. `tandem.log` (Settings
 6. Backspin hard near the very start of a track. Does it stop at 0:00 without hanging there?
 7. In a room: backspin on one PC. Does the other PC hear the same spin, and does the broadcast recording have it?
 
+## Round 10 (v0.10): broadcaster-only booths
+
+- **Join a room as a broadcaster.** Tick **Broadcaster only** in Join a room, on a PC that isn't DJing. That PC plays only the broadcast feed and opens the broadcast window, so Discord can share the window with its sound on, or OBS can capture it, with no virtual cable.
+  - A broadcaster can't change anything: no decks, mixer or library on screen, its controller does nothing, and the host ignores anything it sends.
+  - It doesn't need the music: the host sends it every track on a deck, including the joining DJ's.
+  - Both DJs see who's broadcasting in the top bar. Up to 4 broadcasters per room.
+  - If the host leaves, the broadcaster's decks empty and it goes quiet.
+- **A broadcaster runs 1000 ms behind the room** (its own setting; a DJ's broadcast delay stays 500 ms), since the joining DJ's moves reach it through the host.
+- **TIMING** on the broadcaster shows how long the DJs' moves take to get there. Too close to the delay, it warns (and the top bar does) and offers a longer delay in one click.
+- **The upload speed limit covers all uploads together,** not each one, so a host sending tracks to its partner and broadcasters at once can't fill its connection and delay the DJs' moves. Two transfers at once now share it, so each goes at half the speed.
+- A third DJ trying to join is told to tick **Broadcaster only**.
+- The self-test now runs a room with two DJs and a broadcaster.
+- Protocol version 9: v0.10 can't share a room with v0.9 or earlier, so both DJs and the broadcaster need v0.10.
+
+### Test plan for broadcasters
+
+1. Host and join as usual, then join from a third PC with **Broadcaster only** ticked.
+   - Do both DJs' top bars show 📡 and the broadcaster's name?
+   - Does the broadcaster's window show "*host* b2b *partner*", and the broadcast window open by itself?
+2. Load a track on each DJ's PC that the broadcaster doesn't have.
+   - Does the broadcaster's DECKS list go from "receiving" to "ready" for both?
+3. Play and mix. On the broadcaster's PC, do the sound and the broadcast window match the DJs' moves, 1000 ms late?
+4. Discord: share the broadcaster's "Tandem broadcast" window with sound on, and join the call from a phone.
+   - Is the sound clean, with no other sounds from that PC?
+   - Do picture and sound line up?
+5. Plug a controller into the broadcaster and move things. Does nothing in the room move?
+6. Check TIMING on the broadcaster during the set, and while a DJ loads a track it doesn't have. Does it stay green? If it turns amber, does the raise button fix it?
+7. Close Tandem on the host. Does the broadcaster go quiet and say it's no longer broadcasting?
+
 ## Next candidates
 
 Rough priority order:

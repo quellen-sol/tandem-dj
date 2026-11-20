@@ -6,6 +6,7 @@ mod midi;
 mod output;
 mod selftest;
 mod ui_broadcast;
+mod ui_broadcaster;
 mod ui_decks;
 mod ui_dialogs;
 mod ui_library;
@@ -57,6 +58,8 @@ fn main() {
         demo: args.iter().any(|a| a == "--demo"),
         host_port: arg_after("--dev-host").and_then(|p| p.to_string_lossy().parse().ok()),
         join: arg_after("--dev-join").map(|p| p.to_string_lossy().to_string()),
+        join_broadcaster: args.iter().any(|a| a == "--dev-broadcaster"),
+        late_ms: arg_after("--dev-late").and_then(|p| p.to_string_lossy().parse().ok()),
         search: arg_after("--dev-search").map(|p| p.to_string_lossy().to_string()),
         broadcast_view: args.iter().any(|a| a == "--broadcast-view"),
         shared: false,

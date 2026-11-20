@@ -3,6 +3,12 @@
 //! The host's clock *is* the room clock. The joining DJ measures its offset
 //! with pings (see [`crate::clock`]) before applying the room state, and
 //! keeps pinging so the estimate tracks drift.
+//!
+//! Up to [`MAX_BROADCASTERS`] more booths can join as broadcasters: they
+//! sync their clock and receive the room exactly like the joining DJ (the
+//! host relays the DJ's events and tracks to them), so they can play the
+//! broadcast feed and show the broadcast window. They can't change anything:
+//! the host answers their pings and resync requests and ignores the rest.
 
 use crate::clock::ClockEstimator;
 use crate::protocol::{
@@ -48,6 +54,11 @@ impl PeerConn {
         let _ = self.tx.send(m);
     }
 
+    /// Another handle for queueing messages on this connection.
+    fn sender(&self) -> Sender<Msg> {
+        self.tx.clone()
+    }
+
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Relaxed)
     }
@@ -57,6 +68,9 @@ impl PeerConn {
         let _ = self.stream.shutdown(Shutdown::Both);
     }
 }
+
+/// How many booths can join a room as broadcasters, besides the two DJs.
+pub const MAX_BROADCASTERS: usize = 4;
 
 pub fn random_room_code() -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -117,6 +131,7 @@ fn handle_incoming(h: SessionHandle, mut s: TcpStream, room: &str) -> anyhow::Re
         name,
         room: their_room,
         peer_id,
+        broadcaster,
     } = hello
     else {
         bail!("expected hello")
@@ -141,51 +156,72 @@ fn handle_incoming(h: SessionHandle, mut s: TcpStream, room: &str) -> anyhow::Re
         reject(&mut s, "Wrong room code.");
         bail!("wrong room code");
     }
+    let info = PeerInfo { id: peer_id, name };
     match kind {
-        ConnKind::Files => crate::files::serve(&h, s),
-        ConnKind::Control => host_control(h, s, PeerInfo { id: peer_id, name }),
+        ConnKind::Files => crate::files::serve(&h, s, broadcaster),
+        ConnKind::Control => host_control(h, s, info, broadcaster),
     }
 }
 
-fn host_control(h: SessionHandle, mut s: TcpStream, info: PeerInfo) -> anyhow::Result<()> {
-    let clock = {
+fn host_control(
+    h: SessionHandle,
+    mut s: TcpStream,
+    info: PeerInfo,
+    broadcaster: bool,
+) -> anyhow::Result<()> {
+    let (clock, reply, serial) = {
         let mut ses = h.lock();
-        if ses.has_peer() {
+        let full = if broadcaster {
+            (ses.broadcaster_count() >= MAX_BROADCASTERS)
+                .then(|| format!("This room already has {MAX_BROADCASTERS} broadcasters."))
+        } else {
+            ses.has_peer()
+                .then(|| "This room already has two DJs. Tick \"Broadcaster only\" to join just to stream it.".to_string())
+        };
+        if let Some(reason) = full {
             drop(ses);
-            let _ = write_msg(
-                &mut s,
-                &Msg::Reject {
-                    reason: "This room already has two DJs.".into(),
-                },
-                &[],
-            );
+            let _ = write_msg(&mut s, &Msg::Reject { reason }, &[]);
             bail!("room full");
         }
         let conn = PeerConn::new(s.try_clone()?)?;
+        let reply = conn.sender();
         conn.send(ses.welcome());
-        ses.add_peer(conn, info.clone());
-        ses.clock()
+        let serial = if broadcaster {
+            Some(ses.add_broadcaster(conn, info.clone()))
+        } else {
+            ses.add_peer(conn, info.clone());
+            None
+        };
+        (ses.clock(), reply, serial)
     };
     s.set_read_timeout(Some(Duration::from_secs(15)))?;
     let result = loop {
         match read_msg(&mut s) {
             Ok((Msg::Ping { id, t1, rtt }, _)) => {
                 let remote = clock.now();
-                let mut ses = h.lock();
-                if let Some(p) = ses.peer_conn() {
-                    p.send(Msg::Pong { id, t1, remote });
-                }
-                if let Some(r) = rtt {
-                    ses.set_peer_rtt(r);
+                let _ = reply.send(Msg::Pong { id, t1, remote });
+                if let (Some(r), None) = (rtt, serial) {
+                    h.lock().set_peer_rtt(r);
                 }
             }
             Ok((Msg::Bye, _)) => break Ok(()),
+            Ok((Msg::ResyncRequest, _)) if serial.is_some() => {
+                let timeline = h.lock().timeline().clone();
+                let _ = reply.send(Msg::Resync { timeline });
+            }
+            // A broadcaster can't change the room, whatever it sends.
+            Ok((m, _)) if serial.is_some() => {
+                log::debug!("ignoring {m:?} from broadcaster {}", info.name)
+            }
             Ok((m, _)) => h.lock().on_control_msg(m),
             Err(e) if is_disconnect(&e) => break Ok(()),
             Err(e) => break Err(anyhow!(e)),
         }
     };
-    h.lock().on_peer_left(info.id);
+    match serial {
+        Some(serial) => h.lock().on_broadcaster_left(serial),
+        None => h.lock().on_peer_left(info.id),
+    }
     result
 }
 
@@ -230,6 +266,7 @@ pub(crate) fn connect(
     kind: ConnKind,
     room: &str,
     me: &PeerInfo,
+    broadcaster: bool,
 ) -> anyhow::Result<TcpStream> {
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(6))
         .with_context(|| format!("couldn't reach {addr}"))?;
@@ -244,21 +281,28 @@ pub(crate) fn connect(
             name: me.name.clone(),
             room: room.trim().to_uppercase(),
             peer_id: me.id,
+            broadcaster,
         },
         &[],
     )?;
     Ok(s)
 }
 
-/// Join a host's room. Blocks for the handshake and initial clock sync
-/// (about a second), then runs in the background.
-pub fn join(h: &SessionHandle, addr_text: &str, room: &str) -> anyhow::Result<()> {
+/// Join a host's room, as the second DJ or, with `broadcaster`, only to
+/// play and show the set for a stream. Blocks for the handshake and initial
+/// clock sync (about a second), then runs in the background.
+pub fn join(
+    h: &SessionHandle,
+    addr_text: &str,
+    room: &str,
+    broadcaster: bool,
+) -> anyhow::Result<()> {
     let addr = resolve(addr_text)?;
     let (me, clock) = {
         let s = h.lock();
         (s.me.clone(), s.clock())
     };
-    let mut s = connect(addr, ConnKind::Control, room, &me)?;
+    let mut s = connect(addr, ConnKind::Control, room, &me, broadcaster)?;
     s.set_read_timeout(Some(Duration::from_secs(10)))?;
     let (first, _) = read_msg(&mut s).context("no answer from host")?;
     let (host, timeline, tracks) = match first {
@@ -317,6 +361,7 @@ pub fn join(h: &SessionHandle, addr_text: &str, room: &str) -> anyhow::Result<()
         est,
         addr,
         room.trim().to_uppercase(),
+        broadcaster,
     );
     for m in buffered {
         h.lock().on_control_msg(m);

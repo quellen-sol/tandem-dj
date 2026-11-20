@@ -1,14 +1,18 @@
-//! End-to-end loopback test: a host and a joining DJ in one process, talking
-//! over real TCP, with the joiner's clock deliberately an hour off.
+//! End-to-end loopback test: a host, a joining DJ and a broadcaster in one
+//! process, talking over real TCP, with the joiners' clocks deliberately
+//! hours off.
 //!
-//! Checks that the clock syncs, that a track the joiner doesn't have is
-//! transferred and verified, that both booths' room state stays identical,
-//! that both booths render bit-identical audio for the same moment, and that
-//! a share can be offered, accepted and downloaded.
+//! Checks that the clocks sync, that a track a booth doesn't have is
+//! transferred and verified (the joining DJ's tracks reach the broadcaster
+//! through the host), that every booth's room state stays identical, that
+//! the booths render bit-identical audio for the same moment, that a
+//! broadcaster can't change the room, and that a share can be offered,
+//! accepted and downloaded.
 
 use crate::config::Paths;
 use crate::library::Library;
-use crate::model::Action;
+use crate::model::{Action, Event};
+use crate::protocol::{read_msg, write_msg, ConnKind, Msg, PeerInfo};
 use crate::render::{Lane, LaneKind};
 use crate::session::{Session, SessionHandle, TrackStatus};
 use crate::time::SharedClock;
@@ -62,12 +66,23 @@ fn run(root: &std::path::Path, say: &mut dyn FnMut(&str)) -> anyhow::Result<()> 
     let wav = music.join("Test Artist - Test Tone.wav");
     crate::audio::write_wav(&wav, 44_100, &crate::audio::test_signal(44_100, 6.0, 440.0))?;
 
+    let bob_music = root.join("bob-music");
+    std::fs::create_dir_all(&bob_music)?;
+    let bob_wav = bob_music.join("Bob - Low Tone.wav");
+    crate::audio::write_wav(
+        &bob_wav,
+        44_100,
+        &crate::audio::test_signal(44_100, 5.0, 330.0),
+    )?;
+
     let alice = session(root, "Alice", 0)?;
     let bob = session(root, "Bob", 3_600_000_000)?; // an hour off
+    let carol = session(root, "Carol", -7_200_000_000)?; // two hours the other way
 
     let port = crate::net::host(&alice, 0, "TEST42")?;
-    say(&format!("host listening on 127.0.0.1:{port}"));
-    crate::net::join(&bob, &format!("127.0.0.1:{port}"), "test42")?;
+    let addr = format!("127.0.0.1:{port}");
+    say(&format!("host listening on {addr}"));
+    crate::net::join(&bob, &addr, "test42", false)?;
     let skew = {
         let (a, b) = (alice.lock().clock(), bob.lock().clock());
         (b.now() - a.now()).abs()
@@ -77,6 +92,50 @@ fn run(root: &std::path::Path, say: &mut dyn FnMut(&str)) -> anyhow::Result<()> 
         skew as f64 / 1000.0
     ));
     ensure!(skew < 5_000, "clock offset too large: {skew} us");
+
+    // A third DJ is turned away; a broadcaster gets in.
+    let dave = session(root, "Dave", 0)?;
+    match crate::net::join(&dave, &addr, "test42", false) {
+        Ok(()) => bail!("a third DJ got into the room"),
+        Err(e) => ensure!(
+            format!("{e:#}").contains("two DJs"),
+            "third DJ refused for the wrong reason: {e:#}"
+        ),
+    }
+    crate::net::join(&carol, &addr, "test42", true)?;
+    let skew = {
+        let (a, c) = (alice.lock().clock(), carol.lock().clock());
+        (c.now() - a.now()).abs()
+    };
+    ensure!(
+        skew < 5_000,
+        "broadcaster's clock offset too large: {skew} us"
+    );
+    wait_for(
+        "everyone to see the broadcaster",
+        Duration::from_secs(5),
+        || {
+            let names = |h: &SessionHandle| {
+                let r = h.lock().roster();
+                (
+                    r.djs.into_iter().map(|p| p.name).collect::<Vec<_>>(),
+                    r.broadcasters
+                        .into_iter()
+                        .map(|p| p.name)
+                        .collect::<Vec<_>>(),
+                )
+            };
+            let room = (
+                vec!["Alice".to_string(), "Bob".into()],
+                vec!["Carol".to_string()],
+            );
+            names(&alice) == room && names(&bob) == room && names(&carol) == room
+        },
+    )?;
+    say(&format!(
+        "a third DJ is refused; Carol joins as a broadcaster (clock off by {:.2} ms)",
+        skew as f64 / 1000.0
+    ));
 
     alice.lock().load_path(0, wav.clone());
     let id = {
@@ -95,6 +154,34 @@ fn run(root: &std::path::Path, say: &mut dyn FnMut(&str)) -> anyhow::Result<()> 
         took.as_secs_f64()
     ));
 
+    // Bob's own track goes Bob -> Alice -> Carol.
+    bob.lock().load_path(1, bob_wav.clone());
+    let bob_id = {
+        let mut id = None;
+        wait_for("Bob to load his track", Duration::from_secs(20), || {
+            id = bob.lock().latest().decks[1].track;
+            id.is_some()
+        })?;
+        id.unwrap()
+    };
+    let took = wait_for(
+        "the broadcaster to receive both tracks",
+        Duration::from_secs(40),
+        || {
+            let c = carol.lock();
+            c.track_status(id) == Some(TrackStatus::Ready)
+                && c.track_status(bob_id) == Some(TrackStatus::Ready)
+        },
+    )?;
+    ensure!(
+        alice.lock().track_status(bob_id) == Some(TrackStatus::Ready),
+        "the host didn't get Bob's track"
+    );
+    say(&format!(
+        "the broadcaster has both DJs' tracks (Bob's through the host) after {:.2} s",
+        took.as_secs_f64()
+    ));
+
     alice.lock().act(Action::Play { deck: 0 });
     std::thread::sleep(Duration::from_millis(100));
     bob.lock().act(Action::Tempo {
@@ -102,40 +189,121 @@ fn run(root: &std::path::Path, say: &mut dyn FnMut(&str)) -> anyhow::Result<()> 
         tempo: 1.02,
     });
     bob.lock().act(Action::Volume { deck: 0, v: 0.7 });
+    bob.lock().act(Action::Play { deck: 1 });
     alice.lock().act(Action::Crossfader { v: 0.3 });
+
+    // The broadcaster can't change anything: not through its own session,
+    // and not by sending the host an event directly.
+    let carol_id = carol.lock().me.id;
+    carol.lock().act(Action::Crossfader { v: 0.99 });
+    let mallory = PeerInfo {
+        id: 0xBAD,
+        name: "Mallory".into(),
+    };
+    let mut raw = crate::net::connect(
+        crate::net::resolve(&addr)?,
+        ConnKind::Control,
+        "TEST42",
+        &mallory,
+        true,
+    )?;
+    ensure!(
+        matches!(read_msg(&mut raw)?.0, Msg::Welcome { .. }),
+        "no welcome for a broadcaster"
+    );
+    let now = alice.lock().now();
+    write_msg(
+        &mut raw,
+        &Msg::Event {
+            ev: Event {
+                time: now,
+                origin: mallory.id,
+                seq: 1,
+                action: Action::Crossfader { v: 0.77 },
+            },
+        },
+        &[],
+    )?;
     std::thread::sleep(Duration::from_millis(400));
+    let _ = raw.shutdown(std::net::Shutdown::Both);
+    for (who, h) in [("Alice", &alice), ("Bob", &bob), ("Carol", &carol)] {
+        let s = h.lock();
+        ensure!(
+            s.latest().crossfader == 0.3,
+            "a broadcaster moved the crossfader on {who}'s booth"
+        );
+        ensure!(
+            !s.timeline()
+                .events()
+                .iter()
+                .any(|e| e.origin == mallory.id || e.origin == carol_id),
+            "a broadcaster's event reached {who}'s timeline"
+        );
+    }
+    say("a broadcaster's moves are ignored, by its own booth and by the host");
 
     let t = alice.lock().clock().now() - 100_000;
-    let (da, db) = (
+    let (da, db, dc) = (
         alice.lock().state_at(t).digest(),
         bob.lock().state_at(t).digest(),
+        carol.lock().state_at(t).digest(),
     );
     ensure!(da == db, "room state differs between booths");
-    say("room state identical on both booths");
+    ensure!(da == dc, "room state differs on the broadcaster");
+    say("room state identical on all three booths");
+    let late = carol.lock().view().link.late_us;
+    match late {
+        Some(us) if us < 250_000 => say(&format!(
+            "the DJs' moves reach the broadcaster {:.1} ms after they happen, at most",
+            us as f64 / 1000.0
+        )),
+        other => bail!("broadcaster's lateness: {other:?}"),
+    }
 
     let snaps = (
         alice.lock().snapshot_handle().load_full(),
         bob.lock().snapshot_handle().load_full(),
+        carol.lock().snapshot_handle().load_full(),
     );
     let n = 4096;
-    let render = |snap: &crate::render::AudioSnapshot| {
-        let mut lane = Lane::new(48_000.0, 0, LaneKind::Live);
+    let render = |snap: &crate::render::AudioSnapshot, kind| {
+        let mut lane = Lane::new(48_000.0, 0, kind);
         let (mut m, mut c) = (vec![0.0f32; n * 2], vec![0.0f32; n * 2]);
         lane.render(snap, t, &mut m, &mut c);
         m
     };
-    let (ma, mb) = (render(&snaps.0), render(&snaps.1));
+    let max_diff = |a: &[f32], b: &[f32]| {
+        a.iter()
+            .zip(b)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max)
+    };
+    let (ma, mb) = (
+        render(&snaps.0, LaneKind::Live),
+        render(&snaps.1, LaneKind::Live),
+    );
     ensure!(ma.iter().any(|v| v.abs() > 0.01), "rendered silence");
-    let diff = ma
-        .iter()
-        .zip(&mb)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max);
+    let diff = max_diff(&ma, &mb);
     ensure!(
         diff < 1e-6,
         "booths render different audio (max diff {diff})"
     );
-    say("both booths render identical audio for the same moment");
+    let (ba, bc) = (
+        render(&snaps.0, LaneKind::Broadcast),
+        render(&snaps.2, LaneKind::Broadcast),
+    );
+    let diff = max_diff(&ba, &bc);
+    ensure!(
+        diff < 1e-6,
+        "the broadcaster renders different audio (max diff {diff})"
+    );
+    let view = carol.lock().broadcast_view();
+    let djs: Vec<&str> = view.djs.iter().map(|p| p.name.as_str()).collect();
+    ensure!(
+        djs == ["Alice", "Bob"],
+        "broadcaster's window names {djs:?}"
+    );
+    say("all booths render identical audio for the same moment, the broadcaster's feed too");
 
     // Sharing: Alice offers her folder, Bob accepts.
     alice
@@ -169,7 +337,18 @@ fn run(root: &std::path::Path, say: &mut dyn FnMut(&str)) -> anyhow::Result<()> 
     );
     say("share offered, accepted (consent logged), downloaded and verified");
 
-    bob.lock().leave();
+    // A broadcaster that loses the room stops playing it.
     alice.lock().leave();
+    wait_for(
+        "the broadcaster to notice the host left",
+        Duration::from_secs(10),
+        || {
+            let c = carol.lock();
+            !c.is_broadcaster() && c.latest().decks.iter().all(|d| d.track.is_none())
+        },
+    )?;
+    say("when the host leaves, the broadcaster's decks empty out");
+    bob.lock().leave();
+    carol.lock().leave();
     Ok(())
 }

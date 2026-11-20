@@ -22,6 +22,10 @@ pub struct AudioSettings {
     /// Delayed copy of the master for streaming (e.g. a virtual cable into OBS).
     pub broadcast: Option<Route>,
     pub broadcast_delay_ms: u32,
+    /// The broadcast delay while this booth is in a room as a broadcaster.
+    /// Longer than a DJ's: the joining DJ's moves take two hops to get here,
+    /// and the audience can't tell a stream that's a second late.
+    pub broadcaster_delay_ms: u32,
 }
 
 impl Default for AudioSettings {
@@ -31,8 +35,25 @@ impl Default for AudioSettings {
             cue: None,
             broadcast: None,
             broadcast_delay_ms: 500,
+            broadcaster_delay_ms: 1000,
         }
     }
+}
+
+/// The broadcast delays you can pick, in ms.
+pub const BROADCAST_DELAY_MS: std::ops::RangeInclusive<u32> = 200..=2000;
+
+/// Moves that reach a broadcaster within this much of its delay are too
+/// close: the sound card's buffer and the next spike eat the rest.
+pub const LATE_MARGIN_US: i64 = 100_000;
+
+/// A broadcast delay that leaves room for moves arriving `late_us` after
+/// they happen: a quarter second spare, rounded up to a quarter second and
+/// no more than the longest delay.
+pub fn broadcast_delay_for(late_us: i64) -> u32 {
+    let want_ms = (late_us.max(0) + 250_000) as f64 / 1000.0;
+    let ms = ((want_ms / 250.0).ceil() * 250.0) as u32;
+    ms.clamp(*BROADCAST_DELAY_MS.start(), *BROADCAST_DELAY_MS.end())
 }
 
 /// A column of the library's track list.
@@ -98,6 +119,8 @@ pub struct Settings {
     pub midi_device: Option<String>,
     pub host_port: u16,
     pub last_join: String,
+    /// "Broadcaster only" was ticked the last time this booth joined.
+    pub join_as_broadcaster: bool,
     pub max_upload_mb_s: f32,
     /// Tempo fader range, e.g. 0.08 = ±8%.
     pub tempo_range: f64,
@@ -120,6 +143,7 @@ impl Default for Settings {
             midi_device: None,
             host_port: DEFAULT_PORT,
             last_join: String::new(),
+            join_as_broadcaster: false,
             max_upload_mb_s: 2.0,
             tempo_range: 0.08,
             local: LocalParams::default(),
@@ -288,6 +312,24 @@ pub fn unique_path(path: PathBuf) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delay_for_late_moves() {
+        assert_eq!(broadcast_delay_for(0), 250);
+        assert_eq!(broadcast_delay_for(450_000), 750);
+        assert_eq!(broadcast_delay_for(500_000), 750);
+        assert_eq!(broadcast_delay_for(620_000), 1000);
+        assert_eq!(broadcast_delay_for(1_900_000), 2000);
+        assert_eq!(broadcast_delay_for(5_000_000), 2000);
+    }
+
+    #[test]
+    fn old_settings_get_the_broadcaster_delay() {
+        let old = r#"{"audio": {"master": null, "cue": null, "broadcast": null, "broadcast_delay_ms": 700}}"#;
+        let s: Settings = serde_json::from_str(old).unwrap();
+        assert_eq!(s.audio.broadcast_delay_ms, 700);
+        assert_eq!(s.audio.broadcaster_delay_ms, 1000);
+    }
 
     #[test]
     fn frame_rate_defaults_to_60_and_round_trips() {

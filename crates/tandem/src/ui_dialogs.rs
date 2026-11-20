@@ -282,6 +282,25 @@ impl TandemApp {
                     ui.add(egui::TextEdit::singleline(&mut self.ui.join_code).desired_width(90.0));
                     ui.end_row();
                 });
+                ui.add_space(4.0);
+                if ui
+                    .checkbox(&mut self.settings.join_as_broadcaster, "Broadcaster only")
+                    .on_hover_text("For a PC that streams the set: it can't change anything in the room.")
+                    .changed()
+                {
+                    self.mark_dirty();
+                }
+                if self.settings.join_as_broadcaster {
+                    ui.label(
+                        RichText::new(
+                            "This PC joins just to stream the set. It plays only the broadcast feed, \
+                             with no decks, mixer or library, and nothing you do here changes the room. \
+                             Share the broadcast window with its sound on: no virtual cable needed.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                }
                 ui.add_space(6.0);
                 if self.ui.joining {
                     ui.horizontal(|ui| {
@@ -294,14 +313,16 @@ impl TandemApp {
             });
         if go {
             self.ui.joining = true;
-            let (h, addr, code, out) = (
+            let (h, addr, code, out, broadcaster) = (
                 self.session.clone(),
                 self.settings.last_join.clone(),
                 self.ui.join_code.clone(),
                 self.ui.join_result.clone(),
+                self.settings.join_as_broadcaster,
             );
             std::thread::spawn(move || {
-                let res = tandem_core::net::join(&h, &addr, &code).map_err(|e| format!("{e:#}"));
+                let res = tandem_core::net::join(&h, &addr, &code, broadcaster)
+                    .map_err(|e| format!("{e:#}"));
                 *out.lock() = Some(res);
             });
         }
@@ -371,6 +392,18 @@ impl TandemApp {
 
     fn audio_settings(&mut self, ui: &mut egui::Ui) {
         let before = self.settings.audio.clone();
+        if self.audio_broadcaster {
+            ui.label(
+                RichText::new(
+                    "Broadcasting: Speakers (master) plays the broadcast feed, the headphones are off, \
+                     and the broadcast window is in step with what you hear. \
+                     The broadcast delay below is this PC's delay as a broadcaster (1000 ms to start with); \
+                     your delay as a DJ stays as it was.",
+                )
+                .color(AMBER),
+            );
+            ui.add_space(4.0);
+        }
         if ui.button("Refresh device list").clicked() {
             self.devices = output::list_devices();
         }
@@ -410,8 +443,15 @@ impl TandemApp {
         ui.horizontal(|ui| {
             ui.label("Broadcast delay");
             ui.add(
-                egui::Slider::new(&mut self.settings.audio.broadcast_delay_ms, 200..=2000)
-                    .suffix(" ms"),
+                egui::Slider::new(
+                    if self.audio_broadcaster {
+                        &mut self.settings.audio.broadcaster_delay_ms
+                    } else {
+                        &mut self.settings.audio.broadcast_delay_ms
+                    },
+                    tandem_core::config::BROADCAST_DELAY_MS,
+                )
+                .suffix(" ms"),
             );
         });
         if self.settings.audio != before {
@@ -650,7 +690,7 @@ impl TandemApp {
             }
         });
         ui.horizontal(|ui| {
-            ui.label("Upload speed limit");
+            ui.label("Upload speed limit (all uploads together)");
             if ui
                 .add(
                     egui::DragValue::new(&mut self.settings.max_upload_mb_s)
@@ -665,7 +705,7 @@ impl TandemApp {
                 self.mark_dirty();
             }
         });
-        ui.label(RichText::new("Keeps track transfers from swamping your connection while you play. Lower it if your partner's controls feel laggy during a transfer.").small().weak());
+        ui.label(RichText::new("Keeps track transfers from swamping your connection while you play: every track you send, to your partner or a broadcaster, shares it. Lower it if your partner's controls feel laggy, or a broadcaster warns that moves arrive late, while tracks are being sent.").small().weak());
         ui.separator();
         ui.horizontal(|ui| {
             ui.label("Screen frame rate");

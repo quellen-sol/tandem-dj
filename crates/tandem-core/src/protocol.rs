@@ -3,7 +3,7 @@
 //!
 //! Frame: `[u32 json_len][json][u32 payload_len][payload]`, big-endian.
 //!
-//! Two kinds of TCP connection go from a joining DJ to the host:
+//! Two kinds of TCP connection go from a joining booth to the host:
 //! * **Control** — one per peer: events, clock pings, shares. Kept small and
 //!   latency-sensitive.
 //! * **Files** — one per transfer, so a 60 MB track never queues in front of
@@ -13,7 +13,7 @@ use crate::model::{Event, Timeline, TrackId};
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 pub const DEFAULT_PORT: u16 = 47800;
 const MAX_JSON: u32 = 64 << 20;
 const MAX_PAYLOAD: u32 = 8 << 20;
@@ -72,6 +72,10 @@ pub enum Msg {
         name: String,
         room: String,
         peer_id: u64,
+        /// Joining only to watch and stream the set: this booth gets
+        /// everything the room does and can change nothing.
+        #[serde(default)]
+        broadcaster: bool,
     },
     Welcome {
         host: PeerInfo,
@@ -123,6 +127,13 @@ pub enum Msg {
     /// Client -> host: I can't upload that one.
     NoFile {
         id: TrackId,
+    },
+    /// Host -> everyone: who's in the room, whenever that changes.
+    Members {
+        /// The DJs, host first.
+        djs: Vec<PeerInfo>,
+        /// Booths that joined only to broadcast.
+        broadcasters: Vec<PeerInfo>,
     },
     Bye,
 

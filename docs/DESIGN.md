@@ -70,6 +70,24 @@ Let go of the jog platter mid-spin (vinyl mode) and the record runs on and slows
 
 A stream needs a picture that's as late as its sound. The broadcast window (`ui_broadcast.rs`) draws `Session::broadcast_view()`: the room at `now − broadcast delay`, taken from the same timeline the broadcast lane renders. Every move appears on it at the moment its sound reaches the feed, including the partner's. It's read-only, names DJs by name (never "you"), and is a second OS window (an egui immediate viewport) so it can be captured or screenshared on its own. It's drawn inside the main window's frame, so it redraws at the same rate.
 
+### Broadcaster booths
+
+A booth can join a room "Broadcaster only", to stream it from a PC that isn't DJing. It's an ordinary joiner with three differences:
+
+- **It changes nothing.** `Session::act_at`, `load_path`, `reset_grid` and `offer_share` do nothing on it, and its window has no decks, mixer or library (`ui_broadcaster.rs`). The host enforces this too: a broadcaster's control connection only gets its pings and resync requests answered; events, tracks, shares and uploads from it are dropped.
+- **It plays only the broadcast lane.** `output::start` routes the broadcast lane to the master output (and to the broadcast feed, if that's set to another device or pair), skips the headphones, and meters the broadcast lane. The broadcast window therefore takes its meters as they are, with no extra delay. Because the process plays nothing else, a capture of its window's sound (Discord, OBS application audio) is exactly the feed.
+- **It learns who's in the room from the host,** whose `Members` message lists the DJs and broadcasters whenever that changes. The DJs show the broadcasters in the top bar, and the broadcaster names both DJs on the broadcast window.
+
+The host relays the joining DJ's events and track details to the broadcasters as they arrive, and sends its own events, track details and digests to everyone. A broadcaster sees the joining DJ's moves after two network hops instead of one, which the broadcast delay absorbs.
+
+Tracks come from the host over the usual files connections. The host serves every track on a deck, including ones it found in its own library and ones it downloaded from the joining DJ. A broadcaster can ask for a partner's track before the host has it, so the host holds the download for up to 20 s while it's still arriving, and a client asks again every 5 s for a track on a deck that failed to download.
+
+A broadcaster that loses the room empties its decks rather than carrying on with them as a solo booth.
+
+**Timing.** A move is exact on the stream if it reaches the broadcaster before its broadcast lane plays that moment: within the broadcast delay, less the sound card's buffer. The joining DJ's moves take two hops, so a broadcaster's delay is its own setting (`AudioSettings::broadcaster_delay_ms`, 1000 ms by default; a DJ's stays 500 ms). Each event carries the shared time it happened, so a booth measures how late every move from the room arrives (`Session::note_lateness`, moves made since it joined, a scheduled one counting as on time) and keeps the latest per second for a minute (`LinkView::late_us`). Within 100 ms of the delay the broadcaster warns, and offers `config::broadcast_delay_for`: a quarter second over the lateness, rounded up to a quarter second, at most 2000 ms. It never changes the delay by itself, since the stream repeats or skips by the difference when it does.
+
+A move that's late anyway still lands in time with the music: the timeline puts it at the moment it happened, so a play or hot cue starts on the beat, missing its first few ms, and a fader moves late by the excess. One more than the delay plus 3 s late is clamped to the timeline's base and leaves the booth out of step until a resync.
+
 ### Frame rate
 
 The UI redraws at the **Screen frame rate** setting (60 fps by default). Frames are due on a fixed beat (`TandemApp::pace_frames`), so vsync rounding a frame up to the next monitor refresh doesn't drag the average down. Input still redraws at once. Controller moves go straight from the MIDI thread to the session with their own timestamps, so they never wait for a frame. Note that egui brings a requested repaint forward by its predicted frame time (1/60 s): asking for a repaint after 16 ms means "now", which is why the UI used to run at the monitor's full rate.
@@ -146,11 +164,11 @@ Every peer decodes with the same decoder (symphonia) and the loader's exact dura
 
 ## Network
 
-- **Topology.** The host listens on TCP 47800. The joiner opens one *control* connection, plus one *files* connection per transfer. Files have their own connection so a 60 MB track never queues ahead of a fader move.
-- **Upload cap.** Transfers are capped at 2 MB/s by default (configurable) so they don't flood the uplink.
+- **Topology.** The host listens on TCP 47800. The joiner opens one *control* connection, plus one *files* connection per transfer. Files have their own connection so a 60 MB track never queues ahead of a fader move. Up to 4 broadcasters connect the same way, after or alongside the joining DJ; the host is the hub, so neither the joining DJ nor a broadcaster needs to be reachable.
+- **Upload cap.** All of a booth's uploads together are capped at 2 MB/s by default (configurable), so they don't flood the uplink and delay the control link's messages behind them in the router. One `files::UploadPacer` per session books each 128 KB chunk the next free slot, so a host sending to its partner and two broadcasters at once takes turns at one rate.
 - **Direction.** Connections always go joiner to host, so only the host needs reachability. The host asks the joiner to upload with `PushRequest`.
 - **Format.** Length-prefixed JSON frames, plus a binary payload for file chunks (`protocol.rs`).
-- **Security.** There's no encryption at this layer, so run it over Tailscale. The room code keeps strangers out but is not a password. The host only serves files that are loaded on a deck or offered in a share.
+- **Security.** There's no encryption at this layer, so run it over Tailscale. The room code keeps strangers out but is not a password, and anyone with it can join as a broadcaster. The host only serves files that are loaded on a deck or offered in a share, and only accepts uploads from the joining DJ.
 
 ## Sharing and consent
 
@@ -164,4 +182,4 @@ Every peer decodes with the same decoder (symphonia) and the loader's exact dura
 | Crate | What |
 |---|---|
 | `tandem-core` | Everything platform-independent: `time`, `clock`, `model`, `spin` (records let go mid-spin), `render`, `meter` (level meters), `audio` (decode), `net`, `files`, `session`, `library`, `serato`, `mapping` (MIDI learn and soft takeover), `terms`, `selftest`. Tests run anywhere. |
-| `tandem` | The Windows app: egui UI (`ui_*.rs`, including the broadcast window in `ui_broadcast.rs`), sound output via cpal/WASAPI (`output.rs`), MIDI via midir (`midi.rs`). |
+| `tandem` | The Windows app: egui UI (`ui_*.rs`, including the broadcast window in `ui_broadcast.rs` and a broadcaster booth's main window in `ui_broadcaster.rs`), sound output via cpal/WASAPI (`output.rs`), MIDI via midir (`midi.rs`). |

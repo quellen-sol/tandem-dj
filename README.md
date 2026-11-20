@@ -1,10 +1,10 @@
 # Tandem
 
-Back-to-back DJing with a friend, from anywhere. Two DJs in different places share two decks and a mixer, each hears the full mix at full quality in their own booth, and one of you can stream the set.
+Back-to-back DJing with a friend, from anywhere. Two DJs in different places share two decks and a mixer, each hears the full mix at full quality in their own booth, and one of you, or a third PC, can stream the set.
 
 **Personal, non-commercial use only.** See [TERMS.md](TERMS.md).
 
-> **Status: v0.9.** Windows only. Rooms, BPM and key detection, beatgrid editing, sync, key lock, loops, level meters, crossfader curves, jog wheels that spin on like Serato, a broadcast view for streams and a ready-made DDJ-FLX6 mapping all work; this is still an early version for two people to try. See [docs/ROADMAP.md](docs/ROADMAP.md) for what's next and a test plan.
+> **Status: v0.9.** Windows only. Rooms, BPM and key detection, beatgrid editing, sync, key lock, loops, level meters, crossfader curves, jog wheels that spin on like Serato, a broadcast view for streams, broadcaster-only booths and a ready-made DDJ-FLX6 mapping all work; this is still an early version for two people to try. See [docs/ROADMAP.md](docs/ROADMAP.md) for what's next and a test plan.
 
 ## How it works
 
@@ -28,7 +28,7 @@ To check a PC without opening the app, open a terminal in the folder and run:
 tandem.exe --self-test
 ```
 
-The self-test lists your audio and MIDI devices, opens your default output for half a second of silence, and runs a full two-booth test over the network stack. It ends with `SELF-TEST PASSED`.
+The self-test lists your audio and MIDI devices, opens your default output for half a second of silence, and runs a full room test over the network stack, with two DJs and a broadcaster. It ends with `SELF-TEST PASSED`.
 
 ## Set up your booth
 
@@ -135,6 +135,8 @@ Every agreement is written to a local consent log (Settings → General → Logs
 
 ### Streaming the set
 
+The easiest way is a third PC that joins as a broadcaster: see [Streaming from another PC](#streaming-from-another-pc). To stream from one of the DJs' PCs instead:
+
 1. On the broadcaster's PC, install [VB-Audio Virtual Cable](https://vb-audio.com/Cable/).
 2. Set **Settings → Audio → Broadcast feed** to **CABLE Input**.
 3. In OBS, add an *Audio Input Capture* of **CABLE Output**.
@@ -148,6 +150,24 @@ The broadcast feed is delayed by 500 ms by default, so both DJs' moves are on ti
 - Keep the window visible, on a second screen if you have one. A minimised window can't be captured.
 - It redraws at the **Screen frame rate** (Settings → General), 60 fps by default. That's already as smooth as the stream: Discord shares at 30 fps (60 with Nitro), and OBS usually records at 30 or 60.
 
+### Streaming from another PC
+
+Any other PC with Tandem can join the room **as a broadcaster**: a spare laptop, or a friend who runs the stream. It plays only the broadcast feed and shows the broadcast window, so there's no audio routing to set up.
+
+1. On the streaming PC, click **Join a room**, enter the host's address and room code, tick **Broadcaster only**, and join.
+2. The broadcast window opens. The PC plays the broadcast feed on **Speakers (master)** (Settings → Audio), and its headphones output is off.
+3. **Discord:** share the "Tandem broadcast" window with its sound **on**. Tandem on that PC plays nothing but the broadcast feed, so that's all Discord picks up: no virtual cable, no microphone tricks.
+4. **OBS:** a *Window Capture* of "Tandem broadcast" and an *Application Audio Capture* of Tandem (or a capture of its speakers). Neither needs a delay.
+
+What a broadcaster can and can't do:
+
+- **It can't change anything.** Its main window has no decks, mixer or library, only the DJs' names, whether both decks' tracks have arrived, the feed's level and these instructions. A controller plugged into it does nothing, and the host ignores anything it sends.
+- **It doesn't need your music.** Tracks come from the host as the DJs load them, and are deleted when Tandem closes, like the session copies a DJ gets of their partner's tracks. A track takes a few seconds to arrive (a joining DJ's goes through the host), and its deck is silent on the stream until it has.
+- **It runs 1000 ms behind the room,** twice a DJ's broadcast delay, because the joining DJ's moves reach it through the host. That leaves room for slow connections, and viewers can't tell. It's its own setting: Settings → Audio → Broadcast delay changes it while you're broadcasting, and your delay as a DJ stays as it was.
+- **TIMING,** in its main window, shows how long the DJs' moves take to get there (the longest in the last minute). If that gets too close to the delay, some moves land late on the stream: TIMING turns amber, the top bar warns, and one click raises the delay enough. The stream repeats that much once as it changes, so do it between tracks if you can.
+- **Both DJs see it** in the top bar (📡 and its name). Up to 4 broadcasters can join a room, alongside the two DJs. Tandem remembers the **Broadcaster only** tick for next time.
+- **If the host leaves or the connection drops,** the broadcaster's decks empty and it goes quiet. Join again to carry on.
+
 ## Trying it on one PC
 
 Run a second, completely separate copy with its own settings:
@@ -160,7 +180,7 @@ Host in one window and join `127.0.0.1` from the other.
 
 ## Known limits in v0.9
 
-- **Decks and DJs:** 2 decks, 2 DJs per room.
+- **Decks and DJs:** 2 decks, 2 DJs per room, plus up to 4 broadcasters.
 - **Beatgrids:** detection finds big, steady tempo changes but not gradual drifts, and doesn't find bars (the "1"). Some tracks come out at half or double time (87 instead of 174, say): **½** and **×2** under GRID fix that. Set markers by hand for both: see [Fixing a beatgrid](#fixing-a-beatgrid). A grid can have up to 32 markers, and every bar is 4 beats. Hot cues and play aren't snapped to the beat, except on a synced deck. Loop IN and OUT aren't either (beat loops always are).
 - **Loops:** no slip mode or loop rolls, no fine-adjusting IN/OUT with the jog wheel, and loops aren't saved with the track.
 - **Keys:** detection is good but not perfect: on a test library it matched reference tools on about 3 tracks in 4, and most misses were a compatible neighbour (the relative major/minor, or one step round the Camelot wheel). A track gets one key, even if it changes key part-way through.
@@ -177,6 +197,8 @@ Host in one window and join `127.0.0.1` from the other.
   - Check that the address and room code are right.
   - The host must click **Allow** on the Windows Firewall prompt (or allow `tandem.exe` in firewall settings).
   - Without Tailscale, the host needs TCP 47800 forwarded.
+  - **"This room already has two DJs":** to join just to stream, tick **Broadcaster only**.
+- **The broadcaster says moves arrive late.** Click the raise button in its TIMING. If it only happens while tracks are being sent, lower **Upload speed limit** (Settings → General) on the host. That limit covers all of a PC's uploads together, so it keeps track transfers from filling the connection that carries the DJs' moves.
 - **Controller not listed.** Close other DJ software, replug it, then click **Refresh**.
 - **No sound.** Pick the right devices in **Settings → Audio** and check **Status** there.
 - **Logs.** `%LOCALAPPDATA%\Tandem\data\tandem.log`. Settings → General has buttons to open every folder.
@@ -187,7 +209,7 @@ You need Rust (stable) and the Visual Studio Build Tools (C++ workload). The C++
 
 ```
 cargo build --release -p tandem      # target\release\tandem.exe
-cargo test -p tandem-core            # core tests, including a two-booth TCP test
+cargo test -p tandem-core            # core tests, including a room test over TCP
 ```
 
 `tandem-core` is platform-independent and its tests also run on Linux and macOS. Windows builds and releases are produced by GitHub Actions (`.github/workflows/build.yml`). Push a `v*` tag to publish a release.

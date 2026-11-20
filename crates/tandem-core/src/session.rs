@@ -1,10 +1,10 @@
 //! The session: one booth's view of the room.
 //!
-//! Owns the event timeline, the decoded tracks, the link to the other DJ,
-//! transfers and shares. The UI, MIDI and network threads all talk to it
-//! through a [`SessionHandle`] (a mutex). The audio threads never lock it:
-//! they read an [`AudioSnapshot`] that is swapped in atomically after every
-//! change.
+//! Owns the event timeline, the decoded tracks, the link to the other DJ
+//! (and, on the host, to any broadcasters), transfers and shares. The UI,
+//! MIDI and network threads all talk to it through a [`SessionHandle`] (a
+//! mutex). The audio threads never lock it: they read an [`AudioSnapshot`]
+//! that is swapped in atomically after every change.
 
 use crate::analysis;
 use crate::audio::{decode_file, TrackAudio};
@@ -43,6 +43,28 @@ struct TrackSlot {
     status: TrackStatus,
     audio: Option<Arc<TrackAudio>>,
     last_used: Instant,
+    /// A download from the host failed: try again at this time if the
+    /// track is still on a deck.
+    retry_at: Option<Instant>,
+}
+
+impl TrackSlot {
+    fn new(status: TrackStatus, audio: Option<Arc<TrackAudio>>) -> Self {
+        Self {
+            status,
+            audio,
+            last_used: Instant::now(),
+            retry_at: None,
+        }
+    }
+}
+
+/// Whether the host can send a track to a booth that asks for it.
+pub enum Servable {
+    Ready(PathBuf),
+    /// Not yet: it's still being found, downloaded or decoded here.
+    Pending,
+    No,
 }
 
 #[derive(Clone, Debug)]
@@ -82,6 +104,8 @@ pub enum Role {
     Client {
         addr: SocketAddr,
         room: String,
+        /// Joined only to broadcast: no controls.
+        broadcaster: bool,
     },
 }
 
@@ -89,6 +113,23 @@ pub struct Peer {
     pub conn: PeerConn,
     pub info: PeerInfo,
     pub rtt_us: Option<i64>,
+}
+
+/// Host: a booth that joined only to broadcast. It gets everything the room
+/// does and changes nothing.
+struct Broadcaster {
+    conn: PeerConn,
+    info: PeerInfo,
+    /// Tells a rejoin apart from the connection it replaces.
+    serial: u64,
+}
+
+/// Who's in the room.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Roster {
+    /// The DJs, host first.
+    pub djs: Vec<PeerInfo>,
+    pub broadcasters: Vec<PeerInfo>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -126,14 +167,31 @@ pub struct DeckView {
 #[derive(Clone, Debug)]
 pub enum RoleView {
     Solo,
-    Hosting { port: u16, room: String },
-    Joined { addr: String, room: String },
+    Hosting {
+        port: u16,
+        room: String,
+    },
+    Joined {
+        addr: String,
+        room: String,
+    },
+    /// In a room only to broadcast it.
+    Broadcasting {
+        addr: String,
+        room: String,
+    },
 }
 
 #[derive(Clone, Debug)]
 pub struct LinkView {
     pub role: RoleView,
+    /// The other DJ; a broadcaster's link is to the host.
     pub peer: Option<PeerInfo>,
+    pub roster: Roster,
+    /// How late the other booths' moves have reached this one at most, in
+    /// the last [`LATE_WINDOW`]: from when they happened to when they got
+    /// here. `None` until one has, or not in a room.
+    pub late_us: Option<i64>,
     pub rtt_us: Option<i64>,
     pub clock_spread_us: Option<i64>,
     pub in_sync: Option<bool>,
@@ -230,6 +288,17 @@ pub struct Session {
     meters: Arc<LevelMeters>,
     role: Role,
     peer: Option<Peer>,
+    /// Host: booths that joined only to broadcast.
+    broadcasters: Vec<Broadcaster>,
+    next_serial: u64,
+    /// Client: who's in the room, as the host last said.
+    roster: Roster,
+    /// Moves that happened from this (shared) time on count towards
+    /// lateness: those since joining. `i64::MAX` when not in a room.
+    late_from: i64,
+    /// The latest move to arrive in each second: (second's start, us).
+    late: VecDeque<(Instant, i64)>,
+    upload_pacer: Arc<crate::files::UploadPacer>,
     est: ClockEstimator,
     in_sync: Option<bool>,
     digest_mismatch: u32,
@@ -254,6 +323,11 @@ const MAX_CONCURRENT_FETCHES: usize = 2;
 /// the event is only briefly in the future.
 const RELOCK_HORIZON_US: i64 = 300_000;
 const TRANSFER_STALL: Duration = Duration::from_secs(45);
+/// How long a client waits before asking the host again for a track it
+/// couldn't download.
+const FETCH_RETRY: Duration = Duration::from_secs(5);
+/// How far back [`LinkView::late_us`] looks.
+pub const LATE_WINDOW: Duration = Duration::from_secs(60);
 
 impl Session {
     pub fn create(
@@ -289,6 +363,12 @@ impl Session {
                 meters: Arc::new(LevelMeters::new()),
                 role: Role::Solo,
                 peer: None,
+                broadcasters: Vec::new(),
+                next_serial: 0,
+                roster: Roster::default(),
+                late_from: i64::MAX,
+                late: VecDeque::new(),
+                upload_pacer: Arc::default(),
                 est: ClockEstimator::default(),
                 in_sync: None,
                 digest_mismatch: 0,
@@ -363,9 +443,36 @@ impl Session {
         self.me.name = name;
     }
 
+    /// True while this booth is in a room only to broadcast it: nothing it
+    /// does changes the room.
+    pub fn is_broadcaster(&self) -> bool {
+        matches!(
+            self.role,
+            Role::Client {
+                broadcaster: true,
+                ..
+            }
+        )
+    }
+
+    /// To the other DJ (a broadcaster's link is to the host).
     fn send(&self, m: Msg) {
         if let Some(p) = &self.peer {
             p.conn.send(m);
+        }
+    }
+
+    /// To everyone this booth is linked to: the other DJ and, on the host,
+    /// the broadcasters.
+    fn send_all(&self, m: Msg) {
+        self.relay(&m);
+        self.send(m);
+    }
+
+    /// Host: pass something from the joining DJ on to the broadcasters.
+    fn relay(&self, m: &Msg) {
+        for b in &self.broadcasters {
+            b.conn.send(m.clone());
         }
     }
 
@@ -397,7 +504,12 @@ impl Session {
     }
 
     /// Apply a local action at shared time `t` and send it to the partner.
+    /// A broadcaster's actions are dropped: it only watches.
     pub fn act_at(&mut self, a: Action, t: i64) {
+        if self.is_broadcaster() {
+            log::debug!("broadcasting only: ignoring {a:?}");
+            return;
+        }
         self.seq += 1;
         let ev = Event {
             time: t,
@@ -407,7 +519,7 @@ impl Session {
         };
         self.timeline.insert(ev.clone());
         self.after_event(&ev);
-        self.send(Msg::Event { ev });
+        self.send_all(Msg::Event { ev });
         self.publish();
     }
 
@@ -434,6 +546,9 @@ impl Session {
     /// Put a deck's beatgrid back to what analysis found (analysing the
     /// track now if this booth hasn't already).
     pub fn reset_grid(&mut self, deck: usize) {
+        if self.is_broadcaster() {
+            return;
+        }
         let Some(id) = self.timeline.latest().decks.get(deck).and_then(|d| d.track) else {
             return;
         };
@@ -477,6 +592,10 @@ impl Session {
 
     /// Load a file from this computer onto a deck (hash + decode in the background).
     pub fn load_path(&mut self, deck: usize, path: PathBuf) {
+        if self.is_broadcaster() {
+            log::info!("Broadcasting only: the DJs load the decks");
+            return;
+        }
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -527,14 +646,10 @@ impl Session {
         self.servable.insert(id, path);
         self.tracks.insert(
             id,
-            TrackSlot {
-                status: TrackStatus::Ready,
-                audio: Some(Arc::new(audio)),
-                last_used: Instant::now(),
-            },
+            TrackSlot::new(TrackStatus::Ready, Some(Arc::new(audio))),
         );
         self.track_meta.insert(id, info.clone());
-        self.send(Msg::Track { info: info.clone() });
+        self.send_all(Msg::Track { info: info.clone() });
         self.act(load_action(deck, &info));
     }
 
@@ -555,14 +670,8 @@ impl Session {
                 return;
             }
         }
-        self.tracks.insert(
-            id,
-            TrackSlot {
-                status: TrackStatus::Searching,
-                audio: None,
-                last_used: Instant::now(),
-            },
-        );
+        self.tracks
+            .insert(id, TrackSlot::new(TrackStatus::Searching, None));
         let size = self.track_meta.get(&id).map(|m| m.size);
         let known = self.servable.get(&id).cloned();
         let lib = self.library.clone();
@@ -572,7 +681,12 @@ impl Session {
             let Some(h) = weak.upgrade() else { return };
             match found {
                 Some(path) => {
-                    h.lock().set_status(id, TrackStatus::Decoding);
+                    {
+                        let mut s = h.lock();
+                        // It's on a deck: a broadcaster may ask the host for it.
+                        s.servable.insert(id, path.clone());
+                        s.set_status(id, TrackStatus::Decoding);
+                    }
                     decode_into(&h, id, &path);
                 }
                 None => h.lock().on_track_missing(id),
@@ -603,14 +717,8 @@ impl Session {
             .unwrap_or_else(|| id.short());
         match res {
             Ok(a) => {
-                self.tracks.insert(
-                    id,
-                    TrackSlot {
-                        status: TrackStatus::Ready,
-                        audio: Some(Arc::new(a)),
-                        last_used: Instant::now(),
-                    },
-                );
+                self.tracks
+                    .insert(id, TrackSlot::new(TrackStatus::Ready, Some(Arc::new(a))));
                 log::info!("Ready: {name}");
                 self.publish();
             }
@@ -623,8 +731,33 @@ impl Session {
 
     // ------------------------------------------------------------ transfers
 
+    /// The one limit every upload from this booth shares.
+    pub fn upload_pacer(&self) -> Arc<crate::files::UploadPacer> {
+        self.upload_pacer.clone()
+    }
+
     pub fn servable_path(&self, id: TrackId) -> Option<PathBuf> {
         self.servable.get(&id).cloned()
+    }
+
+    /// Host: can this track go to a booth that asks for it? A track the
+    /// joining DJ just loaded is pending while it's on its way here.
+    pub fn servable(&self, id: TrackId) -> Servable {
+        if let Some(p) = self.servable.get(&id) {
+            return Servable::Ready(p.clone());
+        }
+        let busy = matches!(
+            self.track_status(id),
+            Some(TrackStatus::Searching | TrackStatus::Fetching | TrackStatus::Decoding)
+        );
+        if busy
+            || self.active_fetch.contains_key(&id)
+            || self.fetch_queue.iter().any(|(i, _)| *i == id)
+        {
+            Servable::Pending
+        } else {
+            Servable::No
+        }
     }
 
     fn request_fetch(&mut self, id: TrackId, purpose: Purpose) {
@@ -658,12 +791,21 @@ impl Session {
             self.active_fetch.insert(id, purpose);
             self.transfer_state(id, false, TransferState::Active);
             match &self.role {
-                Role::Client { addr, room } => {
-                    let (addr, room, me, weak) =
-                        (*addr, room.clone(), self.me.clone(), self.weak.clone());
+                Role::Client {
+                    addr,
+                    room,
+                    broadcaster,
+                } => {
+                    let (addr, room, me, weak, bc) = (
+                        *addr,
+                        room.clone(),
+                        self.me.clone(),
+                        self.weak.clone(),
+                        *broadcaster,
+                    );
                     std::thread::spawn(move || {
                         let Some(h) = weak.upgrade() else { return };
-                        let res = crate::files::fetch(&h, addr, &room, &me, id, &dest);
+                        let res = crate::files::fetch(&h, addr, &room, &me, bc, id, &dest);
                         h.lock().on_file_received(
                             id,
                             res.map(|_| dest).map_err(|e| crate::files::describe(&e)),
@@ -719,6 +861,8 @@ impl Session {
         match purpose {
             Purpose::Session => match res {
                 Ok(path) => {
+                    // The host passes a partner's track on to broadcasters.
+                    self.servable.insert(id, path.clone());
                     self.set_status(id, TrackStatus::Decoding);
                     let weak = self.weak.clone();
                     std::thread::spawn(move || {
@@ -727,7 +871,14 @@ impl Session {
                         }
                     });
                 }
-                Err(e) => self.set_status(id, TrackStatus::Failed(e)),
+                Err(e) => {
+                    self.set_status(id, TrackStatus::Failed(e));
+                    if matches!(self.role, Role::Client { .. }) {
+                        if let Some(s) = self.tracks.get_mut(&id) {
+                            s.retry_at = Some(Instant::now() + FETCH_RETRY);
+                        }
+                    }
+                }
             },
             Purpose::Share { share_id, .. } => {
                 if let Ok(path) = &res {
@@ -830,7 +981,7 @@ impl Session {
 
     /// Offer a list of files to the room (hashing happens in the background).
     pub fn offer_share(&mut self, title: String, paths: Vec<PathBuf>) {
-        if self.peer.is_none() {
+        if self.peer.is_none() || self.is_broadcaster() {
             log::warn!("Join or host a room before sharing");
             return;
         }
@@ -1032,9 +1183,70 @@ impl Session {
         });
         self.in_sync = None;
         self.last_digest = Instant::now();
+        self.announce_members();
+    }
+
+    pub fn broadcaster_count(&self) -> usize {
+        self.broadcasters.len()
+    }
+
+    /// Host: a booth joined to broadcast. Returns its connection's serial.
+    pub fn add_broadcaster(&mut self, conn: PeerConn, info: PeerInfo) -> u64 {
+        log::info!("{} joined to broadcast", info.name);
+        self.next_serial += 1;
+        let serial = self.next_serial;
+        self.broadcasters.push(Broadcaster { conn, info, serial });
+        self.announce_members();
+        serial
+    }
+
+    /// Host: a broadcaster's connection ended.
+    pub fn on_broadcaster_left(&mut self, serial: u64) {
+        let Some(i) = self.broadcasters.iter().position(|b| b.serial == serial) else {
+            return;
+        };
+        let b = self.broadcasters.remove(i);
+        b.conn.close();
+        log::info!("{} stopped broadcasting", b.info.name);
+        self.announce_members();
+    }
+
+    /// Who's in the room. A client knows from the host's last word.
+    pub fn roster(&self) -> Roster {
+        match &self.role {
+            Role::Client { broadcaster, .. } => {
+                if !self.roster.djs.is_empty() {
+                    return self.roster.clone();
+                }
+                // Before the host's first word: the host, and this booth if a DJ.
+                let mut djs: Vec<PeerInfo> = self.peer.iter().map(|p| p.info.clone()).collect();
+                if !broadcaster {
+                    djs.push(self.me.clone());
+                }
+                Roster {
+                    djs,
+                    broadcasters: Vec::new(),
+                }
+            }
+            Role::Host { .. } | Role::Solo => Roster {
+                djs: std::iter::once(self.me.clone())
+                    .chain(self.peer.iter().map(|p| p.info.clone()))
+                    .collect(),
+                broadcasters: self.broadcasters.iter().map(|b| b.info.clone()).collect(),
+            },
+        }
+    }
+
+    /// Host: tell everyone who's in the room.
+    fn announce_members(&self) {
+        if matches!(self.role, Role::Host { .. }) {
+            let Roster { djs, broadcasters } = self.roster();
+            self.send_all(Msg::Members { djs, broadcasters });
+        }
     }
 
     /// Client: we joined a host's room.
+    #[allow(clippy::too_many_arguments)]
     pub fn on_joined(
         &mut self,
         conn: PeerConn,
@@ -1044,9 +1256,21 @@ impl Session {
         est: ClockEstimator,
         addr: SocketAddr,
         room: String,
+        broadcaster: bool,
     ) {
-        log::info!("Joined {}'s room", host.name);
-        self.role = Role::Client { addr, room };
+        if broadcaster {
+            log::info!("Joined {}'s room to broadcast", host.name);
+        } else {
+            log::info!("Joined {}'s room", host.name);
+        }
+        self.role = Role::Client {
+            addr,
+            room,
+            broadcaster,
+        };
+        self.roster = Roster::default();
+        self.late_from = self.now();
+        self.late.clear();
         self.peer = Some(Peer {
             conn,
             info: host,
@@ -1112,14 +1336,29 @@ impl Session {
         if p.info.id != peer_id {
             return;
         }
-        if announce {
+        let broadcaster = self.is_broadcaster();
+        if announce && broadcaster {
+            log::info!(
+                "Lost {}'s room. Join again to keep broadcasting.",
+                p.info.name
+            );
+        } else if announce {
             log::info!("{} left the room. You can keep playing.", p.info.name);
         }
         self.peer = None;
         self.in_sync = None;
+        self.roster = Roster::default();
+        self.late_from = i64::MAX;
+        self.late.clear();
         if matches!(self.role, Role::Client { .. }) {
             self.role = Role::Solo;
         }
+        if broadcaster {
+            // It only ever played the DJs' room: don't carry on with it.
+            self.timeline = Timeline::new(self.now() - 10_000_000);
+            self.publish();
+        }
+        self.announce_members();
         let pending: Vec<(TrackId, Purpose)> = self
             .active_fetch
             .drain()
@@ -1138,7 +1377,10 @@ impl Session {
     }
 
     pub fn leave(&mut self) {
-        self.send(Msg::Bye);
+        self.send_all(Msg::Bye);
+        for b in self.broadcasters.drain(..) {
+            b.conn.close();
+        }
         if let Some(p) = self.peer.take() {
             p.conn.close();
             let id = p.info.id;
@@ -1155,13 +1397,23 @@ impl Session {
     pub fn on_control_msg(&mut self, msg: Msg) {
         match msg {
             Msg::Event { ev } => {
+                if ev.time >= self.late_from {
+                    self.note_lateness(self.now() - ev.time);
+                }
                 if self.timeline.insert(ev.clone()) {
                     self.after_event(&ev);
                     self.publish();
+                    self.relay(&Msg::Event { ev });
                 }
             }
             Msg::Track { info } => {
+                self.relay(&Msg::Track { info: info.clone() });
                 self.track_meta.insert(info.id, info);
+            }
+            Msg::Members { djs, broadcasters } => {
+                if matches!(self.role, Role::Client { .. }) {
+                    self.roster = Roster { djs, broadcasters };
+                }
             }
             Msg::Digest { t, digest } => {
                 if self.timeline.state_at(t).digest() == digest {
@@ -1243,9 +1495,36 @@ impl Session {
         }
     }
 
+    /// A move reached this booth `us` after it happened (a scheduled one,
+    /// ahead of time, counts as on time).
+    fn note_lateness(&mut self, us: i64) {
+        let us = us.max(0);
+        let now = Instant::now();
+        match self.late.back_mut() {
+            Some((t, m)) if now.duration_since(*t) < Duration::from_secs(1) => *m = (*m).max(us),
+            _ => self.late.push_back((now, us)),
+        }
+        while self
+            .late
+            .front()
+            .is_some_and(|(t, _)| now.duration_since(*t) > LATE_WINDOW)
+        {
+            self.late.pop_front();
+        }
+    }
+
+    /// The latest any move reached this booth in the last [`LATE_WINDOW`].
+    pub fn late_peak_us(&self) -> Option<i64> {
+        self.late
+            .iter()
+            .filter(|(t, _)| t.elapsed() <= LATE_WINDOW)
+            .map(|&(_, us)| us)
+            .max()
+    }
+
     /// Client: the host asked for one of our files.
     fn start_push(&mut self, id: TrackId) {
-        let (Some(path), Role::Client { addr, room }) =
+        let (Some(path), Role::Client { addr, room, .. }) =
             (self.servable.get(&id).cloned(), &self.role)
         else {
             self.send(Msg::NoFile { id });
@@ -1274,12 +1553,12 @@ impl Session {
         self.library.lock().save_grids();
 
         if matches!(self.role, Role::Host { .. })
-            && self.peer.is_some()
+            && (self.peer.is_some() || !self.broadcasters.is_empty())
             && self.last_digest.elapsed() > Duration::from_secs(2)
         {
             let t = now - 1_500_000;
             let digest = self.timeline.state_at(t).digest();
-            self.send(Msg::Digest { t, digest });
+            self.send_all(Msg::Digest { t, digest });
             self.last_digest = Instant::now();
         }
 
@@ -1341,6 +1620,23 @@ impl Session {
         for id in &in_use {
             if let Some(s) = self.tracks.get_mut(id) {
                 s.last_used = Instant::now();
+            }
+        }
+        // Ask the host again for tracks on a deck that didn't download (a
+        // broadcaster can ask for a partner's track before the host has it).
+        if matches!(self.role, Role::Client { .. }) && self.peer.is_some() {
+            let due: Vec<TrackId> = in_use
+                .iter()
+                .filter(|id| {
+                    self.tracks
+                        .get(id)
+                        .and_then(|s| s.retry_at)
+                        .is_some_and(|t| t <= Instant::now())
+                })
+                .copied()
+                .collect();
+            for id in due {
+                self.ensure_track(id);
             }
         }
         self.publish();
@@ -1408,8 +1704,14 @@ impl Session {
         for d in &mut decks {
             d.loading = None; // this booth's library at work, not the room's
         }
-        let mut djs = vec![self.me.clone()];
-        djs.extend(self.peer.as_ref().map(|p| p.info.clone()));
+        // The DJs only: on a DJ's booth "you" first, on a broadcaster the host.
+        let djs = if self.is_broadcaster() {
+            self.roster().djs
+        } else {
+            let mut djs = vec![self.me.clone()];
+            djs.extend(self.peer.as_ref().map(|p| p.info.clone()));
+            djs
+        };
         BroadcastView {
             t,
             room,
@@ -1428,7 +1730,19 @@ impl Session {
                 port: *port,
                 room: room.clone(),
             },
-            Role::Client { addr, room } => RoleView::Joined {
+            Role::Client {
+                addr,
+                room,
+                broadcaster: false,
+            } => RoleView::Joined {
+                addr: addr.to_string(),
+                room: room.clone(),
+            },
+            Role::Client {
+                addr,
+                room,
+                broadcaster: true,
+            } => RoleView::Broadcasting {
                 addr: addr.to_string(),
                 room: room.clone(),
             },
@@ -1444,6 +1758,8 @@ impl Session {
             link: LinkView {
                 role,
                 peer: self.peer.as_ref().map(|p| p.info.clone()),
+                roster: self.roster(),
+                late_us: self.late_peak_us(),
                 rtt_us: self.peer.as_ref().and_then(|p| p.rtt_us),
                 clock_spread_us: self.est.spread(),
                 in_sync: self.in_sync,
@@ -1525,6 +1841,40 @@ mod tests {
             paths.library_cache.clone(),
         )));
         Session::create("Alice".into(), paths, lib, Arc::new(SharedClock::new()))
+    }
+
+    /// Lateness counts moves made since joining, from when they happened to
+    /// when they arrived; one scheduled ahead counts as on time.
+    #[test]
+    fn lateness_of_arriving_moves() {
+        let root = std::env::temp_dir().join(format!("tandem-late-{}", fastrand::u64(..)));
+        let h = solo(&root);
+        {
+            let mut s = h.lock();
+            let ev = |time: i64, seq: u64| Msg::Event {
+                ev: Event {
+                    time,
+                    origin: 7,
+                    seq,
+                    action: Action::Crossfader { v: 0.5 },
+                },
+            };
+            let now = s.now();
+            s.on_control_msg(ev(now - 300_000, 1));
+            assert_eq!(s.late_peak_us(), None, "not in a room: not measured");
+
+            s.late_from = now - 1_000_000;
+            s.on_control_msg(ev(now - 2_000_000, 2)); // before joining
+            assert_eq!(s.late_peak_us(), None);
+            s.on_control_msg(ev(now - 300_000, 3));
+            s.on_control_msg(ev(now - 120_000, 4));
+            s.on_control_msg(ev(now + 200_000, 5)); // a relock, scheduled ahead
+            let peak = s.late_peak_us().unwrap();
+            assert!((300_000..400_000).contains(&peak), "peak {peak}");
+            assert_eq!(s.view().link.late_us, Some(peak));
+        }
+        drop(h);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The broadcast window shows the room as the broadcast lane plays it:

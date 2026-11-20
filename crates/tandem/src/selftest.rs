@@ -40,6 +40,7 @@ pub fn run() -> i32 {
             snap,
             Arc::new(SharedClock::new()),
             Arc::new(LevelMeters::new()),
+            false,
         );
         std::thread::sleep(Duration::from_millis(500));
         let errors = outs.errors.lock().clone();
@@ -76,7 +77,7 @@ pub fn run() -> i32 {
         }
     }
 
-    println!("\nTwo-booth loopback test:");
+    println!("\nRoom loopback test (two DJs and a broadcaster):");
     match tandem_core::selftest::loopback(&mut |m| println!("  ok: {m}")) {
         Ok(()) => {}
         Err(e) => {

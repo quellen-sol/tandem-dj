@@ -4,35 +4,87 @@
 //! needs an open port): the joiner either downloads (`FileGet`) or uploads
 //! (`FilePut`, when the host asked for one of the joiner's tracks). Every
 //! file is checked against its content hash before it's used.
+//!
+//! Broadcasters only download. A track the joining DJ loaded reaches them
+//! through the host: if the host is still receiving it, the download waits.
+//!
+//! The upload speed limit is for all of a booth's uploads together (one
+//! [`UploadPacer`] per session), so a host sending tracks to its partner and
+//! to broadcasters at once doesn't fill its uplink and delay its moves.
 
 use crate::model::TrackId;
 use crate::net::connect;
 use crate::protocol::{read_msg, write_msg, ConnKind, Msg, PeerInfo};
-use crate::session::{SessionHandle, TransferState};
+use crate::session::{Servable, SessionHandle, TransferState};
 use anyhow::{bail, Context};
+use parking_lot::Mutex;
 use std::io::{BufWriter, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+/// Shares one upload speed limit between every upload a booth is sending.
+/// Each chunk books the next free slot on the line, so concurrent uploads
+/// take turns and together never go faster than the limit.
+pub struct UploadPacer {
+    next: Mutex<Instant>,
+}
+
+impl Default for UploadPacer {
+    fn default() -> Self {
+        Self {
+            next: Mutex::new(Instant::now()),
+        }
+    }
+}
+
+impl UploadPacer {
+    /// Wait until `bytes` more can be sent at `rate` bytes/s (0 = no limit).
+    pub fn take(&self, bytes: usize, rate: f64) {
+        if rate <= 0.0 {
+            return;
+        }
+        let start = {
+            let mut next = self.next.lock();
+            // Time nobody used isn't saved up for a burst later.
+            let start = (*next).max(Instant::now());
+            *next = start + Duration::from_secs_f64(bytes as f64 / rate);
+            start
+        };
+        let now = Instant::now();
+        if start > now {
+            std::thread::sleep(start - now);
+        }
+    }
+}
+
 const CHUNK: usize = 128 * 1024;
+/// How long a download waits for a track the host is still receiving.
+/// Under the asker's 30 s read timeout; it asks again if this runs out.
+const PENDING_WAIT: Duration = Duration::from_secs(20);
 
 /// Host side of a files connection (after the Hello).
-pub fn serve(h: &SessionHandle, mut s: TcpStream) -> anyhow::Result<()> {
+pub fn serve(h: &SessionHandle, mut s: TcpStream, broadcaster: bool) -> anyhow::Result<()> {
     s.set_read_timeout(Some(Duration::from_secs(30)))?;
     s.set_write_timeout(Some(Duration::from_secs(30)))?;
     let (m, _) = read_msg(&mut s)?;
     match m {
         Msg::FileGet { id } => {
-            let (path, rate) = {
-                let ses = h.lock();
-                (ses.servable_path(id), ses.max_upload_bytes_s)
+            let start = Instant::now();
+            let path = loop {
+                match h.lock().servable(id) {
+                    Servable::Ready(path) => break Some(path),
+                    Servable::Pending if start.elapsed() < PENDING_WAIT => {}
+                    Servable::Pending | Servable::No => break None,
+                }
+                std::thread::sleep(Duration::from_millis(200));
             };
+            let rate = h.lock().max_upload_bytes_s;
             let Some(path) = path else {
                 write_msg(
                     &mut s,
                     &Msg::FileError {
-                        reason: "That track isn't shared.".into(),
+                        reason: "The host doesn't have that track yet.".into(),
                     },
                     &[],
                 )?;
@@ -63,7 +115,8 @@ pub fn serve(h: &SessionHandle, mut s: TcpStream) -> anyhow::Result<()> {
             res
         }
         Msg::FilePut { id, size, .. } => {
-            let Some(dest) = h.lock().accept_push(id) else {
+            let dest = (!broadcaster).then(|| h.lock().accept_push(id)).flatten();
+            let Some(dest) = dest else {
                 write_msg(
                     &mut s,
                     &Msg::FileError {
@@ -93,10 +146,11 @@ pub fn fetch(
     addr: SocketAddr,
     room: &str,
     me: &PeerInfo,
+    broadcaster: bool,
     id: TrackId,
     dest: &Path,
 ) -> anyhow::Result<()> {
-    let mut s = connect(addr, ConnKind::Files, room, me)?;
+    let mut s = connect(addr, ConnKind::Files, room, me, broadcaster)?;
     write_msg(&mut s, &Msg::FileGet { id }, &[])?;
     let (m, _) = read_msg(&mut s)?;
     let size = match m {
@@ -121,7 +175,7 @@ pub fn push(
     let size = std::fs::metadata(path)?.len();
     let name = file_name(path);
     let rate = h.lock().max_upload_bytes_s;
-    let mut s = connect(addr, ConnKind::Files, room, me)?;
+    let mut s = connect(addr, ConnKind::Files, room, me, false)?;
     write_msg(
         &mut s,
         &Msg::FilePut {
@@ -173,7 +227,7 @@ fn send_body(
 ) -> anyhow::Result<()> {
     let mut f = std::fs::File::open(path)?;
     let mut buf = vec![0u8; CHUNK];
-    let start = Instant::now();
+    let pacer = h.lock().upload_pacer();
     let mut last = Instant::now();
     let mut sent = 0u64;
     let mut w = BufWriter::with_capacity(CHUNK + 1024, s.try_clone()?);
@@ -182,19 +236,14 @@ fn send_body(
         if n == 0 {
             break;
         }
+        // Stay under the upload limit, shared with this booth's other
+        // uploads, so transfers don't swamp the control link.
+        pacer.take(n, rate);
         write_msg(&mut w, &Msg::Chunk, &buf[..n])?;
         sent += n as u64;
         if last.elapsed() > Duration::from_millis(150) {
             h.lock().transfer_progress(id, true, sent, size);
             last = Instant::now();
-        }
-        // Stay under the upload cap so transfers don't swamp the control link.
-        if rate > 0.0 {
-            let due = Duration::from_secs_f64(sent as f64 / rate);
-            let el = start.elapsed();
-            if due > el {
-                std::thread::sleep(due - el);
-            }
         }
     }
     write_msg(&mut w, &Msg::End, &[])?;
@@ -253,4 +302,46 @@ fn recv_body(
         let _ = std::fs::remove_file(&part);
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// Two uploads at once share the limit: 2 MB at 10 MB/s takes about
+    /// 0.2 s in total, not 0.1 s each side by side.
+    #[test]
+    fn concurrent_uploads_share_one_limit() {
+        let pacer = Arc::new(UploadPacer::default());
+        let rate = 10.0 * 1e6;
+        let start = Instant::now();
+        let threads: Vec<_> = (0..2)
+            .map(|_| {
+                let p = pacer.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..10 {
+                        p.take(100_000, rate);
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let took = start.elapsed();
+        // The first chunk goes straight away; the other 19 wait their turn.
+        assert!(took >= Duration::from_millis(185), "took {took:?}");
+        assert!(took < Duration::from_millis(1000), "took {took:?}");
+    }
+
+    #[test]
+    fn no_limit_never_waits() {
+        let pacer = UploadPacer::default();
+        let start = Instant::now();
+        for _ in 0..1000 {
+            pacer.take(1 << 20, 0.0);
+        }
+        assert!(start.elapsed() < Duration::from_millis(50));
+    }
 }

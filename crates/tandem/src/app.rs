@@ -17,7 +17,7 @@ use tandem_core::model::{Action, TrackId, XfCurve, DECKS};
 use tandem_core::protocol::TrackInfo;
 use tandem_core::render::LocalParams;
 use tandem_core::serato::SeratoCrate;
-use tandem_core::session::{Session, SessionHandle, SessionView};
+use tandem_core::session::{RoleView, Session, SessionHandle, SessionView};
 use tandem_core::time::{local_us, SharedClock};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -167,13 +167,18 @@ pub struct UiState {
 /// Developer options: `--screenshot <file.bmp>` saves the window and exits;
 /// `--demo` loads the first two library tracks and starts playing (deck B
 /// synced, key-matched and on a 4-beat loop);
-/// `--broadcast-view` opens the broadcast window at start.
+/// `--broadcast-view` opens the broadcast window at start;
+/// `--dev-host <port>` / `--dev-join <addr>` host or join room DEVTEST,
+/// with `--dev-broadcaster` joining it as a broadcaster;
+/// `--dev-late <ms>` shows moves arriving that late, to see the warnings.
 pub struct DevOpts {
     pub screenshot: Option<PathBuf>,
     pub shot_frame: u64,
     pub demo: bool,
     pub host_port: Option<u16>,
     pub join: Option<String>,
+    pub join_broadcaster: bool,
+    pub late_ms: Option<i64>,
     pub search: Option<String>,
     pub broadcast_view: bool,
     pub shared: bool,
@@ -189,6 +194,9 @@ pub struct TandemApp {
     pub(crate) session: SessionHandle,
     pub(crate) library: Arc<Mutex<Library>>,
     pub(crate) audio: AudioOutputs,
+    /// The audio is playing only the broadcast feed (this booth is in a
+    /// room as a broadcaster).
+    pub(crate) audio_broadcaster: bool,
     pub(crate) midi: Midi,
     pub(crate) devices: Vec<DeviceInfo>,
     pub(crate) midi_ports: Vec<String>,
@@ -254,7 +262,7 @@ impl TandemApp {
             let s = session.lock();
             (s.snapshot_handle(), s.clock(), s.meters())
         };
-        let audio = output::start(&settings.audio, snap, clock, meters.clone());
+        let audio = output::start(&settings.audio, snap, clock, meters.clone(), false);
 
         let mut midi = Midi::new(settings.tempo_range);
         if let Some(port) = settings.midi_device.clone() {
@@ -303,6 +311,7 @@ impl TandemApp {
             session,
             library,
             audio,
+            audio_broadcaster: false,
             midi,
             devices: output::list_devices(),
             midi_ports: crate::midi::ports(),
@@ -343,16 +352,31 @@ impl TandemApp {
     }
 
     /// Read the level meters for this frame. The broadcast window's are the
-    /// ones from a broadcast delay ago.
+    /// ones from a broadcast delay ago, unless this booth is a broadcaster:
+    /// its meters already measure the broadcast feed.
     fn take_levels(&mut self) {
         let now = local_us();
         let levels = self.meters.read();
         self.meter_view.update(&levels, now);
-        let delay = self.settings.audio.broadcast_delay_ms as i64 * 1000;
+        let delay = if self.audio_broadcaster {
+            0
+        } else {
+            self.bcast_delay_ms() as i64 * 1000
+        };
         self.meter_history.push(now, levels, delay + 1_000_000);
         if self.ui.broadcast_view {
             let late = self.meter_history.at(now - delay);
             self.bcast_meter_view.update(&late, now);
+        }
+    }
+
+    /// How far behind the room the broadcast feed and window run: a
+    /// broadcaster booth has its own, longer delay.
+    pub(crate) fn bcast_delay_ms(&self) -> u32 {
+        if self.audio_broadcaster {
+            self.settings.audio.broadcaster_delay_ms
+        } else {
+            self.settings.audio.broadcast_delay_ms
         }
     }
 
@@ -368,11 +392,37 @@ impl TandemApp {
         self.audio = AudioOutputs::none(); // close devices before reopening them
         let (snap, clock) = {
             let mut s = self.session.lock();
-            s.bcast_delay_us = self.settings.audio.broadcast_delay_ms as i64 * 1000;
+            s.bcast_delay_us = self.bcast_delay_ms() as i64 * 1000;
             (s.snapshot_handle(), s.clock())
         };
-        self.audio = output::start(&self.settings.audio, snap, clock, self.meters.clone());
+        self.audio = output::start(
+            &self.settings.audio,
+            snap,
+            clock,
+            self.meters.clone(),
+            self.audio_broadcaster,
+        );
         self.mark_dirty();
+    }
+
+    /// Joining as a broadcaster plays only the broadcast feed and opens the
+    /// broadcast window; leaving the room (or the host closing it) goes back.
+    fn follow_role(&mut self, view: &SessionView) {
+        let broadcasting = matches!(view.link.role, RoleView::Broadcasting { .. });
+        if broadcasting == self.audio_broadcaster {
+            return;
+        }
+        self.audio_broadcaster = broadcasting;
+        self.restart_audio();
+        self.meter_history = MeterHistory::default();
+        if broadcasting {
+            self.ui.broadcast_view = true;
+            // The sync click would go out on the stream.
+            self.local_edit.click = false;
+            self.toast("Broadcasting: share the \"Tandem broadcast\" window with its sound on.");
+        } else {
+            self.toast("You're no longer broadcasting.");
+        }
     }
 
     /// Press/release edges for a button that must be held (CUE, pitch bend).
@@ -630,16 +680,26 @@ impl eframe::App for TandemApp {
             self.terms_gate(ctx);
             return;
         }
-        let view = self.session.lock().view();
+        let mut view = self.session.lock().view();
+        if let (Some(ms), Some(_)) = (self.dev.late_ms, view.link.late_us) {
+            view.link.late_us = Some(ms * 1000);
+        }
+        let view = view;
         self.local_edit = view.local;
+        self.follow_role(&view);
         self.take_levels();
         self.handle_midi_queue(&view);
         self.refresh_filter(&view);
 
         self.top_bar(ctx, &view);
         self.status_bar(ctx);
-        self.library_panel(ctx, &view);
-        egui::CentralPanel::default().show(ctx, |ui| self.decks_area(ui, &view));
+        if self.audio_broadcaster {
+            // Nothing to play with: the DJs run the room.
+            egui::CentralPanel::default().show(ctx, |ui| self.broadcaster_panel(ui, &view));
+        } else {
+            self.library_panel(ctx, &view);
+            egui::CentralPanel::default().show(ctx, |ui| self.decks_area(ui, &view));
+        }
         self.windows(ctx, &view);
         self.broadcast_window(ctx);
         self.end_frame(&view);
@@ -705,8 +765,9 @@ impl TandemApp {
         }
         if let (Some(addr), 30) = (self.dev.join.clone(), f) {
             let h = self.session.clone();
+            let broadcaster = self.dev.join_broadcaster;
             std::thread::spawn(move || {
-                if let Err(e) = tandem_core::net::join(&h, &addr, "DEVTEST") {
+                if let Err(e) = tandem_core::net::join(&h, &addr, "DEVTEST", broadcaster) {
                     log::error!("dev join: {e:#}");
                 }
             });

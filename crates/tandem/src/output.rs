@@ -2,6 +2,8 @@
 //!
 //! Each device gets one stream. A stream renders the lanes routed to it:
 //! the live lane for master/headphones and the delayed lane for broadcast.
+//! A broadcaster booth plays only the delayed lane: on the master output
+//! (and the broadcast feed, if it has one), with the headphones off.
 
 use anyhow::{anyhow, bail};
 use arc_swap::ArcSwap;
@@ -70,6 +72,8 @@ struct RouteOut {
     bus: Bus,
     /// First channel index of the stereo pair.
     ch: usize,
+    /// The master output: its lane fills the level meters.
+    metered: bool,
 }
 
 pub struct AudioOutputs {
@@ -88,13 +92,15 @@ impl AudioOutputs {
     }
 }
 
-/// Open every device the settings route to. The live lane of the device
-/// that plays the master output fills `meters`.
+/// Open every device the settings route to. The lane that plays the master
+/// output fills `meters`: the live lane, or on a `broadcaster` booth the
+/// broadcast lane, which is all it plays.
 pub fn start(
     cfg: &AudioSettings,
     snap: Arc<ArcSwap<AudioSnapshot>>,
     clock: Arc<SharedClock>,
     meters: Arc<LevelMeters>,
+    broadcaster: bool,
 ) -> AudioOutputs {
     let errors = Arc::new(Mutex::new(Vec::new()));
     let mut by_dev: Vec<(String, Vec<RouteOut>)> = Vec::new();
@@ -111,43 +117,58 @@ pub fn start(
         add(
             r,
             RouteOut {
-                lane: LaneSel::Live,
+                lane: if broadcaster {
+                    LaneSel::Broadcast
+                } else {
+                    LaneSel::Live
+                },
                 bus: Bus::Master,
                 ch: r.pair as usize * 2,
+                metered: true,
             },
         );
     }
-    if let Some(r) = &cfg.cue {
+    if let (Some(r), false) = (&cfg.cue, broadcaster) {
         add(
             r,
             RouteOut {
                 lane: LaneSel::Live,
                 bus: Bus::Cue,
                 ch: r.pair as usize * 2,
+                metered: false,
             },
         );
     }
-    if let Some(r) = &cfg.broadcast {
+    // A broadcaster's master already plays the feed: not twice on one pair.
+    if let Some(r) = cfg
+        .broadcast
+        .as_ref()
+        .filter(|r| !(broadcaster && master.as_ref() == Some(*r)))
+    {
         add(
             r,
             RouteOut {
                 lane: LaneSel::Broadcast,
                 bus: Bus::Master,
                 ch: r.pair as usize * 2,
+                metered: false,
             },
         );
     }
 
+    let delay_ms = if broadcaster {
+        cfg.broadcaster_delay_ms
+    } else {
+        cfg.broadcast_delay_ms
+    };
     let mut streams = Vec::new();
     let mut status = Vec::new();
     for (dev, routes) in by_dev {
-        let metered = routes
-            .iter()
-            .any(|r| r.lane == LaneSel::Live && r.bus == Bus::Master);
+        let metered = routes.iter().any(|r| r.metered);
         match open_device(
             &dev,
             routes,
-            cfg.broadcast_delay_ms,
+            delay_ms,
             snap.clone(),
             clock.clone(),
             metered.then(|| meters.clone()),
@@ -266,17 +287,24 @@ fn build<T: SizedSample + FromSample<f32>>(
     const MAXF: usize = 4096;
     let ch = config.channels as usize;
     let sr = config.sample_rate.0 as f64;
-    let mut live = routes.iter().any(|r| r.lane == LaneSel::Live).then(|| {
-        let lane = Lane::new(sr, 0, LaneKind::Live);
-        match meters {
-            Some(m) => lane.with_meters(m),
-            None => lane,
-        }
-    });
+    let metered = routes.iter().find(|r| r.metered).map(|r| r.lane);
+    let lane = |sel: LaneSel, lane: Lane| match (&meters, metered) {
+        (Some(m), Some(l)) if l == sel => lane.with_meters(m.clone()),
+        _ => lane,
+    };
+    let mut live = routes
+        .iter()
+        .any(|r| r.lane == LaneSel::Live)
+        .then(|| lane(LaneSel::Live, Lane::new(sr, 0, LaneKind::Live)));
     let mut bcast = routes
         .iter()
         .any(|r| r.lane == LaneSel::Broadcast)
-        .then(|| Lane::new(sr, delay_ms as i64 * 1000, LaneKind::Broadcast));
+        .then(|| {
+            lane(
+                LaneSel::Broadcast,
+                Lane::new(sr, delay_ms as i64 * 1000, LaneKind::Broadcast),
+            )
+        });
     let (mut lm, mut lc, mut bm, mut bc) = (
         vec![0f32; MAXF * 2],
         vec![0f32; MAXF * 2],
