@@ -3721,7 +3721,7 @@ dependencies = [
 
 [[package]]
 name = "tandem"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3739,7 +3739,7 @@ dependencies = [
 
 [[package]]
 name = "tandem-core"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "arc-swap",
