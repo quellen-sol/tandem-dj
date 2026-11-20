@@ -322,6 +322,13 @@ Work through these in order and note anything that fails. `tandem.log` (Settings
   - Test: with Speakers (master) on your PC's speakers, turn the FLX6's MASTER LEVEL knob. Does the master slider follow it (after you turn the knob past the slider, if you'd moved the slider on screen)? Then pick "Line (DDJ-FLX6)" for Speakers: does the knob change only the FLX6's own volume, with the slider staying put?
 - No protocol change: v0.11.8 and v0.11.9 can share a room.
 
+### v0.11.10
+
+- **Small screens.** Tandem now fits laptop screens. It opens maximised when its usual window doesn't fit, and goes down to a 1080p laptop at 175% display scaling. On a short window the library gets less height first, then the two decks switch to compact panels with a shorter mixer: each channel's knobs beside its fader, and your headphone and master levels (with the level knobs' notes) under **🎧 LEVELS**. Every scrolling waveform stays on screen; with four decks on a very short window, the deck controls scroll instead.
+- Drag the library's top edge to set its height yourself: Tandem keeps it from then on, but the library never covers the waveforms. On a narrow window the top bar keeps the room's address and clock spread in the hover text of the room name and round trip.
+  - Test: on a laptop at 150% display scaling (or a window about 1280 × 640), are both waveforms moving, and do every deck control, the mixer and the library still work? Does **🎧 LEVELS** open your headphone and master levels? Switch on **4 decks**: are all four waveforms there?
+- No protocol change: v0.11.9 and v0.11.10 can share a room.
+
 ## Next candidates
 
 Rough priority order:
