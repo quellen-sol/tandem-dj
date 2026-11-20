@@ -278,6 +278,12 @@ Work through these in order and note anything that fails. `tandem.log` (Settings
   - Test: on the FLX6, press the browse knob, turn to a crate, press again, turn to a track and press LOAD. Does the outline move each time, and does the track load? Does BACK go to the lists?
 - No protocol change: v0.11.1 and v0.11.2 can share a room.
 
+### v0.11.3
+
+- **Clear the library search in one click.** While the search box has text, a **✖** sits at its right end: click it, or press Escape while typing, to empty the box. The track you had selected stays selected in the whole list, scrolled into view, and the cursor stays in the box for the next search.
+  - Test: search for an artist, pick the third result, then click **✖**. Is the whole list back, with that track still highlighted and on screen? Search again and press Escape: the same?
+- No protocol change: v0.11.2 and v0.11.3 can share a room.
+
 ## Next candidates
 
 Rough priority order:
