@@ -391,6 +391,12 @@ pub struct Session {
     grid_watch: [(Option<TrackId>, u64, Option<f64>); DECKS],
     /// Relock events already scheduled: (deck, shared time).
     relocks: Vec<(u8, i64)>,
+    /// Things to tell the DJ (a load refused), for the UI to pick up with
+    /// [`Session::take_notices`].
+    notices: Vec<String>,
+    /// Loads this booth made that are still recent enough to be dropped by
+    /// a partner's earlier move arriving late: (time, seq, deck, track).
+    my_loads: Vec<(i64, u64, usize, TrackId)>,
     weak: Weak<Mutex<Session>>,
 }
 
@@ -463,6 +469,8 @@ impl Session {
                 bcast_delay_us: 500_000,
                 grid_watch: [(None, 0, None); DECKS],
                 relocks: Vec::new(),
+                notices: Vec::new(),
+                my_loads: Vec::new(),
                 weak: weak.clone(),
             })
         });
@@ -587,11 +595,18 @@ impl Session {
     }
 
     /// Apply a local action at shared time `t` and send it to the partner.
-    /// A broadcaster's actions are dropped: it only watches.
+    /// A broadcaster's actions are dropped: it only watches. So is a load
+    /// onto a deck the room can hear (the model would drop it anyway), with
+    /// a notice saying why.
     pub fn act_at(&mut self, a: Action, t: i64) {
         if self.is_broadcaster() {
             log::debug!("broadcasting only: ignoring {a:?}");
             return;
+        }
+        if let Action::Load { deck, .. } = a {
+            if self.refuse_load(deck as usize, t) {
+                return;
+            }
         }
         self.seq += 1;
         let ev = Event {
@@ -601,9 +616,47 @@ impl Session {
             action: a,
         };
         self.timeline.insert(ev.clone());
+        if let Action::Load { deck, track, .. } = ev.action {
+            self.my_loads.push((t, self.seq, deck as usize, track));
+        }
         self.after_event(&ev);
         self.send_all(Msg::Event { ev });
         self.publish();
+    }
+
+    /// Tell the DJ if the room dropped one of this booth's recent loads: a
+    /// partner's move from just before it (bringing that deck's fader up,
+    /// say) arrived after it, so the deck could be heard when it landed.
+    fn check_my_loads(&mut self) {
+        let base = self.timeline.base_time();
+        let mut dropped = Vec::new();
+        let timeline = &self.timeline;
+        self.my_loads.retain(|&(t, _, deck, track)| {
+            if t < base {
+                return false;
+            }
+            let st = timeline.state_at(t);
+            if st.decks[deck].track == Some(track) {
+                return true;
+            }
+            dropped.extend(st.load_refusal(deck, t));
+            false
+        });
+        for why in dropped {
+            log::debug!("Load dropped: {why}");
+            self.notices.push(why);
+        }
+    }
+
+    /// The room's timeline has just replaced this booth's (joining, or
+    /// getting back in after the link dropped). Loads it made while cut off
+    /// never reached the room, so they're forgotten without a word: the
+    /// deck wasn't playing over them. Any that did reach it are checked.
+    fn took_room_timeline(&mut self) {
+        let (me, events) = (self.me.id, self.timeline.events());
+        self.my_loads
+            .retain(|l| events.iter().any(|e| e.origin == me && e.seq == l.1));
+        self.check_my_loads();
     }
 
     fn after_event(&mut self, ev: &Event) {
@@ -671,12 +724,34 @@ impl Session {
         self.publish();
     }
 
+    /// What to tell the DJ since the last call: loads refused, oldest first.
+    pub fn take_notices(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.notices)
+    }
+
     // ------------------------------------------------------------ tracks
 
-    /// Load a file from this computer onto a deck (hash + decode in the background).
+    /// True (and a notice for the DJ) if deck `deck` can be heard in the
+    /// master at time `t`, so a track can't be loaded onto it.
+    fn refuse_load(&mut self, deck: usize, t: i64) -> bool {
+        let Some(why) = self.timeline.state_at(t).load_refusal(deck, t) else {
+            return false;
+        };
+        // Debug: the toast already says it, beside the status bar's log line.
+        log::debug!("Not loading: {why}");
+        self.notices.push(why);
+        true
+    }
+
+    /// Load a file from this computer onto a deck (hash + decode in the
+    /// background). Refused up front if the deck can be heard, and again
+    /// once the track is ready if it can be by then.
     pub fn load_path(&mut self, deck: usize, path: PathBuf) {
         if self.is_broadcaster() {
             log::info!("Broadcasting only: the DJs load the decks");
+            return;
+        }
+        if deck >= DECKS || self.refuse_load(deck, self.now()) {
             return;
         }
         let name = path
@@ -725,6 +800,10 @@ impl Session {
         info: TrackInfo,
         audio: TrackAudio,
     ) {
+        // The deck may have been brought up while the track was decoding.
+        if self.refuse_load(deck, self.now()) {
+            return;
+        }
         let id = info.id;
         self.servable.insert(id, path);
         self.tracks.insert(
@@ -1453,6 +1532,7 @@ impl Session {
         self.in_sync = None;
         self.digest_mismatch = 0;
         self.timeline = timeline;
+        self.took_room_timeline();
         for t in tracks {
             self.track_meta.insert(t.id, t);
         }
@@ -1697,6 +1777,7 @@ impl Session {
                 }
                 if self.timeline.insert(ev.clone()) {
                     self.after_event(&ev);
+                    self.check_my_loads();
                     self.publish();
                     self.relay(&Msg::Event { ev });
                 }
@@ -1844,6 +1925,8 @@ impl Session {
     fn maintenance(&mut self) {
         let now = self.now();
         self.timeline.compact(now - self.bcast_delay_us - 3_000_000);
+        let base = self.timeline.base_time();
+        self.my_loads.retain(|l| l.0 >= base);
         self.follow_grid_tempos(now);
         self.library.lock().save_grids();
 
@@ -2185,6 +2268,164 @@ mod tests {
             let peak = s.late_peak_us().unwrap();
             assert!((300_000..400_000).contains(&peak), "peak {peak}");
             assert_eq!(s.view().link.late_us, Some(peak));
+        }
+        drop(h);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A load onto a deck the room can hear is refused before anything is
+    /// decoded or sent, with a notice saying why; once the deck is paused,
+    /// it goes through.
+    #[test]
+    fn loads_onto_an_audible_deck_are_refused_with_a_notice() {
+        let root = std::env::temp_dir().join(format!("tandem-refuse-{}", fastrand::u64(..)));
+        let h = solo(&root);
+        {
+            let mut s = h.lock();
+            let load = |n: u8| Action::Load {
+                deck: 0,
+                track: TrackId([n; 32]),
+                duration: 300.0,
+                cue: 0.0,
+                grid: None,
+                key: -1,
+            };
+            s.act(load(1));
+            s.act(Action::Play { deck: 0 });
+            assert!(s.take_notices().is_empty());
+            let events = s.timeline.events().len();
+
+            s.act(load(2));
+            s.load_path(0, root.join("no such file.mp3"));
+            assert_eq!(s.timeline.events().len(), events, "nothing sent");
+            assert!(s.loading[0].is_none(), "nothing decoding");
+            let notices = s.take_notices();
+            assert_eq!(notices.len(), 2);
+            assert_eq!(
+                notices[0],
+                "Deck A is playing: pause it or pull its fader down to load onto it."
+            );
+            assert!(s.take_notices().is_empty());
+
+            s.act(Action::Pause { deck: 0 });
+            s.act(load(2));
+            assert!(s.take_notices().is_empty());
+            assert_eq!(s.view().room.decks[0].track, Some(TrackId([2; 32])));
+        }
+        drop(h);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The partner brought a deck up just before this booth loaded onto it,
+    /// but their move arrived after the load: the room drops the load, and
+    /// the DJ is told why.
+    #[test]
+    fn a_load_dropped_by_a_late_move_is_reported() {
+        let root = std::env::temp_dir().join(format!("tandem-race-{}", fastrand::u64(..)));
+        let h = solo(&root);
+        {
+            let mut s = h.lock();
+            let load = |n: u8| Action::Load {
+                deck: 1,
+                track: TrackId([n; 32]),
+                duration: 300.0,
+                cue: 0.0,
+                grid: None,
+                key: -1,
+            };
+            let now = s.now();
+            s.act_at(load(1), now - 1_000_000);
+            s.act_at(Action::Volume { deck: 1, v: 0.0 }, now - 900_000);
+            s.act_at(Action::Play { deck: 1 }, now - 800_000);
+            // Fader down: this booth may load onto it.
+            s.act_at(load(2), now - 100_000);
+            assert_eq!(s.view().room.decks[1].track, Some(TrackId([2; 32])));
+            assert!(s.take_notices().is_empty());
+            // The partner's fader move from before the load arrives.
+            s.on_control_msg(Msg::Event {
+                ev: Event {
+                    time: now - 200_000,
+                    origin: 7,
+                    seq: 1,
+                    action: Action::Volume { deck: 1, v: 0.9 },
+                },
+            });
+            let room = s.view().room;
+            assert_eq!(room.decks[1].track, Some(TrackId([1; 32])));
+            assert!(room.decks[1].playing);
+            assert_eq!(
+                s.take_notices(),
+                vec!["Deck B is playing: pause it or pull its fader down to load onto it."]
+            );
+            // Told once.
+            s.on_control_msg(Msg::Event {
+                ev: Event {
+                    time: now - 50_000,
+                    origin: 7,
+                    seq: 2,
+                    action: Action::Crossfader { v: 0.4 },
+                },
+            });
+            assert!(s.take_notices().is_empty());
+        }
+        drop(h);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Getting back into the room replaces this booth's timeline. A load it
+    /// made while cut off never reached the room and goes without a word;
+    /// one that reached it and lost a race there is reported.
+    #[test]
+    fn loads_lost_to_a_dropped_link_arent_reported_as_refused() {
+        let root = std::env::temp_dir().join(format!("tandem-rejoin-{}", fastrand::u64(..)));
+        let h = solo(&root);
+        {
+            let mut s = h.lock();
+            let load = |deck: u8, n: u8| Action::Load {
+                deck,
+                track: TrackId([n; 32]),
+                duration: 300.0,
+                cue: 0.0,
+                grid: None,
+                key: -1,
+            };
+            let now = s.now();
+            // Made while the link was down: never reached the room.
+            s.act_at(load(0, 1), now - 500_000);
+            // Reached the room just before the link went.
+            s.act_at(load(1, 2), now - 100_000);
+            let reached = s.timeline.events().last().unwrap().clone();
+            assert!(s.take_notices().is_empty());
+
+            // The room as the host has it: A and B both playing out loud
+            // (B since just before this booth's load).
+            let mut room = Timeline::new(now - 10_000_000);
+            let mut seq = 0;
+            let mut host = |time: i64, action: Action| {
+                seq += 1;
+                room.insert(Event {
+                    time,
+                    origin: 7,
+                    seq,
+                    action,
+                });
+            };
+            host(now - 2_000_000, load(0, 8));
+            host(now - 2_000_000, load(1, 9));
+            host(now - 1_900_000, Action::Play { deck: 0 });
+            host(now - 200_000, Action::Play { deck: 1 });
+            room.insert(reached);
+            s.timeline = room;
+            s.took_room_timeline();
+
+            let decks = s.view().room.decks;
+            assert_eq!(decks[0].track, Some(TrackId([8; 32])));
+            assert_eq!(decks[1].track, Some(TrackId([9; 32])));
+            assert_eq!(
+                s.take_notices(),
+                vec!["Deck B is playing: pause it or pull its fader down to load onto it."]
+            );
+            assert!(s.my_loads.is_empty());
         }
         drop(h);
         let _ = std::fs::remove_dir_all(&root);

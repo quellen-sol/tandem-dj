@@ -603,9 +603,9 @@ impl TandemApp {
         if let Some(i) = double {
             self.ui.sel_index = i;
             match (self.free_deck(view), self.item_at(i, view)) {
-                (Some(d), Some(item)) => self.load(d, item, view),
-                (None, _) => {}
-                _ => {}
+                (Ok(d), Some(item)) => self.load(d, item, view),
+                (Err(why), Some(_)) => self.toast(why),
+                (_, None) => {}
             }
         }
         if let Some((i, d)) = menu_load {

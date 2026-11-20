@@ -295,6 +295,22 @@ impl DeckState {
         self.motion(t).2
     }
 
+    /// Making sound at time `t`: the track is playing (holding CUE or a hot
+    /// cue from a pause too), under the DJ's hand, rolling, or still
+    /// spinning after being let go, and hasn't run off either end.
+    pub fn sounding_at(&self, t: i64) -> bool {
+        if self.track.is_none() {
+            return false;
+        }
+        // A roll goes round on the grid even after the track underneath
+        // has run out.
+        if self.scratching || self.roll.is_some() {
+            return true;
+        }
+        let (v, p) = (self.speed_at(t), self.position_at(t));
+        (v > 0.0 && p < self.duration) || (v < 0.0 && p > 0.0)
+    }
+
     /// The loop that's set, `(in, out)`, whether or not it's playing.
     pub fn loop_span(&self) -> Option<(f64, f64)> {
         match (self.loop_in, self.loop_out) {
@@ -642,6 +658,10 @@ impl Default for RoomState {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "a")]
 pub enum Action {
+    /// Put a track on the deck, paused at `cue`. Dropped if the deck can be
+    /// heard in the master at that moment (see
+    /// [`RoomState::audible_in_master`]): nobody loads over music the room
+    /// is hearing.
     Load {
         deck: u8,
         track: TrackId,
@@ -950,6 +970,31 @@ impl RoomState {
             .or_else(|| Self::others(x).find(|&y| d[y].track.is_some()))
     }
 
+    /// Deck `x` is making sound at time `t` (see [`DeckState::sounding_at`])
+    /// and can be heard in the master: louder there than
+    /// [`render::SILENT_GAIN`](crate::render::SILENT_GAIN), −40 dB, by
+    /// [`render::master_gain`](crate::render::master_gain). The channel
+    /// fader at about 10% or below, the crossfader at the far end from the
+    /// deck, or the filter turned all the way, each make it silent. The headphone
+    /// cue doesn't count. A track can't be loaded onto a deck that's
+    /// audible.
+    pub fn audible_in_master(&self, x: usize, t: i64) -> bool {
+        x < DECKS
+            && self.decks[x].sounding_at(t)
+            && crate::render::master_gain(self, x) > crate::render::SILENT_GAIN
+    }
+
+    /// Why a track can't be loaded onto deck `x` at time `t`, to tell the
+    /// DJ, or None if it can be.
+    pub fn load_refusal(&self, x: usize, t: i64) -> Option<String> {
+        self.audible_in_master(x, t).then(|| {
+            format!(
+                "Deck {} is playing: pause it or pull its fader down to load onto it.",
+                deck_letter(x)
+            )
+        })
+    }
+
     /// Keep the sync master sensible after every event. There's none while
     /// no deck is synced. A master that isn't playing (or has lost its track
     /// or grid) hands over to a synced deck that is, so the deck you're
@@ -989,6 +1034,11 @@ impl RoomState {
         if deck >= DECKS {
             return;
         }
+        if matches!(ev.action, Action::Load { .. }) && self.audible_in_master(deck, t) {
+            // Never over music the room can hear, whichever booth loaded it
+            // and however it raced the faders: the deck carries on as it was.
+            return;
+        }
         if let Action::XfAssign { side, .. } = ev.action {
             self.decks[deck].last_touch = ev.origin;
             self.xf_assign[deck] = side;
@@ -1021,8 +1071,6 @@ impl RoomState {
         let was_looping = self.decks[deck].looping;
         // A jump, PAUSE or any loop control lets go of a loop roll first.
         let lets_go = lets_go_of_roll(&ev.action, &self.decks[deck]);
-        // Only a load needs the whole previous deck (and DeckState is big).
-        let before = matches!(ev.action, Action::Load { .. }).then(|| self.decks[deck]);
         // Moves the playhead to somewhere chosen (a cue, a seek): if that's
         // outside a playing loop, the loop ends.
         let lands = matches!(
@@ -1065,11 +1113,6 @@ impl RoomState {
         // Settle the loop now, so the BPM check below sees where it lands.
         self.decks[deck].settle_loop();
         match ev.action {
-            Action::Load { .. } if was_playing => {
-                if let Some(before) = before {
-                    self.start_on_beat(deck, t, before)
-                }
-            }
             Action::Tempo { .. } => self.follow_tempo(deck, t),
             Action::Play { .. } if !was_playing && self.decks[deck].synced => {
                 // Starting a synced deck: start it on the beat.
@@ -1089,60 +1132,6 @@ impl RoomState {
             Action::SetGrid { .. } => self.relock(deck, t),
             _ if jumps && self.decks[deck].bpm_at(t) != bpm_before => self.relock(deck, t),
             _ => {}
-        }
-    }
-
-    /// A track loaded onto a deck that was playing starts playing at once,
-    /// placed so its beats land on the beat of what's playing: the master
-    /// or another deck if one's playing, otherwise the track it replaced.
-    /// It starts on its first beat (or the first one it can reach without
-    /// going before 0:00). A synced deck stays synced.
-    fn start_on_beat(&mut self, x: usize, t: i64, prev: DeckState) {
-        let playing = |d: &DeckState| d.playing && has_beat(d);
-        let other = self
-            .master_deck()
-            .filter(|&m| m != x && playing(&self.decks[m]))
-            .or_else(|| Self::others(x).find(|&y| playing(&self.decks[y])))
-            .map(|y| self.decks[y]);
-        let d = &mut self.decks[x];
-        if d.track.is_none() {
-            return;
-        }
-        d.playing = true;
-        d.anchor_time = t;
-        d.spin = None;
-        let Some(g) = d.grid else {
-            d.anchor_pos = 0.0;
-            return;
-        };
-        let reference = if other.is_some() {
-            other
-        } else if has_beat(&prev) {
-            Some(prev)
-        } else {
-            None
-        };
-        // Start on the first marker (bar 1), or the first beat after it we
-        // can reach without going before 0:00.
-        let first = g.first_beat().max(0.0);
-        d.anchor_pos = match reference.and_then(|r| r.bpm_at(t).map(|b| (r, b))) {
-            None => g.next_beat(first),
-            Some((r, r_bpm)) => {
-                // Seconds until the reference's next beat.
-                let phase = r.beat_phase(1.0, t);
-                let wait = if phase < 1e-9 {
-                    0.0
-                } else {
-                    (1.0 - phase) * 60.0 / (r_bpm * r.rate())
-                };
-                let lead = wait * d.rate();
-                g.next_beat(first.max(lead)) - lead
-            }
-        };
-        if prev.synced {
-            if let Some(y) = self.sync_target(x) {
-                self.decks[x].synced = self.sync_deck(x, y, t, true);
-            }
         }
     }
 
@@ -1273,6 +1262,8 @@ impl RoomState {
                 d.cue_point = d.anchor_pos;
                 d.hot_cues = [None; HOT_CUES];
                 d.clear_loop();
+                // Already let go (see `lets_go_of_roll`).
+                d.roll = None;
                 d.bend = 0.0;
                 d.scratching = false;
                 d.gen += 1;
@@ -2438,7 +2429,10 @@ mod tests {
         go(&mut s, 5_000_000, Action::Sync { deck: 1, on: false });
         go(&mut s, 6_000_000, Action::Sync { deck: 0, on: true });
         assert_eq!(s.master, Some(1));
+        // B can't be loaded while it can be heard: pull its fader down first.
+        go(&mut s, 6_500_000, Action::Volume { deck: 1, v: 0.0 });
         go(&mut s, 7_000_000, grid_load(1, 3, 90.0, 0.0));
+        assert_eq!(s.decks[1].track, Some(tid(3)));
         assert_eq!(s.master, Some(0), "A is synced and playing");
         go(
             &mut s,
@@ -2570,41 +2564,272 @@ mod tests {
         assert_eq!(s.decks[1].tempo, 1.0);
     }
 
-    #[test]
-    fn loading_onto_a_playing_deck_starts_on_the_beat() {
-        let mut s = RoomState::default();
-        // Deck B plays at 124; deck A is playing something else.
-        s.apply(&ev(0, 1, 1, grid_load(1, 2, 124.0, 0.31)));
-        s.apply(&ev(0, 1, 2, Action::Play { deck: 1 }));
-        s.apply(&ev(0, 1, 3, grid_load(0, 1, 124.0, 0.05)));
-        s.apply(&ev(0, 1, 4, Action::Play { deck: 0 }));
-        // Load a new 124 BPM track onto A mid-play.
-        s.apply(&ev(9_876_543, 1, 5, grid_load(0, 3, 124.0, 1.2)));
-        let a = s.decks[0];
-        assert!(a.playing, "keeps playing");
-        assert_eq!(a.track, Some(tid(3)));
-        // Its beats line up with deck B's.
-        assert!(beat_offset(&s, 12_000_000, 1.0).abs() < 1e-6);
-        // It starts just before its first beat (no earlier than one beat before).
-        let p = a.position_at(9_876_543);
-        assert!(p <= 1.2 && p > 1.2 - 60.0 / 124.0, "started at {p}");
-    }
-
-    #[test]
-    fn loading_onto_a_playing_deck_follows_the_replaced_track() {
+    /// Deck A playing at full volume, the crossfader all the way to it.
+    fn a_playing() -> RoomState {
         let mut s = RoomState::default();
         s.apply(&ev(0, 1, 1, grid_load(0, 1, 120.0, 0.0)));
         s.apply(&ev(0, 1, 2, Action::Play { deck: 0 }));
-        // Other deck idle: the new track lands on the old track's beat.
-        let t = 3_210_000;
-        let old_phase = ((s.decks[0].position_at(t) - 0.0) * 2.0).rem_euclid(1.0);
-        s.apply(&ev(t, 1, 3, grid_load(0, 2, 120.0, 0.7)));
-        let d = s.decks[0];
-        let wait = (1.0 - old_phase) * 0.5;
-        assert!(
-            (d.position_at(t) + wait - 0.7).abs() < 1e-9
-                || (d.position_at(t) + wait - 1.2).abs() < 1e-9
+        s.apply(&ev(0, 1, 3, Action::Crossfader { v: 0.0 }));
+        s
+    }
+
+    #[test]
+    fn a_playing_deck_is_audible_until_something_mutes_it() {
+        let t = 5_000_000;
+        let s = a_playing();
+        assert!(s.audible_in_master(0, t));
+        assert!(s
+            .load_refusal(0, t)
+            .unwrap()
+            .starts_with("Deck A is playing"));
+        assert!(!s.audible_in_master(1, t), "no track");
+        assert!(!s.audible_in_master(DECKS, t));
+        let with = |a: Action| {
+            let mut s = s;
+            s.apply(&ev(1_000_000, 1, 10, a));
+            s
+        };
+        // Paused, or never started.
+        assert!(!with(Action::Pause { deck: 0 }).audible_in_master(0, t));
+        // Channel fader: about 10% is -40 dB, and below that is silent.
+        for (v, audible) in [(0.0, false), (0.09, false), (0.11, true), (1.0, true)] {
+            let s = with(Action::Volume { deck: 0, v });
+            assert_eq!(s.audible_in_master(0, t), audible, "fader at {v}");
+        }
+        // Filter: silent within 1% of either end (low-pass or high-pass).
+        for (v, audible) in [
+            (0.0, false),
+            (0.008, false),
+            (0.02, true),
+            (0.5, true),
+            (0.98, true),
+            (0.992, false),
+            (1.0, false),
+        ] {
+            let s = with(Action::Filter { deck: 0, v });
+            assert_eq!(s.audible_in_master(0, t), audible, "filter at {v}");
+        }
+        // Trim and EQ turned all the way down mute it too.
+        assert!(!with(Action::Trim { deck: 0, v: 0.0 }).audible_in_master(0, t));
+        let mut killed = s;
+        for band in 0..3 {
+            killed.apply(&ev(
+                1_000_000,
+                1,
+                10 + band as u64,
+                Action::Eq {
+                    deck: 0,
+                    band,
+                    v: 0.0,
+                },
+            ));
+        }
+        assert!(!killed.audible_in_master(0, t));
+        assert!(with(Action::Eq {
+            deck: 0,
+            band: 0,
+            v: 0.0
+        })
+        .audible_in_master(0, t));
+        // Cuts add up: the fader at 30% (-21 dB) and trim down 21 dB.
+        let mut quiet = with(Action::Volume { deck: 0, v: 0.3 });
+        assert!(quiet.audible_in_master(0, t));
+        quiet.apply(&ev(1_000_000, 1, 11, Action::Trim { deck: 0, v: 0.15 }));
+        assert!(!quiet.audible_in_master(0, t));
+    }
+
+    #[test]
+    fn the_crossfader_mutes_a_deck_only_at_the_far_end() {
+        let t = 5_000_000;
+        for curve in XfCurve::ALL {
+            for side in XfSide::ALL {
+                let mut s = a_playing();
+                s.apply(&ev(1_000_000, 1, 10, Action::CrossfaderCurve { curve }));
+                s.apply(&ev(1_000_000, 1, 11, Action::XfAssign { deck: 0, side }));
+                let at = |x: f32| {
+                    let mut s = s;
+                    s.apply(&ev(2_000_000, 1, 12, Action::Crossfader { v: x }));
+                    s.audible_in_master(0, t)
+                };
+                // The end away from the deck's side cuts it; THRU never does.
+                let (near, far) = match side {
+                    XfSide::A => (0.0, 1.0),
+                    XfSide::B => (1.0, 0.0),
+                    XfSide::Thru => (0.0, 1.0),
+                };
+                assert!(at(near), "{curve:?} {side:?} near end");
+                assert!(at(0.5), "{curve:?} {side:?} middle");
+                assert_eq!(at(far), side == XfSide::Thru, "{curve:?} {side:?} far end");
+                // Short of the far end, it's still heard on every curve.
+                let short = near + (far - near) * 0.95;
+                assert!(at(short), "{curve:?} {side:?} short of the far end");
+            }
+        }
+    }
+
+    #[test]
+    fn a_deck_sounds_while_it_plays_previews_or_is_scratched() {
+        let mut s = RoomState::default();
+        let mut seq = 0;
+        let mut go = |s: &mut RoomState, t: i64, a: Action| {
+            seq += 1;
+            s.apply(&ev(t, 1, seq, a));
+        };
+        go(&mut s, 0, grid_load(0, 1, 120.0, 0.0));
+        assert!(!s.decks[0].sounding_at(1_000_000), "loaded, paused");
+        // Holding CUE from a pause previews it.
+        go(&mut s, 1_000_000, Action::CueDown { deck: 0 });
+        assert!(s.audible_in_master(0, 1_500_000));
+        go(&mut s, 2_000_000, Action::CueUp { deck: 0 });
+        assert!(!s.audible_in_master(0, 2_500_000));
+        // A hand on the platter of a paused deck: scratching.
+        go(
+            &mut s,
+            3_000_000,
+            Action::JogTouch {
+                deck: 0,
+                down: true,
+                spin: 0.0,
+            },
         );
+        assert!(s.audible_in_master(0, 3_500_000));
+        // Let go mid-spin: it sounds until it coasts to a stop.
+        go(
+            &mut s,
+            4_000_000,
+            Action::JogTouch {
+                deck: 0,
+                down: false,
+                spin: 2.0,
+            },
+        );
+        assert!(s.audible_in_master(0, 4_100_000));
+        assert!(!s.audible_in_master(0, 9_000_000));
+        // Played off the end of the track: silent, though still "playing".
+        go(&mut s, 10_000_000, Action::Play { deck: 0 });
+        assert!(s.audible_in_master(0, 10_000_000));
+        assert!(s.decks[0].playing);
+        assert!(!s.audible_in_master(0, 400_000_000));
+        // A roll held near the end keeps going round after the track
+        // underneath has run out.
+        go(
+            &mut s,
+            400_000_000,
+            Action::Seek {
+                deck: 0,
+                pos: 298.0,
+            },
+        );
+        go(&mut s, 400_000_000, roll(0, 2.0, true));
+        assert!(s.decks[0].roll.is_some());
+        assert!(s.decks[0].slip_position_at(405_000_000) >= 300.0);
+        assert!(s.audible_in_master(0, 405_000_000));
+    }
+
+    #[test]
+    fn a_track_cant_be_loaded_over_a_deck_the_room_can_hear() {
+        let mut s = a_playing();
+        let before = s;
+        s.apply(&ev(3_000_000, 2, 1, grid_load(0, 2, 124.0, 0.0)));
+        assert_eq!(
+            s, before,
+            "dropped: nothing changes, not even who touched it"
+        );
+        assert_eq!(s.digest(), before.digest());
+        // Paused, it can be.
+        s.apply(&ev(4_000_000, 1, 3, Action::Pause { deck: 0 }));
+        s.apply(&ev(5_000_000, 2, 2, grid_load(0, 2, 124.0, 0.0)));
+        assert_eq!(s.decks[0].track, Some(tid(2)));
+    }
+
+    #[test]
+    fn a_load_onto_a_silent_playing_deck_starts_paused_at_the_cue() {
+        let mut s = RoomState::default();
+        let mut seq = 0;
+        let mut go = |s: &mut RoomState, t: i64, a: Action| {
+            seq += 1;
+            s.apply(&ev(t, 1, seq, a));
+        };
+        go(&mut s, 0, grid_load(0, 1, 120.0, 0.0));
+        go(&mut s, 0, grid_load(1, 2, 124.0, 0.0));
+        go(&mut s, 0, Action::Play { deck: 0 });
+        go(&mut s, 0, Action::Play { deck: 1 });
+        go(&mut s, 0, Action::Sync { deck: 1, on: true });
+        go(
+            &mut s,
+            1_000_000,
+            Action::BeatLoop {
+                deck: 1,
+                beats: 4.0,
+            },
+        );
+        go(
+            &mut s,
+            1_500_000,
+            Action::Bend {
+                deck: 1,
+                bend: 0.04,
+            },
+        );
+        go(&mut s, 1_800_000, roll(1, 1.0, true));
+        assert!(s.decks[1].synced && s.decks[1].looping && s.decks[1].roll.is_some());
+        // B is cut by the crossfader (all the way to A), so it can be loaded.
+        go(&mut s, 2_000_000, Action::Crossfader { v: 0.0 });
+        assert!(s.decks[1].sounding_at(3_000_000));
+        assert!(!s.audible_in_master(1, 3_000_000));
+        let load = Action::Load {
+            deck: 1,
+            track: tid(3),
+            duration: 200.0,
+            cue: 12.5,
+            grid: BeatGrid::new(0.2, 126.0).map(Box::new),
+            key: 4,
+        };
+        go(&mut s, 3_000_000, load);
+        let b = s.decks[1];
+        assert_eq!(b.track, Some(tid(3)));
+        assert!(!b.playing, "starts paused");
+        assert_eq!((b.position_at(9_000_000), b.cue_point), (12.5, 12.5));
+        assert!(!b.synced && !b.looping && b.loop_span().is_none() && b.roll.is_none());
+        assert!(!b.cue_preview && !b.scratching && b.spin.is_none());
+        assert_eq!(b.bend, 0.0);
+        assert_eq!(s.master, None, "nothing synced any more");
+        // A plays on untouched.
+        assert!(s.decks[0].playing);
+        assert!(close(at(&s, 0, 9_000_000), 9.0));
+    }
+
+    /// One booth loads onto a muted deck just as the other brings its fader
+    /// up. Whichever order the events arrive in, both booths end up with
+    /// the same room: the fader came first, so the load is dropped.
+    #[test]
+    fn a_load_racing_a_fader_comes_out_the_same_on_both_booths() {
+        let mut base = Timeline::new(0);
+        base.insert(ev(0, 1, 1, grid_load(0, 1, 120.0, 0.0)));
+        base.insert(ev(0, 1, 2, Action::Volume { deck: 0, v: 0.0 }));
+        base.insert(ev(0, 1, 3, Action::Play { deck: 0 }));
+        let fader_up = ev(2_000_000, 1, 4, Action::Volume { deck: 0, v: 0.8 });
+        let load = ev(2_000_100, 2, 1, grid_load(0, 2, 124.0, 0.0));
+        // Booth 2 loaded first by its own reckoning; booth 1's fader arrives later.
+        let mut two = base.clone();
+        two.insert(load.clone());
+        assert_eq!(two.latest().decks[0].track, Some(tid(2)));
+        two.insert(fader_up.clone());
+        let mut one = base.clone();
+        one.insert(fader_up);
+        one.insert(load);
+        let (a, b) = (one.latest(), two.latest());
+        assert_eq!(a.digest(), b.digest());
+        assert_eq!(a.decks[0].track, Some(tid(1)), "the load was dropped");
+        assert!(a.decks[0].playing);
+        // A load just before the fader came up gets in, on both.
+        let early = ev(1_999_900, 2, 1, grid_load(0, 2, 124.0, 0.0));
+        let mut three = base.clone();
+        three.insert(ev(2_000_000, 1, 4, Action::Volume { deck: 0, v: 0.8 }));
+        three.insert(early);
+        let c = three.latest().decks[0];
+        assert_eq!(c.track, Some(tid(2)));
+        assert!(!c.playing);
     }
 
     #[test]
@@ -2839,10 +3064,13 @@ mod tests {
         go(&mut s, 25_750_000, loop_out(false));
         assert_eq!(s.decks[0].active_loop(), Some((11.0, 11.75)));
         assert!(close(at(&s, 0, 26_000_000), 11.25));
-        // Loading another track forgets the loop.
+        // Loading another track (fader down, so the deck can be loaded while
+        // it loops) forgets the loop.
+        go(&mut s, 26_500_000, Action::Volume { deck: 0, v: 0.0 });
         go(&mut s, 27_000_000, grid_load(0, 2, 120.0, 0.0));
         assert_eq!(s.decks[0].loop_span(), None);
         assert!(!s.decks[0].looping);
+        assert!(!s.decks[0].playing);
     }
 
     fn loop_in(quantize: bool) -> Action {
@@ -3681,9 +3909,12 @@ mod tests {
         assert!(d.roll.is_none());
         assert!(close(d.loop_in.unwrap(), 6.9));
         assert!(close(at(&s, 0, 7_500_000), 6.9));
-        // Loading another track forgets the roll.
+        // Loading another track (fader down, so it can be loaded while it
+        // rolls) forgets the roll.
         go(&mut s, 8_000_000, roll(0, 0.25, true));
+        go(&mut s, 8_050_000, Action::Volume { deck: 0, v: 0.0 });
         go(&mut s, 8_100_000, grid_load(0, 2, 120.0, 0.0));
+        assert_eq!(s.decks[0].track, Some(tid(2)));
         assert!(s.decks[0].roll.is_none());
     }
 

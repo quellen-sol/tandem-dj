@@ -70,7 +70,14 @@ Mappings are saved per controller, so you only do this once. When Tandem's built
 - **SHIFT + SYNC** on the controller, or right-clicking SYNC, turns sync off. The deck goes back to its own BPM, offset only by where your tempo fader sits.
 - **KEY LOCK** is on by default, so changing tempo doesn't change pitch. Turn it off for vinyl-style pitch. Scratching always sounds like vinyl.
 - **Keys** show in Camelot notation (8A, 11B…), in green when a deck is harmonically compatible with the deck it's mixed with: the master, otherwise a deck that's playing (the one across the crossfader first). Use **−/+** to shift a deck by semitones. **MATCH KEY** shifts it the smallest amount needed to sit in that deck's key, or its relative major/minor.
-- **Loading onto a playing deck** swaps the track instantly. The new track starts on the beat of what's playing: the master or another deck if one's playing, otherwise the track you replaced. It starts at bar 1 (its first grid marker). A synced deck stays synced.
+- **A loaded track always starts paused** at its start, with sync and any loop off, ready to cue.
+- **You can't load over music the room can hear.** If a deck is playing and audible in the mix, loading onto it is refused, from the library, the controller's LOAD buttons or your partner's booth, with a note at the bottom of the window: *Deck A is playing: pause it or pull its fader down to load onto it.* A playing deck that's as good as silent can be loaded over (it stops and takes the new track):
+  - its **channel fader** at about 10% or below (−40 dB),
+  - the **crossfader** all the way to the other side (a channel on THRU never counts),
+  - its **filter** turned all the way, either way (the last 1% of travel),
+  - or its **trim** all the way down, or all three **EQ** bands killed.
+
+  These add up: the fader at 30% with TRIM well down counts too. Your headphone cue doesn't matter: it's what the room hears. If you load just as your partner brings that deck up, whichever happened first wins, on both booths.
 - **Bar numbers** run along the bottom of each scrolling waveform, and the deck shows the bar and beat you're on (e.g. `12.3`). Bar 1 is the first grid marker. The bars before it count down **−1, −2…**, so you can park a track a bar or two early, press play and wait for the 1.
 
 ## Loops
@@ -110,7 +117,7 @@ Every room has four decks, A to D. Click **4 decks** in the top bar to show C an
 
 - **The four-deck view** puts A over C on the left and B over D on the right, with a four-channel mixer between them in the order C, A, B, D (like a four-channel club mixer and the FLX6), and all four scrolling waveforms underneath. Each deck keeps all its controls in a more compact panel.
 - **It switches on by itself** when deck C or D gets a track or starts playing, whether you, your controller or your partner did it, so nothing that's playing is ever off screen. You can switch it off again while C and D are stopped.
-- **Loading:** **Load to A B C D** in the library, the right-click menu on a track, or the controller's LOAD buttons. A double-click loads onto the first deck on screen that's stopped.
+- **Loading:** **Load to A B C D** in the library, the right-click menu on a track, or the controller's LOAD buttons. A double-click loads onto the first deck on screen that's stopped, otherwise onto one that's playing but silent in the mix (see [BPM, sync and keys](#bpm-sync-and-keys)).
 - **On the DDJ-FLX6,** press a side's **DECK** button to switch it between decks 1 and 3 (or 2 and 4): decks 3 and 4 are C and D, with their own pads, loops, jog and tempo fader. Mixer channels 3 and 4 are C and D's channels, with their meters. A mapping you saved with v0.10 or earlier moves its deck 3 and 4 controls over by itself, keeping your jog calibration and any controls you changed. Soft takeover and the tempo fader work per deck, just as on A and B.
 - **Sync** works across all four: every synced deck follows the master. See [BPM, sync and keys](#bpm-sync-and-keys).
 

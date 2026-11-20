@@ -192,6 +192,26 @@ All of this runs in the booth whose controller it is; the room only sees the `Te
 
 A controller that sends the same message with SHIFT held (the Denon SC Live 4) can't use `TempoShift`: that needs SHIFT tracked in software, as a modifier for other bindings.
 
+### Loading onto a deck
+
+A `Load` puts the track on the deck paused at its cue point, whatever the deck was doing: it's never playing afterwards, and the deck's loop, sync, bend, CUE or hot cue preview, scratch and spin all go. Loading onto the sync master gives up the master.
+
+Nobody loads over music the room can hear. `RoomState::audible_in_master(x, t)` is true when deck x is making sound at t (`DeckState::sounding_at`: playing, previewing a cue, under the DJ's hand or still spinning, and not run off either end) and `render::master_gain` puts it above `SILENT_GAIN`, −40 dB. `master_gain` multiplies the mixer's own gain laws: trim, the loudest EQ band, the filter, the channel fader, and the crossfader for the channel's side and the room's curve. The headphone cue doesn't count. Each of these makes a deck silent on its own:
+
+| Control | Silent at | Why there |
+|---|---|---|
+| Channel fader | about 10% and below | its gain is position², so 10% is −40 dB |
+| Crossfader | the far end from the channel's side; never on THRU | every curve cuts the far end completely. Short of it, only Linear gets under −40 dB, in its last 1% |
+| Filter | the last 1% of travel, either way | the sweep alone still lets the bass (low-pass) or the hats (high-pass) through, and only the fade over the last 10% silences it. Measured on pink noise, 1% from the end lets through −40 dB on the low-pass side and −45 dB on the high-pass side; further in, the rule counts only the fade, which errs towards "audible" |
+| Trim, EQ | trim all the way down, or all three bands killed | both are zero gain there |
+
+They multiply, so smaller cuts add up (the fader at 30%, −21 dB, with trim down 21 dB is −42 dB). Boosts count too: trim at +12 dB needs the fader lower.
+
+Two places enforce it:
+
+- **The shared model.** `RoomState::apply` drops a `Load` onto a deck that's audible at the event's own time, before changing anything (not even who touched the deck). Faders, crossfader, curve, assign switches, filter, trim and EQ are all room state, so every booth and the broadcast lane decide the same way whatever order events arrive in. If one DJ loads just as the other brings that deck up, the earlier event wins on both booths. A partner's load arriving over the network gets the same treatment.
+- **The booth that loads.** `Session::act_at` refuses a `Load` the model would drop, and `load_path` refuses before decoding and again once the track is ready, since a fader may have come up meantime. Both queue a notice (`Session::take_notices`) that the app shows as a toast. Every way of loading (library buttons, right-click, double-click, the controller's LOAD buttons) goes through these. A double-click picks the first stopped deck on screen, otherwise the quietest silent one. If a partner's earlier move arrives late and the room drops a load this booth already sent, `check_my_loads` notices (the deck doesn't have the track at the load's time) and gives the same notice.
+
 ### Local vs shared
 
 | Shared (in the timeline) | Local (this booth only) |

@@ -765,8 +765,10 @@ impl TandemApp {
         }
     }
 
+    /// Load onto a deck. The track starts paused at its cue. A deck the
+    /// room can hear can't be loaded: the session refuses, and its notice
+    /// comes back as a toast (see [`RoomState::audible_in_master`]).
     pub(crate) fn load(&mut self, deck: usize, item: Item, _view: &SessionView) {
-        // Loading onto a playing deck is fine: the new track starts on the beat.
         let mut s = self.session.lock();
         match item {
             Item::File(p) => s.load_path(deck, p),
@@ -774,23 +776,27 @@ impl TandemApp {
         }
     }
 
-    /// The deck to load into on double-click: the first one on screen
-    /// that's stopped, otherwise the one that's quietest in the mix.
-    pub(crate) fn free_deck(&self, view: &SessionView) -> Option<usize> {
+    /// The deck to load onto on double-click: the first one on screen
+    /// that's stopped, otherwise the quietest one that's silent in the
+    /// master. If every deck on screen can be heard, says so instead.
+    pub(crate) fn free_deck(&self, view: &SessionView) -> Result<usize, String> {
         let shown = self.shown_decks();
+        let (room, t) = (&view.room, view.now);
+        let gain = |d: usize| tandem_core::render::master_gain(room, d);
         (0..shown)
-            .find(|d| !view.decks[*d].state.playing)
+            .find(|&d| !room.decks[d].sounding_at(t))
             .or_else(|| {
-                let gain = |d: usize| {
-                    let room = &view.room;
-                    tandem_core::render::fader_gain(room.decks[d].volume)
-                        * tandem_core::render::xfader_gain(
-                            room.xf_curve,
-                            room.xf_assign[d],
-                            room.crossfader,
-                        )
-                };
-                (0..shown).min_by(|a, b| gain(*a).partial_cmp(&gain(*b)).unwrap())
+                (0..shown)
+                    .filter(|&d| !room.audible_in_master(d, t))
+                    .min_by(|&a, &b| gain(a).total_cmp(&gain(b)))
+            })
+            .ok_or_else(|| {
+                let letters: Vec<String> = (0..shown).map(|d| deck_letter(d).to_string()).collect();
+                let (last, rest) = letters.split_last().expect("decks on screen");
+                format!(
+                    "Decks {} and {last} are playing: pause one or pull its fader down to load onto it.",
+                    rest.join(", ")
+                )
             })
     }
 
@@ -852,7 +858,13 @@ impl eframe::App for TandemApp {
             self.terms_gate(ctx);
             return;
         }
-        let mut view = self.session.lock().view();
+        let (mut view, notices) = {
+            let mut s = self.session.lock();
+            (s.view(), s.take_notices())
+        };
+        for n in notices {
+            self.toast(n);
+        }
         if let (Some(ms), Some(_)) = (self.dev.late_ms, view.link.late_us) {
             view.link.late_us = Some(ms * 1000);
         }
@@ -995,6 +1007,8 @@ impl TandemApp {
                 });
             }
         }
+        // Try to load onto deck A while it plays, so the screenshot shows
+        // the toast refusing it.
         if self.dev.demo && self.dev.demo_started && f == self.dev.shot_frame.saturating_sub(40) {
             if let Some(item) = self.item_at(2, view) {
                 self.load(0, item, view);

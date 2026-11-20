@@ -796,6 +796,40 @@ pub fn xfader_gain(curve: XfCurve, side: XfSide, x: f32) -> f32 {
     }
 }
 
+/// A deck this quiet in the master or quieter (−40 dB) is as good as
+/// silent: a track may be loaded over it (see
+/// [`RoomState::audible_in_master`]).
+pub const SILENT_GAIN: f32 = 0.01;
+
+/// Within this much of either end of its travel (1%), the filter counts as
+/// cutting a deck out. Measured on pink noise, it lets through −40 dB there
+/// on the low-pass side and −45 dB on the high-pass side, and less further
+/// on (−43 dB at a controller's last step before the end).
+const FILTER_KILL: f32 = 0.01;
+
+/// Roughly how loud deck `d` is in the master mix (and the broadcast),
+/// relative to the track itself: trim, EQ (its loudest band), the filter,
+/// the channel fader and the crossfader. The headphone cue doesn't count.
+///
+/// The filter counts by its fade at the ends of its travel, and as silence
+/// within [`FILTER_KILL`] of either end. Its sweep alone is left out: short
+/// of the fade, it still lets the bass or the hats through.
+pub fn master_gain(state: &RoomState, d: usize) -> f32 {
+    let st = &state.decks[d];
+    let k = st.filter;
+    let filter = if k <= FILTER_KILL || k >= 1.0 - FILTER_KILL {
+        0.0
+    } else {
+        filter_edge_gain(k)
+    };
+    let eq = st.eq.iter().map(|&v| eq_gain(v)).fold(0.0, f32::max);
+    trim_gain(st.trim)
+        * eq
+        * filter
+        * fader_gain(st.volume)
+        * xfader_gain(state.xf_curve, state.xf_assign[d], state.crossfader)
+}
+
 #[inline]
 fn soft_clip(x: f32) -> f32 {
     let a = x.abs();
@@ -1037,6 +1071,48 @@ mod tests {
         assert!(filter_level(0.97) < filter_level(0.85) * 0.3);
         assert_eq!(filter_edge_gain(0.5), 1.0);
         assert_eq!(filter_edge_gain(1.0 - FILTER_FADE), 1.0);
+    }
+
+    /// The load rule only calls a deck filtered out where the real filter
+    /// lets through -40 dB or less, and calls it out all the way to the ends.
+    #[test]
+    fn the_filter_only_counts_as_silent_where_it_is() {
+        let mut s = RoomState::default();
+        s.crossfader = 0.0;
+        let fine = (0..=30).map(|i| i as f32 / 1000.0);
+        let coarse = (4..=50).map(|i| i as f32 / 100.0);
+        for k in fine.chain(coarse) {
+            for k in [k, 1.0 - k] {
+                s.decks[0].filter = k;
+                if master_gain(&s, 0) <= SILENT_GAIN {
+                    assert!(filter_level(k) <= SILENT_GAIN, "k {k}: {}", filter_level(k));
+                }
+            }
+        }
+        for k in [0.0, FILTER_KILL, 1.0 - FILTER_KILL, 1.0] {
+            s.decks[0].filter = k;
+            assert_eq!(master_gain(&s, 0), 0.0, "k {k}");
+        }
+        s.decks[0].filter = 0.5;
+        assert_eq!(master_gain(&s, 0), 1.0);
+    }
+
+    #[test]
+    fn master_gain_follows_the_mixer() {
+        let mut s = RoomState::default();
+        // Constant power, crossfader in the middle: -3 dB.
+        let mid = std::f32::consts::FRAC_1_SQRT_2;
+        assert!((master_gain(&s, 0) - mid).abs() < 1e-6);
+        s.decks[0].volume = 0.5;
+        assert!((master_gain(&s, 0) - 0.25 * mid).abs() < 1e-6);
+        s.decks[0].trim = 1.0;
+        assert!((master_gain(&s, 0) - 0.25 * mid * trim_gain(1.0)).abs() < 1e-6);
+        s.decks[0].eq = [0.0, 0.0, 1.0];
+        assert!((master_gain(&s, 0) - 0.25 * mid * trim_gain(1.0) * 2.0).abs() < 1e-6);
+        s.crossfader = 1.0;
+        assert_eq!(master_gain(&s, 0), 0.0);
+        s.xf_assign[0] = XfSide::Thru;
+        assert!(master_gain(&s, 0) > 1.0);
     }
 
     fn track() -> Arc<TrackAudio> {
