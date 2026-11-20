@@ -162,7 +162,7 @@ Tandem fits laptop screens, down to a 1080p laptop at 175% display scaling.
 3. **Join.** The other clicks **Join a room**, enters the address and code, and joins.
 4. **Check the connection.** The top bar shows your partner, the round-trip time and **✔ in sync**. If it says **⚠ no reply for N s** instead, nothing has arrived from the other PC for a while: its connection has stalled. The room carries on if it comes back within 15 seconds.
 
-**If the connection drops,** the joining PC gets back into the room by itself. Its top bar says **Reconnecting to … attempt N** while it tries (for up to 5 minutes), and the host's says **Waiting for … to reconnect**. The decks play on meanwhile, but what the joining DJ changes doesn't reach the room: once it's back, its decks follow the room again, as on a fresh join. **Give up** stops trying. Leaving on purpose, or the host closing the room, never starts this.
+**If the connection drops,** the joining PC gets back into the room by itself. Its top bar says **Reconnecting to … attempt N** while it tries (for up to 5 minutes), and the host's says **Waiting for … to reconnect**. The decks play on meanwhile, but what the joining DJ changes doesn't reach the room: once it's back, its decks follow the room again, as on a fresh join. A track that was being sent either way pauses and carries on from where it got to once you're back together, and a deck waiting for it comes in where the room is. **Give up** stops trying. Leaving on purpose, or the host closing the room, never starts this.
 
 **Sync click** in the top bar plays a metronome on the shared room clock. Put both laptops side by side, or on a phone call, and the clicks should line up.
 

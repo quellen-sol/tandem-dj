@@ -8,7 +8,9 @@ use tandem_core::grid::{BeatGrid, Marker, MAX_MARKERS};
 use tandem_core::mapping::{beats_label, MidiEngine, Target};
 use tandem_core::model::{Action, DeckState, XfCurve, XfSide, BEAT_LOOPS, DECKS, HOT_CUES};
 use tandem_core::net::{LINK_QUIET, LINK_TIMEOUT, REJOIN_FOR};
-use tandem_core::session::{deck_letter, DeckView, RejoinView, RoleView, SessionView, TrackStatus};
+use tandem_core::session::{
+    deck_letter, DeckView, RejoinView, RoleView, SessionView, TrackStatus, TransferState,
+};
 
 pub const DECK_COLORS: [Color32; DECKS] = [
     Color32::from_rgb(255, 146, 60),
@@ -656,7 +658,7 @@ impl TandemApp {
             let (title, artist) = track_names(dv);
             ui.add(egui::Label::new(RichText::new(title).size(17.0).strong()).truncate());
             ui.add(egui::Label::new(RichText::new(artist).weak()).truncate());
-            let status = deck_status(dv, view);
+            let status = deck_status(dv, view, false);
             ui.label(match status {
                 Some((s, c)) => RichText::new(s).color(c).small(),
                 None => RichText::new(" ").small(),
@@ -755,8 +757,13 @@ impl TandemApp {
             ui.horizontal(|ui| {
                 deck_readout(ui, d, view, pos, 13.0);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if let Some((s, c)) = deck_status(dv, view) {
-                        ui.add(egui::Label::new(RichText::new(s).color(c).small()).truncate());
+                    if let Some((s, c)) = deck_status(dv, view, true) {
+                        let full = deck_status(dv, view, false).map(|(f, _)| f);
+                        let r =
+                            ui.add(egui::Label::new(RichText::new(s).color(c).small()).truncate());
+                        if let Some(f) = full {
+                            r.on_hover_text(f);
+                        }
                     } else if let Some(r) = st.roll {
                         roll_label(ui, r.beats);
                     } else if st.scratching {
@@ -2158,7 +2165,10 @@ fn deck_readout(ui: &mut egui::Ui, d: usize, view: &SessionView, pos: f64, size:
     }
 }
 
-fn deck_status(dv: &DeckView, view: &SessionView) -> Option<(String, Color32)> {
+/// What a deck's track is waiting for, if anything. `short` for a compact
+/// panel, where it shares a row with the readout: a download's progress then
+/// goes first, so it isn't cut off.
+fn deck_status(dv: &DeckView, view: &SessionView, short: bool) -> Option<(String, Color32)> {
     if let Some(l) = &dv.loading {
         return Some((format!("Loading {l}…"), AMBER));
     }
@@ -2167,16 +2177,56 @@ fn deck_status(dv: &DeckView, view: &SessionView) -> Option<(String, Color32)> {
         TrackStatus::Searching => Some(("Looking for this track in your library…".into(), AMBER)),
         TrackStatus::Decoding => Some(("Decoding…".into(), AMBER)),
         TrackStatus::Fetching => {
-            let pct = view
+            let t = view
                 .transfers
                 .iter()
-                .find(|t| t.id == id && !t.upload && t.total > 0)
-                .map(|t| format!(" {:.0}%", t.done as f64 * 100.0 / t.total as f64))
-                .unwrap_or_default();
-            Some((
-                format!("Receiving this track from your partner…{pct}"),
-                AMBER,
-            ))
+                .find(|t| t.id == id && !t.upload && t.total > 0);
+            let pct = |b: u64| t.map_or(0.0, |t| b as f64 * 100.0 / t.total as f64);
+            if short {
+                let text = match t {
+                    Some(t) if t.state == TransferState::Paused && t.done == 0 => {
+                        "Waiting for the link".into()
+                    }
+                    Some(t) if t.state == TransferState::Paused => {
+                        format!("Paused at {:.0}% (link down)", pct(t.done))
+                    }
+                    Some(t) if t.state == TransferState::Queued && t.done > 0 => {
+                        format!("Resuming at {:.0}%…", pct(t.done))
+                    }
+                    Some(t) if t.from > 0 => format!(
+                        "Receiving {:.0}% (resumed at {:.0}%)",
+                        pct(t.done),
+                        pct(t.from)
+                    ),
+                    Some(t) => format!("Receiving {:.0}%", pct(t.done)),
+                    None => "Receiving…".into(),
+                };
+                return Some((text, AMBER));
+            }
+            let text = match t {
+                Some(t) if t.state == TransferState::Paused && t.done == 0 => {
+                    "Receiving this track from your partner: waiting until the link is back".into()
+                }
+                Some(t) if t.state == TransferState::Paused => format!(
+                    "Receiving this track from your partner: paused at {:.0}% until the link is back",
+                    pct(t.done)
+                ),
+                Some(t) if t.state == TransferState::Queued && t.done > 0 => format!(
+                    "Receiving this track from your partner… resuming at {:.0}%",
+                    pct(t.done)
+                ),
+                Some(t) if t.from > 0 => format!(
+                    "Receiving this track from your partner… {:.0}% (resumed at {:.0}%)",
+                    pct(t.done),
+                    pct(t.from)
+                ),
+                Some(t) => format!(
+                    "Receiving this track from your partner… {:.0}%",
+                    pct(t.done)
+                ),
+                None => "Receiving this track from your partner…".to_string(),
+            };
+            Some((text, AMBER))
         }
         TrackStatus::Failed(e) => Some((format!("Can't play: {e}"), RED)),
         TrackStatus::Ready => None,

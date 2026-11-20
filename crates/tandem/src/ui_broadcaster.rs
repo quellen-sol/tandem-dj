@@ -241,13 +241,25 @@ fn deck_row(ui: &mut egui::Ui, d: usize, view: &SessionView) {
             let status = match &dv.status {
                 Some(TrackStatus::Ready) => ("✔ ready".to_string(), GREEN),
                 Some(TrackStatus::Fetching) => match download(id) {
+                    Some(t) if t.total > 0 => {
+                        let pct = t.done as f64 / t.total as f64 * 100.0;
+                        let text = match t.state {
+                            TransferState::Paused if t.done == 0 => {
+                                "waiting for the link".to_string()
+                            }
+                            TransferState::Paused => format!("paused at {pct:.0}%"),
+                            TransferState::Queued if t.done > 0 => {
+                                format!("resuming at {pct:.0}%")
+                            }
+                            TransferState::Queued => "waiting to download".to_string(),
+                            _ if t.from > 0 => format!("receiving {pct:.0}% (resumed)"),
+                            _ => format!("receiving {pct:.0}%"),
+                        };
+                        (text, AMBER)
+                    }
                     Some(t) if t.state == TransferState::Queued => {
                         ("waiting to download".to_string(), AMBER)
                     }
-                    Some(t) if t.total > 0 => (
-                        format!("receiving {:.0}%", t.done as f64 / t.total as f64 * 100.0),
-                        AMBER,
-                    ),
                     _ => ("receiving…".to_string(), AMBER),
                 },
                 Some(TrackStatus::Searching) => ("looking for it…".to_string(), AMBER),

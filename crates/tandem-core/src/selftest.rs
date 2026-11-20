@@ -7,14 +7,15 @@
 //! through the host), that every booth's room state stays identical, that
 //! the booths render bit-identical audio for the same moment, that a
 //! broadcaster can't change the room, that a share can be offered,
-//! accepted and downloaded, and that a booth whose link drops gets back in.
+//! accepted and downloaded, that a booth whose link drops gets back in, and
+//! that a track it was receiving carries on from where it got to.
 
 use crate::config::Paths;
 use crate::library::Library;
 use crate::model::{Action, Event};
 use crate::protocol::{read_msg, write_msg, ConnKind, Msg, PeerInfo};
 use crate::render::{Lane, LaneKind};
-use crate::session::{Session, SessionHandle, TrackStatus};
+use crate::session::{Session, SessionHandle, TrackStatus, TransferState};
 use crate::time::SharedClock;
 use anyhow::{bail, ensure};
 use parking_lot::Mutex;
@@ -380,6 +381,78 @@ fn run(root: &std::path::Path, say: &mut dyn FnMut(&str)) -> anyhow::Result<()> 
     say(&format!(
         "a dropped link: Bob gets back in by himself after {:.1} s, with the room as it is",
         took.as_secs_f64()
+    ));
+
+    // A track on its way when the link drops carries on from where it got
+    // to, and the deck that waited for it plays with the room.
+    let long = music.join("Test Artist - Long Tone.wav");
+    crate::audio::write_wav(
+        &long,
+        44_100,
+        &crate::audio::test_signal(44_100, 12.0, 520.0),
+    )?;
+    alice.lock().max_upload_bytes_s = 1_200_000.0;
+    alice.lock().load_path(2, long);
+    let long_id = {
+        let mut id = None;
+        wait_for(
+            "Alice to load the long track",
+            Duration::from_secs(20),
+            || {
+                id = alice.lock().latest().decks[2].track;
+                id.is_some()
+            },
+        )?;
+        id.unwrap()
+    };
+    alice.lock().act(Action::Play { deck: 2 });
+    let download = |h: &SessionHandle| {
+        let v = h.lock().view();
+        v.transfers
+            .into_iter()
+            .find(|t| t.id == long_id && !t.upload)
+    };
+    wait_for("Bob to be part-way", Duration::from_secs(15), || {
+        download(&bob).is_some_and(|t| t.total > 0 && t.done * 4 >= t.total)
+    })?;
+    bob.lock().cut_link();
+    wait_for("Bob's download to pause", Duration::from_secs(5), || {
+        download(&bob).is_some_and(|t| t.state == TransferState::Paused)
+    })?;
+    wait_for(
+        "the long track to reach Bob and Carol",
+        Duration::from_secs(30),
+        || {
+            bob.lock().track_status(long_id) == Some(TrackStatus::Ready)
+                && carol.lock().track_status(long_id) == Some(TrackStatus::Ready)
+        },
+    )?;
+    let t = download(&bob).ok_or_else(|| anyhow::anyhow!("Bob's download is gone"))?;
+    ensure!(
+        t.from > 0,
+        "Bob's download started over after the link dropped"
+    );
+    let t_now = alice.lock().clock().now() - 100_000;
+    let (sa, sb) = (
+        alice.lock().snapshot_handle().load_full(),
+        bob.lock().snapshot_handle().load_full(),
+    );
+    let render_at = |snap: &crate::render::AudioSnapshot| {
+        let mut lane = Lane::new(48_000.0, 0, LaneKind::Live);
+        let (mut m, mut c) = (vec![0.0f32; n * 2], vec![0.0f32; n * 2]);
+        lane.render(snap, t_now, &mut m, &mut c);
+        m
+    };
+    let (ma, mb) = (render_at(&sa), render_at(&sb));
+    ensure!(ma.iter().any(|v| v.abs() > 0.01), "rendered silence");
+    let diff = max_diff(&ma, &mb);
+    ensure!(
+        diff < 1e-6,
+        "Bob's booth plays the resumed track differently (max diff {diff})"
+    );
+    say(&format!(
+        "a track cut off at {:.0}% carries on from there once Bob's back, and his deck plays with the room",
+        t.from as f64 * 100.0 / t.total as f64
     ));
 
     // A broadcaster that loses the room stops playing it.

@@ -216,7 +216,7 @@ fn handle_incoming(h: SessionHandle, mut s: TcpStream, room: &str) -> anyhow::Re
     }
     let info = PeerInfo { id: peer_id, name };
     match kind {
-        ConnKind::Files => crate::files::serve(&h, s, broadcaster),
+        ConnKind::Files => crate::files::serve(&h, s, &info, broadcaster),
         ConnKind::Control if closed_already(&s) => {
             log::debug!(
                 "{} gave up on this connection before it got here",
@@ -643,9 +643,10 @@ fn why_not_back(e: &anyhow::Error, to: &RoomAddr) -> String {
 mod tests {
     use super::*;
     use crate::config::Paths;
+    use crate::files::Landing;
     use crate::library::Library;
-    use crate::model::Action;
-    use crate::session::{RoleView, TrackStatus};
+    use crate::model::{Action, TrackId};
+    use crate::session::{RoleView, TrackStatus, Transfer, TransferState};
     use crate::time::SharedClock;
     use parking_lot::Mutex;
     use std::io::{Read, Write};
@@ -1128,6 +1129,296 @@ mod tests {
             bob.lock().view().link.peer.is_none(),
             "Bob got back in after giving up"
         );
+        alice.lock().leave();
+    }
+
+    /// A tone of `secs` seconds (about 176 KB a second) in `dir`.
+    fn tone(dir: &std::path::Path, name: &str, secs: f64, hz: f64) -> std::path::PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let p = dir.join(name);
+        crate::audio::write_wav(&p, 44_100, &crate::audio::test_signal(44_100, secs, hz)).unwrap();
+        p
+    }
+
+    fn id_of(path: &std::path::Path) -> TrackId {
+        TrackId::of_bytes(&std::fs::read(path).unwrap())
+    }
+
+    /// The track on a booth's deck once its load is done.
+    fn loaded(h: &SessionHandle, deck: usize) -> TrackId {
+        let mut id = None;
+        wait_for("the load", Duration::from_secs(20), || {
+            id = h.lock().latest().decks[deck].track;
+            id.is_some()
+        });
+        id.unwrap()
+    }
+
+    /// The booth's download of a track, as its transfer list shows it.
+    fn download(h: &SessionHandle, id: TrackId) -> Option<Transfer> {
+        let v = h.lock().view();
+        v.transfers.into_iter().find(|t| t.id == id && !t.upload)
+    }
+
+    fn ready(h: &SessionHandle, id: TrackId) -> bool {
+        h.lock().track_status(id) == Some(TrackStatus::Ready)
+    }
+
+    /// Got the whole track, checked, and kept no `.part` file.
+    fn arrived_whole(h: &SessionHandle, id: TrackId) {
+        let s = h.lock();
+        let path = s.servable_path(id).expect("where the track went");
+        assert_eq!(
+            id_of(&path),
+            id,
+            "{} differs from the track",
+            path.display()
+        );
+        assert!(!s.part_path(id).exists(), "the .part file was left behind");
+    }
+
+    /// A track on its way when the link drops carries on from where it got
+    /// to once the booths are back together, instead of starting over: from
+    /// the host to the joining DJ and a broadcaster, and from the joining DJ
+    /// to the host. Meanwhile it shows as paused, not failed. Every booth
+    /// ends up with the whole, checked file, and the decks that waited for
+    /// it play the room as the host does.
+    #[test]
+    fn a_transfer_cut_off_part_way_carries_on_after_rejoining() {
+        let rig = Rig::new("resume-cut");
+        let t = Duration::from_secs(2);
+        let alice = rig.booth("Alice", 0, t);
+        let bob = rig.booth("Bob", 3_600_000_000, t);
+        let carol = rig.booth("Carol", -1_800_000_000, t);
+        // Slow uploads, so the link drops part-way through.
+        alice.lock().max_upload_bytes_s = 1_200_000.0;
+        bob.lock().max_upload_bytes_s = 600_000.0;
+        let port = host(&alice, 0, "RESUME").unwrap();
+        let relay = Relay::new(port);
+        join(&bob, &relay.addr(), "RESUME", false).unwrap();
+        join(&carol, &relay.addr(), "RESUME", true).unwrap();
+
+        // Long enough to still be playing when they've arrived.
+        let a_wav = tone(&rig.root.join("a"), "Alice Tone.wav", 20.0, 440.0);
+        let b_wav = tone(&rig.root.join("b"), "Bob Tone.wav", 20.0, 330.0);
+        alice.lock().load_path(0, a_wav);
+        bob.lock().load_path(1, b_wav);
+        let (a_id, b_id) = (loaded(&alice, 0), loaded(&bob, 1));
+        alice.lock().act(Action::Play { deck: 0 });
+        bob.lock().act(Action::Play { deck: 1 });
+
+        let part_way = |h: &SessionHandle, id| {
+            download(h, id).is_some_and(|t| t.total > 0 && t.done * 4 >= t.total)
+        };
+        wait_for("the tracks to be part-way", Duration::from_secs(15), || {
+            part_way(&bob, a_id) && part_way(&carol, a_id) && part_way(&alice, b_id)
+        });
+        relay.sever();
+
+        let paused = |h: &SessionHandle, id| {
+            download(h, id).filter(|t| t.state == TransferState::Paused && t.done < t.total)
+        };
+        let mut at = Vec::new();
+        wait_for("the downloads to pause", Duration::from_secs(5), || {
+            at = [(&bob, a_id), (&carol, a_id), (&alice, b_id)]
+                .iter()
+                .filter_map(|(h, id)| paused(h, *id).map(|t| t.done))
+                .collect();
+            at.len() == 3
+        });
+        assert_eq!(bob.lock().track_status(a_id), Some(TrackStatus::Fetching));
+        assert_eq!(alice.lock().track_status(b_id), Some(TrackStatus::Fetching));
+
+        wait_for(
+            "everyone to have both tracks",
+            Duration::from_secs(20),
+            || {
+                ready(&bob, a_id)
+                    && ready(&alice, b_id)
+                    && ready(&carol, a_id)
+                    && ready(&carol, b_id)
+            },
+        );
+        assert!(linked(&bob) && linked(&carol));
+        for ((h, id), at) in [(&bob, a_id), (&carol, a_id), (&alice, b_id)]
+            .iter()
+            .zip(at)
+        {
+            let t = download(h, *id).unwrap();
+            assert_eq!(t.state, TransferState::Done);
+            assert!(
+                t.from >= at && t.from > 0,
+                "{}: started again from byte {} (it had {at})",
+                h.lock().me.name,
+                t.from
+            );
+            arrived_whole(h, *id);
+        }
+
+        // The decks that waited play the room as the host does.
+        let snap = |h: &SessionHandle| h.lock().snapshot_handle().load_full();
+        let (sa, sb, sc) = (snap(&alice), snap(&bob), snap(&carol));
+        let t = alice.lock().now() - 100_000;
+        // (Not the digests: a detected BPM can come through JSON a bit off.)
+        let render = |s: &crate::render::AudioSnapshot, kind| {
+            let mut lane = crate::render::Lane::new(48_000.0, 0, kind);
+            let (mut m, mut c) = (vec![0.0f32; 8192], vec![0.0f32; 8192]);
+            lane.render(s, t, &mut m, &mut c);
+            m
+        };
+        use crate::render::LaneKind::{Broadcast, Live};
+        let ma = render(&sa, Live);
+        assert!(ma.iter().any(|v| v.abs() > 0.01), "silence");
+        assert_eq!(ma, render(&sb, Live), "Bob's booth sounds different");
+        assert_eq!(
+            render(&sa, Broadcast),
+            render(&sc, Broadcast),
+            "Carol's stream sounds different"
+        );
+        for h in [&bob, &carol, &alice] {
+            h.lock().leave();
+        }
+    }
+
+    /// The link goes silent mid-transfer, and the host still holds the old
+    /// link and the transfers on it when the joining DJ is back (the case
+    /// where two transfers could write one `.part` file). The old ones are
+    /// stopped, and the new ones carry on from where they got to.
+    #[test]
+    fn a_silent_drop_mid_transfer_carries_on_over_the_new_link() {
+        let rig = Rig::new("resume-stall");
+        // The host gives up on a silent link only after Bob is back.
+        let alice = rig.booth("Alice", 0, Duration::from_secs(10));
+        let bob = rig.booth("Bob", -7_200_000_000, Duration::from_secs(2));
+        alice.lock().max_upload_bytes_s = 300_000.0;
+        bob.lock().max_upload_bytes_s = 300_000.0;
+        let port = host(&alice, 0, "STALL2").unwrap();
+        let relay = Relay::new(port);
+        join(&bob, &relay.addr(), "STALL2", false).unwrap();
+
+        alice
+            .lock()
+            .load_path(0, tone(&rig.root.join("a"), "A.wav", 6.0, 440.0));
+        bob.lock()
+            .load_path(0, tone(&rig.root.join("b"), "B.wav", 5.0, 330.0));
+        let a_id = loaded(&alice, 0);
+        wait_for(
+            "both tracks to be on their way",
+            Duration::from_secs(20),
+            || {
+                let b_id = alice.lock().latest().decks[0].track;
+                let on_way = |h, id| download(h, id).is_some_and(|t| t.done * 4 >= t.total.max(1));
+                // Bob's load lands after Alice's, on the same deck.
+                b_id.is_some_and(|b| b != a_id && on_way(&alice, b)) && on_way(&bob, a_id)
+            },
+        );
+        let b_id = alice.lock().latest().decks[0].track.unwrap();
+
+        relay.blackhole();
+        wait_for("Bob to notice", Duration::from_secs(5), || rejoining(&bob));
+        assert!(
+            alice.lock().view().link.peer.is_some(),
+            "Alice dropped Bob before he was back"
+        );
+        relay.restore();
+        wait_for("both tracks to arrive", Duration::from_secs(20), || {
+            ready(&bob, a_id) && ready(&alice, b_id)
+        });
+        for (h, id) in [(&bob, a_id), (&alice, b_id)] {
+            let t = download(h, id).unwrap();
+            assert!(t.from > 0, "{} started again from 0", h.lock().me.name);
+            arrived_whole(h, id);
+        }
+        bob.lock().leave();
+        alice.lock().leave();
+    }
+
+    /// A download carries on from whatever its `.part` file holds: it asks
+    /// for the rest by offset, and the whole file checks out. A partial file
+    /// that doesn't check out is thrown away and the track sent again from
+    /// the start, whichever way it's going.
+    #[test]
+    fn carries_on_from_a_partial_file_or_starts_over_from_a_bad_one() {
+        let rig = Rig::new("resume-partial");
+        let alice = rig.booth("Alice", 0, LINK_TIMEOUT);
+        let bob = rig.booth("Bob", 0, LINK_TIMEOUT);
+        let port = host(&alice, 0, "PART12").unwrap();
+        join(&bob, &format!("127.0.0.1:{port}"), "PART12", false).unwrap();
+
+        let a_wav = tone(&rig.root.join("a"), "A.wav", 4.0, 440.0);
+        let c_wav = tone(&rig.root.join("a"), "C.wav", 4.0, 550.0);
+        let b_wav = tone(&rig.root.join("b"), "B.wav", 4.0, 330.0);
+        let bytes = |p| std::fs::read(p).unwrap();
+        let (a, b, c) = (bytes(&a_wav), bytes(&b_wav), bytes(&c_wav));
+        let (a_id, b_id, c_id) = (id_of(&a_wav), id_of(&b_wav), id_of(&c_wav));
+        let garbled = |x: &[u8]| x.iter().map(|v| v ^ 0x5a).collect::<Vec<u8>>();
+        // Bob has the first 40% of A, and a garbled start of C; Alice a
+        // garbled start of B.
+        let good = a.len() * 2 / 5;
+        std::fs::write(bob.lock().part_path(a_id), &a[..good]).unwrap();
+        std::fs::write(bob.lock().part_path(c_id), garbled(&c[..c.len() / 3])).unwrap();
+        std::fs::write(alice.lock().part_path(b_id), garbled(&b[..b.len() / 3])).unwrap();
+
+        alice.lock().load_path(0, a_wav);
+        alice.lock().load_path(2, c_wav);
+        bob.lock().load_path(1, b_wav);
+        wait_for("all three to arrive", Duration::from_secs(20), || {
+            ready(&bob, a_id) && ready(&bob, c_id) && ready(&alice, b_id)
+        });
+        assert_eq!(download(&bob, a_id).unwrap().from, good as u64);
+        for (h, id) in [(&bob, a_id), (&bob, c_id), (&alice, b_id)] {
+            arrived_whole(h, id);
+        }
+        // The bad ones came again from the start.
+        assert_eq!(download(&bob, c_id).unwrap().from, 0);
+        assert_eq!(download(&alice, b_id).unwrap().from, 0);
+        bob.lock().leave();
+        alice.lock().leave();
+    }
+
+    /// Two downloads of one track at once, as when one the link dropped
+    /// under is still running when the next starts, never write its `.part`
+    /// file together: the newer one stops the older, which steps aside
+    /// without failing the track, and carries on from where it got to.
+    #[test]
+    fn two_downloads_of_one_track_never_write_together() {
+        let rig = Rig::new("resume-two");
+        let alice = rig.booth("Alice", 0, LINK_TIMEOUT);
+        let bob = rig.booth("Bob", 0, LINK_TIMEOUT);
+        alice.lock().max_upload_bytes_s = 300_000.0;
+        let port = host(&alice, 0, "TWO123").unwrap();
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        join(&bob, &addr.to_string(), "TWO123", false).unwrap();
+        // Offered, so Alice will send it, but not downloading yet.
+        let wav = tone(&rig.root.join("a"), "A.wav", 5.0, 440.0);
+        let id = id_of(&wav);
+        alice.lock().offer_share("Two".into(), vec![wav]);
+        wait_for("the offer", Duration::from_secs(10), || {
+            !bob.lock().view().incoming.is_empty()
+        });
+        let (me, host_id, part) = {
+            let b = bob.lock();
+            (b.me.clone(), alice.lock().me.id, b.part_path(id))
+        };
+        let get = |to: &str| {
+            let (h, me) = (bob.clone(), me.clone());
+            let landing = Landing::At(rig.root.join(to));
+            thread::spawn(move || {
+                crate::files::fetch(&h, addr, "TWO123", &me, false, host_id, id, &landing)
+            })
+        };
+        let first = get("first.wav");
+        wait_for("the first to get going", Duration::from_secs(10), || {
+            std::fs::metadata(&part).is_ok_and(|m| m.len() > 200_000)
+        });
+        let second = get("second.wav");
+        let first = first.join().unwrap();
+        assert!(crate::files::was_stopped(&first), "{first:?}");
+        let got = second.join().unwrap().unwrap();
+        assert_eq!(id_of(&got), id);
+        assert!(download(&bob, id).unwrap().from > 200_000);
+        assert!(!rig.root.join("first.wav").exists());
+        bob.lock().leave();
         alice.lock().leave();
     }
 

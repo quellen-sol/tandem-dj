@@ -147,21 +147,39 @@ pub enum Msg {
     // --- files connection
     FileGet {
         id: TrackId,
+        /// Send from this byte on: the asker already has the file up to
+        /// here, from a transfer that was cut off. 0 from booths older than
+        /// this field.
+        #[serde(default)]
+        offset: u64,
     },
     FilePut {
         id: TrackId,
         size: u64,
         file_name: String,
+        /// The uploader can start part-way, from the `offset` in the host's
+        /// `FileOk`. False from booths older than this field, which always
+        /// send it all.
+        #[serde(default)]
+        resume: bool,
     },
     FileHeader {
         id: TrackId,
         size: u64,
         file_name: String,
+        /// Where the bytes that follow start: the `FileGet`'s offset, or 0
+        /// (the whole file, as from booths older than this field).
+        #[serde(default)]
+        offset: u64,
     },
     /// Payload carries the bytes.
     Chunk,
     End,
-    FileOk,
+    FileOk {
+        /// In answer to a `FilePut` with `resume`: send from this byte on.
+        #[serde(default)]
+        offset: u64,
+    },
     FileError {
         reason: String,
     },
@@ -214,6 +232,86 @@ fn read_u32<R: Read>(r: &mut R) -> io::Result<u32> {
 mod tests {
     use super::*;
     use crate::model::Action;
+
+    /// Booths from before transfers could carry on still share a room:
+    /// what they send reads as starting from byte 0, and what's sent to them
+    /// reads as it always did (so they send, and get, whole files).
+    #[test]
+    fn file_messages_work_with_booths_from_before_resuming() {
+        /// The file messages as v0.11.6 has them.
+        #[allow(clippy::enum_variant_names)]
+        #[derive(Debug, Serialize, Deserialize)]
+        #[serde(tag = "msg")]
+        enum OldMsg {
+            FileGet {
+                id: TrackId,
+            },
+            FilePut {
+                id: TrackId,
+                size: u64,
+                file_name: String,
+            },
+            FileHeader {
+                id: TrackId,
+                size: u64,
+                file_name: String,
+            },
+            FileOk,
+        }
+        let id = TrackId([3; 32]);
+        let name = "a.mp3".to_string();
+        let to_new = |m: OldMsg| -> Msg {
+            serde_json::from_slice(&serde_json::to_vec(&m).unwrap()).unwrap()
+        };
+        assert!(matches!(
+            to_new(OldMsg::FileGet { id }),
+            Msg::FileGet { offset: 0, .. }
+        ));
+        assert!(matches!(
+            to_new(OldMsg::FilePut {
+                id,
+                size: 9,
+                file_name: name.clone()
+            }),
+            Msg::FilePut { resume: false, .. }
+        ));
+        assert!(matches!(
+            to_new(OldMsg::FileHeader {
+                id,
+                size: 9,
+                file_name: name.clone()
+            }),
+            Msg::FileHeader { offset: 0, .. }
+        ));
+        assert!(matches!(to_new(OldMsg::FileOk), Msg::FileOk { offset: 0 }));
+
+        let to_old = |m: Msg| -> OldMsg {
+            serde_json::from_slice(&serde_json::to_vec(&m).unwrap()).unwrap()
+        };
+        assert!(matches!(
+            to_old(Msg::FileGet { id, offset: 5 }),
+            OldMsg::FileGet { .. }
+        ));
+        assert!(matches!(
+            to_old(Msg::FilePut {
+                id,
+                size: 9,
+                file_name: name.clone(),
+                resume: true
+            }),
+            OldMsg::FilePut { size: 9, .. }
+        ));
+        assert!(matches!(
+            to_old(Msg::FileHeader {
+                id,
+                size: 9,
+                file_name: name,
+                offset: 0
+            }),
+            OldMsg::FileHeader { size: 9, .. }
+        ));
+        assert!(matches!(to_old(Msg::FileOk { offset: 0 }), OldMsg::FileOk));
+    }
 
     #[test]
     fn frame_roundtrip() {

@@ -9,7 +9,8 @@
 use crate::analysis;
 use crate::audio::{decode_file, TrackAudio};
 use crate::clock::ClockEstimator;
-use crate::config::{sanitize_file_name, unique_path, Paths};
+use crate::config::{sanitize_file_name, Paths};
+use crate::files::{Landing, Running};
 use crate::grid::BeatGrid;
 use crate::library::{self, Library};
 use crate::meter::LevelMeters;
@@ -76,10 +77,31 @@ pub enum Purpose {
     Share { share_id: u64, dir: PathBuf },
 }
 
+/// A download this booth has started.
+struct Fetch {
+    purpose: Purpose,
+    /// Tells this try apart from an earlier one of the same track, whose
+    /// thread may still be finishing. 0 for one that hasn't started.
+    serial: u64,
+}
+
+/// Host: an upload from the joining DJ that this booth asked for.
+pub struct Expected {
+    /// The download it's for (see `Fetch::serial`).
+    pub serial: u64,
+    /// The track's `.part` file.
+    pub part: PathBuf,
+    /// Where it goes once it checks out.
+    pub landing: Landing,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum TransferState {
     Queued,
     Active,
+    /// The link dropped part-way: it carries on from here when the same
+    /// booth is back.
+    Paused,
     Done,
     Failed(String),
 }
@@ -91,6 +113,9 @@ pub struct Transfer {
     pub upload: bool,
     pub done: u64,
     pub total: u64,
+    /// Where this try started: past 0 when it carried on from where an
+    /// earlier one was cut off.
+    pub from: u64,
     pub state: TransferState,
     pub updated: Instant,
 }
@@ -270,6 +295,8 @@ pub struct ShareView {
     pub received: usize,
     pub already_had: usize,
     pub failed: usize,
+    /// Tracks of it the link dropped under, waiting to carry on.
+    pub paused: usize,
     pub dir: PathBuf,
 }
 
@@ -346,7 +373,15 @@ pub struct Session {
     loading: [Option<String>; DECKS],
     servable: HashMap<TrackId, PathBuf>,
     fetch_queue: VecDeque<(TrackId, Purpose)>,
-    active_fetch: HashMap<TrackId, Purpose>,
+    active_fetch: HashMap<TrackId, Fetch>,
+    /// Downloads a dropped link cut off. They carry on from where they got
+    /// to when the booth they come from (`paused_from`) is back.
+    paused: Vec<(TrackId, Fetch)>,
+    paused_from: u64,
+    paused_since: Instant,
+    fetch_serial: u64,
+    /// Every transfer running in this booth (see [`crate::files`]).
+    running: Arc<Running>,
     transfers: Vec<Transfer>,
     pub local: LocalParams,
     snapshot: Arc<ArcSwap<AudioSnapshot>>,
@@ -406,6 +441,10 @@ const MAX_CONCURRENT_FETCHES: usize = 2;
 /// the event is only briefly in the future.
 const RELOCK_HORIZON_US: i64 = 300_000;
 const TRANSFER_STALL: Duration = Duration::from_secs(45);
+/// How long a download the network cut off waits before carrying on while
+/// the link looks fine. When the link is dropping as well, it notices
+/// within this, and the download waits for it to be back instead.
+const RESUME_AFTER: Duration = Duration::from_secs(1);
 /// How long a client waits before asking the host again for a track it
 /// couldn't download.
 const FETCH_RETRY: Duration = Duration::from_secs(5);
@@ -440,6 +479,11 @@ impl Session {
                 servable: HashMap::new(),
                 fetch_queue: VecDeque::new(),
                 active_fetch: HashMap::new(),
+                paused: Vec::new(),
+                paused_from: 0,
+                paused_since: Instant::now(),
+                fetch_serial: 0,
+                running: Arc::default(),
                 transfers: Vec::new(),
                 local: LocalParams::default(),
                 snapshot,
@@ -893,7 +937,21 @@ impl Session {
             Ok(a) => {
                 self.tracks
                     .insert(id, TrackSlot::new(TrackStatus::Ready, Some(Arc::new(a))));
-                log::info!("Ready: {name}");
+                // A deck that played on while it waited comes in where the room is.
+                let now = self.now();
+                let room = self.timeline.state_at(now);
+                let playing = (0..DECKS).find(|&d| {
+                    let st = &room.decks[d];
+                    st.track == Some(id) && st.playing && st.position_at(now) < st.duration
+                });
+                match playing {
+                    Some(d) => log::info!(
+                        "Ready: {name}; deck {} comes in playing, at {:.3} s",
+                        deck_letter(d),
+                        room.decks[d].position_at(now)
+                    ),
+                    None => log::info!("Ready: {name}"),
+                }
                 self.publish();
             }
             Err(e) => {
@@ -908,6 +966,19 @@ impl Session {
     /// The one limit every upload from this booth shares.
     pub fn upload_pacer(&self) -> Arc<crate::files::UploadPacer> {
         self.upload_pacer.clone()
+    }
+
+    /// Every transfer running in this booth.
+    pub fn running(&self) -> Arc<Running> {
+        self.running.clone()
+    }
+
+    /// Where a download of this track keeps what has arrived so far. It's
+    /// named after the track's hash, so any later download of the same
+    /// track this session (after the link drops, or a rejoin by hand)
+    /// carries on from it.
+    pub fn part_path(&self, id: TrackId) -> PathBuf {
+        self.paths.cache_dir.join(format!("{}.part", id.to_hex()))
     }
 
     pub fn servable_path(&self, id: TrackId) -> Option<PathBuf> {
@@ -944,7 +1015,14 @@ impl Session {
             .map(|m| m.file_name.clone())
             .unwrap_or_else(|| id.short());
         let total = self.track_meta.get(&id).map(|m| m.size).unwrap_or(0);
-        self.transfer_set(id, false, &name, 0, total, TransferState::Queued);
+        // One the link cut off shows where it will carry on from.
+        let done = self
+            .transfers
+            .iter()
+            .find(|t| t.id == id && !t.upload && t.state == TransferState::Paused)
+            .map(|t| t.done)
+            .unwrap_or(0);
+        self.transfer_set(id, false, &name, done, total, TransferState::Queued);
         match purpose {
             Purpose::Session => self.fetch_queue.push_front((id, purpose)),
             Purpose::Share { .. } => self.fetch_queue.push_back((id, purpose)),
@@ -957,12 +1035,14 @@ impl Session {
             let Some((id, purpose)) = self.fetch_queue.pop_front() else {
                 break;
             };
-            if self.peer.is_none() {
+            let Some(peer) = self.peer.as_ref().map(|p| p.info.id) else {
                 self.finish_fetch(id, purpose, Err("not connected".into()));
                 continue;
-            }
-            let dest = self.dest_for(id, &purpose);
-            self.active_fetch.insert(id, purpose);
+            };
+            let landing = self.landing(id, &purpose);
+            self.fetch_serial += 1;
+            let serial = self.fetch_serial;
+            self.active_fetch.insert(id, Fetch { purpose, serial });
             self.transfer_state(id, false, TransferState::Active);
             match &self.role {
                 Role::Client {
@@ -979,11 +1059,20 @@ impl Session {
                     );
                     std::thread::spawn(move || {
                         let Some(h) = weak.upgrade() else { return };
-                        let res = crate::files::fetch(&h, addr, &room, &me, bc, id, &dest);
-                        h.lock().on_file_received(
-                            id,
-                            res.map(|_| dest).map_err(|e| crate::files::describe(&e)),
-                        );
+                        let res = crate::files::fetch(&h, addr, &room, &me, bc, peer, id, &landing);
+                        match res {
+                            // Its link dropped (it's paused) or a newer try
+                            // took over.
+                            Err(_) if crate::files::was_stopped(&res) => {}
+                            Err(e) if crate::files::interrupted(&e) => {
+                                h.lock().fetch_interrupted(id, serial)
+                            }
+                            res => h.lock().file_received(
+                                id,
+                                serial,
+                                res.map_err(|e| crate::files::describe(&e)),
+                            ),
+                        }
                     });
                 }
                 Role::Host { .. } => self.send(Msg::PushRequest { id }),
@@ -992,7 +1081,9 @@ impl Session {
         }
     }
 
-    fn dest_for(&self, id: TrackId, purpose: &Purpose) -> PathBuf {
+    /// Where a downloaded track goes once it checks out: a session copy in
+    /// the cache, or a new file in the share's folder.
+    fn landing(&self, id: TrackId, purpose: &Purpose) -> Landing {
         let name = self
             .track_meta
             .get(&id)
@@ -1000,23 +1091,157 @@ impl Session {
             .unwrap_or_else(|| format!("{}.bin", id.short()));
         let name = sanitize_file_name(&name);
         match purpose {
-            Purpose::Session => self.paths.cache_dir.join(format!("{}-{name}", id.short())),
-            Purpose::Share { dir, .. } => unique_path(dir.join(name)),
+            Purpose::Session => {
+                Landing::At(self.paths.cache_dir.join(format!("{}-{name}", id.short())))
+            }
+            Purpose::Share { dir, .. } => Landing::NewIn(dir.clone(), name),
         }
     }
 
-    /// Host side of an upload from the client: where should it go?
-    pub fn accept_push(&mut self, id: TrackId) -> Option<PathBuf> {
-        let purpose = self.active_fetch.get(&id)?.clone();
-        Some(self.dest_for(id, &purpose))
+    /// Host side of an upload from the client: is it one this booth asked
+    /// for, and where does it go?
+    pub fn accept_push(&mut self, id: TrackId) -> Option<Expected> {
+        let f = self.active_fetch.get(&id)?;
+        Some(Expected {
+            serial: f.serial,
+            part: self.part_path(id),
+            landing: self.landing(id, &f.purpose),
+        })
     }
 
-    pub fn on_file_received(&mut self, id: TrackId, res: Result<PathBuf, String>) {
-        let Some(purpose) = self.active_fetch.remove(&id) else {
+    /// Host: the joining DJ's upload of a track carried on from a partial
+    /// file that didn't check out. That file is cleared now, so ask for the
+    /// whole track again.
+    pub fn push_again(&mut self, id: TrackId, serial: u64) {
+        if self
+            .active_fetch
+            .get(&id)
+            .is_some_and(|f| f.serial == serial)
+        {
+            self.send(Msg::PushRequest { id });
+        }
+    }
+
+    /// Download `serial` of a track ended. A try that's no longer the
+    /// current one is ignored, except a finished one the link cut off.
+    pub fn file_received(&mut self, id: TrackId, serial: u64, res: Result<PathBuf, String>) {
+        if self
+            .active_fetch
+            .get(&id)
+            .is_some_and(|f| f.serial == serial)
+        {
+            if let Some(f) = self.active_fetch.remove(&id) {
+                self.finish_fetch(id, f.purpose, res);
+            }
+            self.pump_fetches();
+        } else if res.is_ok() {
+            // It got all of it just as the link dropped.
+            if let Some(i) = self
+                .paused
+                .iter()
+                .position(|(i, f)| *i == id && f.serial == serial)
+            {
+                let (_, f) = self.paused.remove(i);
+                self.finish_fetch(id, f.purpose, res);
+            }
+        }
+    }
+
+    /// Download `serial` of a track was cut off by the network. Often the
+    /// link is dropping too, and its own end comes a moment later, so it
+    /// waits with the paused ones: it carries on when the link is back, or
+    /// in a moment if the link is fine.
+    pub fn fetch_interrupted(&mut self, id: TrackId, serial: u64) {
+        let Some(peer) = self.peer.as_ref().map(|p| p.info.id) else {
             return;
         };
-        self.finish_fetch(id, purpose, res);
+        if !self
+            .active_fetch
+            .get(&id)
+            .is_some_and(|f| f.serial == serial)
+        {
+            return;
+        }
+        if let Some(f) = self.active_fetch.remove(&id) {
+            self.pause(peer, vec![(id, f)]);
+        }
         self.pump_fetches();
+    }
+
+    /// The current download of a track failed (the partner hasn't got it,
+    /// or it stalled).
+    fn fetch_failed(&mut self, id: TrackId, why: &str) {
+        if let Some(f) = self.active_fetch.remove(&id) {
+            self.finish_fetch(id, f.purpose, Err(why.into()));
+            self.pump_fetches();
+        }
+    }
+
+    /// The link dropped: the downloads through it stop where they are, and
+    /// carry on from there when booth `from` is back.
+    fn pause_fetches(&mut self, from: u64) {
+        let cut: Vec<(TrackId, Fetch)> = self
+            .active_fetch
+            .drain()
+            .chain(
+                self.fetch_queue
+                    .drain(..)
+                    .map(|(id, purpose)| (id, Fetch { purpose, serial: 0 })),
+            )
+            .collect();
+        self.pause(from, cut);
+    }
+
+    /// Hold these downloads from booth `from` where they got to.
+    fn pause(&mut self, from: u64, cut: Vec<(TrackId, Fetch)>) {
+        if self.paused_from != from {
+            self.fail_paused("connection lost");
+        }
+        self.paused_from = from;
+        self.paused_since = Instant::now();
+        for (id, f) in cut {
+            if let Some(t) = self.transfers.iter_mut().find(|t| t.id == id && !t.upload) {
+                if t.total > 0 && t.done > 0 {
+                    log::info!(
+                        "Paused the download of {} at byte {} of {} ({:.0}%) until the link is back",
+                        t.name,
+                        t.done,
+                        t.total,
+                        t.done as f64 * 100.0 / t.total as f64
+                    );
+                }
+                t.state = TransferState::Paused;
+                t.updated = Instant::now();
+            }
+            self.paused.push((id, f));
+        }
+    }
+
+    /// Booth `peer` is linked again: carry on with the downloads from it
+    /// that a dropped link cut off. Any from another booth have failed.
+    fn resume_fetches(&mut self, peer: u64) {
+        if self.paused.is_empty() {
+            return;
+        }
+        if peer != self.paused_from {
+            self.fail_paused("connection lost");
+            return;
+        }
+        let paused = std::mem::take(&mut self.paused);
+        log::info!(
+            "Carrying on with {} download{} from where the link dropped",
+            paused.len(),
+            if paused.len() == 1 { "" } else { "s" }
+        );
+        for (id, f) in paused {
+            self.request_fetch(id, f.purpose);
+        }
+    }
+
+    fn fail_paused(&mut self, why: &str) {
+        for (id, f) in std::mem::take(&mut self.paused) {
+            self.finish_fetch(id, f.purpose, Err(why.into()));
+        }
     }
 
     fn finish_fetch(&mut self, id: TrackId, purpose: Purpose, res: Result<PathBuf, String>) {
@@ -1088,6 +1313,7 @@ impl Session {
         }
     }
 
+    /// Start (or restart) a transfer's entry, at `done` of `total` bytes.
     pub fn transfer_set(
         &mut self,
         id: TrackId,
@@ -1106,6 +1332,7 @@ impl Session {
             Some(t) => {
                 t.done = done;
                 t.total = total;
+                t.from = done;
                 t.state = state;
                 t.updated = now;
             }
@@ -1115,6 +1342,7 @@ impl Session {
                 upload,
                 done,
                 total,
+                from: done,
                 state,
                 updated: now,
             }),
@@ -1388,13 +1616,16 @@ impl Session {
         let same = |pid: u64, pkey: u64| pid == id && pkey == key;
         let mut found = false;
         if self.peer.as_ref().is_some_and(|p| same(p.info.id, p.key)) {
-            self.unlink("connection replaced");
+            // Its downloads here carry on over the new link.
+            self.unlink("connection replaced", true);
             found = true;
         }
+        let running = self.running.clone();
         self.broadcasters.retain(|b| {
             let old = same(b.info.id, b.key);
             if old {
                 b.conn.close();
+                running.stop_with(b.info.id);
                 found = true;
             }
             !old
@@ -1417,6 +1648,7 @@ impl Session {
         }
         self.next_serial += 1;
         let serial = self.next_serial;
+        let info_id = info.id;
         self.peer = Some(Peer {
             conn,
             info,
@@ -1428,8 +1660,10 @@ impl Session {
         self.in_sync = None;
         self.last_digest = Instant::now();
         self.announce_members();
-        // Ask again for tracks on a deck that didn't arrive from them before
-        // (a rejoin is where interrupted uploads to here would resume).
+        // Uploads from them the dropped link cut off carry on from where
+        // they got to, and tracks on a deck that didn't arrive from them
+        // before are asked for again.
+        self.resume_fetches(info_id);
         self.ensure_room_tracks();
         serial
     }
@@ -1532,6 +1766,7 @@ impl Session {
         self.late.clear();
         self.next_serial += 1;
         let serial = self.next_serial;
+        let host_id = host.id;
         self.peer = Some(Peer {
             conn,
             info: host,
@@ -1548,7 +1783,9 @@ impl Session {
         for t in tracks {
             self.track_meta.insert(t.id, t);
         }
-        // After a rejoin, this is where interrupted downloads start again.
+        // Downloads the dropped link cut off carry on from where they got
+        // to; tracks on the decks this booth hasn't got are fetched.
+        self.resume_fetches(host_id);
         self.ensure_room_tracks();
         self.publish();
         serial
@@ -1608,6 +1845,7 @@ impl Session {
         if let Some(i) = self.broadcasters.iter().position(|b| b.serial == serial) {
             let b = self.broadcasters.remove(i);
             b.conn.close();
+            self.running.stop_with(b.info.id);
             match end {
                 LinkEnd::Bye => log::info!("{} stopped broadcasting", b.info.name),
                 LinkEnd::Lost(why) => log::info!(
@@ -1633,7 +1871,7 @@ impl Session {
                     "Lost the link to {}'s room ({why}). Reconnecting…",
                     info.name
                 );
-                self.unlink("connection lost");
+                self.unlink("connection lost", true);
                 self.rejoin_gen += 1;
                 self.rejoin = Some(Rejoin {
                     host: info,
@@ -1654,34 +1892,51 @@ impl Session {
                     key,
                     since: Instant::now(),
                 });
+                self.unlink("connection lost", true);
+                return None;
             }
-            LinkEnd::Lost(why) => log::warn!(
-                "Lost the link to {} ({why}). You can keep playing.",
-                info.name
-            ),
+            LinkEnd::Lost(why) => {
+                log::warn!(
+                    "Lost the link to {} ({why}). You can keep playing.",
+                    info.name
+                );
+                self.unlink("connection lost", false);
+                return None;
+            }
         }
-        self.unlink("partner left");
+        self.unlink("partner left", false);
         self.end_client();
         None
     }
 
     /// Forget the link to the other DJ (or, on a client, the host), however
-    /// it ended: transfers through it fail.
-    fn unlink(&mut self, why: &str) {
-        if let Some(p) = self.peer.take() {
+    /// it ended. Transfers with that booth stop. With `pause` (the link was
+    /// lost, and the booth may be back) downloads from it carry on from
+    /// where they got to when it is; otherwise they fail.
+    fn unlink(&mut self, why: &str, pause: bool) {
+        let peer = self.peer.take();
+        if let Some(p) = &peer {
             p.conn.close();
+            self.running.stop_with(p.info.id);
         }
         self.in_sync = None;
         self.late_from = i64::MAX;
         self.late.clear();
         self.announce_members();
-        let pending: Vec<(TrackId, Purpose)> = self
-            .active_fetch
-            .drain()
-            .chain(self.fetch_queue.drain(..))
-            .collect();
-        for (id, purpose) in pending {
-            self.finish_fetch(id, purpose, Err(why.into()));
+        match peer {
+            Some(p) if pause => self.pause_fetches(p.info.id),
+            _ => {
+                let pending: Vec<(TrackId, Purpose)> = self
+                    .active_fetch
+                    .drain()
+                    .map(|(id, f)| (id, f.purpose))
+                    .chain(self.fetch_queue.drain(..))
+                    .collect();
+                for (id, purpose) in pending {
+                    self.finish_fetch(id, purpose, Err(why.into()));
+                }
+                self.fail_paused(why);
+            }
         }
         for t in self
             .transfers
@@ -1770,8 +2025,9 @@ impl Session {
         }
         for b in self.broadcasters.drain(..) {
             b.conn.close();
+            self.running.stop_with(b.info.id);
         }
-        self.unlink("partner left");
+        self.unlink("partner left", false);
         self.awaiting = None;
         if let Role::Host { stop, .. } = &self.role {
             stop.store(true, Ordering::Relaxed);
@@ -1875,9 +2131,7 @@ impl Session {
                 }
             }
             Msg::PushRequest { id } => self.start_push(id),
-            Msg::NoFile { id } => {
-                self.on_file_received(id, Err("partner doesn't have that file".into()))
-            }
+            Msg::NoFile { id } => self.fetch_failed(id, "partner doesn't have that file"),
             Msg::Bye => {}
             other => log::debug!("ignoring unexpected control message {other:?}"),
         }
@@ -1912,16 +2166,18 @@ impl Session {
 
     /// Client: the host asked for one of our files.
     fn start_push(&mut self, id: TrackId) {
-        let (Some(path), Role::Client { addr, room, .. }) =
-            (self.servable.get(&id).cloned(), &self.role)
-        else {
+        let (Some(path), Role::Client { addr, room, .. }, Some(host)) = (
+            self.servable.get(&id).cloned(),
+            &self.role,
+            self.peer.as_ref().map(|p| p.info.id),
+        ) else {
             self.send(Msg::NoFile { id });
             return;
         };
         let (addr, room, me, weak) = (*addr, room.clone(), self.me.clone(), self.weak.clone());
         std::thread::spawn(move || {
             let Some(h) = weak.upgrade() else { return };
-            if let Err(e) = crate::files::push(&h, addr, &room, &me, id, &path) {
+            if let Err(e) = crate::files::push(&h, addr, &room, &me, host, id, &path) {
                 log::warn!("Upload failed: {}", crate::files::describe(&e));
                 h.lock().transfer_state(
                     id,
@@ -1964,7 +2220,28 @@ impl Session {
             .map(|t| t.id)
             .collect();
         for id in stalled {
-            self.on_file_received(id, Err("transfer stalled".into()));
+            self.fetch_failed(id, "transfer stalled");
+        }
+        // Downloads a dropped link cut off fail once nobody is coming back:
+        // this booth gave up getting back in, or the host stopped waiting.
+        let coming_back = self.rejoin.is_some()
+            || self
+                .awaiting
+                .as_ref()
+                .is_some_and(|a| a.since.elapsed() < self.rejoin_for + self.link_timeout);
+        if !self.paused.is_empty() && self.peer.is_none() && !coming_back {
+            self.fail_paused("connection lost");
+        }
+        // A download cut off while the link stayed up carries on.
+        let linked = self
+            .peer
+            .as_ref()
+            .map(|p| p.info.id)
+            .filter(|&id| id == self.paused_from);
+        if let Some(id) = linked {
+            if !self.paused.is_empty() && self.paused_since.elapsed() >= RESUME_AFTER {
+                self.resume_fetches(id);
+            }
         }
         self.transfers.retain(|t| {
             !matches!(t.state, TransferState::Done) || t.updated.elapsed() < Duration::from_secs(20)
@@ -2192,6 +2469,14 @@ impl Session {
                     received: s.received,
                     already_had: s.already_had,
                     failed: s.failed,
+                    paused: self
+                        .paused
+                        .iter()
+                        .filter(|(_, f)| {
+                            matches!(f.purpose, Purpose::Share { share_id, .. }
+                                if share_id == s.offer.share_id)
+                        })
+                        .count(),
                     dir: s.dir.clone(),
                 })
                 .collect(),

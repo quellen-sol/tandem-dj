@@ -1678,6 +1678,119 @@ mod tests {
         }
     }
 
+    /// A track that arrives while its deck is playing (downloaded late, or
+    /// after the link dropped) comes in where the room is, as if it had been
+    /// there all along: on the live lane and on the broadcast lane, half a
+    /// second behind. From a moment after it arrives (once the mixer's
+    /// filters, which had silence, settle) it plays what a lane that had the
+    /// track from the start plays, to within the model's microsecond. Key
+    /// lock can't match sample for sample, since the stretcher's output
+    /// depends on where it started, so there it's the timing: within a
+    /// millisecond of the same track without key lock.
+    #[test]
+    fn a_track_that_arrives_late_comes_in_where_the_room_is() {
+        let a = track();
+        let block = 480; // 10 ms
+        let arrives = 150; // 1.5 s into the track
+                           // The left channel from 0.2 s after the track arrives to 3 s.
+        let play = |kind: LaneKind, delay: i64, key_lock: bool, tempo: f64, arrives: usize| {
+            let mut tl = Timeline::new(-1_000_000);
+            for (seq, action) in [
+                Action::Load {
+                    deck: 0,
+                    track: a.id,
+                    duration: a.duration(),
+                    cue: 0.0,
+                    grid: None,
+                    key: -1,
+                },
+                Action::Crossfader { v: 0.0 },
+                Action::KeyLock {
+                    deck: 0,
+                    on: key_lock,
+                },
+                Action::Tempo { deck: 0, tempo },
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                tl.insert(Event {
+                    time: -1_000_000,
+                    origin: 1,
+                    seq: seq as u64 + 1,
+                    action,
+                });
+            }
+            tl.insert(Event {
+                time: 0,
+                origin: 1,
+                seq: 9,
+                action: Action::Play { deck: 0 },
+            });
+            let with = snap_with(tl.clone(), a.clone());
+            let without = AudioSnapshot {
+                timeline: tl,
+                tracks: Vec::new(),
+                local: LocalParams::default(),
+            };
+            let mut lane = Lane::new(48_000.0, delay, kind);
+            let (mut m, mut c) = (vec![0.0; block * 2], vec![0.0; block * 2]);
+            let mut out: Vec<f32> = Vec::new();
+            for k in 0..300 {
+                let snap = if k < arrives { &without } else { &with };
+                lane.render(snap, k as i64 * 10_000 + delay, &mut m, &mut c);
+                if k < arrives {
+                    assert!(m.iter().all(|v| *v == 0.0), "sound before the track");
+                } else if k == arrives && arrives > 0 {
+                    // It comes in straight away, after a 2 ms fade-in.
+                    assert!(
+                        m[200..].iter().any(|v| v.abs() > 0.01),
+                        "{kind:?}, key lock {key_lock}: silent after the track arrived"
+                    );
+                }
+                if k >= 170 {
+                    out.extend(m.iter().step_by(2));
+                }
+            }
+            out
+        };
+        // How many samples `x` lags `r`, and how well they match then.
+        let lag = |r: &[f32], x: &[f32]| {
+            let span = 2000..x.len() - 2000;
+            let corr = |lag: i64| -> f64 {
+                span.clone()
+                    .map(|i| r[(i as i64 + lag) as usize] as f64 * x[i] as f64)
+                    .sum()
+            };
+            let best = (-300..=300)
+                .max_by(|a, b| corr(*a).total_cmp(&corr(*b)))
+                .unwrap();
+            let energy: f64 = span.clone().map(|i| (x[i] as f64).powi(2)).sum();
+            (best, corr(best) / energy)
+        };
+        for (kind, delay) in [(LaneKind::Live, 0), (LaneKind::Broadcast, 500_000)] {
+            let along = play(kind, delay, false, 1.04, 0);
+            let late = play(kind, delay, false, 1.04, arrives);
+            let worst = along
+                .iter()
+                .zip(&late)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max);
+            // A microsecond is 0.05 frames, at most about 1e-3 here.
+            assert!(worst < 1e-3, "{kind:?}: off by up to {worst}");
+
+            let vinyl = play(kind, delay, false, 1.0, 0);
+            let locked = play(kind, delay, true, 1.0, arrives);
+            let (off, fit) = lag(&vinyl, &locked);
+            assert!(fit > 0.6, "{kind:?}, key lock: doesn't match ({fit})");
+            assert!(
+                off.abs() <= 48,
+                "{kind:?}, key lock: {off} samples out ({:.2} ms)",
+                off as f64 / 48.0
+            );
+        }
+    }
+
     #[test]
     fn key_lock_keeps_pitch() {
         let frames: Vec<[i16; 2]> = (0..44_100 * 4)

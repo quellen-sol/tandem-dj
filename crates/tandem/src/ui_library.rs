@@ -142,21 +142,31 @@ impl TandemApp {
                 if r.clicked() {
                     pick = Some(Source::Room);
                 }
-                let receiving = view
+                let receiving: Vec<_> = view
                     .incoming
                     .iter()
                     .filter(|s| {
                         s.state == ShareState::Accepted
                             && s.received + s.already_had + s.failed < s.tracks.len()
                     })
-                    .count();
-                let shared_label = if receiving > 0 {
-                    format!("⬇ Shared with me (receiving {receiving})")
-                } else {
-                    "⬇ Shared with me".to_string()
+                    .collect();
+                // Every track still to come is waiting for the link.
+                let paused = !receiving.is_empty()
+                    && receiving.iter().all(|s| {
+                        s.received + s.already_had + s.failed + s.paused == s.tracks.len()
+                    });
+                let shared_label = match receiving.len() {
+                    0 => "⬇ Shared with me".to_string(),
+                    n if paused => format!("⬇ Shared with me (receiving {n}, paused)"),
+                    n => format!("⬇ Shared with me (receiving {n})"),
                 };
                 let on = self.ui.source == Source::Shared;
-                let r = ui.selectable_label(on, shared_label);
+                let mut r = ui.selectable_label(on, shared_label);
+                if paused {
+                    r = r.on_hover_text(
+                        "The connection dropped. The downloads carry on from where they got to when it's back.",
+                    );
+                }
                 follow(&r, on && knob);
                 if r.clicked() {
                     pick = Some(Source::Shared);
@@ -245,9 +255,19 @@ impl TandemApp {
                         } else {
                             0.0
                         };
+                        let pct = |b: u64| format!("{:.0}%", b as f64 * 100.0 / t.total.max(1) as f64);
                         let text = match &t.state {
+                            TransferState::Queued if t.done > 0 => {
+                                format!("{arrow} {} (resuming at {})", t.name, pct(t.done))
+                            }
                             TransferState::Queued => format!("{arrow} {} (queued)", t.name),
+                            TransferState::Active if t.from > 0 => {
+                                format!("{arrow} {} (resumed at {})", t.name, pct(t.from))
+                            }
                             TransferState::Active => format!("{arrow} {}", t.name),
+                            TransferState::Paused => {
+                                format!("{arrow} {} (paused until the link is back)", t.name)
+                            }
                             TransferState::Done => format!("{arrow} {} ✔", t.name),
                             TransferState::Failed(e) => format!("{arrow} {} failed: {e}", t.name),
                         };
