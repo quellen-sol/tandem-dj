@@ -83,6 +83,7 @@ fn run(root: &std::path::Path, say: &mut dyn FnMut(&str)) -> anyhow::Result<()> 
     let addr = format!("127.0.0.1:{port}");
     say(&format!("host listening on {addr}"));
     crate::net::join(&bob, &addr, "test42", false)?;
+    let joined = Instant::now();
     let skew = {
         let (a, b) = (alice.lock().clock(), bob.lock().clock());
         (b.now() - a.now()).abs()
@@ -251,6 +252,20 @@ fn run(root: &std::path::Path, say: &mut dyn FnMut(&str)) -> anyhow::Result<()> 
     ensure!(da == db, "room state differs between booths");
     ensure!(da == dc, "room state differs on the broadcaster");
     say("room state identical on all three booths");
+
+    // Pings keep each end's "last heard" fresh, so a stalled link stands out.
+    let settle = Duration::from_millis(2_500);
+    if joined.elapsed() < settle {
+        std::thread::sleep(settle - joined.elapsed());
+    }
+    for (who, h) in [("Alice", &alice), ("Bob", &bob), ("Carol", &carol)] {
+        let quiet = h.lock().view().link.quiet_for;
+        ensure!(
+            matches!(quiet, Some(q) if q < Duration::from_secs(2)),
+            "{who} hasn't heard from the other end lately: {quiet:?}"
+        );
+    }
+    say("each end keeps hearing the other (pings keep the link fresh)");
     let late = carol.lock().view().link.late_us;
     match late {
         Some(us) if us < 250_000 => say(&format!(

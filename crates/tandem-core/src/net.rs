@@ -72,6 +72,13 @@ impl PeerConn {
 /// How many booths can join a room as broadcasters, besides the two DJs.
 pub const MAX_BROADCASTERS: usize = 4;
 
+/// A control link that hears nothing for this long is dropped.
+pub const LINK_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// After this long without a Ping or Pong, the link has stalled and the last
+/// round trip is out of date (Pings run about once a second).
+pub const LINK_QUIET: Duration = Duration::from_secs(3);
+
 pub fn random_room_code() -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
     (0..6)
@@ -194,14 +201,14 @@ fn host_control(
         };
         (ses.clock(), reply, serial)
     };
-    s.set_read_timeout(Some(Duration::from_secs(15)))?;
+    s.set_read_timeout(Some(LINK_TIMEOUT))?;
     let result = loop {
         match read_msg(&mut s) {
             Ok((Msg::Ping { id, t1, rtt }, _)) => {
                 let remote = clock.now();
                 let _ = reply.send(Msg::Pong { id, t1, remote });
-                if let (Some(r), None) = (rtt, serial) {
-                    h.lock().set_peer_rtt(r);
+                if serial.is_none() {
+                    h.lock().on_peer_ping(rtt);
                 }
             }
             Ok((Msg::Bye, _)) => break Ok(()),
@@ -368,7 +375,7 @@ pub fn join(
     }
 
     // Reader.
-    s.set_read_timeout(Some(Duration::from_secs(15)))?;
+    s.set_read_timeout(Some(LINK_TIMEOUT))?;
     let (h2, clock2) = (h.clone(), clock.clone());
     let mut reader = s.try_clone()?;
     thread::Builder::new()

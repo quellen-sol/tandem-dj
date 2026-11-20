@@ -133,7 +133,7 @@ The room has one curve, like the curve switch on a club mixer, so changing it ch
 1. **Get connected.** The easiest way is for both of you to install [Tailscale](https://tailscale.com) (free) and sign in. You'll each get a `100.x.y.z` address that works from anywhere. Without it, the host has to forward TCP port 47800 on their router.
 2. **Host.** One of you clicks **Host a room**, then sends the other one of the listed addresses and the room code. Click **Allow** if Windows Firewall asks.
 3. **Join.** The other clicks **Join a room**, enters the address and code, and joins.
-4. **Check the connection.** The top bar shows your partner, the round-trip time and **✔ in sync**.
+4. **Check the connection.** The top bar shows your partner, the round-trip time and **✔ in sync**. If it says **⚠ no reply for N s** instead, nothing has arrived from the other PC for a while: its connection has stalled. The room carries on if it comes back within 15 seconds.
 
 **Sync click** in the top bar plays a metronome on the shared room clock. Put both laptops side by side, or on a phone call, and the clicks should line up.
 

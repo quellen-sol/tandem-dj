@@ -266,6 +266,12 @@ Work through these in order and note anything that fails. `tandem.log` (Settings
    - Does the broadcast window show C and D, on a DJ's PC and on a broadcaster's?
 7. Switch **4 decks** off with C and D stopped. Are A and B back to the big layout?
 
+### v0.11.1
+
+- **A stalled connection shows in the top bar.** When nothing has arrived from your partner for 3 seconds (from the host, on a broadcaster booth), the dot turns amber and **⚠ no reply for N s** replaces the round trip, which used to sit at its last value until the room gave up. If the connection comes back within 15 seconds the room carries on; after that it drops, as before.
+  - Test: in a room, unplug one PC's network for about 5 seconds. Does **⚠ no reply** appear after about 3 seconds on both PCs, and the round trip come back once it's plugged in?
+- No protocol change: v0.11.0 and v0.11.1 can share a room.
+
 ## Next candidates
 
 Rough priority order:

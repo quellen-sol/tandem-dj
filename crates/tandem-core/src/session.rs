@@ -114,6 +114,9 @@ pub struct Peer {
     pub conn: PeerConn,
     pub info: PeerInfo,
     pub rtt_us: Option<i64>,
+    /// When the link last showed it's alive: a Ping arriving (host) or a
+    /// Pong (joiner). They come about once a second.
+    heard: Instant,
 }
 
 /// Host: a booth that joined only to broadcast. It gets everything the room
@@ -194,6 +197,10 @@ pub struct LinkView {
     /// here. `None` until one has, or not in a room.
     pub late_us: Option<i64>,
     pub rtt_us: Option<i64>,
+    /// How long since the other end was last heard from. Pings run about once
+    /// a second, so a few seconds of quiet means the link has stalled and
+    /// `rtt_us` is out of date. `None` when not linked.
+    pub quiet_for: Option<Duration>,
     pub clock_spread_us: Option<i64>,
     pub in_sync: Option<bool>,
 }
@@ -1181,6 +1188,7 @@ impl Session {
             conn,
             info,
             rtt_us: None,
+            heard: Instant::now(),
         });
         self.in_sync = None;
         self.last_digest = Instant::now();
@@ -1276,6 +1284,7 @@ impl Session {
             conn,
             info: host,
             rtt_us: est.last_rtt(),
+            heard: Instant::now(),
         });
         self.est = est;
         self.in_sync = None;
@@ -1314,12 +1323,17 @@ impl Session {
         let rtt = self.est.last_rtt();
         if let Some(p) = &mut self.peer {
             p.rtt_us = rtt;
+            p.heard = Instant::now();
         }
     }
 
-    pub fn set_peer_rtt(&mut self, rtt: i64) {
+    /// Host: the other DJ's Ping arrived, carrying its latest round trip.
+    pub fn on_peer_ping(&mut self, rtt: Option<i64>) {
         if let Some(p) = &mut self.peer {
-            p.rtt_us = Some(rtt);
+            if rtt.is_some() {
+                p.rtt_us = rtt;
+            }
+            p.heard = Instant::now();
         }
     }
 
@@ -1761,6 +1775,7 @@ impl Session {
                 roster: self.roster(),
                 late_us: self.late_peak_us(),
                 rtt_us: self.peer.as_ref().and_then(|p| p.rtt_us),
+                quiet_for: self.peer.as_ref().map(|p| p.heard.elapsed()),
                 clock_spread_us: self.est.spread(),
                 in_sync: self.in_sync,
             },

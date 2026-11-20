@@ -7,6 +7,7 @@ use tandem_core::audio::PEAK_BLOCK;
 use tandem_core::grid::{BeatGrid, Marker, MAX_MARKERS};
 use tandem_core::mapping::beats_label;
 use tandem_core::model::{Action, DeckState, XfCurve, XfSide, BEAT_LOOPS, DECKS, HOT_CUES};
+use tandem_core::net::{LINK_QUIET, LINK_TIMEOUT};
 use tandem_core::session::{deck_letter, DeckView, RoleView, SessionView, TrackStatus};
 
 pub const DECK_COLORS: [Color32; DECKS] = [
@@ -184,8 +185,14 @@ impl TandemApp {
             return;
         };
         let broadcasting = matches!(view.link.role, RoleView::Broadcasting { .. });
+        // A stalled link keeps its last round trip, which would look healthy.
+        let quiet = view.link.quiet_for.filter(|q| *q >= LINK_QUIET);
         let (dot, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
-        ui.painter().circle_filled(dot.center(), 4.0, GREEN);
+        ui.painter().circle_filled(
+            dot.center(),
+            4.0,
+            if quiet.is_some() { AMBER } else { GREEN },
+        );
         let name = if broadcasting {
             let djs: Vec<&str> = view
                 .link
@@ -199,6 +206,19 @@ impl TandemApp {
             peer.name.clone()
         };
         ui.label(RichText::new(name).color(GREEN).strong());
+        if let Some(q) = quiet {
+            let other = if broadcasting {
+                "the host"
+            } else {
+                "your partner"
+            };
+            ui.label(RichText::new(format!("⚠ no reply for {} s", q.as_secs())).color(AMBER))
+                .on_hover_text(format!(
+                    "Nothing has arrived from {other} for a while: their connection may have dropped. The room carries on if it comes back within {} s.",
+                    LINK_TIMEOUT.as_secs()
+                ));
+            return;
+        }
         if let Some(rtt) = view.link.rtt_us {
             let tip = if broadcasting {
                 "Time for a message to reach the host and come back. This booth plays the room a broadcast delay behind, so both DJs' moves are on time in it."
