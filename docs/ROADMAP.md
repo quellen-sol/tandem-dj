@@ -315,6 +315,13 @@ Work through these in order and note anything that fails. `tandem.log` (Settings
   - Test: play deck A with its fader up and press LOAD on A. Is it refused, with the note? Pull A's fader down and press LOAD again: does the new track sit paused at 0:00?
 - Protocol version 13: v0.11.8 can't share a room with earlier versions, so every booth needs v0.11.8.
 
+### v0.11.9
+
+- **Master and headphone level knobs.** The controller's MASTER LEVEL and HEADPHONE LEVEL knobs now set your own master and headphone levels (never your partner's), and the sliders on screen follow them, so the master knob works through your PC's speakers or a headset too. They're mapped on the DDJ-FLX6; on other controllers, Learn them in Settings → Controller. Saved FLX6 mappings pick them up by themselves.
+- When Tandem plays through the controller's own sound card, the controller turns that output up and down by itself, so Tandem's level stays put and the sound isn't turned down twice. Tandem knows the sound card by its name ("Line (DDJ-FLX6)"). The mixer says so under the level sliders, and Settings → Controller says what each knob does with your audio settings.
+  - Test: with Speakers (master) on your PC's speakers, turn the FLX6's MASTER LEVEL knob. Does the master slider follow it (after you turn the knob past the slider, if you'd moved the slider on screen)? Then pick "Line (DDJ-FLX6)" for Speakers: does the knob change only the FLX6's own volume, with the slider staying put?
+- No protocol change: v0.11.8 and v0.11.9 can share a room.
+
 ## Next candidates
 
 Rough priority order:
