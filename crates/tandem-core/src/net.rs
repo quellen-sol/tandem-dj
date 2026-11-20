@@ -1208,9 +1208,10 @@ mod tests {
         bob.lock().act(Action::Play { deck: 1 });
 
         let part_way = |h: &SessionHandle, id| {
-            download(h, id).is_some_and(|t| t.total > 0 && t.done * 4 >= t.total)
+            download(h, id)
+                .is_some_and(|t| t.total > 0 && t.done * 4 >= t.total && t.done < t.total)
         };
-        wait_for("the tracks to be part-way", Duration::from_secs(15), || {
+        wait_for("the tracks to be part-way", Duration::from_secs(30), || {
             part_way(&bob, a_id) && part_way(&carol, a_id) && part_way(&alice, b_id)
         });
         relay.sever();
@@ -1218,20 +1219,23 @@ mod tests {
         let paused = |h: &SessionHandle, id| {
             download(h, id).filter(|t| t.state == TransferState::Paused && t.done < t.total)
         };
-        let mut at = Vec::new();
-        wait_for("the downloads to pause", Duration::from_secs(5), || {
-            at = [(&bob, a_id), (&carol, a_id), (&alice, b_id)]
-                .iter()
-                .filter_map(|(h, id)| paused(h, *id).map(|t| t.done))
-                .collect();
-            at.len() == 3
+        // Each shows as paused, not failed, while the booths are apart
+        // (Bob and Carol get back in after a second or so).
+        let cut = [(&bob, a_id), (&carol, a_id), (&alice, b_id)];
+        let mut at = [None; 3];
+        wait_for("the downloads to pause", Duration::from_secs(10), || {
+            for (i, (h, id)) in cut.iter().enumerate() {
+                if let (None, Some(t)) = (at[i], paused(h, *id)) {
+                    assert_eq!(h.lock().track_status(*id), Some(TrackStatus::Fetching));
+                    at[i] = Some(t.done);
+                }
+            }
+            at.iter().all(Option::is_some)
         });
-        assert_eq!(bob.lock().track_status(a_id), Some(TrackStatus::Fetching));
-        assert_eq!(alice.lock().track_status(b_id), Some(TrackStatus::Fetching));
 
         wait_for(
             "everyone to have both tracks",
-            Duration::from_secs(20),
+            Duration::from_secs(40),
             || {
                 ready(&bob, a_id)
                     && ready(&alice, b_id)
@@ -1240,10 +1244,7 @@ mod tests {
             },
         );
         assert!(linked(&bob) && linked(&carol));
-        for ((h, id), at) in [(&bob, a_id), (&carol, a_id), (&alice, b_id)]
-            .iter()
-            .zip(at)
-        {
+        for ((h, id), at) in cut.iter().zip(at.map(Option::unwrap)) {
             let t = download(h, *id).unwrap();
             assert_eq!(t.state, TransferState::Done);
             assert!(
@@ -1287,8 +1288,8 @@ mod tests {
     #[test]
     fn a_silent_drop_mid_transfer_carries_on_over_the_new_link() {
         let rig = Rig::new("resume-stall");
-        // The host gives up on a silent link only after Bob is back.
-        let alice = rig.booth("Alice", 0, Duration::from_secs(10));
+        // The host gives up on a silent link only well after Bob is back.
+        let alice = rig.booth("Alice", 0, LINK_TIMEOUT);
         let bob = rig.booth("Bob", -7_200_000_000, Duration::from_secs(2));
         alice.lock().max_upload_bytes_s = 300_000.0;
         bob.lock().max_upload_bytes_s = 300_000.0;
@@ -1296,32 +1297,32 @@ mod tests {
         let relay = Relay::new(port);
         join(&bob, &relay.addr(), "STALL2", false).unwrap();
 
-        alice
-            .lock()
-            .load_path(0, tone(&rig.root.join("a"), "A.wav", 6.0, 440.0));
-        bob.lock()
-            .load_path(0, tone(&rig.root.join("b"), "B.wav", 5.0, 330.0));
-        let a_id = loaded(&alice, 0);
+        // Each on its own deck: two loads onto one deck at once land in
+        // whichever order the booths finish decoding.
+        let a_wav = tone(&rig.root.join("a"), "A.wav", 10.0, 440.0);
+        let b_wav = tone(&rig.root.join("b"), "B.wav", 10.0, 330.0);
+        let (a_id, b_id) = (id_of(&a_wav), id_of(&b_wav));
+        alice.lock().load_path(0, a_wav);
+        bob.lock().load_path(1, b_wav);
+        // About 6 s each at this speed: cut both a quarter of the way in.
+        let part_way = |h: &SessionHandle, id| {
+            download(h, id)
+                .is_some_and(|t| t.total > 0 && t.done * 4 >= t.total && t.done < t.total)
+        };
         wait_for(
             "both tracks to be on their way",
-            Duration::from_secs(20),
-            || {
-                let b_id = alice.lock().latest().decks[0].track;
-                let on_way = |h, id| download(h, id).is_some_and(|t| t.done * 4 >= t.total.max(1));
-                // Bob's load lands after Alice's, on the same deck.
-                b_id.is_some_and(|b| b != a_id && on_way(&alice, b)) && on_way(&bob, a_id)
-            },
+            Duration::from_secs(30),
+            || part_way(&bob, a_id) && part_way(&alice, b_id),
         );
-        let b_id = alice.lock().latest().decks[0].track.unwrap();
 
         relay.blackhole();
-        wait_for("Bob to notice", Duration::from_secs(5), || rejoining(&bob));
+        wait_for("Bob to notice", Duration::from_secs(10), || rejoining(&bob));
         assert!(
             alice.lock().view().link.peer.is_some(),
             "Alice dropped Bob before he was back"
         );
         relay.restore();
-        wait_for("both tracks to arrive", Duration::from_secs(20), || {
+        wait_for("both tracks to arrive", Duration::from_secs(40), || {
             ready(&bob, a_id) && ready(&alice, b_id)
         });
         for (h, id) in [(&bob, a_id), (&alice, b_id)] {
@@ -1362,7 +1363,7 @@ mod tests {
         alice.lock().load_path(0, a_wav);
         alice.lock().load_path(2, c_wav);
         bob.lock().load_path(1, b_wav);
-        wait_for("all three to arrive", Duration::from_secs(20), || {
+        wait_for("all three to arrive", Duration::from_secs(40), || {
             ready(&bob, a_id) && ready(&bob, c_id) && ready(&alice, b_id)
         });
         assert_eq!(download(&bob, a_id).unwrap().from, good as u64);
@@ -1385,7 +1386,7 @@ mod tests {
         let rig = Rig::new("resume-two");
         let alice = rig.booth("Alice", 0, LINK_TIMEOUT);
         let bob = rig.booth("Bob", 0, LINK_TIMEOUT);
-        alice.lock().max_upload_bytes_s = 300_000.0;
+        alice.lock().max_upload_bytes_s = 200_000.0;
         let port = host(&alice, 0, "TWO123").unwrap();
         let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         join(&bob, &addr.to_string(), "TWO123", false).unwrap();

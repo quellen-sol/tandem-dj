@@ -413,7 +413,7 @@ fn run(root: &std::path::Path, say: &mut dyn FnMut(&str)) -> anyhow::Result<()> 
             .find(|t| t.id == long_id && !t.upload)
     };
     wait_for("Bob to be part-way", Duration::from_secs(15), || {
-        download(&bob).is_some_and(|t| t.total > 0 && t.done * 4 >= t.total)
+        download(&bob).is_some_and(|t| t.total > 0 && t.done * 4 >= t.total && t.done < t.total)
     })?;
     bob.lock().cut_link();
     wait_for("Bob's download to pause", Duration::from_secs(5), || {

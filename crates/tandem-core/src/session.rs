@@ -118,6 +118,9 @@ pub struct Transfer {
     pub from: u64,
     pub state: TransferState,
     pub updated: Instant,
+    /// Tells this try apart from an earlier one of the same transfer (see
+    /// [`Session::transfer_ended`]).
+    serial: u64,
 }
 
 pub enum Role {
@@ -380,6 +383,7 @@ pub struct Session {
     paused_from: u64,
     paused_since: Instant,
     fetch_serial: u64,
+    transfer_serial: u64,
     /// Every transfer running in this booth (see [`crate::files`]).
     running: Arc<Running>,
     transfers: Vec<Transfer>,
@@ -483,6 +487,7 @@ impl Session {
                 paused_from: 0,
                 paused_since: Instant::now(),
                 fetch_serial: 0,
+                transfer_serial: 0,
                 running: Arc::default(),
                 transfers: Vec::new(),
                 local: LocalParams::default(),
@@ -1314,6 +1319,7 @@ impl Session {
     }
 
     /// Start (or restart) a transfer's entry, at `done` of `total` bytes.
+    /// Returns this try's serial, for [`Session::transfer_ended`].
     pub fn transfer_set(
         &mut self,
         id: TrackId,
@@ -1322,8 +1328,10 @@ impl Session {
         done: u64,
         total: u64,
         state: TransferState,
-    ) {
+    ) -> u64 {
         let now = Instant::now();
+        self.transfer_serial += 1;
+        let serial = self.transfer_serial;
         match self
             .transfers
             .iter_mut()
@@ -1335,6 +1343,7 @@ impl Session {
                 t.from = done;
                 t.state = state;
                 t.updated = now;
+                t.serial = serial;
             }
             None => self.transfers.push(Transfer {
                 id,
@@ -1345,7 +1354,23 @@ impl Session {
                 from: done,
                 state,
                 updated: now,
+                serial,
             }),
+        }
+        serial
+    }
+
+    /// Try `serial` of a transfer ended. A try that a newer one has taken
+    /// over from (an upload stuck on a dropped connection until it timed
+    /// out, say) doesn't change the entry.
+    pub fn transfer_ended(&mut self, id: TrackId, upload: bool, serial: u64, state: TransferState) {
+        if let Some(t) = self
+            .transfers
+            .iter_mut()
+            .find(|t| t.id == id && t.upload == upload && t.serial == serial)
+        {
+            t.state = state;
+            t.updated = Instant::now();
         }
     }
 
@@ -2177,13 +2202,13 @@ impl Session {
         let (addr, room, me, weak) = (*addr, room.clone(), self.me.clone(), self.weak.clone());
         std::thread::spawn(move || {
             let Some(h) = weak.upgrade() else { return };
-            if let Err(e) = crate::files::push(&h, addr, &room, &me, host, id, &path) {
-                log::warn!("Upload failed: {}", crate::files::describe(&e));
-                h.lock().transfer_state(
-                    id,
-                    true,
-                    TransferState::Failed(crate::files::describe(&e)),
-                );
+            let res = crate::files::push(&h, addr, &room, &me, host, id, &path);
+            match res {
+                // The link dropped, or the host asked again and a newer
+                // upload carries on.
+                Err(_) if crate::files::was_stopped(&res) => {}
+                Err(e) => log::warn!("Upload failed: {}", crate::files::describe(&e)),
+                Ok(()) => {}
             }
         });
     }

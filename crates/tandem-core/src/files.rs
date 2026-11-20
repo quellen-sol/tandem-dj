@@ -20,8 +20,12 @@
 //! that doesn't check out is cleared and the track sent again from the
 //! start. Every transfer is registered in [`Running`], so a dropped link
 //! stops its transfers at once, and a transfer that wants a `.part` file
-//! that another is still writing stops that one and waits for it to let
-//! go: two transfers never write one file.
+//! that another is still writing stops that one and takes over: every
+//! write to the file goes through its transfer's gate, which stopping
+//! closes, so two transfers never write one file. The stopped one may stay
+//! stuck in a network call until it times out (on Windows, closing a
+//! connection from another thread doesn't always end a read or write
+//! blocked on it), but it never touches the file again.
 
 use crate::config::unique_path;
 use crate::model::TrackId;
@@ -29,7 +33,7 @@ use crate::net::connect;
 use crate::protocol::{read_msg, write_msg, ConnKind, Msg, PeerInfo};
 use crate::session::{Expected, Servable, SessionHandle, TransferState};
 use anyhow::{bail, Context};
-use parking_lot::{Condvar, Mutex};
+use parking_lot::Mutex;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
@@ -77,18 +81,12 @@ const CHUNK: usize = 128 * 1024;
 /// How long a download waits for a track the host is still receiving.
 /// Under the asker's 30 s read timeout; it asks again if this runs out.
 const PENDING_WAIT: Duration = Duration::from_secs(20);
-/// How long a transfer waits for an earlier one to let go of a `.part`
-/// file after stopping it. A stopped transfer lets go as soon as its
-/// connection closes, or, if it's still connecting, when that gives up.
-const PART_WAIT: Duration = Duration::from_secs(15);
-
 /// The transfers running in this booth, so they can be stopped: all of
 /// them with a booth whose link dropped, and one writing a `.part` file
 /// that a newer transfer of the same track wants.
 #[derive(Default)]
 pub struct Running {
     runs: Mutex<Vec<Arc<Run>>>,
-    freed: Condvar,
 }
 
 /// One running transfer.
@@ -98,12 +96,18 @@ struct Run {
     /// The `.part` file it writes, if it's receiving.
     part: Option<PathBuf>,
     stopped: AtomicBool,
+    /// Held for every change to the `.part` file, and to stop the transfer.
+    gate: Mutex<()>,
     conn: Mutex<Option<TcpStream>>,
 }
 
 impl Run {
+    /// Stop it. A change to its `.part` file in progress finishes first;
+    /// none starts after this.
     fn stop(&self) {
+        let _gate = self.gate.lock();
         self.stopped.store(true, Ordering::Relaxed);
+        // Ends a network call it's blocked in, mostly: see the module docs.
         if let Some(s) = self.conn.lock().as_ref() {
             let _ = s.shutdown(Shutdown::Both);
         }
@@ -123,8 +127,7 @@ impl RunGuard {
         self.run.stopped.load(Ordering::Relaxed)
     }
 
-    /// The transfer runs over `s` from now on: stopping it closes `s`,
-    /// which ends a read or write on it at once.
+    /// The transfer runs over `s` from now on: stopping it closes `s`.
     fn attach(&self, s: &TcpStream) -> anyhow::Result<()> {
         let mut conn = self.run.conn.lock();
         if self.stopped() {
@@ -134,6 +137,18 @@ impl RunGuard {
         *conn = Some(s.try_clone()?);
         Ok(())
     }
+
+    /// Change this transfer's `.part` file with `f`, unless the transfer
+    /// has been stopped (then it's [`Stopped`]). Stopping waits for a
+    /// change in progress, so once a newer transfer has stopped this one,
+    /// this one never touches the file again.
+    fn on_part<T>(&self, f: impl FnOnce() -> std::io::Result<T>) -> anyhow::Result<T> {
+        let _gate = self.run.gate.lock();
+        if self.stopped() {
+            return Err(Stopped.into());
+        }
+        Ok(f()?)
+    }
 }
 
 impl Drop for RunGuard {
@@ -142,37 +157,33 @@ impl Drop for RunGuard {
             .runs
             .lock()
             .retain(|r| !Arc::ptr_eq(r, &self.run));
-        self.running.freed.notify_all();
     }
 }
 
 impl Running {
     /// Register a transfer with booth `peer`. One that writes `part` gets
-    /// that file to itself: a transfer still writing it is stopped first,
-    /// and this waits until it has let go.
-    pub fn start(self: &Arc<Self>, peer: u64, part: Option<&Path>) -> anyhow::Result<RunGuard> {
-        let deadline = Instant::now() + PART_WAIT;
+    /// that file to itself: a transfer still writing it is stopped, and
+    /// never changes it again. It may take a while to notice and end (see
+    /// the module docs), but this doesn't wait for that.
+    pub fn start(self: &Arc<Self>, peer: u64, part: Option<&Path>) -> RunGuard {
         let mut runs = self.runs.lock();
-        while let Some(old) =
-            part.and_then(|p| runs.iter().find(|r| r.part.as_deref() == Some(p)).cloned())
-        {
-            old.stop();
-            if Instant::now() >= deadline {
-                bail!("an earlier transfer of this track is still finishing");
+        if let Some(p) = part {
+            for old in runs.iter().filter(|r| r.part.as_deref() == Some(p)) {
+                old.stop();
             }
-            self.freed.wait_until(&mut runs, deadline);
         }
         let run = Arc::new(Run {
             peer,
             part: part.map(Path::to_path_buf),
             stopped: AtomicBool::new(false),
+            gate: Mutex::new(()),
             conn: Mutex::new(None),
         });
         runs.push(run.clone());
-        Ok(RunGuard {
+        RunGuard {
             running: self.clone(),
             run,
-        })
+        }
     }
 
     /// Stop every transfer with booth `peer`: the link to it dropped.
@@ -334,9 +345,9 @@ impl Partial {
 
     /// Write from byte `offset` on: where the file ends (carrying on), or
     /// 0 (starting over).
-    fn start_at(&mut self, offset: u64) -> anyhow::Result<()> {
+    fn start_at(&mut self, offset: u64, run: &RunGuard) -> anyhow::Result<()> {
         if offset == 0 {
-            self.clear()?;
+            run.on_part(|| self.clear())?;
         } else if offset != self.have {
             bail!(
                 "asked to carry on from byte {offset} of a partial file that has {}",
@@ -403,7 +414,7 @@ pub fn serve(
             // Carry on from where the asker got to, if the file has that.
             let offset = if offset <= size { offset } else { 0 };
             let file_name = file_name(&path);
-            let run = running.start(from.id, None)?;
+            let run = running.start(from.id, None);
             run.attach(&s)?;
             write_msg(
                 &mut s,
@@ -422,18 +433,22 @@ pub fn serve(
                     percent(offset, size)
                 );
             }
-            h.lock()
-                .transfer_set(id, true, &file_name, offset, size, TransferState::Active);
+            let serial =
+                h.lock()
+                    .transfer_set(id, true, &file_name, offset, size, TransferState::Active);
             let res = send_body(h, &mut s, id, &path, offset, size, rate);
-            h.lock().transfer_state(
-                id,
-                true,
-                match &res {
-                    Ok(_) => TransferState::Done,
-                    Err(e) => TransferState::Failed(describe(e)),
-                },
-            );
-            res
+            let state = match &res {
+                Ok(_) => TransferState::Done,
+                Err(_) if run.stopped() => TransferState::Failed("connection lost".into()),
+                Err(e) => TransferState::Failed(describe(e)),
+            };
+            h.lock().transfer_ended(id, true, serial, state);
+            match res {
+                // Its link dropped: it carries on over a new connection if
+                // the booth comes back.
+                Err(_) if run.stopped() => Ok(()),
+                res => res,
+            }
         }
         Msg::FilePut {
             id, size, resume, ..
@@ -450,7 +465,7 @@ pub fn serve(
                 return Ok(());
             };
             let running = h.lock().running();
-            let run = running.start(from.id, Some(&expected.part))?;
+            let run = running.start(from.id, Some(&expected.part));
             let res = recv_push(h, &mut s, &run, id, size, resume, &expected, from);
             match res {
                 // Its link dropped, or a newer upload of it took over.
@@ -506,7 +521,7 @@ fn recv_push(
     run.attach(s)?;
     let mut p = Partial::open(&expected.part, run)?;
     let offset = if resume && p.have <= size { p.have } else { 0 };
-    p.start_at(offset)?;
+    p.start_at(offset, run)?;
     write_msg(s, &Msg::FileOk { offset }, &[])?;
     let name = {
         let mut ses = h.lock();
@@ -524,7 +539,7 @@ fn recv_push(
             percent(offset, size)
         );
     }
-    recv_body(h, s, id, size, &expected.part, p, &expected.landing)
+    recv_body(h, s, run, id, size, &expected.part, p, &expected.landing)
 }
 
 /// Joiner: download a track from the host (booth `host`) and put it at
@@ -550,7 +565,7 @@ pub fn fetch(
             s.track_file_name(id),
         )
     };
-    let run = running.start(host, Some(&part))?;
+    let run = running.start(host, Some(&part));
     let mut again = false;
     let res = loop {
         let res = (|| -> anyhow::Result<PathBuf> {
@@ -564,7 +579,7 @@ pub fn fetch(
                 Msg::Reject { reason } => bail!(reason),
                 other => bail!("unexpected reply {other:?}"),
             };
-            p.start_at(offset)?;
+            p.start_at(offset, &run)?;
             {
                 let mut ses = h.lock();
                 if run.stopped() {
@@ -578,7 +593,7 @@ pub fn fetch(
                     percent(offset, size)
                 );
             }
-            recv_body(h, &mut s, id, size, &part, p, landing)
+            recv_body(h, &mut s, &run, id, size, &part, p, landing)
         })();
         match res {
             Err(e) if e.downcast_ref::<BadPartial>().is_some() && !again => {
@@ -613,40 +628,55 @@ pub fn push(
         let s = h.lock();
         (s.max_upload_bytes_s, s.booth_key(), s.running())
     };
-    let run = running.start(host, None)?;
-    let mut s = connect(addr, ConnKind::Files, room, me, key, false)?;
-    run.attach(&s)?;
-    write_msg(
-        &mut s,
-        &Msg::FilePut {
-            id,
-            size,
-            file_name: name.clone(),
-            resume: true,
-        },
-        &[],
-    )?;
-    let offset = match read_msg(&mut s)?.0 {
-        Msg::FileOk { offset } if offset <= size => offset,
-        Msg::FileOk { offset } => bail!("the host asked for byte {offset} of {size}"),
-        Msg::FileError { reason } | Msg::Reject { reason } => bail!(reason),
-        other => bail!("unexpected reply {other:?}"),
-    };
-    if offset > 0 {
-        log::info!(
-            "Resuming the upload of {name} from byte {offset} of {size} ({:.0}%)",
-            percent(offset, size)
-        );
-    }
-    h.lock()
-        .transfer_set(id, true, &name, offset, size, TransferState::Active);
-    send_body(h, &mut s, id, path, offset, size, rate)?;
-    match read_msg(&mut s)?.0 {
-        Msg::FileOk { .. } => {
-            h.lock().transfer_state(id, true, TransferState::Done);
-            Ok(())
+    let run = running.start(host, None);
+    let res = (|| -> anyhow::Result<()> {
+        let mut s = connect(addr, ConnKind::Files, room, me, key, false)?;
+        run.attach(&s)?;
+        write_msg(
+            &mut s,
+            &Msg::FilePut {
+                id,
+                size,
+                file_name: name.clone(),
+                resume: true,
+            },
+            &[],
+        )?;
+        let offset = match read_msg(&mut s)?.0 {
+            Msg::FileOk { offset } if offset <= size => offset,
+            Msg::FileOk { offset } => bail!("the host asked for byte {offset} of {size}"),
+            Msg::FileError { reason } | Msg::Reject { reason } => bail!(reason),
+            other => bail!("unexpected reply {other:?}"),
+        };
+        if offset > 0 {
+            log::info!(
+                "Resuming the upload of {name} from byte {offset} of {size} ({:.0}%)",
+                percent(offset, size)
+            );
         }
-        other => bail!("host didn't confirm the upload ({other:?})"),
+        let serial = h
+            .lock()
+            .transfer_set(id, true, &name, offset, size, TransferState::Active);
+        let res =
+            send_body(h, &mut s, id, path, offset, size, rate).and_then(|()| {
+                match read_msg(&mut s)?.0 {
+                    Msg::FileOk { .. } => Ok(()),
+                    other => bail!("host didn't confirm the upload ({other:?})"),
+                }
+            });
+        let state = match &res {
+            Ok(()) => TransferState::Done,
+            Err(_) if run.stopped() => TransferState::Failed("connection lost".into()),
+            Err(e) => TransferState::Failed(describe(e)),
+        };
+        h.lock().transfer_ended(id, true, serial, state);
+        res
+    })();
+    match res {
+        // Its link dropped, or the host asked again and a newer upload of
+        // the track carries on.
+        Err(_) if run.stopped() => Err(Stopped.into()),
+        res => res,
     }
 }
 
@@ -703,14 +733,16 @@ fn send_body(
 }
 
 /// Receive the rest of a track (from `p.have` on) into its `.part` file at
-/// `part`, check the whole file against the track's hash and move it to
-/// `landing`. Returns where it went. If the connection breaks, the `.part`
-/// file keeps what arrived, for the next try to carry on from. A file
-/// that doesn't check out is cleared; when it carried on from a partial
-/// file, that's a [`BadPartial`].
+/// `part`, which `run` writes, check the whole file against the track's
+/// hash and move it to `landing`. Returns where it went. If the
+/// connection breaks, the `.part` file keeps what arrived, for the next try
+/// to carry on from. A file that doesn't check out is cleared; when it
+/// carried on from a partial file, that's a [`BadPartial`].
+#[allow(clippy::too_many_arguments)]
 fn recv_body(
     h: &SessionHandle,
     s: &mut TcpStream,
+    run: &RunGuard,
     id: TrackId,
     size: u64,
     part: &Path,
@@ -720,34 +752,32 @@ fn recv_body(
     let resumed = p.have > 0;
     let mut done = p.have;
     let mut fits = true;
-    {
-        let mut f = BufWriter::with_capacity(CHUNK, &p.file);
-        let mut last = Instant::now();
-        loop {
-            let (m, payload) = read_msg(s)?;
-            match m {
-                Msg::Chunk => {
-                    if done + payload.len() as u64 > size {
-                        fits = false;
-                        break;
-                    }
-                    f.write_all(&payload)?;
-                    p.hasher.update(&payload);
-                    done += payload.len() as u64;
-                    if last.elapsed() > Duration::from_millis(150) {
-                        h.lock().transfer_progress(id, false, done, size);
-                        last = Instant::now();
-                    }
+    let mut last = Instant::now();
+    loop {
+        let (m, payload) = read_msg(s)?;
+        match m {
+            Msg::Chunk => {
+                if done + payload.len() as u64 > size {
+                    fits = false;
+                    break;
                 }
-                Msg::End => break,
-                Msg::FileError { reason } => bail!(reason),
-                other => bail!("unexpected {other:?} during transfer"),
+                // A chunk at a time, through the gate (no buffering here,
+                // so nothing is left to land in the file after a stop).
+                run.on_part(|| p.file.write_all(&payload))?;
+                p.hasher.update(&payload);
+                done += payload.len() as u64;
+                if last.elapsed() > Duration::from_millis(150) {
+                    h.lock().transfer_progress(id, false, done, size);
+                    last = Instant::now();
+                }
             }
+            Msg::End => break,
+            Msg::FileError { reason } => bail!(reason),
+            other => bail!("unexpected {other:?} during transfer"),
         }
-        f.flush()?;
     }
     if !fits || done != size || TrackId(*p.hasher.finalize().as_bytes()) != id {
-        p.clear()?;
+        run.on_part(|| p.clear())?;
         if resumed {
             return Err(BadPartial.into());
         }
@@ -755,7 +785,11 @@ fn recv_body(
     }
     h.lock().transfer_progress(id, false, done, size);
     drop(p); // closed before it moves
-    Ok(landing.place(part)?)
+             // Out of the way of any later transfer of the track first (quick: the
+             // same folder), then to where it goes, which can take a while.
+    let done_path = part.with_extension("done");
+    run.on_part(|| std::fs::rename(part, &done_path))?;
+    Ok(landing.place(&done_path)?)
 }
 
 #[cfg(test)]
@@ -790,57 +824,74 @@ mod tests {
     }
 
     /// A transfer that wants a `.part` file another is still writing (one
-    /// the link dropped under, blocked on its dead connection) stops it and
-    /// gets the file only once that one has let go: never both at once.
+    /// the link dropped under) takes it over at once: the old one finishes
+    /// the write it's in the middle of, then never touches the file again,
+    /// however long it stays stuck on its dead connection.
     #[test]
     fn one_writer_per_part_file() {
         let running = Arc::new(Running::default());
         let part = std::env::temp_dir().join(format!("tandem-part-{}.part", fastrand::u64(..)));
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let mut old_conn = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (_server_end, _) = listener.accept().unwrap();
-
-        let first = running.start(7, Some(&part)).unwrap();
-        first.attach(&old_conn).unwrap();
-        let writing = Arc::new(AtomicBool::new(true));
-        let w = writing.clone();
-        let old = std::thread::spawn(move || {
-            // Blocked on a connection that sends nothing, like one whose
-            // network went away.
-            let mut buf = [0u8; 16];
-            let res = old_conn.read(&mut buf);
-            std::thread::sleep(Duration::from_millis(100)); // finishing a write
-            assert!(
-                first.stopped(),
-                "read returned {res:?} without being stopped"
-            );
-            w.store(false, Ordering::SeqCst);
-            drop(first);
-        });
-
-        let start = Instant::now();
-        let second = running.start(7, Some(&part)).unwrap();
-        assert!(
-            !writing.load(Ordering::SeqCst),
-            "got the file while the old transfer was still writing it"
+        let first = Arc::new(running.start(7, Some(&part)));
+        let (writing, wrote) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
         );
-        assert!(start.elapsed() < Duration::from_secs(2));
+        let old = {
+            let (first, writing, wrote) = (first.clone(), writing.clone(), wrote.clone());
+            std::thread::spawn(move || {
+                first
+                    .on_part(|| {
+                        writing.store(true, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(150));
+                        wrote.store(true, Ordering::SeqCst);
+                        Ok(())
+                    })
+                    .unwrap();
+                std::thread::sleep(Duration::from_millis(100));
+                let again = first
+                    .on_part(|| -> std::io::Result<()> { panic!("wrote after being stopped") });
+                assert!(was_stopped(&again));
+            })
+        };
+        while !writing.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let second = running.start(7, Some(&part));
+        assert!(
+            wrote.load(Ordering::SeqCst),
+            "took the file over in the middle of a write"
+        );
+        assert!(first.stopped() && !second.stopped());
         old.join().unwrap();
-        assert!(!second.stopped());
+        second.on_part(|| Ok(())).unwrap();
 
-        // Another track's file, or an upload, doesn't wait.
-        let other = running
-            .start(7, Some(&part.with_extension("other")))
-            .unwrap();
-        let upload = running.start(7, None).unwrap();
-        assert!(!second.stopped());
+        // One stuck in a read that closing its connection doesn't end (as
+        // on Windows after a silent drop) doesn't hold the next one up.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let conn = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (far_end, _) = listener.accept().unwrap();
+        second.attach(&conn).unwrap();
+        let stuck = std::thread::spawn(move || {
+            let _ = (&conn).read(&mut [0u8; 16]);
+        });
+        let start = Instant::now();
+        let third = running.start(7, Some(&part));
+        assert!(start.elapsed() < Duration::from_millis(100));
+        assert!(second.stopped() && !third.stopped());
+        drop(far_end);
+        stuck.join().unwrap();
+
+        // Another track's file, or an upload, doesn't stop it.
+        let other = running.start(7, Some(&part.with_extension("other")));
+        let upload = running.start(7, None);
+        assert!(!third.stopped());
 
         // The link to booth 7 drops: all of them stop; booth 8's don't.
-        let elsewhere = running.start(8, None).unwrap();
+        let elsewhere = running.start(8, None);
         running.stop_with(7);
-        assert!(second.stopped() && other.stopped() && upload.stopped());
+        assert!(third.stopped() && other.stopped() && upload.stopped());
         assert!(!elsewhere.stopped());
-        drop((second, other, upload, elsewhere));
+        drop((first, second, third, other, upload, elsewhere));
         assert!(running.runs.lock().is_empty());
     }
 
