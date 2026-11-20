@@ -166,6 +166,19 @@ On the DDJ-FLX6, decks 3 and 4 send on MIDI channels 3 and 4 and drive decks C a
 
 The browse knob moves through either the tracks of the list on show or the lists on the left (`BrowseFocus` in `app.rs`). Pressing it switches between them, BACK goes to the lists, and a blue outline marks the side it's on. Turning through the lists shows each one's tracks straight away, like Serato and rekordbox. It doesn't rescan crates or All Music on the way, since All Music walks every folder; pressing the knob to go into one rescans it, as clicking it does. Crates are skipped while their section is closed. Clicking a list goes into it, so the knob goes back to its tracks; that keeps the old habit of picking a list with the mouse and a track with the knob. Turn, press and BACK reach the UI as `MidiOut`s, never as room events, so a booth's browsing never goes on the wire.
 
+### Controller tempo faders
+
+Faders and knobs use soft takeover (`mapping.rs`), but the tempo fader can't: SYNC moves a deck's tempo without moving the fader, and SHIFT + TEMPO moves the fader without moving the tempo, so a DJ who runs out of travel can slide it back and keep going. `MidiEngine::tempo_fader` keeps where the fader physically is, from either message (`Target::Tempo` and `Target::TempoShift`; on the DDJ-FLX6, CC 0x00 and CC 0x05).
+
+- **On the fader** (it was at the deck's tempo before this move, within 0.05%): it sets the tempo directly.
+- **Off the fader:** a move changes the tempo by exactly as much as the fader moved, from wherever the deck is. A quick move whose new reading happens to land on the deck's tempo doesn't put the deck on the fader, or one fast flick would undo what SHIFT gained.
+- **Back on the fader** when SHIFT leaves it at the deck's tempo, someone moves the deck to where it sits (SHIFT + SYNC, the partner), or the tempo is held at the limit and the fader catches up.
+- **The limit** is the room's ±50% (the model's clamp), not the fader's range: going past the range is what SHIFT is for. Held at the limit, the fader may run on by one coarse step (1/128 of its travel) before the rest is dropped. A 14-bit fader's coarse half arrives before its fine half, and that dip and return mustn't creep the tempo off the limit while the DJ pushes against it.
+
+All of this runs in the booth whose controller it is; the room only sees the `Tempo` actions it sends. So it works the same on synced decks (the sync group follows them like any tempo change) and when the partner moves the same deck: the next move starts from wherever the deck is.
+
+A controller that sends the same message with SHIFT held (the Denon SC Live 4) can't use `TempoShift`: that needs SHIFT tracked in software, as a modifier for other bindings.
+
 ### Local vs shared
 
 | Shared (in the timeline) | Local (this booth only) |

@@ -6,8 +6,9 @@
 //! knobs) use *soft takeover*: once the room value has been changed, your
 //! hardware control only takes effect after it reaches that value, so it
 //! never jumps over what your partner set. The tempo fader is the exception:
-//! SYNC moves tempos without moving the fader, so when the two disagree the
-//! fader works *relatively* (see [`MidiEngine::tempo_fader`]).
+//! SYNC moves tempos without moving the fader (and SHIFT moves the fader
+//! without moving the tempo), so when the two disagree the fader works
+//! *relatively* (see [`MidiEngine::tempo_fader`]).
 
 use crate::meter::{to_db, Levels};
 use crate::model::{deck_letter, Action, RoomState, BEAT_LOOPS, DECKS};
@@ -114,6 +115,11 @@ pub enum Target {
     Tempo {
         deck: u8,
     },
+    /// The tempo fader moved with SHIFT held: the fader moves, the tempo
+    /// doesn't (for controllers that send another message with SHIFT).
+    TempoShift {
+        deck: u8,
+    },
     Volume {
         deck: u8,
     },
@@ -185,6 +191,9 @@ impl Target {
                 )
             }
             Target::Tempo { deck: d } => format!("Deck {} · Tempo fader", deck(d)),
+            Target::TempoShift { deck: d } => {
+                format!("Deck {} · SHIFT + tempo fader (tempo stays)", deck(d))
+            }
             Target::Volume { deck: d } => format!("Deck {} · Channel fader", deck(d)),
             Target::Eq { deck: d, band } => {
                 format!(
@@ -240,6 +249,7 @@ impl Target {
             | LoopDouble { deck }
             | BeatLoop { deck, .. }
             | Tempo { deck }
+            | TempoShift { deck }
             | Volume { deck }
             | Eq { deck, .. }
             | Trim { deck }
@@ -261,6 +271,7 @@ impl Target {
     pub fn kind(&self) -> TargetKind {
         match self {
             Target::Tempo { .. }
+            | Target::TempoShift { .. }
             | Target::Volume { .. }
             | Target::Eq { .. }
             | Target::Trim { .. }
@@ -306,6 +317,7 @@ impl Target {
             v.push(Target::BendDown { deck: d });
             v.push(Target::BendUp { deck: d });
             v.push(Target::Tempo { deck: d });
+            v.push(Target::TempoShift { deck: d });
             v.push(Target::Trim { deck: d });
             for band in (0..3).rev() {
                 v.push(Target::Eq { deck: d, band });
@@ -407,7 +419,7 @@ pub struct Mapping {
 }
 
 /// Bump when built-in presets gain controls; saved mappings pick them up.
-pub const PRESET_VERSION: u32 = 8;
+pub const PRESET_VERSION: u32 = 9;
 /// Up to this preset version, four-deck controllers drove Tandem's two
 /// decks: decks 1 and 3 drove A, decks 2 and 4 drove B.
 const LAST_TWO_DECK_PRESET: u32 = 6;
@@ -559,11 +571,14 @@ pub enum MidiOut {
     Learned(Binding),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 struct Takeover {
     engaged: bool,
     last_sent: Option<f32>,
     last_hw: Option<f32>,
+    /// Tempo fader only: how far (in tempo) it has moved past the room's
+    /// limit, up to one coarse step (see [`MidiEngine::tempo_fader`]).
+    past_limit: f64,
 }
 
 pub struct MidiEngine {
@@ -985,7 +1000,7 @@ impl MidiEngine {
             .filter(|b| b.trigger == trig)
             .cloned()
             .collect();
-        for b in bindings {
+        for b in &bindings {
             match b.target.kind() {
                 TargetKind::Relative => {
                     let Some(raw) = raw7 else { continue };
@@ -1047,6 +1062,17 @@ impl MidiEngine {
                         }
                         continue;
                     }
+                    if let Target::TempoShift { deck } = b.target {
+                        // A controller that sends the same message with
+                        // SHIFT held can't tell the two apart: the plain
+                        // fader wins.
+                        if !bindings.iter().any(|x| x.target == Target::Tempo { deck }) {
+                            let t = self.tempo_takeover(deck);
+                            t.last_hw = Some(v);
+                            t.past_limit = 0.0;
+                        }
+                        continue;
+                    }
                     let current = self.current(b.target, room, local);
                     if !self.pickup(b.target, v, current) {
                         continue;
@@ -1076,9 +1102,20 @@ impl MidiEngine {
     /// - While the deck's tempo is where the fader says, the fader sets it
     ///   directly.
     /// - When they disagree (SYNC changed the tempo, the other deck's fader
-    ///   carried it, or your partner moved it), moving the fader changes the
-    ///   tempo by exactly as much as the fader moved, from wherever the deck
-    ///   is. SHIFT + SYNC puts the deck back on the fader.
+    ///   carried it, your partner moved it, or you moved the fader with
+    ///   SHIFT held), moving the fader changes the tempo by exactly as much
+    ///   as the fader moved, from wherever the deck is. SHIFT + SYNC puts
+    ///   the deck back on the fader.
+    ///
+    /// So a DJ who runs out of travel can SHIFT-move the fader back and keep
+    /// going the same way, as far as the room's limit (±50%), past the
+    /// fader's own range. Whether the deck is on the fader is judged by
+    /// where the fader was before this move: a quick move whose new reading
+    /// happens to land on the deck's tempo mustn't grab it (and throw away
+    /// what SHIFT gained). The deck is back on the fader only when SHIFT
+    /// left the fader exactly at the deck's tempo, the deck was moved to
+    /// where the fader is, or the tempo stopped at the limit and the fader
+    /// caught up.
     ///
     /// A deck nobody has touched (tempo 0%) takes the fader's position
     /// straight away, like the other controls.
@@ -1088,26 +1125,33 @@ impl MidiEngine {
         let range = self.tempo_range;
         let at = |v: f32| 1.0 + (v as f64 - 0.5) * 2.0 * range;
         let current = room.decks.get(deck as usize)?.tempo;
-        let t = self
-            .takeover
-            .entry(Target::Tempo { deck })
-            .or_insert(Takeover {
-                engaged: false,
-                last_sent: None,
-                last_hw: None,
-            });
+        let t = self.tempo_takeover(deck);
         let prev = t.last_hw.replace(v);
+        let past_limit = std::mem::take(&mut t.past_limit);
         let hw = at(v);
         let next = match prev {
-            _ if (hw - current).abs() < MATCH => hw,
+            Some(p) if (at(p) - current).abs() < MATCH => hw,
+            // First reading from this fader: it takes the deck if it's
+            // already there or nobody has touched the deck; otherwise we
+            // only learn where it is.
+            None if (hw - current).abs() < MATCH => hw,
             None if t.last_sent.is_none() && (current - 1.0).abs() < 1e-9 => hw,
-            // First reading from this fader: we only learn where it is.
             None => return None,
             Some(p) => {
-                let next = (current + hw - at(p)).clamp(0.5, 1.5);
-                // Rejoined the fader (e.g. it hit the deck's tempo after
-                // someone else moved it): snap so rounding can't build up.
+                // Held at the limit, the fader may run on past it by up to
+                // one coarse step (1/128 of its travel), taken up first on
+                // the way back. A 14-bit fader's coarse half arrives before
+                // its fine half, and that dip and return mustn't creep the
+                // tempo off the limit while the DJ pushes against it.
+                let at_limit = current <= 0.5 || current >= 1.5;
+                let want = current + hw - at(p) + if at_limit { past_limit } else { 0.0 };
+                let next = want.clamp(0.5, 1.5);
+                let step = 2.0 * range / 128.0;
+                t.past_limit = (want - next).clamp(-step, step);
+                // Caught up with a tempo held at the limit: on the fader
+                // from here (snapped, so rounding can't build up).
                 if (next - hw).abs() < MATCH {
+                    t.past_limit = 0.0;
                     hw
                 } else {
                     next
@@ -1117,6 +1161,12 @@ impl MidiEngine {
         t.engaged = next == hw;
         t.last_sent = Some(v);
         (next != current).then_some(next)
+    }
+
+    /// Deck `deck`'s tempo fader. Its `last_hw` is where the fader
+    /// physically is, whichever message (with or without SHIFT) said so last.
+    fn tempo_takeover(&mut self, deck: u8) -> &mut Takeover {
+        self.takeover.entry(Target::Tempo { deck }).or_default()
     }
 
     /// Where the control currently is in the room, in 0..1 fader units.
@@ -1147,11 +1197,7 @@ impl MidiEngine {
     }
 
     fn pickup(&mut self, target: Target, v: f32, current: f32) -> bool {
-        let t = self.takeover.entry(target).or_insert(Takeover {
-            engaged: false,
-            last_sent: None,
-            last_hw: None,
-        });
+        let t = self.takeover.entry(target).or_default();
         if t.engaged {
             if let Some(sent) = t.last_sent {
                 if (current - sent).abs() > 0.02 {
@@ -1341,6 +1387,8 @@ fn pioneer_ddj(device: &str, name: &str, hw_decks: u8, ticks_per_rev: f32) -> Ma
             m.bind(Trigger::cc(ch, cc), Target::Jog { deck });
         }
         m.bind(Trigger::cc(ch, 0x00), Target::Tempo { deck });
+        // With SHIFT held, TEMPO sends CC 0x05 (fine half 0x25) instead.
+        m.bind(Trigger::cc(ch, 0x05), Target::TempoShift { deck });
         m.bind(Trigger::note(6, 0x46 + hw), Target::Load { deck });
         // Loop section: IN, OUT, RELOOP/EXIT; SHIFT + IN is a 4-beat loop;
         // CUE/LOOP CALL ◀ / ▶ halve and double the loop.
@@ -1743,6 +1791,9 @@ mod tests {
         };
         m.bindings
             .retain(|b| !(b.target.deck().is_some_and(|d| d >= 2) && mixer(&b.target)));
+        // SHIFT + TEMPO came with preset version 9.
+        m.bindings
+            .retain(|b| !matches!(b.target, Target::TempoShift { .. }));
         for b in &mut m.bindings {
             if let Some(d) = b.target.deck() {
                 b.target = b.target.with_deck(d % 2);
@@ -1763,8 +1814,9 @@ mod tests {
         saved.bind(custom, Target::Play { deck: 0 });
         let moved_and_added = saved.upgrade_from(&preset);
         // 41 controls on each of decks 3 and 4 (less the custom pad) move;
-        // 7 mixer controls on each of channels 3 and 4, and their meters, are new.
-        assert_eq!(moved_and_added, 2 * 41 - 1 + 2 * 7 + 2);
+        // 7 mixer controls on each of channels 3 and 4, and their meters, are
+        // new, and so is SHIFT + TEMPO on all four decks.
+        assert_eq!(moved_and_added, 2 * 41 - 1 + 2 * 7 + 2 + 4);
         assert_eq!(saved.preset_version, PRESET_VERSION);
         assert_eq!(saved.jog_ticks_per_rev, Some(6387.0));
         assert_eq!(saved.meters, preset.meters);
@@ -1951,6 +2003,308 @@ mod tests {
         drive(&mut e, &mut room, &[[0xb0, 0x00, 72], [0xb0, 0x20, 0]]);
         let want = 1.0 + (72.0 * 128.0 / 16383.0 - 0.5) * 0.16;
         assert!((room.decks[0].tempo - want).abs() < 1e-9);
+    }
+
+    /// A DDJ-FLX6 tempo fader on MIDI channel `ch` moving from `from` to
+    /// `to` (14-bit positions) in `steps` moves, sent the way the FLX6 sends
+    /// it: the coarse half on CC `cc`, then the fine half on CC `cc + 32`,
+    /// every time (checked against a recording). CC 0x00 is the plain
+    /// fader, CC 0x05 the fader with SHIFT held.
+    fn fader(ch: u8, cc: u8, from: u16, to: u16, steps: i32) -> Vec<[u8; 3]> {
+        (1..=steps)
+            .flat_map(|i| {
+                let p = (from as i32 + (to as i32 - from as i32) * i / steps) as u16;
+                [
+                    [0xB0 | ch, cc, (p >> 7) as u8],
+                    [0xB0 | ch, cc + 32, (p & 0x7F) as u8],
+                ]
+            })
+            .collect()
+    }
+
+    const TOP: u16 = 16383;
+    const CENTRE: u16 = 8192;
+    const BOTTOM: u16 = 0;
+
+    /// Deck `d`'s tempo after each MSB/LSB pair (the controller sends the
+    /// pair together; in between, the coarse half sits with the old fine half).
+    fn tempo_after_pairs(
+        e: &mut MidiEngine,
+        room: &mut RoomState,
+        d: usize,
+        msgs: &[[u8; 3]],
+    ) -> Vec<f64> {
+        msgs.chunks(2)
+            .map(|pair| {
+                drive(e, room, pair);
+                room.decks[d].tempo
+            })
+            .collect()
+    }
+
+    /// Two decks with tracks and beatgrids (128 and 115 BPM), both tempo
+    /// faders seen at the centre.
+    fn two_decks(e: &mut MidiEngine) -> RoomState {
+        let mut room = RoomState::default();
+        for (d, bpm) in [(0, 128.0), (1, 115.0)] {
+            let deck = &mut room.decks[d];
+            deck.track = Some(crate::model::TrackId([d as u8 + 1; 32]));
+            deck.duration = 300.0;
+            deck.grid = crate::grid::BeatGrid::new(0.0, bpm);
+        }
+        drive(e, &mut room, &fader(0, 0x00, CENTRE, CENTRE, 1));
+        drive(e, &mut room, &fader(1, 0x00, CENTRE, CENTRE, 1));
+        room
+    }
+
+    #[test]
+    fn shift_tempo_moves_the_fader_not_the_tempo() {
+        // The DJ's report: move the tempo fader down, SHIFT + move it back
+        // up to 0: nothing happens. Move it down again: lower still.
+        let mut e = MidiEngine::new(pioneer_ddj("DDJ-FLX6", "test", 4, 2048.0), 0.08);
+        let mut room = RoomState::default();
+        drive(&mut e, &mut room, &fader(0, 0x00, CENTRE, CENTRE, 1));
+        let centre = room.decks[0].tempo;
+        assert!((centre - 1.0).abs() < 1e-5);
+
+        // Down to the bottom: -8%.
+        let down = tempo_after_pairs(&mut e, &mut room, 0, &fader(0, 0x00, CENTRE, BOTTOM, 37));
+        assert!(down.windows(2).all(|w| w[1] < w[0]));
+        assert!((room.decks[0].tempo - 0.92).abs() < 1e-9);
+
+        // SHIFT + back up to the centre: no tempo change at all.
+        let shifted = fader(0, 0x05, BOTTOM, CENTRE, 37);
+        assert!(drive(&mut e, &mut room, &shifted).is_empty());
+        assert_eq!(room.decks[0].tempo, 0.92);
+        let hw = e.hardware_tempo(0).unwrap();
+        assert!((hw - 1.0).abs() < 1e-5, "the fader is at the centre: {hw}");
+
+        // Down again: from -8% to -16%, smoothly, starting at once.
+        let down = tempo_after_pairs(&mut e, &mut room, 0, &fader(0, 0x00, CENTRE, BOTTOM, 37));
+        assert!(down[0] < 0.92 && down[0] > 0.91, "first move: {}", down[0]);
+        assert!(down.windows(2).all(|w| w[1] < w[0] && w[0] - w[1] < 0.005));
+        let want = 0.92 - (centre - 0.92);
+        assert!((room.decks[0].tempo - want).abs() < 1e-9);
+
+        // And back up, all the way: the fader is 8% above the deck now.
+        tempo_after_pairs(&mut e, &mut room, 0, &fader(0, 0x00, BOTTOM, TOP, 37));
+        assert!((room.decks[0].tempo - (want + 0.16)).abs() < 1e-9);
+        // Deck B and the others never moved.
+        assert!(room.decks[1..].iter().all(|d| d.tempo == 1.0));
+    }
+
+    #[test]
+    fn shift_tempo_goes_on_to_the_rooms_limit() {
+        let mut e = MidiEngine::new(pioneer_ddj("DDJ-FLX6", "test", 4, 2048.0), 0.08);
+        let mut room = RoomState::default();
+        // Top to bottom, SHIFT back to the top, again and again: 16% a
+        // time, down to the room's -50%, and no further.
+        drive(&mut e, &mut room, &fader(0, 0x00, TOP, TOP, 1));
+        assert!((room.decks[0].tempo - 1.08).abs() < 1e-9);
+        for want in [0.92, 0.76, 0.60, 0.5, 0.5] {
+            let tempos = tempo_after_pairs(&mut e, &mut room, 0, &fader(0, 0x00, TOP, BOTTOM, 20));
+            assert!(tempos.iter().all(|&t| t >= 0.5));
+            assert!((room.decks[0].tempo - want).abs() < 1e-9, "{want}");
+            drive(&mut e, &mut room, &fader(0, 0x05, BOTTOM, TOP, 20));
+        }
+        // Pushing on against the limit, with the fine halves all over the
+        // place, leaves the tempo exactly there.
+        let pushed = tempo_after_pairs(&mut e, &mut room, 0, &fader(0, 0x00, TOP, BOTTOM, 37));
+        assert!(pushed.iter().all(|&t| t == 0.5), "{pushed:?}");
+        drive(&mut e, &mut room, &fader(0, 0x05, BOTTOM, TOP, 20));
+        // Coming back starts at once: the moves past the limit aren't owed
+        // back (beyond one coarse step, 1/128 of the fader's travel).
+        let up_1pct = (TOP as f64 - 0.01 / 0.16 * 16383.0).round() as u16;
+        drive(&mut e, &mut room, &fader(0, 0x00, TOP, up_1pct, 1));
+        assert_eq!(room.decks[0].tempo, 0.5);
+        drive(&mut e, &mut room, &fader(0, 0x00, up_1pct, TOP, 1));
+        assert!((room.decks[0].tempo - 0.51).abs() < 1e-4);
+        // The same upwards, to +50%.
+        drive(&mut e, &mut room, &fader(0, 0x05, TOP, BOTTOM, 20));
+        for _ in 0..8 {
+            drive(&mut e, &mut room, &fader(0, 0x00, BOTTOM, TOP, 20));
+            drive(&mut e, &mut room, &fader(0, 0x05, TOP, BOTTOM, 20));
+        }
+        assert_eq!(room.decks[0].tempo, 1.5);
+    }
+
+    #[test]
+    fn a_quick_move_onto_the_decks_tempo_doesnt_grab_it() {
+        let mut e = MidiEngine::new(pioneer_ddj("DDJ-FLX6", "test", 4, 2048.0), 0.08);
+        let mut room = RoomState::default();
+        // Fader at -2%, then SHIFT up to the centre: the deck is 2% below it.
+        const MINUS_2: u16 = 6144;
+        drive(&mut e, &mut room, &fader(0, 0x00, MINUS_2, MINUS_2, 1));
+        let at_minus_2 = room.decks[0].tempo;
+        assert!((at_minus_2 - 0.98).abs() < 1e-4);
+        drive(&mut e, &mut room, &fader(0, 0x05, MINUS_2, CENTRE, 10));
+        // One quick move straight back to -2%: the fader now reads the
+        // deck's tempo, but it moved 2%, so the tempo moves 2%.
+        drive(&mut e, &mut room, &fader(0, 0x00, CENTRE, MINUS_2, 1));
+        let quick = room.decks[0].tempo;
+        assert!((quick - (at_minus_2 - 0.02)).abs() < 1e-4, "{quick}");
+
+        // SHIFT-moving the fader exactly onto the deck's tempo puts it back
+        // on the fader: from then on it sets the tempo directly.
+        let on = ((quick - 1.0) / 0.16 + 0.5) * 16383.0;
+        drive(
+            &mut e,
+            &mut room,
+            &fader(0, 0x05, MINUS_2, on.round() as u16, 5),
+        );
+        assert_eq!(room.decks[0].tempo, quick);
+        drive(
+            &mut e,
+            &mut room,
+            &fader(0, 0x00, on.round() as u16, 2000, 5),
+        );
+        let want = 1.0 + (2000.0 / 16383.0 - 0.5) * 0.16;
+        assert!((room.decks[0].tempo - want).abs() < 1e-9);
+    }
+
+    #[test]
+    fn shift_sync_after_shift_tempo_goes_to_where_the_fader_is() {
+        let mut e = MidiEngine::new(pioneer_ddj("DDJ-FLX6", "test", 4, 2048.0), 0.08);
+        let mut room = two_decks(&mut e);
+        // -4% on the fader, then SHIFT moves the fader to +4%.
+        drive(&mut e, &mut room, &fader(0, 0x00, CENTRE, 4096, 10));
+        drive(&mut e, &mut room, &fader(0, 0x05, 4096, 12288, 10));
+        assert!((room.decks[0].tempo - 0.96).abs() < 1e-4);
+        // Right-clicking SYNC on screen uses the same position.
+        assert!((e.hardware_tempo(0).unwrap() - 1.04).abs() < 1e-4);
+        // SYNC, then SHIFT + SYNC: back on the fader, at +4%.
+        drive(&mut e, &mut room, &[[0x90, 0x58, 127]]);
+        assert!(room.decks[0].synced);
+        drive(&mut e, &mut room, &[[0x90, 0x60, 127]]);
+        assert!(!room.decks[0].synced);
+        assert!((room.decks[0].tempo - 1.04).abs() < 1e-4);
+        // The fader sets the tempo directly again.
+        drive(&mut e, &mut room, &fader(0, 0x00, 12288, 10000, 3));
+        let want = 1.0 + (10000.0 / 16383.0 - 0.5) * 0.16;
+        assert!((room.decks[0].tempo - want).abs() < 1e-9);
+    }
+
+    #[test]
+    fn shift_tempo_on_synced_decks() {
+        let mut e = MidiEngine::new(pioneer_ddj("DDJ-FLX6", "test", 4, 2048.0), 0.08);
+        let mut room = two_decks(&mut e);
+        // A syncs to B: B is the master, A plays at B's 115 BPM.
+        drive(&mut e, &mut room, &[[0x90, 0x58, 127]]);
+        assert_eq!(room.master, Some(1));
+        let locked = |room: &RoomState| {
+            (room.decks[0].tempo * 128.0 - room.decks[1].tempo * 115.0).abs() < 1e-6
+        };
+        let synced = room.decks[0].tempo;
+        assert!(locked(&room));
+
+        // A's fader down 4%: A moves 4% and carries the master.
+        drive(&mut e, &mut room, &fader(0, 0x00, CENTRE, 4096, 15));
+        assert!((room.decks[0].tempo - (synced - 0.04)).abs() < 1e-4);
+        assert!(locked(&room));
+        // SHIFT + A's fader back to the centre: neither deck moves.
+        let before = (room.decks[0].tempo, room.decks[1].tempo);
+        assert!(drive(&mut e, &mut room, &fader(0, 0x05, 4096, CENTRE, 15)).is_empty());
+        assert_eq!((room.decks[0].tempo, room.decks[1].tempo), before);
+        // Down 4% again: both go lower still, still locked.
+        drive(&mut e, &mut room, &fader(0, 0x00, CENTRE, 4096, 15));
+        assert!((room.decks[0].tempo - (synced - 0.08)).abs() < 1e-4);
+        assert!(locked(&room));
+
+        // The master's own fader: SHIFT down, then up 2% from where B is.
+        let b = room.decks[1].tempo;
+        assert!(drive(&mut e, &mut room, &fader(1, 0x05, CENTRE, 0, 15)).is_empty());
+        drive(&mut e, &mut room, &fader(1, 0x00, 0, 2048, 15));
+        assert!((room.decks[1].tempo - (b + 0.02)).abs() < 1e-4);
+        assert!(locked(&room));
+        assert!(room.decks[0].synced);
+    }
+
+    #[test]
+    fn shift_tempo_then_the_partner_moves_the_deck() {
+        let mut e = MidiEngine::new(pioneer_ddj("DDJ-FLX6", "test", 4, 2048.0), 0.08);
+        let mut room = RoomState::default();
+        let partner = |room: &mut RoomState, tempo: f64| {
+            room.apply(&crate::model::Event {
+                time: 5_000_000,
+                origin: 2,
+                seq: 1,
+                action: Action::Tempo { deck: 0, tempo },
+            })
+        };
+        drive(&mut e, &mut room, &fader(0, 0x00, CENTRE, 4096, 10));
+        drive(&mut e, &mut room, &fader(0, 0x05, 4096, CENTRE, 10));
+        // The partner sets the deck to +2% on their screen. Moving our
+        // fader down 2% starts from there.
+        partner(&mut room, 1.02);
+        drive(&mut e, &mut room, &fader(0, 0x00, CENTRE, 6144, 10));
+        assert!((room.decks[0].tempo - 1.0).abs() < 1e-4);
+        // The partner puts the deck where our fader sits: it's on the fader
+        // again, and sets the tempo directly.
+        let here = e.hardware_tempo(0).unwrap();
+        partner(&mut room, here);
+        drive(&mut e, &mut room, &fader(0, 0x00, 6144, 3000, 10));
+        let want = 1.0 + (3000.0 / 16383.0 - 0.5) * 0.16;
+        assert!((room.decks[0].tempo - want).abs() < 1e-9);
+    }
+
+    #[test]
+    fn learned_shift_tempo_and_a_controller_that_cant_tell() {
+        let (room, local) = (RoomState::default(), LocalParams::default());
+        // Learn SHIFT + tempo fader from the FLX6's shifted pair.
+        let mut e = engine();
+        e.learn = Some(Target::TempoShift { deck: 0 });
+        let out = e.handle(&[0xb0, 0x05, 70], &room, &local);
+        assert!(matches!(&out[0], MidiOut::Learned(b) if b.trigger == Trigger::cc(0, 0x05)));
+        assert!(e.handle(&[0xb0, 0x25, 3], &room, &local).is_empty());
+
+        // A controller that sends the same message with SHIFT held: if both
+        // get learned on it, it stays a plain tempo fader.
+        let mut e = engine();
+        e.mapping
+            .bind(Trigger::cc(0, 0x1F), Target::TempoShift { deck: 0 });
+        e.mapping
+            .bind(Trigger::cc(0, 0x1F), Target::Tempo { deck: 0 });
+        let mut room = RoomState::default();
+        drive(&mut e, &mut room, &[[0xb0, 0x1F, 64]]);
+        drive(&mut e, &mut room, &[[0xb0, 0x1F, 30]]);
+        let want = 1.0 + (30.0 / 127.0 - 0.5) * 0.16;
+        assert!((room.decks[0].tempo - want).abs() < 1e-6);
+    }
+
+    #[test]
+    fn saved_v7_and_v8_mappings_gain_shift_tempo() {
+        let preset = pioneer_ddj("DDJ-FLX6", "Pioneer DDJ-FLX6", 4, 2048.0);
+        let browse = |t: &Target| matches!(t, Target::BrowsePress | Target::BrowseBack);
+        let shift_tempo = |t: &Target| matches!(t, Target::TempoShift { .. });
+        // Saved by preset 8 (v0.11.2 to v0.11.4): SHIFT + TEMPO on all four
+        // decks. Saved by preset 7: also the browse knob's press and BACK.
+        for (version, added) in [(8, 4), (7, 4 + 2)] {
+            let mut saved = preset.clone();
+            saved.preset_version = version;
+            saved.jog_ticks_per_rev = Some(6387.0);
+            saved
+                .bindings
+                .retain(|b| !shift_tempo(&b.target) && (version > 7 || !browse(&b.target)));
+            assert_eq!(saved.upgrade_from(&preset), added, "preset {version}");
+            assert_eq!(saved.preset_version, PRESET_VERSION);
+            assert_eq!(saved.bindings.len(), preset.bindings.len());
+            for deck in 0..4 {
+                let b = saved.binding_for(Target::TempoShift { deck }).unwrap();
+                assert_eq!(b.trigger, Trigger::cc(deck, 0x05));
+            }
+            assert_eq!(saved.jog_ticks_per_rev, Some(6387.0));
+            assert_eq!(saved.upgrade_from(&preset), 0, "only once");
+            // And it works: SHIFT + TEMPO moves the fader, not the tempo.
+            let mut e = MidiEngine::new(saved, 0.08);
+            let mut room = RoomState::default();
+            drive(&mut e, &mut room, &fader(0, 0x00, CENTRE, BOTTOM, 10));
+            assert!(drive(&mut e, &mut room, &fader(0, 0x05, BOTTOM, CENTRE, 10)).is_empty());
+            drive(&mut e, &mut room, &fader(0, 0x00, CENTRE, 4096, 10));
+            assert!(
+                (room.decks[0].tempo - 0.88).abs() < 1e-4,
+                "preset {version}"
+            );
+        }
     }
 
     #[test]
