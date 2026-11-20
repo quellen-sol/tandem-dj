@@ -290,6 +290,12 @@ Work through these in order and note anything that fails. `tandem.log` (Settings
   - Test: press IN off the beat, then OUT about a bar later. Does the green band start on a beat line and end exactly a bar later, with the **4** pad lit? Does OUT about half a bar after IN give ½ bar (the **2** pad)? With quantize off, does the loop start right where you pressed?
 - Protocol version 11: v0.11.4 can't share a room with earlier versions, so every booth needs v0.11.4.
 
+### v0.11.5
+
+- **SHIFT + tempo fader moves the fader, not the tempo.** Run out of travel? Hold SHIFT, slide the fader back, let go and keep going the same way, past the fader's range, up to ±50%. It used to jump back by however far you'd slid it. It works the same on synced decks (the synced decks follow as usual) and when your partner has moved the deck. Saved FLX6 mappings pick it up by themselves, and other controllers can learn **SHIFT + tempo fader**.
+  - Test: move deck A's tempo fader to the bottom (−8%), SHIFT + slide it back to the centre (the tempo stays at −8%), then move it down again. Does the tempo go on smoothly to −16%? Then press SHIFT + SYNC: does the deck go to where the fader sits?
+- No protocol change: v0.11.4 and v0.11.5 can share a room.
+
 ## Next candidates
 
 Rough priority order:
