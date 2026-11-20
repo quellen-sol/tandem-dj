@@ -818,20 +818,33 @@ impl TandemApp {
                         .fill(if on { lit } else { off })
                         .min_size(vec2(w, h))
                 };
+                // Quantize only does anything on a track with a beatgrid.
+                let quantize = self.settings.quantize_loops;
+                let (in_tip, out_tip) = if quantize && st.grid.is_some() {
+                    (
+                        "Loop in: mark where a loop starts (on the nearest beat), then press OUT where it ends. While looping, moves the start of the loop to the nearest beat.",
+                        "Loop out: end the loop and go round it. The loop is 1 bar, ½ bar, ¼ bar … or 2, 4, 8 bars …, whichever is nearest to when you press, so OUT about a bar after IN makes a 1-bar loop. While looping, makes it the length nearest to here. (Quantize is in Settings › General.)",
+                    )
+                } else {
+                    (
+                        "Loop in: mark where a loop starts, then press OUT where it ends. While looping, moves the start of the loop to here.",
+                        "Loop out: end the loop here and go round it. While looping, moves the end of the loop to here.",
+                    )
+                };
                 if ui
                     .add(button("IN", st.looping || waiting, 26.0))
-                    .on_hover_text("Loop in: mark where a loop starts, then press OUT where it ends. While looping, moves the start of the loop to here.")
+                    .on_hover_text(in_tip)
                     .clicked()
                 {
-                    self.pending.push(Action::LoopIn { deck });
+                    self.pending.push(Action::LoopIn { deck, quantize });
                 }
                 if ui
                     .add_enabled(st.loop_in.is_some(), button("OUT", st.looping, 30.0))
-                    .on_hover_text("Loop out: end the loop here and go round it. While looping, moves the end of the loop to here.")
+                    .on_hover_text(out_tip)
                     .on_disabled_hover_text("Press IN first, where the loop should start.")
                     .clicked()
                 {
-                    self.pending.push(Action::LoopOut { deck });
+                    self.pending.push(Action::LoopOut { deck, quantize });
                 }
                 let label = if st.looping { "EXIT" } else { "RELOOP" };
                 if ui

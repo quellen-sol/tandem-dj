@@ -707,6 +707,18 @@ impl TandemApp {
         });
         ui.label(RichText::new("Keeps track transfers from swamping your connection while you play: every track you send, to your partner or a broadcaster, shares it. Lower it if your partner's controls feel laggy, or a broadcaster warns that moves arrive late, while tracks are being sent.").small().weak());
         ui.separator();
+        if ui
+            .checkbox(
+                &mut self.settings.quantize_loops,
+                "Quantize loop IN and OUT",
+            )
+            .changed()
+        {
+            self.midi.engine.lock().quantize_loops = self.settings.quantize_loops;
+            self.mark_dirty();
+        }
+        ui.label(RichText::new("IN goes on the nearest beat, and OUT makes the loop 1 bar, ½ bar, ¼ bar … or 2, 4, 8 bars …, whichever is nearest to when you press it: OUT about a bar after IN makes a 1-bar loop. Off: IN and OUT go exactly where the playhead is. Tracks without a beatgrid always loop exactly. This is your own setting; your partner's loops follow theirs.").small().weak());
+        ui.separator();
         ui.horizontal(|ui| {
             ui.label("Screen frame rate");
             let mut rate = self.settings.frame_rate;

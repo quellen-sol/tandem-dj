@@ -1759,8 +1759,20 @@ mod tests {
                 &a,
                 key_lock,
                 &[
-                    (1_000_000, Action::LoopIn { deck: 0 }),
-                    (1_730_000, Action::LoopOut { deck: 0 }),
+                    (
+                        1_000_000,
+                        Action::LoopIn {
+                            deck: 0,
+                            quantize: false,
+                        },
+                    ),
+                    (
+                        1_730_000,
+                        Action::LoopOut {
+                            deck: 0,
+                            quantize: false,
+                        },
+                    ),
                     (3_100_000, Action::LoopHalve { deck: 0 }),
                     (4_000_000, Action::Reloop { deck: 0 }),
                     (5_000_000, Action::Reloop { deck: 0 }),
@@ -1774,6 +1786,38 @@ mod tests {
                     (6_500_000, Action::Reloop { deck: 0 }),
                 ],
                 7.5,
+            );
+        }
+    }
+
+    #[test]
+    fn quantized_loop_out_pressed_late_goes_round() {
+        // 120 BPM from 0. IN at 1.1 s snaps to 1.0; OUT 4.4 beats after
+        // that makes a 4-beat loop that ends at 3.0 s, behind the playhead,
+        // which has gone round to 1.2 s. The head follows it there.
+        let a = sine_track();
+        for key_lock in [false, true] {
+            render_loop(
+                &a,
+                key_lock,
+                &[
+                    (
+                        1_100_000,
+                        Action::LoopIn {
+                            deck: 0,
+                            quantize: true,
+                        },
+                    ),
+                    (
+                        3_200_000,
+                        Action::LoopOut {
+                            deck: 0,
+                            quantize: true,
+                        },
+                    ),
+                    (6_000_000, Action::Reloop { deck: 0 }),
+                ],
+                7.0,
             );
         }
     }

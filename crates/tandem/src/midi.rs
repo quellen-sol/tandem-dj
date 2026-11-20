@@ -54,11 +54,13 @@ pub struct Midi {
 }
 
 impl Midi {
-    pub fn new(tempo_range: f64) -> Self {
+    pub fn new(tempo_range: f64, quantize_loops: bool) -> Self {
+        let mut engine = MidiEngine::new(Mapping::default(), tempo_range);
+        engine.quantize_loops = quantize_loops;
         Self {
             conn: None,
             feedback: None,
-            engine: Arc::new(Mutex::new(MidiEngine::new(Mapping::default(), tempo_range))),
+            engine: Arc::new(Mutex::new(engine)),
             port: None,
             has_output: false,
             ui_queue: Arc::new(Mutex::new(Vec::new())),

@@ -571,6 +571,8 @@ pub struct MidiEngine {
     /// Set by the mapping screen; the next matching control you touch gets bound.
     pub learn: Option<Target>,
     pub tempo_range: f64,
+    /// LOOP IN and OUT snap to the beatgrid (this DJ's setting).
+    pub quantize_loops: bool,
     pub last_message: Option<String>,
     takeover: HashMap<Target, Takeover>,
     msb: HashMap<(u8, u8), u8>,
@@ -615,6 +617,7 @@ impl MidiEngine {
             mapping,
             learn: None,
             tempo_range,
+            quantize_loops: true,
             last_message: None,
             takeover: HashMap::new(),
             msb: HashMap::new(),
@@ -862,12 +865,14 @@ impl MidiEngine {
                 Target::HotCueClear { deck, slot } if down => {
                     out.push(MidiOut::Action(Action::ClearHotCue { deck, slot }))
                 }
-                Target::LoopIn { deck } if down => {
-                    out.push(MidiOut::Action(Action::LoopIn { deck }))
-                }
-                Target::LoopOut { deck } if down => {
-                    out.push(MidiOut::Action(Action::LoopOut { deck }))
-                }
+                Target::LoopIn { deck } if down => out.push(MidiOut::Action(Action::LoopIn {
+                    deck,
+                    quantize: self.quantize_loops,
+                })),
+                Target::LoopOut { deck } if down => out.push(MidiOut::Action(Action::LoopOut {
+                    deck,
+                    quantize: self.quantize_loops,
+                })),
                 Target::Reloop { deck } if down => {
                     out.push(MidiOut::Action(Action::Reloop { deck }))
                 }
@@ -2001,8 +2006,19 @@ mod tests {
             assert!(e.handle(&[msg[0], msg[1], 0], &room, &local).is_empty());
             out
         };
-        assert_eq!(press([0x90, 0x10, 0x7F]), act(Action::LoopIn { deck: 0 }));
-        assert_eq!(press([0x90, 0x11, 0x7F]), act(Action::LoopOut { deck: 0 }));
+        // Quantized unless the DJ turned it off.
+        let loop_in = |deck| Action::LoopIn {
+            deck,
+            quantize: true,
+        };
+        assert_eq!(press([0x90, 0x10, 0x7F]), act(loop_in(0)));
+        assert_eq!(
+            press([0x90, 0x11, 0x7F]),
+            act(Action::LoopOut {
+                deck: 0,
+                quantize: true
+            })
+        );
         assert_eq!(press([0x90, 0x4D, 0x7F]), act(Action::Reloop { deck: 0 }));
         assert_eq!(
             press([0x90, 0x4C, 0x7F]),
@@ -2020,7 +2036,7 @@ mod tests {
             press([0x90, 0x53, 0x7F]),
             act(Action::LoopDouble { deck: 0 })
         );
-        assert_eq!(press([0x91, 0x10, 0x7F]), act(Action::LoopIn { deck: 1 }));
+        assert_eq!(press([0x91, 0x10, 0x7F]), act(loop_in(1)));
         assert_eq!(press([0x91, 0x4D, 0x7F]), act(Action::Reloop { deck: 1 }));
         // BEAT LOOP pads (SHIFT + BEAT JUMP): ¼ to 32 beats.
         for (i, beats) in BEAT_LOOPS.iter().enumerate() {
@@ -2050,6 +2066,15 @@ mod tests {
         ] {
             assert!(press(msg).is_empty(), "{msg:02X?}");
         }
+        // Quantize turned off in Settings: IN and OUT go to the playhead.
+        e.quantize_loops = false;
+        assert_eq!(
+            e.handle(&[0x90, 0x10, 0x7F], &room, &local),
+            act(Action::LoopIn {
+                deck: 0,
+                quantize: false
+            })
+        );
     }
 
     #[test]

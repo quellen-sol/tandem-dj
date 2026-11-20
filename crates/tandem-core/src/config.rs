@@ -133,6 +133,10 @@ pub struct Settings {
     pub crossfader_curve: XfCurve,
     /// Show decks C and D (they also show whenever one has a track).
     pub four_decks: bool,
+    /// LOOP IN goes on the nearest beat and LOOP OUT makes the loop 1 bar,
+    /// ½ bar, 2 bars … (on tracks with a beatgrid). Off: exactly at the
+    /// playhead. Each DJ's own: the booth that presses decides.
+    pub quantize_loops: bool,
 }
 
 impl Default for Settings {
@@ -153,6 +157,7 @@ impl Default for Settings {
             frame_rate: FrameRate::default(),
             crossfader_curve: XfCurve::default(),
             four_decks: false,
+            quantize_loops: true,
         }
     }
 }
@@ -346,6 +351,10 @@ mod tests {
         assert_eq!(old.local.pfl, [false, true, false, false]);
         assert_eq!(old.local.cue_mix, 0.5);
         assert!(!old.four_decks);
+        // Loop IN/OUT quantize came later, on by default.
+        assert!(old.quantize_loops);
+        let off: Settings = serde_json::from_str(r#"{"quantize_loops":false}"#).unwrap();
+        assert!(!off.quantize_loops);
     }
 
     #[test]

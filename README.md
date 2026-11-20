@@ -75,7 +75,9 @@ Mappings are saved per controller, so you only do this once. When Tandem's built
 
 Each deck has a **LOOP** row, and the controller's loop buttons and BEAT LOOP pads do the same things.
 
-- **IN** marks where a loop starts. **OUT** marks where it ends, and the deck goes straight back to IN and loops. While looping, IN and OUT move the start or the end to the playhead.
+- **IN** marks where a loop starts, on the nearest beat. **OUT** ends it, and the deck goes round the loop. Loops made with IN and OUT are quantized: the loop is **1 bar, ½ bar, ¼ bar …** (down to ¼ beat) **or 2, 4, 8 bars …**, whichever is nearest to when you press OUT. So IN, then OUT about a bar later, makes a 1-bar loop; OUT pressed a little late still gives exactly 1 bar, and the deck carries on round the loop on the beat.
+- **While looping,** IN moves the start to the nearest beat, and OUT makes the loop the length nearest to the playhead (keeping its start).
+- **Quantize off** (Settings › General › **Quantize loop IN and OUT**): IN and OUT go exactly where the playhead is, and while looping they move the start or the end to the playhead. Tracks without a beatgrid always loop exactly. It's each DJ's own setting: a loop your partner makes follows theirs.
 - **RELOOP/EXIT** leaves the loop, and playback carries on through it. Press it again to jump back to the loop and go round it again.
 - **Beat loops (¼ to 32 beats)** start on the beat the playhead is in, so they're always on the beat. A ¼-beat loop is the quarter of the beat the playhead is in. Press the same size again to leave the loop. Another size resizes the loop, keeping its start. Without a beatgrid, a beat loop starts at the playhead, at 120 BPM.
 - **×½ / ×2** halve and double the loop, keeping its start.
@@ -196,7 +198,7 @@ Host in one window and join `127.0.0.1` from the other.
 ## Known limits in v0.11
 
 - **Decks and DJs:** 4 decks, 2 DJs per room, plus up to 4 broadcasters. There's one sync master: you can't sync two groups of decks to two different tempos.
-- **Beatgrids:** detection finds big, steady tempo changes but not gradual drifts, and doesn't find bars (the "1"). Some tracks come out at half or double time (87 instead of 174, say): **½** and **×2** under GRID fix that. Set markers by hand for both: see [Fixing a beatgrid](#fixing-a-beatgrid). A grid can have up to 32 markers, and every bar is 4 beats. Hot cues and play aren't snapped to the beat, except on a synced deck. Loop IN and OUT aren't either (beat loops always are).
+- **Beatgrids:** detection finds big, steady tempo changes but not gradual drifts, and doesn't find bars (the "1"). Some tracks come out at half or double time (87 instead of 174, say): **½** and **×2** under GRID fix that. Set markers by hand for both: see [Fixing a beatgrid](#fixing-a-beatgrid). A grid can have up to 32 markers, and every bar is 4 beats. Hot cues and play aren't snapped to the beat, except on a synced deck (loops are: see [Loops](#loops)). Quantized loops count bars from the beat you press IN on, not from the grid's bar 1.
 - **Loops:** no slip mode or loop rolls, no fine-adjusting IN/OUT with the jog wheel, and loops aren't saved with the track.
 - **Keys:** detection is good but not perfect: on a test library it matched reference tools on about 3 tracks in 4, and most misses were a compatible neighbour (the relative major/minor, or one step round the Camelot wheel). A track gets one key, even if it changes key part-way through.
 - **Mixer:** no effects. EQ is a 3-band isolator, plus a filter and trim per channel.

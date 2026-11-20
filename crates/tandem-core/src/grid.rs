@@ -198,16 +198,31 @@ impl BeatGrid {
         (self.beat_at(pos) * mult).rem_euclid(1.0)
     }
 
-    /// The bar and beat the playhead at `pos` is in (the last beat at or
-    /// before it).
-    pub fn bar_beat_at(&self, pos: f64) -> (i64, u8) {
+    /// The last beat at or before `pos`: its section, and its beat within
+    /// the section.
+    fn beat_index(&self, pos: f64) -> (usize, i64) {
         let i = self.section(pos);
         let m = self.markers[i];
         let mut j = ((pos - m.pos) / m.beat_len() + 1e-9).floor() as i64;
         if i + 1 < self.len as usize {
             j = j.min(self.beats_in_section(i) - 1);
         }
+        (i, j)
+    }
+
+    /// The bar and beat the playhead at `pos` is in (the last beat at or
+    /// before it).
+    pub fn bar_beat_at(&self, pos: f64) -> (i64, u8) {
+        let (i, j) = self.beat_index(pos);
         label(self.bar_start(i), j)
+    }
+
+    /// The beats either side of `pos`: the last one at or before it and the
+    /// first one at or after it (the same beat when `pos` is on one).
+    pub fn beats_around(&self, pos: f64) -> (f64, f64) {
+        let (i, j) = self.beat_index(pos);
+        let m = self.markers[i];
+        (m.pos + j as f64 * m.beat_len(), self.next_beat(pos))
     }
 
     /// The first beat at or after `pos`.
@@ -436,6 +451,22 @@ mod tests {
         // A later section uses its own tempo.
         let g = grid(&[(0.0, 120.0), (20.0, 150.0)]);
         assert!(close(g.beat_loop(20.5, 2.0), (20.4, 21.2)));
+    }
+
+    #[test]
+    fn beats_around_a_position() {
+        let close =
+            |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).abs() < 1e-9 && (a.1 - b.1).abs() < 1e-9;
+        // 120 BPM from 0.25 s.
+        let g = BeatGrid::new(0.25, 120.0).unwrap();
+        assert!(close(g.beats_around(1.4), (1.25, 1.75)));
+        assert!(close(g.beats_around(1.25), (1.25, 1.25)));
+        assert!(close(g.beats_around(0.1), (-0.25, 0.25)));
+        // A section's last beat stretches to meet the next marker (here
+        // 8.4 beats round to 8): no beat line between 3.5 s and 4.2 s.
+        let g = grid(&[(0.0, 120.0), (4.2, 120.0)]);
+        assert!(close(g.beats_around(4.0), (3.5, 4.2)));
+        assert!(close(g.beats_around(4.3), (4.2, 4.7)));
     }
 
     #[test]

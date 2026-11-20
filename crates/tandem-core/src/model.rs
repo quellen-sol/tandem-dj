@@ -25,6 +25,18 @@ const MAX_LOOP_BEATS: f64 = 512.0;
 /// Beat length (seconds) for beat loops on a track with no beatgrid (120 BPM).
 const NO_GRID_BEAT: f64 = 0.5;
 
+/// The length (in beats) of a quantized loop whose LOOP OUT was pressed
+/// `beats` after its in point: whichever of ¼ beat, ½ beat, 1 beat, ½ bar,
+/// 1 bar, 2 bars, 4 bars … 128 bars is nearest. Pressing OUT about a bar
+/// after IN makes a 1-bar loop.
+pub fn quantized_loop_beats(beats: f64) -> f64 {
+    let mut len = BEAT_LOOPS[0];
+    while len < MAX_LOOP_BEATS && beats >= len * 1.5 {
+        len *= 2.0;
+    }
+    len
+}
+
 /// "A", "B", "C", "D" for deck 0–3.
 pub fn deck_letter(d: usize) -> char {
     (b'A' + d as u8) as char
@@ -267,6 +279,21 @@ impl DeckState {
         self.grid
             .map(|g| 60.0 / g.bpm_at(pos))
             .unwrap_or(NO_GRID_BEAT)
+    }
+
+    /// The beat nearest `p` that's inside the track (`p` itself with no
+    /// grid): where a quantized LOOP IN goes.
+    fn snap_to_beat(&self, p: f64) -> f64 {
+        let Some(g) = self.grid else { return p };
+        let (before, after) = g.beats_around(p);
+        let inside = |x: f64| (0.0..self.duration).contains(&x);
+        if inside(after) && (after - p < p - before || !inside(before)) {
+            after
+        } else if inside(before) {
+            before
+        } else {
+            p
+        }
     }
 
     /// How much higher (as a frequency ratio) the deck sounds than the
@@ -578,13 +605,22 @@ pub enum Action {
     },
     /// LOOP IN: a loop starts at the playhead, and LOOP OUT ends it. While
     /// looping, it moves the start of the loop to the playhead instead.
+    /// `quantize` (the pressing DJ's setting): on the nearest beat instead,
+    /// on a track with a beatgrid.
     LoopIn {
         deck: u8,
+        #[serde(default)]
+        quantize: bool,
     },
     /// LOOP OUT: the loop ends at the playhead, and playback goes back to
     /// the loop in point and loops. While looping, it moves the end here.
+    /// `quantize`: on a track with a beatgrid, the loop is the length from
+    /// [`quantized_loop_beats`] instead (1 bar, ½ bar, 2 bars …), and a
+    /// playhead already past the end has gone round the loop.
     LoopOut {
         deck: u8,
+        #[serde(default)]
+        quantize: bool,
     },
     /// RELOOP/EXIT: while looping, leave the loop (playback carries on
     /// through it). Otherwise jump back to the loop in point and loop again.
@@ -679,8 +715,8 @@ impl Action {
             | HotCue { deck, .. }
             | HotCueUp { deck, .. }
             | ClearHotCue { deck, .. }
-            | LoopIn { deck }
-            | LoopOut { deck }
+            | LoopIn { deck, .. }
+            | LoopOut { deck, .. }
             | Reloop { deck }
             | BeatLoop { deck, .. }
             | LoopHalve { deck }
@@ -1228,28 +1264,31 @@ impl RoomState {
                     *h = None;
                 }
             }
-            Action::LoopIn { .. } => {
+            Action::LoopIn { quantize, .. } => {
                 if d.track.is_none() {
                     return;
                 }
                 let p = d.position_at(t);
+                // Quantized, it can land a little after the playhead, which
+                // then walks into the loop.
+                let a = if quantize { d.snap_to_beat(p) } else { p };
                 match d.active_loop() {
                     Some((_, b)) => {
-                        if p < b - MIN_LOOP {
+                        if a < b - MIN_LOOP {
                             d.reanchor(t);
-                            d.loop_in = Some(p);
+                            d.loop_in = Some(a);
                             d.loop_beats = None;
                         }
                     }
                     None => {
-                        d.loop_in = Some(p);
+                        d.loop_in = Some(a);
                         d.loop_out = None;
                         d.looping = false;
                         d.loop_beats = None;
                     }
                 }
             }
-            Action::LoopOut { .. } => {
+            Action::LoopOut { quantize, .. } => {
                 let (Some(a), Some(_)) = (d.loop_in, d.track) else {
                     return;
                 };
@@ -1257,13 +1296,30 @@ impl RoomState {
                 if p < a + MIN_LOOP {
                     return;
                 }
-                // The playhead is on the new out point, so settling the loop
-                // takes it straight back to the in point. No `gen` bump: the
-                // renderer follows loops itself and wraps seamlessly.
+                let (end, beats) = match d.grid.filter(|_| quantize) {
+                    Some(_) => {
+                        // The nearest musical length, timed with the tempo
+                        // at the in point (as beat loops are).
+                        let len = d.beat_len_at(a);
+                        let n = quantized_loop_beats((p - a) / len);
+                        let want = a + n * len;
+                        let end = want.min(d.duration);
+                        (end, (end == want).then_some(n))
+                    }
+                    None => (p, None),
+                };
+                if end - a < MIN_LOOP {
+                    return;
+                }
+                // A playhead at or past the new out point has gone round:
+                // settling the loop takes it back to the in point (plus how
+                // far past it was, so a quantized loop stays on the beat).
+                // No `gen` bump: the renderer follows loops itself and wraps
+                // seamlessly.
                 d.reanchor(t);
-                d.loop_out = Some(p);
+                d.loop_out = Some(end);
                 d.looping = true;
-                d.loop_beats = None;
+                d.loop_beats = beats;
             }
             Action::Reloop { .. } => {
                 if d.track.is_none() {
@@ -2547,12 +2603,12 @@ mod tests {
         };
         go(&mut s, 0, grid_load(0, 1, 120.0, 0.0));
         // LOOP OUT with no LOOP IN does nothing.
-        go(&mut s, 0, Action::LoopOut { deck: 0 });
+        go(&mut s, 0, loop_out(false));
         assert!(!s.decks[0].looping);
         go(&mut s, 0, Action::Play { deck: 0 });
-        go(&mut s, 10_000_000, Action::LoopIn { deck: 0 });
+        go(&mut s, 10_000_000, loop_in(false));
         assert!(!s.decks[0].looping, "waits for LOOP OUT");
-        go(&mut s, 12_000_000, Action::LoopOut { deck: 0 });
+        go(&mut s, 12_000_000, loop_out(false));
         let d = s.decks[0];
         assert_eq!(d.active_loop(), Some((10.0, 12.0)));
         assert_eq!(d.gen, s.decks[0].gen);
@@ -2571,17 +2627,166 @@ mod tests {
         assert!(close(at(&s, 0, 21_000_000), 11.0));
         assert!(close(at(&s, 0, 22_500_000), 10.5));
         // LOOP IN while looping moves the start to the playhead.
-        go(&mut s, 23_000_000, Action::LoopIn { deck: 0 });
+        go(&mut s, 23_000_000, loop_in(false));
         assert_eq!(s.decks[0].active_loop(), Some((11.0, 12.0)));
         assert!(close(at(&s, 0, 24_500_000), 11.5));
         // LOOP OUT while looping moves the end to the playhead.
-        go(&mut s, 25_750_000, Action::LoopOut { deck: 0 });
+        go(&mut s, 25_750_000, loop_out(false));
         assert_eq!(s.decks[0].active_loop(), Some((11.0, 11.75)));
         assert!(close(at(&s, 0, 26_000_000), 11.25));
         // Loading another track forgets the loop.
         go(&mut s, 27_000_000, grid_load(0, 2, 120.0, 0.0));
         assert_eq!(s.decks[0].loop_span(), None);
         assert!(!s.decks[0].looping);
+    }
+
+    fn loop_in(quantize: bool) -> Action {
+        Action::LoopIn { deck: 0, quantize }
+    }
+
+    fn loop_out(quantize: bool) -> Action {
+        Action::LoopOut { deck: 0, quantize }
+    }
+
+    /// Deck A playing from 0:00 at t = 0, at 120 BPM with its first beat at
+    /// `first_beat`: a beat every 0.5 s, a bar every 2 s.
+    fn playing_on_grid(first_beat: f64) -> RoomState {
+        let mut s = RoomState::default();
+        s.apply(&ev(0, 1, 1, grid_load(0, 1, 120.0, first_beat)));
+        s.apply(&ev(0, 1, 2, Action::Play { deck: 0 }));
+        s
+    }
+
+    fn span_is(s: &RoomState, a: f64, b: f64) -> bool {
+        s.decks[0]
+            .loop_span()
+            .is_some_and(|(x, y)| close(x, a) && close(y, b))
+    }
+
+    #[test]
+    fn quantized_loop_in_snaps_to_the_beat_and_out_to_a_bar() {
+        // Beats at 0.25 s, 0.75 s, 1.25 s …
+        let mut s = playing_on_grid(0.25);
+        // IN at 10.1 s: the nearest beat is 10.25 s, just ahead.
+        s.apply(&ev(10_100_000, 1, 10, loop_in(true)));
+        assert_eq!(s.decks[0].loop_in, Some(10.25));
+        assert!(!s.decks[0].looping, "waits for LOOP OUT");
+        // OUT 4.3 beats later: exactly 1 bar. The playhead was past the
+        // end, so it has gone round, still on the beat.
+        s.apply(&ev(12_400_000, 1, 11, loop_out(true)));
+        assert_eq!(s.decks[0].active_loop(), Some((10.25, 12.25)));
+        assert_eq!(s.decks[0].loop_beats, Some(4.0));
+        assert!(close(at(&s, 0, 12_400_000), 10.4));
+        assert!(close(at(&s, 0, 14_300_000), 10.3));
+        // While looping, IN moves the start to the nearest beat (2.1 beats
+        // into the loop: the beat before), and the end stays.
+        s.apply(&ev(13_350_000, 1, 12, loop_in(true)));
+        assert_eq!(s.decks[0].active_loop(), Some((11.25, 12.25)));
+        // OUT while looping, 1.4 beats in: a 1-beat loop.
+        s.apply(&ev(13_950_000, 1, 13, loop_out(true)));
+        assert_eq!(s.decks[0].active_loop(), Some((11.25, 11.75)));
+        assert_eq!(s.decks[0].loop_beats, Some(1.0));
+        assert!(close(at(&s, 0, 13_950_000), 11.45));
+        // ×2 carries on in beats.
+        s.apply(&ev(14_000_000, 1, 14, Action::LoopDouble { deck: 0 }));
+        assert_eq!(s.decks[0].active_loop(), Some((11.25, 12.25)));
+        assert_eq!(s.decks[0].loop_beats, Some(2.0));
+        // IN while looping can land just ahead of the playhead, which then
+        // walks into the loop.
+        assert!(close(at(&s, 0, 14_150_000), 11.65));
+        s.apply(&ev(14_150_000, 1, 15, loop_in(true)));
+        assert_eq!(s.decks[0].active_loop(), Some((11.75, 12.25)));
+        assert!(close(at(&s, 0, 14_250_000), 11.75));
+        assert!(close(at(&s, 0, 14_850_000), 11.85));
+    }
+
+    #[test]
+    fn quantized_loop_out_takes_the_nearest_musical_length() {
+        assert_eq!(quantized_loop_beats(0.0), 0.25);
+        assert_eq!(quantized_loop_beats(5.9), 4.0);
+        assert_eq!(quantized_loop_beats(6.0), 8.0);
+        assert_eq!(quantized_loop_beats(1e9), MAX_LOOP_BEATS);
+        // OUT pressed `gap` seconds after IN (on a beat; a beat is 0.5 s).
+        for (gap, beats) in [
+            (0.05, 0.25),
+            (0.12, 0.25),
+            (0.2, 0.5),
+            (0.3, 0.5),
+            (0.45, 1.0),
+            (0.8, 2.0),
+            (1.1, 2.0),
+            (1.6, 4.0),
+            (1.9, 4.0),
+            (2.3, 4.0),
+            (2.9, 4.0),
+            (3.1, 8.0),
+            (7.5, 16.0),
+        ] {
+            let mut s = playing_on_grid(0.25);
+            s.apply(&ev(10_250_000, 1, 10, loop_in(true)));
+            let t = 10_250_000 + (gap * 1e6) as i64;
+            s.apply(&ev(t, 1, 11, loop_out(true)));
+            assert!(span_is(&s, 10.25, 10.25 + beats * 0.5), "{gap} s");
+            assert_eq!(s.decks[0].loop_beats, Some(beats), "{gap} s");
+        }
+    }
+
+    #[test]
+    fn loops_are_exact_with_quantize_off_or_no_grid() {
+        // Quantize off: exactly at the playhead, even on a grid.
+        let mut s = playing_on_grid(0.25);
+        s.apply(&ev(10_100_000, 1, 10, loop_in(false)));
+        s.apply(&ev(12_400_000, 1, 11, loop_out(false)));
+        assert!(span_is(&s, 10.1, 12.4));
+        assert_eq!(s.decks[0].loop_beats, None);
+        // No grid: quantize has nothing to snap to.
+        let mut s = RoomState::default();
+        s.apply(&ev(
+            0,
+            1,
+            1,
+            Action::Load {
+                deck: 0,
+                track: tid(1),
+                duration: 300.0,
+                cue: 0.0,
+                grid: None,
+                key: -1,
+            },
+        ));
+        s.apply(&ev(0, 1, 2, Action::Play { deck: 0 }));
+        s.apply(&ev(10_100_000, 1, 3, loop_in(true)));
+        s.apply(&ev(12_400_000, 1, 4, loop_out(true)));
+        assert!(span_is(&s, 10.1, 12.4));
+        assert_eq!(s.decks[0].loop_beats, None);
+        // Old peers' events (no flag) are exact.
+        let old: Action = serde_json::from_str(r#"{"a":"LoopIn","deck":0}"#).unwrap();
+        assert_eq!(old, loop_in(false));
+    }
+
+    #[test]
+    fn quantized_loops_stay_inside_the_track() {
+        // Paused at 0:00, first beat at 0.4 s: the nearest beat (-0.1 s) is
+        // before the track starts, so IN takes the next one.
+        let mut s = RoomState::default();
+        s.apply(&ev(0, 1, 1, grid_load(0, 1, 120.0, 0.4)));
+        s.apply(&ev(0, 1, 2, loop_in(true)));
+        assert!(close(s.decks[0].loop_in.unwrap(), 0.4));
+        // A bar that would run past the end of the track (300 s) stops there.
+        s.apply(&ev(
+            0,
+            1,
+            3,
+            Action::Seek {
+                deck: 0,
+                pos: 298.4,
+            },
+        ));
+        s.apply(&ev(0, 1, 4, Action::Play { deck: 0 }));
+        s.apply(&ev(0, 1, 5, loop_in(true)));
+        s.apply(&ev(1_500_000, 1, 6, loop_out(true)));
+        assert!(span_is(&s, 298.4, 300.0));
+        assert_eq!(s.decks[0].loop_beats, None);
     }
 
     #[test]
@@ -2821,8 +3026,8 @@ mod tests {
         assert_eq!(s.decks[0].active_loop(), Some((16.0, 20.0)));
         s.apply(&ev(0, 1, 7, Action::Reloop { deck: 0 }));
         s.apply(&ev(0, 1, 8, Action::Seek { deck: 0, pos: 18.0 }));
-        s.apply(&ev(0, 1, 9, Action::LoopIn { deck: 0 }));
-        s.apply(&ev(4_000_000, 1, 10, Action::LoopOut { deck: 0 }));
+        s.apply(&ev(0, 1, 9, loop_in(false)));
+        s.apply(&ev(4_000_000, 1, 10, loop_out(false)));
         assert_eq!(s.decks[0].active_loop(), Some((18.0, 22.0)));
         let t = 4_000_000;
         assert_eq!(
@@ -2852,8 +3057,24 @@ mod tests {
                     beats: 2.0,
                 },
             ),
-            ev(1_500_000, 2, 3, Action::LoopIn { deck: 1 }),
-            ev(2_700_000, 2, 4, Action::LoopOut { deck: 1 }),
+            ev(
+                1_500_000,
+                2,
+                3,
+                Action::LoopIn {
+                    deck: 1,
+                    quantize: true,
+                },
+            ),
+            ev(
+                2_700_000,
+                2,
+                4,
+                Action::LoopOut {
+                    deck: 1,
+                    quantize: true,
+                },
+            ),
             ev(3_100_000, 1, 4, Action::LoopHalve { deck: 0 }),
             ev(4_000_000, 2, 5, Action::Sync { deck: 1, on: true }),
             ev(5_200_000, 1, 5, Action::Reloop { deck: 0 }),

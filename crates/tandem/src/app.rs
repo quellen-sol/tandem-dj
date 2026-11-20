@@ -337,7 +337,7 @@ impl TandemApp {
         };
         let audio = output::start(&settings.audio, snap, clock, meters.clone(), false);
 
-        let mut midi = Midi::new(settings.tempo_range);
+        let mut midi = Midi::new(settings.tempo_range, settings.quantize_loops);
         if let Some(port) = settings.midi_device.clone() {
             if let Err(e) = midi.connect(&port, session.clone(), &paths.mappings_dir) {
                 log::warn!("MIDI: {e:#}");
