@@ -628,6 +628,40 @@ impl TandemApp {
                 .small()
                 .weak(),
         );
+        // What the level knobs do depends on where the sound goes.
+        let levels = [
+            (
+                Target::MasterLevel,
+                "master",
+                "the master plays",
+                "it",
+                engine.card.master,
+                &self.audio.master_device,
+            ),
+            (
+                Target::HeadphoneLevel,
+                "headphone",
+                "the headphones play",
+                "them",
+                engine.card.phones,
+                &self.audio.cue_device,
+            ),
+        ];
+        for (target, what, output, it, on_card, device) in levels {
+            if engine.mapping.binding_for(target).is_none() {
+                continue;
+            }
+            let name = target.label();
+            let text = match device {
+                _ if on_card => format!(
+                    "{name} knob: {output} through this controller's own sound card, and the knob \
+                     turns {it} up and down there by itself, so it leaves Tandem's {what} level alone."
+                ),
+                Some(d) => format!("{name} knob: sets Tandem's {what} level, as {output} through {d}."),
+                None => format!("{name} knob: sets Tandem's {what} level."),
+            };
+            ui.label(RichText::new(text).small().weak());
+        }
         ui.separator();
         let learning = engine.learn;
         egui::ScrollArea::vertical().max_height(380.0).show(ui, |ui| {

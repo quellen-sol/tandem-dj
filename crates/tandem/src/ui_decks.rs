@@ -5,7 +5,7 @@ use crate::ui_meters;
 use eframe::egui::{self, pos2, vec2, Align, Color32, Layout, Rect, RichText, Sense, Stroke};
 use tandem_core::audio::PEAK_BLOCK;
 use tandem_core::grid::{BeatGrid, Marker, MAX_MARKERS};
-use tandem_core::mapping::beats_label;
+use tandem_core::mapping::{beats_label, MidiEngine, Target};
 use tandem_core::model::{Action, DeckState, XfCurve, XfSide, BEAT_LOOPS, DECKS, HOT_CUES};
 use tandem_core::net::{LINK_QUIET, LINK_TIMEOUT, REJOIN_FOR};
 use tandem_core::session::{deck_letter, DeckView, RejoinView, RoleView, SessionView, TrackStatus};
@@ -1065,6 +1065,7 @@ impl TandemApp {
 
     /// Headphone mix and level, master and broadcast level.
     fn local_levels(&mut self, ui: &mut egui::Ui) {
+        let knobs = self.level_knobs;
         ui.label(RichText::new("Your booth only").small().weak());
         ui.spacing_mut().slider_width = 130.0;
         ui.add(
@@ -1076,12 +1077,14 @@ impl TandemApp {
             egui::Slider::new(&mut self.local_edit.hp_level, 0.0..=1.0)
                 .show_value(false)
                 .text("phones level"),
-        );
+        )
+        .on_hover_text(knobs.phones.tip(Target::HeadphoneLevel));
         ui.add(
             egui::Slider::new(&mut self.local_edit.master_level, 0.0..=1.0)
                 .show_value(false)
                 .text("master level"),
-        );
+        )
+        .on_hover_text(knobs.master.tip(Target::MasterLevel));
         if self.settings.audio.broadcast.is_some() {
             ui.add(
                 egui::Slider::new(&mut self.local_edit.bcast_level, 0.0..=1.0)
@@ -1089,11 +1092,13 @@ impl TandemApp {
                     .text("broadcast level"),
             );
         }
+        knobs.notes(ui);
     }
 
     /// The same, two to a row, for the four-deck mixer.
     fn local_levels_compact(&mut self, ui: &mut egui::Ui) {
         let tip = "Your booth only";
+        let knobs = self.level_knobs;
         ui.spacing_mut().slider_width = 64.0;
         let bcast = self.settings.audio.broadcast.is_some();
         let l = &mut self.local_edit;
@@ -1107,11 +1112,11 @@ impl TandemApp {
                     .on_hover_text("Headphones: cue (left) ↔ master (right). Your booth only.");
                 ui.label(RichText::new("level").small()).on_hover_text(tip);
                 ui.add(egui::Slider::new(&mut l.hp_level, 0.0..=1.0).show_value(false))
-                    .on_hover_text("Headphone level. Your booth only.");
+                    .on_hover_text(knobs.phones.tip(Target::HeadphoneLevel));
                 ui.end_row();
                 ui.label(RichText::new("master").small()).on_hover_text(tip);
                 ui.add(egui::Slider::new(&mut l.master_level, 0.0..=1.0).show_value(false))
-                    .on_hover_text("Master level. Your booth only.");
+                    .on_hover_text(knobs.master.tip(Target::MasterLevel));
                 if bcast {
                     ui.label(RichText::new("broadcast").small())
                         .on_hover_text(tip);
@@ -1120,6 +1125,7 @@ impl TandemApp {
                 }
                 ui.end_row();
             });
+        knobs.notes(ui);
     }
 
     /// The crossfader's curve switch. It's part of the room (one mixer, one
@@ -1364,6 +1370,103 @@ impl TandemApp {
             .on_hover_text(
                 "Master level: the mix after the faders and crossfader, before your master level. Red: over full scale.",
             );
+    }
+}
+
+/// What the controller's knob does to one of this booth's levels.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum LevelKnob {
+    /// No knob is mapped to it.
+    #[default]
+    None,
+    /// The knob sets it. `waiting`: the slider was moved on screen, and the
+    /// knob takes over once it reaches it (soft takeover).
+    Sets { waiting: bool },
+    /// The controller's own sound card plays this output, and the knob
+    /// turns it up and down there: it leaves Tandem's level alone.
+    OnController,
+}
+
+impl LevelKnob {
+    fn of(engine: &MidiEngine, target: Target, waiting: &[Target]) -> Self {
+        if engine.mapping.binding_for(target).is_none() {
+            LevelKnob::None
+        } else if engine.card.sets(target) {
+            LevelKnob::OnController
+        } else {
+            LevelKnob::Sets {
+                waiting: waiting.contains(&target),
+            }
+        }
+    }
+
+    /// The hover text for the slider of `level`'s target.
+    fn tip(self, level: Target) -> String {
+        let name = level.label();
+        let knob = name.to_lowercase();
+        match self {
+            LevelKnob::None => format!("{name}. Your booth only."),
+            LevelKnob::Sets { .. } => {
+                format!("{name}. Your booth only. Your controller's {knob} knob sets it too.")
+            }
+            LevelKnob::OnController => format!(
+                "{name}. Your booth only. Your controller's own sound card plays this, and its \
+                 {knob} knob turns it up and down there, so the knob doesn't move this slider."
+            ),
+        }
+    }
+}
+
+/// What the controller's master and headphone level knobs do.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LevelKnobs {
+    pub master: LevelKnob,
+    pub phones: LevelKnob,
+}
+
+impl LevelKnobs {
+    pub(crate) fn of(engine: &MidiEngine, connected: bool) -> Self {
+        if !connected {
+            return Self::default();
+        }
+        let waiting = engine.waiting_for_pickup();
+        Self {
+            master: LevelKnob::of(engine, Target::MasterLevel, &waiting),
+            phones: LevelKnob::of(engine, Target::HeadphoneLevel, &waiting),
+        }
+    }
+
+    /// A line under the level sliders when a knob doesn't simply move its
+    /// slider: it's waiting to pick it up, or it acts on the controller's
+    /// own sound card instead.
+    fn notes(self, ui: &mut egui::Ui) {
+        let waiting = |k: LevelKnob| k == LevelKnob::Sets { waiting: true };
+        let pickup = match (waiting(self.master), waiting(self.phones)) {
+            (true, true) => Some("Turn the level knobs past the sliders to pick them up."),
+            (true, false) => Some("Turn the master knob past the slider to pick it up."),
+            (false, true) => Some("Turn the phones knob past the slider to pick it up."),
+            (false, false) => None,
+        };
+        if let Some(text) = pickup {
+            ui.label(RichText::new(text).small().color(AMBER));
+        }
+        let on = |k: LevelKnob| k == LevelKnob::OnController;
+        let hardware = match (on(self.master), on(self.phones)) {
+            (true, true) => {
+                Some("Level knobs: set the levels on your controller's own sound card.")
+            }
+            (true, false) => {
+                Some("Master knob: sets the level on your controller's own sound card.")
+            }
+            (false, true) => {
+                Some("Phones knob: sets the level on your controller's own sound card.")
+            }
+            (false, false) => None,
+        };
+        if let Some(text) = hardware {
+            ui.label(RichText::new(text).small().weak())
+                .on_hover_text("Your controller's own sound card plays this, and turns it up and down by itself. So its knob leaves Tandem's level alone, or the sound would be turned down twice.");
+        }
     }
 }
 

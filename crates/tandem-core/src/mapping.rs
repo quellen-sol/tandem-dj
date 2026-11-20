@@ -160,6 +160,10 @@ pub enum Target {
     },
     Crossfader,
     CueMix,
+    /// This booth's headphone level (never the room's).
+    HeadphoneLevel,
+    /// This booth's master level (never the room's).
+    MasterLevel,
     /// Turning the browse knob: moves through the tracks, or through the
     /// lists on the left when they have the knob.
     Browse,
@@ -222,6 +226,8 @@ impl Target {
             Target::Load { deck: d } => format!("Deck {} · Load selected track", deck(d)),
             Target::Crossfader => "Crossfader".into(),
             Target::CueMix => "Headphone cue/master mix".into(),
+            Target::HeadphoneLevel => "Headphone level".into(),
+            Target::MasterLevel => "Master level".into(),
             Target::Browse => "Library browse encoder".into(),
             Target::BrowsePress => "Library browse press (lists ↔ tracks)".into(),
             Target::BrowseBack => "Library back (to the lists)".into(),
@@ -271,7 +277,8 @@ impl Target {
             | BendDown { deck }
             | BendUp { deck }
             | Load { deck } => deck,
-            Crossfader | CueMix | Browse | BrowsePress | BrowseBack => return None,
+            Crossfader | CueMix | HeadphoneLevel | MasterLevel | Browse | BrowsePress
+            | BrowseBack => return None,
         };
         if let Some(d) = set {
             *deck = d;
@@ -288,7 +295,9 @@ impl Target {
             | Target::Trim { .. }
             | Target::Filter { .. }
             | Target::Crossfader
-            | Target::CueMix => TargetKind::Absolute,
+            | Target::CueMix
+            | Target::HeadphoneLevel
+            | Target::MasterLevel => TargetKind::Absolute,
             Target::Jog { .. } | Target::Browse => TargetKind::Relative,
             _ => TargetKind::Button,
         }
@@ -342,6 +351,8 @@ impl Target {
         }
         v.push(Target::Crossfader);
         v.push(Target::CueMix);
+        v.push(Target::HeadphoneLevel);
+        v.push(Target::MasterLevel);
         v.push(Target::Browse);
         v.push(Target::BrowsePress);
         v.push(Target::BrowseBack);
@@ -438,7 +449,7 @@ pub struct Mapping {
 }
 
 /// Bump when built-in presets gain controls; saved mappings pick them up.
-pub const PRESET_VERSION: u32 = 10;
+pub const PRESET_VERSION: u32 = 11;
 /// Up to this preset version, four-deck controllers drove Tandem's two
 /// decks: decks 1 and 3 drove A, decks 2 and 4 drove B.
 const LAST_TWO_DECK_PRESET: u32 = 6;
@@ -583,11 +594,80 @@ pub enum MidiOut {
     Action(Action),
     TogglePfl(u8),
     CueMix(f32),
+    HeadphoneLevel(f32),
+    MasterLevel(f32),
     Browse(i32),
     BrowsePress,
     BrowseBack,
     LoadSelected(u8),
     Learned(Binding),
+}
+
+/// Which of this booth's outputs play through the controller's own sound
+/// card. A controller's MASTER and HEADPHONE LEVEL knobs also turn its own
+/// outputs up and down, in hardware: there they leave Tandem's levels
+/// alone, or the sound would be turned down twice. Through any other sound
+/// card (the PC's speakers, a headset), they set Tandem's levels.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ControllerCard {
+    /// The master output plays through it.
+    pub master: bool,
+    /// The headphone output plays through it.
+    pub phones: bool,
+}
+
+impl ControllerCard {
+    /// For the controller on MIDI port `port`, with the master and the
+    /// headphones on the sound cards named `master` and `phones`.
+    pub fn find(port: Option<&str>, master: Option<&str>, phones: Option<&str>) -> Self {
+        let on = |device: Option<&str>| match (port, device) {
+            (Some(p), Some(d)) => is_controller_card(p, d),
+            _ => false,
+        };
+        Self {
+            master: on(master),
+            phones: on(phones),
+        }
+    }
+
+    /// The controller sets this level itself, on its own sound card.
+    pub fn sets(&self, target: Target) -> bool {
+        match target {
+            Target::MasterLevel => self.master,
+            Target::HeadphoneLevel => self.phones,
+            _ => false,
+        }
+    }
+}
+
+/// Whether the sound card `device` is the one built into the controller on
+/// MIDI port `port`. Windows names a controller's sound card after it: the
+/// DDJ-FLX6's MIDI port is "DDJ-FLX6" and its sound card "Line (DDJ-FLX6)".
+/// So it is when the card's name contains the port's, ignoring case,
+/// spaces and punctuation, Windows' "2- " prefix and a "MIDI" at the end.
+pub fn is_controller_card(port: &str, device: &str) -> bool {
+    let squash = |s: &str| -> String {
+        s.chars()
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect()
+    };
+    let port = match port.split_once("- ") {
+        Some((n, rest)) if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) => rest,
+        _ => port,
+    };
+    // "… MIDI" or "… MIDI 1": the sound card won't say MIDI.
+    let mut words: Vec<&str> = port.split_whitespace().collect();
+    let midi = |w: &str| w.eq_ignore_ascii_case("midi");
+    let number = |w: &str| w.chars().all(|c| c.is_ascii_digit());
+    match words[..] {
+        [_, .., m, n] if midi(m) && number(n) => words.truncate(words.len() - 2),
+        [_, .., m] if midi(m) => words.truncate(words.len() - 1),
+        _ => {}
+    }
+    let key = squash(&words.concat());
+    // Long enough not to be a generic word ("USB MIDI" is "usb").
+    key.len() >= 4 && squash(device).contains(&key)
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -608,6 +688,9 @@ pub struct MidiEngine {
     /// LOOP IN and OUT snap to the beatgrid (this DJ's setting).
     pub quantize_loops: bool,
     pub last_message: Option<String>,
+    /// Which outputs play through the controller's own sound card (the app
+    /// keeps it up to date).
+    pub card: ControllerCard,
     takeover: HashMap<Target, Takeover>,
     msb: HashMap<(u8, u8), u8>,
     lsb: HashMap<(u8, u8), u8>,
@@ -655,6 +738,7 @@ impl MidiEngine {
             tempo_range,
             quantize_loops: true,
             last_message: None,
+            card: ControllerCard::default(),
             takeover: HashMap::new(),
             msb: HashMap::new(),
             lsb: HashMap::new(),
@@ -1108,6 +1192,11 @@ impl MidiEngine {
                     self.button(trig, raw7.map(|r| r >= 64).unwrap_or(v >= 0.5), room, out);
                 }
                 TargetKind::Absolute => {
+                    if self.card.sets(b.target) {
+                        // The controller already turns its own output up
+                        // or down: Tandem's level stays where it is.
+                        continue;
+                    }
                     let v = if b.invert { 1.0 - v } else { v };
                     if let Target::Tempo { deck } = b.target {
                         if let Some(tempo) = self.tempo_fader(deck, v, room) {
@@ -1142,6 +1231,8 @@ impl MidiEngine {
                         Target::Filter { deck } => MidiOut::Action(Action::Filter { deck, v }),
                         Target::Crossfader => MidiOut::Action(Action::Crossfader { v }),
                         Target::CueMix => MidiOut::CueMix(v),
+                        Target::HeadphoneLevel => MidiOut::HeadphoneLevel(v),
+                        Target::MasterLevel => MidiOut::MasterLevel(v),
                         _ => continue,
                     });
                 }
@@ -1235,15 +1326,20 @@ impl MidiEngine {
             Target::Filter { deck } => room.decks[deck as usize].filter,
             Target::Crossfader => room.crossfader,
             Target::CueMix => local.cue_mix,
+            Target::HeadphoneLevel => local.hp_level,
+            Target::MasterLevel => local.master_level,
             _ => 0.0,
         }
     }
 
     /// The value nobody has changed yet, so the hardware can take it directly.
     fn pristine(target: Target, current: f32) -> bool {
+        let local = LocalParams::default();
         let default = match target {
             Target::Volume { .. } => 1.0,
-            Target::CueMix => 0.0,
+            Target::CueMix => local.cue_mix,
+            Target::HeadphoneLevel => local.hp_level,
+            Target::MasterLevel => local.master_level,
             _ => 0.5,
         };
         (current - default).abs() < 1e-6
@@ -1401,8 +1497,7 @@ pub fn mapping_key(port_name: &str) -> String {
 pub fn builtin_preset(port_name: &str) -> Option<Mapping> {
     let n = port_name.to_uppercase();
     if n.contains("DDJ-FLX6") {
-        // Large jogs: same resolution as the DDJ-SX family until calibrated.
-        Some(pioneer_ddj(port_name, "Pioneer DDJ-FLX6", 4, 2048.0))
+        Some(ddj_flx6(port_name))
     } else if n.contains("DDJ-FLX4") || n.contains("DDJ-400") {
         Some(pioneer_ddj(
             port_name,
@@ -1413,6 +1508,17 @@ pub fn builtin_preset(port_name: &str) -> Option<Mapping> {
     } else {
         None
     }
+}
+
+/// The DDJ-FLX6: the Pioneer DDJ layout on four decks, and its MASTER LEVEL
+/// and HEADPHONE LEVEL knobs, 14-bit CCs on channel 7 (from Pioneer's FLX6
+/// MIDI list; HEADPHONE LEVEL also recorded from one).
+fn ddj_flx6(device: &str) -> Mapping {
+    // Large jogs: same resolution as the DDJ-SX family until calibrated.
+    let mut m = pioneer_ddj(device, "Pioneer DDJ-FLX6", 4, 2048.0);
+    m.bind(Trigger::cc(6, 0x08), Target::MasterLevel);
+    m.bind(Trigger::cc(6, 0x0D), Target::HeadphoneLevel);
+    m
 }
 
 /// Pioneer DDJ layout (DDJ-400 / FLX4 / FLX6 generation). Deck N and mixer
@@ -2860,6 +2966,225 @@ mod tests {
         for k in [(0x90, 0x10), (0x90, 0x11), (0x90, 0x4D), (0x97, 0x64)] {
             assert_eq!(on(&room, k), Some(false), "{k:02X?}");
         }
+    }
+
+    /// HEADPHONE LEVEL on a DDJ-FLX6 turned down to zero and back up, as
+    /// recorded: (MSB on CC 0x0D, LSB on CC 0x2D), channel 7.
+    #[rustfmt::skip]
+    const FLX6_HEADPHONE_SWEEP: [(u8, u8); 85] = [
+        (0x16, 0x40), (0x13, 0x39), (0x0E, 0x0E), (0x0A, 0x67), (0x08, 0x11), (0x05, 0x5C),
+        (0x04, 0x5A), (0x03, 0x68), (0x02, 0x76), (0x02, 0x25), (0x01, 0x74), (0x01, 0x43),
+        (0x01, 0x12), (0x00, 0x62), (0x00, 0x31), (0x00, 0x00), (0x00, 0x31), (0x00, 0x62),
+        (0x01, 0x33), (0x02, 0x35), (0x03, 0x27), (0x03, 0x78), (0x04, 0x7A), (0x06, 0x0D),
+        (0x07, 0x40), (0x0A, 0x46), (0x0D, 0x1C), (0x0F, 0x72), (0x13, 0x5A), (0x16, 0x40),
+        (0x19, 0x05), (0x1D, 0x2E), (0x20, 0x24), (0x23, 0x0A), (0x27, 0x54), (0x2B, 0x3C),
+        (0x2F, 0x04), (0x33, 0x6E), (0x36, 0x23), (0x38, 0x27), (0x3A, 0x2C), (0x3B, 0x6F),
+        (0x3D, 0x53), (0x40, 0x49), (0x42, 0x7E), (0x45, 0x53), (0x49, 0x5C), (0x4C, 0x42),
+        (0x4F, 0x59), (0x53, 0x00), (0x55, 0x25), (0x58, 0x0A), (0x5C, 0x03), (0x5E, 0x38),
+        (0x60, 0x0B), (0x62, 0x10), (0x62, 0x41), (0x62, 0x71), (0x60, 0x3C), (0x5D, 0x15),
+        (0x59, 0x3D), (0x53, 0x00), (0x4E, 0x67), (0x49, 0x6C), (0x42, 0x2C), (0x3D, 0x22),
+        (0x38, 0x48), (0x31, 0x39), (0x2C, 0x4E), (0x28, 0x56), (0x23, 0x4B), (0x1F, 0x74),
+        (0x1C, 0x0B), (0x16, 0x0F), (0x12, 0x06), (0x0D, 0x6D), (0x08, 0x42), (0x06, 0x2D),
+        (0x05, 0x1B), (0x03, 0x68), (0x02, 0x56), (0x02, 0x25), (0x01, 0x23), (0x00, 0x41),
+        (0x00, 0x00),
+    ];
+
+    /// 14-bit knob moves on channel 7: MSB on `cc`, then LSB on `cc + 32`.
+    fn knob(cc: u8, moves: &[(u8, u8)]) -> Vec<[u8; 3]> {
+        moves
+            .iter()
+            .flat_map(|&(msb, lsb)| [[0xB6, cc, msb], [0xB6, cc + 32, lsb]])
+            .collect()
+    }
+
+    /// Plays messages in as the MIDI thread does, applying this booth's
+    /// levels to `local` as the session would. Returns every output.
+    fn play_levels(e: &mut MidiEngine, local: &mut LocalParams, msgs: &[[u8; 3]]) -> Vec<MidiOut> {
+        let room = RoomState::default();
+        let mut all = Vec::new();
+        for m in msgs {
+            for o in e.handle(m, &room, local) {
+                match o {
+                    MidiOut::MasterLevel(v) => local.master_level = v,
+                    MidiOut::HeadphoneLevel(v) => local.hp_level = v,
+                    _ => {}
+                }
+                all.push(o);
+            }
+        }
+        all
+    }
+
+    #[test]
+    fn flx6_level_knobs_set_this_booths_levels() {
+        let mut e = MidiEngine::new(builtin_preset("DDJ-FLX6").unwrap(), 0.08);
+        let mut local = LocalParams::default();
+        // The recorded HEADPHONE LEVEL sweep: down to zero, up to about
+        // three quarters, and back down.
+        let out = play_levels(&mut e, &mut local, &knob(0x0D, &FLX6_HEADPHONE_SWEEP));
+        assert!(out.len() >= 2 * 84, "every move counts: {}", out.len());
+        assert!(
+            out.iter().all(|o| matches!(o, MidiOut::HeadphoneLevel(_))),
+            "only this booth's headphone level, never the room: {out:?}"
+        );
+        let levels: Vec<f32> = out
+            .iter()
+            .map(|o| match o {
+                MidiOut::HeadphoneLevel(v) => *v,
+                _ => unreachable!(),
+            })
+            .collect();
+        let top = levels.iter().cloned().fold(0.0, f32::max);
+        let want = ((0x62 << 7) | 0x71) as f32 / 16383.0;
+        assert!((top - want).abs() < 1e-6, "{top} vs {want}: 14-bit");
+        assert_eq!(local.hp_level, 0.0);
+        assert_eq!(local.master_level, LocalParams::default().master_level);
+
+        // MASTER LEVEL, per Pioneer's list: CC 0x08 and 0x28.
+        let out = play_levels(
+            &mut e,
+            &mut local,
+            &knob(0x08, &[(0x40, 0x00), (0x7F, 0x7F)]),
+        );
+        assert!(out.iter().all(|o| matches!(o, MidiOut::MasterLevel(_))));
+        assert_eq!(local.master_level, 1.0);
+        let out = play_levels(&mut e, &mut local, &knob(0x08, &[(0x20, 0x00)]));
+        assert_eq!(out.last(), Some(&MidiOut::MasterLevel(4096.0 / 16383.0)));
+
+        // Moved on screen: the knob picks it up again once it gets there.
+        local.master_level = 0.6;
+        assert!(play_levels(&mut e, &mut local, &knob(0x08, &[(0x30, 0x00)])).is_empty());
+        assert_eq!(e.waiting_for_pickup(), vec![Target::MasterLevel]);
+        let out = play_levels(&mut e, &mut local, &knob(0x08, &[(0x50, 0x00)]));
+        assert!(!out.is_empty());
+        assert!((local.master_level - (0x50 << 7) as f32 / 16383.0).abs() < 1e-6);
+        assert!(e.waiting_for_pickup().is_empty());
+    }
+
+    #[test]
+    fn level_knobs_leave_the_controllers_own_sound_card_to_it() {
+        let mut e = MidiEngine::new(builtin_preset("DDJ-FLX6").unwrap(), 0.08);
+        let mut local = LocalParams::default();
+        // The master plays through the FLX6, the headphones through a headset.
+        e.card = ControllerCard::find(
+            Some("DDJ-FLX6"),
+            Some("Line (DDJ-FLX6)"),
+            Some("Speakers (G733 Gaming Headset)"),
+        );
+        assert_eq!(
+            e.card,
+            ControllerCard {
+                master: true,
+                phones: false
+            }
+        );
+        // The FLX6 turns its own output down: Tandem's level stays put.
+        let master = knob(0x08, &[(0x10, 0x00), (0x08, 0x00)]);
+        assert!(play_levels(&mut e, &mut local, &master).is_empty());
+        assert_eq!(local.master_level, LocalParams::default().master_level);
+        assert!(e.waiting_for_pickup().is_empty(), "nothing to pick up");
+        let out = play_levels(&mut e, &mut local, &knob(0x0D, &[(0x20, 0x00)]));
+        assert!(matches!(out.last(), Some(MidiOut::HeadphoneLevel(_))));
+        // The master moved to the PC's speakers: the knob sets it again.
+        e.card = ControllerCard::find(
+            Some("DDJ-FLX6"),
+            Some("Speakers (Realtek(R) Audio)"),
+            Some("Speakers (G733 Gaming Headset)"),
+        );
+        assert_eq!(e.card, ControllerCard::default());
+        play_levels(&mut e, &mut local, &master);
+        assert_eq!(local.master_level, (0x08 << 7) as f32 / 16383.0);
+    }
+
+    #[test]
+    fn controller_sound_cards_by_name() {
+        // Names as Windows shows them for a DDJ-FLX6 and the user's other cards.
+        assert!(is_controller_card("DDJ-FLX6", "Line (DDJ-FLX6)"));
+        assert!(is_controller_card("2- DDJ-FLX6", "Line (DDJ-FLX6)"));
+        assert!(is_controller_card("DDJ-FLX6", "Speakers (2- DDJ-FLX6)"));
+        assert!(!is_controller_card(
+            "DDJ-FLX6",
+            "Speakers (G733 Gaming Headset)"
+        ));
+        assert!(!is_controller_card(
+            "DDJ-FLX6",
+            "CABLE Input (VB-Audio Virtual Cable)"
+        ));
+        assert!(!is_controller_card("DDJ-FLX4", "Line (DDJ-FLX6)"));
+        assert!(is_controller_card("SC LIVE 4", "Speakers (SC LIVE 4)"));
+        assert!(is_controller_card(
+            "Mixtrack Pro FX MIDI 1",
+            "Speakers (Mixtrack Pro FX)"
+        ));
+        // A generic interface isn't every USB sound card.
+        assert!(!is_controller_card(
+            "USB MIDI",
+            "Speakers (USB Audio Device)"
+        ));
+        assert_eq!(
+            ControllerCard::find(None, Some("Line (DDJ-FLX6)"), None),
+            ControllerCard::default()
+        );
+    }
+
+    #[test]
+    fn saved_v7_to_v10_flx6_mappings_gain_the_level_knobs() {
+        let preset = builtin_preset("DDJ-FLX6").unwrap();
+        assert_eq!(preset.preset_version, 11);
+        let level = |t: &Target| matches!(t, Target::MasterLevel | Target::HeadphoneLevel);
+        let rolls = |t: &Target| matches!(t, Target::Roll { .. });
+        let shift_tempo = |t: &Target| matches!(t, Target::TempoShift { .. });
+        let browse = |t: &Target| matches!(t, Target::BrowsePress | Target::BrowseBack);
+        // Saved by preset 10 (v0.11.7 and v0.11.8): just the two knobs are
+        // new. Preset 9: the roll pads too. Preset 8: and SHIFT + TEMPO on
+        // all four decks. Preset 7: and the browse knob's press and BACK.
+        for (version, added) in [(10, 2), (9, 2 + 32), (8, 2 + 32 + 4), (7, 2 + 32 + 4 + 2)] {
+            let mut saved = preset.clone();
+            saved.preset_version = version;
+            saved.jog_ticks_per_rev = Some(6387.0);
+            saved.bindings.retain(|b| {
+                !level(&b.target)
+                    && (version > 9 || !rolls(&b.target))
+                    && (version > 8 || !shift_tempo(&b.target))
+                    && (version > 7 || !browse(&b.target))
+            });
+            let mut custom = saved.clone();
+            assert_eq!(saved.upgrade_from(&preset), added, "preset {version}");
+            assert_eq!(saved.preset_version, PRESET_VERSION);
+            assert_eq!(saved.bindings.len(), preset.bindings.len());
+            assert_eq!(
+                saved.binding_for(Target::MasterLevel).map(|b| b.trigger),
+                Some(Trigger::cc(6, 0x08))
+            );
+            assert_eq!(
+                saved.binding_for(Target::HeadphoneLevel).map(|b| b.trigger),
+                Some(Trigger::cc(6, 0x0D))
+            );
+            assert_eq!(saved.jog_ticks_per_rev, Some(6387.0));
+            assert_eq!(saved.upgrade_from(&preset), 0, "only once");
+            // A DJ who'd put HEADPHONE LEVEL's CC on something else keeps it.
+            custom.bind(Trigger::cc(6, 0x0D), Target::CueMix);
+            assert_eq!(custom.upgrade_from(&preset), added - 1, "preset {version}");
+            assert_eq!(custom.binding_for(Target::HeadphoneLevel), None);
+            // And the knob works.
+            let mut e = MidiEngine::new(saved, 0.08);
+            let mut local = LocalParams::default();
+            play_levels(&mut e, &mut local, &knob(0x08, &[(0x20, 0x00)]));
+            assert_eq!(local.master_level, (0x20 << 7) as f32 / 16383.0);
+        }
+        // Two-deck Pioneers don't get them (their knobs may not send MIDI),
+        // but keep everything else the family has.
+        let small = builtin_preset("DDJ-FLX4").unwrap();
+        assert!(!small.bindings.iter().any(|b| level(&b.target)));
+        assert_eq!(
+            small.bindings.iter().filter(|b| rolls(&b.target)).count(),
+            16
+        );
+        assert!(small.binding_for(Target::BrowsePress).is_some());
+        // The FLX6 is the family's four-deck layout plus the two knobs.
+        let family = pioneer_ddj("DDJ-FLX6", "Pioneer DDJ-FLX6", 4, 2048.0);
+        assert_eq!(preset.bindings.len(), family.bindings.len() + 2);
+        assert!(family.bindings.iter().all(|b| preset.bindings.contains(b)));
     }
 
     #[test]

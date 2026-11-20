@@ -80,6 +80,10 @@ pub struct AudioOutputs {
     _streams: Vec<cpal::Stream>,
     pub status: Vec<String>,
     pub errors: Arc<Mutex<Vec<String>>>,
+    /// The sound card playing the master (the system default if none is
+    /// picked), and the one playing the headphones.
+    pub master_device: Option<String>,
+    pub cue_device: Option<String>,
 }
 
 impl AudioOutputs {
@@ -88,6 +92,8 @@ impl AudioOutputs {
             _streams: Vec::new(),
             status: Vec::new(),
             errors: Arc::new(Mutex::new(Vec::new())),
+            master_device: None,
+            cue_device: None,
         }
     }
 }
@@ -192,6 +198,12 @@ pub fn start(
         _streams: streams,
         status,
         errors,
+        master_device: master.map(|r| r.device),
+        cue_device: cfg
+            .cue
+            .as_ref()
+            .filter(|_| !broadcaster)
+            .map(|r| r.device.clone()),
     }
 }
 

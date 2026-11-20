@@ -724,6 +724,18 @@ impl Session {
         self.publish();
     }
 
+    /// This booth's headphone level (the controller's knob).
+    pub fn set_hp_level(&mut self, v: f32) {
+        self.local.hp_level = v.clamp(0.0, 1.0);
+        self.publish();
+    }
+
+    /// This booth's master level (the controller's knob).
+    pub fn set_master_level(&mut self, v: f32) {
+        self.local.master_level = v.clamp(0.0, 1.0);
+        self.publish();
+    }
+
     /// What to tell the DJ since the last call: loads refused, oldest first.
     pub fn take_notices(&mut self) -> Vec<String> {
         std::mem::take(&mut self.notices)

@@ -221,6 +221,8 @@ Two places enforce it:
 | the sync master | master and broadcast levels, sync click |
 | | showing decks C and D |
 
+**Level knobs.** A controller's MASTER LEVEL and HEADPHONE LEVEL knobs (`Target::MasterLevel`, `Target::HeadphoneLevel`) set this booth's `LocalParams` levels directly from the MIDI thread, with soft takeover against the sliders on screen, and never send an action. On a controller with a sound card, the same knobs also turn its own outputs up and down in hardware. So when the master or the headphones play through it, the knob leaves that level alone; otherwise the sound would be turned down twice. `ControllerCard` decides by name: Windows names a controller's sound card after it (MIDI port "DDJ-FLX6", sound card "Line (DDJ-FLX6)"), so it's the controller's when its name contains the port's, ignoring case, punctuation, the "2- " prefix and a trailing "MIDI". The app works it out every frame from the controller's port and the devices the audio actually opened, the system default included. The FLX6 preset has both knobs from preset version 11 (14-bit, CC 0x08 and 0x0D on channel 7), so saved FLX6 mappings pick them up.
+
 ### Tracks
 
 A track's id is the BLAKE3 hash of its file, so identical files match whatever they're called.

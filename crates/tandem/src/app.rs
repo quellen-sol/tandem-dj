@@ -2,6 +2,7 @@
 
 use crate::midi::Midi;
 use crate::output::{self, AudioOutputs, DeviceInfo};
+use crate::ui_decks::LevelKnobs;
 use crate::ui_meters::{MeterHistory, MeterView};
 use eframe::egui;
 use parking_lot::Mutex;
@@ -11,7 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tandem_core::config::{FrameRate, LibrarySort, Paths, Settings};
 use tandem_core::library::{self, LibTrack, Library, SortRow, SourceKind};
-use tandem_core::mapping::MidiOut;
+use tandem_core::mapping::{ControllerCard, MidiOut};
 use tandem_core::meter::LevelMeters;
 use tandem_core::model::{deck_letter, Action, RoomState, TrackId, XfCurve, DECKS};
 use tandem_core::protocol::TrackInfo;
@@ -284,6 +285,8 @@ pub struct TandemApp {
     pub(crate) pending: Vec<Action>,
     /// Local (this booth only) settings edited this frame.
     pub(crate) local_edit: LocalParams,
+    /// What the controller's master and headphone level knobs do.
+    pub(crate) level_knobs: LevelKnobs,
     /// When the next frame is due, at the chosen frame rate.
     next_frame: Instant,
     /// Levels from the live lane, as the mixer shows them.
@@ -402,6 +405,7 @@ impl TandemApp {
             ui,
             pending: Vec::new(),
             local_edit,
+            level_knobs: LevelKnobs::default(),
             next_frame: Instant::now(),
             meters,
             meter_view: MeterView::default(),
@@ -516,6 +520,20 @@ impl TandemApp {
             self.audio_broadcaster,
         );
         self.mark_dirty();
+    }
+
+    /// Tell the controller which outputs play through its own sound card,
+    /// as the audio settings and the controller change, and note what its
+    /// level knobs do for the mixer to show.
+    fn follow_controller_card(&mut self) {
+        let card = ControllerCard::find(
+            self.midi.port.as_deref(),
+            self.audio.master_device.as_deref(),
+            self.audio.cue_device.as_deref(),
+        );
+        let mut e = self.midi.engine.lock();
+        e.card = card;
+        self.level_knobs = LevelKnobs::of(&e, self.midi.port.is_some());
     }
 
     /// Joining as a broadcaster plays only the broadcast feed and opens the
@@ -870,6 +888,7 @@ impl eframe::App for TandemApp {
         }
         let view = view;
         self.local_edit = view.local;
+        self.follow_controller_card();
         self.follow_role(&view);
         self.follow_four_decks(&view.room);
         self.take_levels();

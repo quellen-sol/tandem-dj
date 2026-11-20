@@ -164,6 +164,8 @@ impl Midi {
                             MidiOut::Action(a) => s.act_at(a, t),
                             MidiOut::TogglePfl(d) => s.toggle_pfl(d),
                             MidiOut::CueMix(v) => s.set_cue_mix(v),
+                            MidiOut::HeadphoneLevel(v) => s.set_hp_level(v),
+                            MidiOut::MasterLevel(v) => s.set_master_level(v),
                             other => queue.lock().push(other),
                         }
                     }
