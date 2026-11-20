@@ -223,6 +223,67 @@ impl TandemApp {
             });
     }
 
+    /// The search box. While it has text, a ✖ inside its right end clears
+    /// it, and so does Escape in the box. On an empty box, Escape just
+    /// leaves it, as before.
+    fn search_box(&mut self, ui: &mut egui::Ui) {
+        // The ✖ sits in the box's right margin, made wider by the room the
+        // text gives up, so the box is as wide as ever.
+        const CLEAR_W: f32 = 22.0;
+        let margin = egui::Margin {
+            left: 4,
+            right: CLEAR_W as i8,
+            top: 2,
+            bottom: 2,
+        };
+        let id = ui.make_persistent_id("library search");
+        // egui has already taken the focus away when Escape reaches us: give
+        // it back, so the next search can be typed straight away.
+        if !self.ui.search.is_empty()
+            && ui.input(|i| i.key_pressed(egui::Key::Escape))
+            && ui.memory(|m| m.had_focus_last_frame(id))
+        {
+            self.ui.search.clear();
+            ui.memory_mut(|m| m.request_focus(id));
+        }
+        let text = egui::TextEdit::singleline(&mut self.ui.search)
+            .id(id)
+            .hint_text("🔍 Search title or artist")
+            // 228 px in all, as before.
+            .desired_width(228.0 - 4.0 - CLEAR_W)
+            .margin(margin)
+            .show(ui)
+            .text_clip_rect;
+        if self.ui.search.is_empty() {
+            return;
+        }
+        let cell = egui::Rect::from_min_size(
+            pos2(text.right(), text.top() - margin.top as f32),
+            vec2(CLEAR_W, text.height() + margin.sum().y),
+        );
+        // On top of the box and sensing drags too, so pressing it doesn't
+        // also start a text selection underneath.
+        let resp = ui
+            .interact(cell, id.with("clear"), Sense::click_and_drag())
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text("Clear the search (Esc)");
+        let p = ui.painter();
+        if resp.hovered() {
+            p.circle_filled(cell.center(), 8.0, Color32::from_gray(60));
+        }
+        p.text(
+            cell.center(),
+            Align2::CENTER_CENTER,
+            "✖",
+            FontId::proportional(11.0),
+            Color32::from_gray(if resp.hovered() { 235 } else { 150 }),
+        );
+        if resp.clicked() {
+            self.ui.search.clear();
+            ui.memory_mut(|m| m.request_focus(id));
+        }
+    }
+
     fn tracks(&mut self, ui: &mut egui::Ui, view: &SessionView) {
         let shown = self.shown_decks();
         let src = self.ui.source.clone();
@@ -242,11 +303,7 @@ impl TandemApp {
 
         ui.horizontal(|ui| {
             ui.label(RichText::new(src.label()).strong());
-            ui.add(
-                egui::TextEdit::singleline(&mut self.ui.search)
-                    .hint_text("🔍 Search title or artist")
-                    .desired_width(220.0),
-            );
+            self.search_box(ui);
             ui.label("Load to");
             let spacing = ui.spacing().item_spacing.x;
             ui.spacing_mut().item_spacing.x = 3.0;

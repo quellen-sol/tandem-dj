@@ -119,6 +119,36 @@ pub struct FilterKey {
     sort: Option<LibrarySort>,
 }
 
+/// The row to select after the list was refiltered or resorted, and whether
+/// to scroll to it. `selected` is the track that was selected, `rows` the new
+/// rows (track indices) and `sel_index` the row selected before.
+fn reselect(
+    prev: Option<&FilterKey>,
+    key: &FilterKey,
+    selected: Option<usize>,
+    rows: &[usize],
+    sel_index: usize,
+) -> (usize, bool) {
+    let found = selected.and_then(|s| rows.iter().position(|&i| i == s));
+    let (row, scroll) = match prev {
+        // A new list: its first track.
+        None => (0, false),
+        Some(p) if p.source != key.source => (0, false),
+        // Search cleared: the whole list again, with the track that was
+        // selected still selected and in view.
+        Some(p) if p.query != key.query && key.query.is_empty() => (found.unwrap_or(0), true),
+        // A new search: its first match, at the top.
+        Some(p) if p.query != key.query => (0, true),
+        // Same rows, re-sorted or with new details: follow the track. Re-sorted
+        // by hand: bring it into view.
+        Some(p) => match found {
+            Some(row) => (row, p.sort != key.sort),
+            None => (sel_index, false),
+        },
+    };
+    (row.min(rows.len().saturating_sub(1)), scroll)
+}
+
 /// BPM shown for a library track: from analysis (or the DJ's edited grid),
 /// never from tags.
 pub fn lib_bpm(t: &LibTrack) -> Option<f64> {
@@ -704,23 +734,15 @@ impl TandemApp {
             }
         }
         let prev = self.ui.filter_key.replace(key.clone());
-        let same_list = prev
-            .as_ref()
-            .is_some_and(|p| p.source == key.source && p.query == key.query);
-        if !same_list {
-            self.ui.sel_index = 0;
-        } else if let Some(row) =
-            selected.and_then(|s| self.ui.filtered.iter().position(|&i| i == s))
-        {
-            self.ui.sel_index = row;
-            // Re-sorted by hand: bring the selected track into view.
-            if prev.is_some_and(|p| p.sort != key.sort) {
-                self.ui.scroll_to_sel = true;
-            }
-        }
-        if self.ui.sel_index >= self.ui.filtered.len() {
-            self.ui.sel_index = self.ui.filtered.len().saturating_sub(1);
-        }
+        let (row, scroll) = reselect(
+            prev.as_ref(),
+            &key,
+            selected,
+            &self.ui.filtered,
+            self.ui.sel_index,
+        );
+        self.ui.sel_index = row;
+        self.ui.scroll_to_sel |= scroll;
     }
 
     pub(crate) fn item_at(&self, row: usize, view: &SessionView) -> Option<Item> {
@@ -1016,6 +1038,109 @@ impl Drop for TandemApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tandem_core::config::SortColumn;
+
+    fn key(source: &str, query: &str, sort: Option<LibrarySort>) -> FilterKey {
+        FilterKey {
+            source: source.into(),
+            query: query.into(),
+            len: 10,
+            rev: 0,
+            sort,
+        }
+    }
+
+    #[test]
+    fn clearing_the_search_keeps_the_track_selected() {
+        // "daft" matched tracks 7 and 3, and the second was selected.
+        let searched = key("all", "daft", None);
+        let cleared = key("all", "", None);
+        let rows: Vec<usize> = (0..10).collect();
+        assert_eq!(
+            reselect(Some(&searched), &cleared, Some(3), &rows, 1),
+            (3, true)
+        );
+        // In a sorted list too.
+        let rows: Vec<usize> = (0..10).rev().collect();
+        assert_eq!(
+            reselect(Some(&searched), &cleared, Some(3), &rows, 1),
+            (6, true)
+        );
+        // Nothing matched, so nothing was selected: the top of the list.
+        assert_eq!(
+            reselect(Some(&searched), &cleared, None, &rows, 0),
+            (0, true)
+        );
+    }
+
+    #[test]
+    fn a_new_search_selects_its_first_match() {
+        let rows = [4, 8];
+        let typed = |from: &str, to: &str, rows: &[usize]| {
+            reselect(
+                Some(&key("all", from, None)),
+                &key("all", to, None),
+                Some(8),
+                rows,
+                5,
+            )
+        };
+        assert_eq!(typed("", "da", &rows), (0, true));
+        assert_eq!(typed("da", "daf", &rows), (0, true));
+        assert_eq!(typed("da", "dazz", &[]), (0, true));
+    }
+
+    #[test]
+    fn the_same_search_follows_the_track() {
+        let by_bpm = Some(LibrarySort {
+            column: SortColumn::Bpm,
+            descending: false,
+        });
+        let rows = [2, 0, 1];
+        // Sorted by hand: the track stays selected and comes into view.
+        assert_eq!(
+            reselect(
+                Some(&key("all", "", None)),
+                &key("all", "", by_bpm),
+                Some(1),
+                &rows,
+                1
+            ),
+            (2, true)
+        );
+        // New details (BPM analysed): the track stays selected where it is.
+        let mut analysed = key("all", "", by_bpm);
+        analysed.rev = 1;
+        let before = key("all", "", by_bpm);
+        assert_eq!(
+            reselect(Some(&before), &analysed, Some(0), &rows, 0),
+            (1, false)
+        );
+        // The track has gone: the same row, inside the shorter list.
+        assert_eq!(
+            reselect(Some(&before), &analysed, Some(9), &rows, 5),
+            (2, false)
+        );
+    }
+
+    #[test]
+    fn another_list_starts_at_its_first_track() {
+        let rows = [0, 1, 2];
+        assert_eq!(
+            reselect(None, &key("all", "", None), None, &rows, 0),
+            (0, false)
+        );
+        assert_eq!(
+            reselect(
+                Some(&key("all", "", None)),
+                &key("crate", "", None),
+                Some(1),
+                &rows,
+                1
+            ),
+            (0, false)
+        );
+    }
 
     #[test]
     fn the_knob_steps_through_the_lists_and_stops_at_the_ends() {
