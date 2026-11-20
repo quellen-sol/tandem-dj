@@ -308,6 +308,13 @@ Work through these in order and note anything that fails. `tandem.log` (Settings
   - Test: switch deck A's pads to BEAT JUMP and, on a playing deck, hold pad 4 (½ beat) for a few bars, then let go. Does the track carry on in time, as if it had never rolled? Hold pad 5 (1 beat), press pad 4 and let it go again: does it go ½ beat, then back to 1 beat?
 - Protocol version 12: v0.11.7 can't share a room with earlier versions, so every booth needs v0.11.7.
 
+### v0.11.8
+
+- **No more loading over the music.** Loading onto a deck that's playing and audible in the mix is refused, whether from the library, the controller's LOAD buttons or your partner's booth, with a note at the bottom of the window: *Deck A is playing: pause it or pull its fader down to load onto it.* A deck that's playing but silent in the mix can still be loaded over: its fader at about 10% or below, the crossfader all the way across, its filter turned all the way, or its trim or all three EQs down. If you load just as your partner brings that deck up, whichever happened first wins, on both booths.
+- **A loaded track always starts paused** at its start, with sync, loops and rolls off, ready to cue. It used to start playing on the beat if the deck had been playing.
+  - Test: play deck A with its fader up and press LOAD on A. Is it refused, with the note? Pull A's fader down and press LOAD again: does the new track sit paused at 0:00?
+- Protocol version 13: v0.11.8 can't share a room with earlier versions, so every booth needs v0.11.8.
+
 ## Next candidates
 
 Rough priority order:
