@@ -8,6 +8,7 @@
 //! including events that arrive late over the network.
 
 use crate::grid::BeatGrid;
+use crate::spin;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 
@@ -110,6 +111,11 @@ pub struct DeckState {
     /// True while the DJ's hand is on the jog platter (vinyl mode): the
     /// record is held, and jog movement moves the playhead directly.
     pub scratching: bool,
+    /// The record was let go mid-spin: its speed at `anchor_time` (track
+    /// seconds per second, negative = backwards). It runs on and slows down
+    /// by itself (see [`crate::spin`]). `None`: it moves at the deck's speed.
+    #[serde(default)]
+    pub spin: Option<f64>,
     /// Where the track's beats and bars are (None: no steady beat found).
     pub grid: Option<BeatGrid>,
     /// Tempo-locked to the other deck (SYNC on).
@@ -160,6 +166,7 @@ impl Default for DeckState {
             trim: 0.5,
             filter: 0.5,
             scratching: false,
+            spin: None,
             grid: None,
             synced: false,
             key: -1,
@@ -186,12 +193,44 @@ impl DeckState {
         if self.track.is_none() {
             return 0.0;
         }
-        let p = if self.playing && !self.scratching {
-            self.anchor_pos + (t - self.anchor_time) as f64 * 1e-6 * self.rate()
-        } else {
-            self.anchor_pos
-        };
+        let p = self.anchor_pos + self.motion(t).0;
         self.wrap(p).clamp(0.0, self.duration.max(0.0))
+    }
+
+    /// The speed the playhead moves at when nobody is holding the record:
+    /// the play speed, or 0 when paused.
+    fn rest_speed(&self) -> f64 {
+        if self.playing {
+            self.rate()
+        } else {
+            0.0
+        }
+    }
+
+    /// From `anchor_time` to shared time `t`: how far the playhead has moved
+    /// (before going round a loop), its speed at `t` (track seconds per
+    /// second), and whether a record let go mid-spin is still running on.
+    fn motion(&self, t: i64) -> (f64, f64, bool) {
+        let dt = (t - self.anchor_time) as f64 * 1e-6;
+        if self.scratching {
+            return (0.0, 0.0, false);
+        }
+        let rest = self.rest_speed();
+        match self.spin {
+            Some(v) => spin::motion(v, rest, dt),
+            None => (dt * rest, rest, false),
+        }
+    }
+
+    /// How fast the playhead is moving at time `t`, in track seconds per
+    /// second (negative = backwards).
+    pub fn speed_at(&self, t: i64) -> f64 {
+        self.motion(t).1
+    }
+
+    /// True while a record let go mid-spin is still running on at time `t`.
+    pub fn spinning_at(&self, t: i64) -> bool {
+        self.motion(t).2
     }
 
     /// The loop that's set, `(in, out)`, whether or not it's playing.
@@ -270,7 +309,12 @@ impl DeckState {
     pub fn next_tempo_change(&self, now: i64, horizon: i64) -> Option<i64> {
         let g = self.grid.as_ref()?;
         let rate = self.rate();
-        if self.track.is_none() || !self.playing || self.scratching || rate <= 1e-6 {
+        if self.track.is_none()
+            || !self.playing
+            || self.scratching
+            || self.spinning_at(now)
+            || rate <= 1e-6
+        {
             return None;
         }
         let pos = self.position_at(now);
@@ -295,8 +339,11 @@ impl DeckState {
     }
 
     fn reanchor(&mut self, t: i64) {
+        let (_, speed, spinning) = self.motion(t);
         self.anchor_pos = self.position_at(t);
         self.anchor_time = t;
+        // A spinning record keeps its momentum through whatever changed.
+        self.spin = spinning.then_some(speed);
     }
 
     fn clear_loop(&mut self) {
@@ -540,10 +587,14 @@ pub enum Action {
         deck: u8,
         v: f32,
     },
-    /// Hand on / off the jog platter (vinyl mode).
+    /// Hand on / off the jog platter (vinyl mode). On letting go, `spin` is
+    /// how fast the hand was moving the record (track seconds per second,
+    /// negative = backwards): fast enough, and the record spins on by itself.
     JogTouch {
         deck: u8,
         down: bool,
+        #[serde(default)]
+        spin: f32,
     },
     Crossfader {
         v: f32,
@@ -724,6 +775,7 @@ impl RoomState {
         }
         d.playing = true;
         d.anchor_time = t;
+        d.spin = None;
         let Some(g) = d.grid else {
             d.anchor_pos = 0.0;
             return;
@@ -861,6 +913,7 @@ impl RoomState {
                 d.cue_preview = false;
                 d.preview_slot = None;
                 d.anchor_time = t;
+                d.spin = None;
                 d.anchor_pos = cue.clamp(0.0, d.duration);
                 d.cue_point = d.anchor_pos;
                 d.hot_cues = [None; HOT_CUES];
@@ -876,6 +929,7 @@ impl RoomState {
                 d.cue_preview = false;
                 d.preview_slot = None;
                 d.anchor_time = t;
+                d.spin = None;
                 d.anchor_pos = 0.0;
                 d.cue_point = 0.0;
                 d.hot_cues = [None; HOT_CUES];
@@ -921,6 +975,7 @@ impl RoomState {
                     d.playing = false;
                     d.anchor_pos = d.cue_point;
                     d.anchor_time = t;
+                    d.spin = None;
                     d.gen += 1;
                 } else if !d.playing {
                     let pos = d.position_at(t);
@@ -930,12 +985,14 @@ impl RoomState {
                         d.cue_preview = true;
                         d.anchor_pos = d.cue_point;
                         d.anchor_time = t;
+                        d.spin = None;
                         d.gen += 1;
                     } else {
                         // Paused elsewhere: set a new cue point here.
                         d.cue_point = pos;
                         d.anchor_pos = pos;
                         d.anchor_time = t;
+                        d.spin = None;
                     }
                 }
             }
@@ -945,6 +1002,7 @@ impl RoomState {
                     d.playing = false;
                     d.anchor_pos = d.cue_point;
                     d.anchor_time = t;
+                    d.spin = None;
                     d.gen += 1;
                 }
             }
@@ -960,6 +1018,7 @@ impl RoomState {
                         let preview = !d.playing || d.cue_preview;
                         d.anchor_pos = p;
                         d.anchor_time = t;
+                        d.spin = None;
                         d.playing = true;
                         d.cue_preview = preview;
                         d.preview_slot = preview.then_some(slot);
@@ -977,6 +1036,7 @@ impl RoomState {
                     d.playing = false;
                     d.anchor_pos = back;
                     d.anchor_time = t;
+                    d.spin = None;
                     d.gen += 1;
                 }
             }
@@ -1032,6 +1092,7 @@ impl RoomState {
                 } else if let Some((a, _)) = d.loop_span() {
                     d.anchor_pos = a;
                     d.anchor_time = t;
+                    d.spin = None;
                     d.looping = true;
                     d.gen += 1;
                 }
@@ -1097,6 +1158,7 @@ impl RoomState {
                 if d.track.is_some() {
                     d.anchor_pos = pos.clamp(0.0, d.duration);
                     d.anchor_time = t;
+                    d.spin = None;
                     d.gen += 1;
                 }
             }
@@ -1117,11 +1179,17 @@ impl RoomState {
             Action::Volume { v, .. } => d.volume = v.clamp(0.0, 1.0),
             Action::Trim { v, .. } => d.trim = v.clamp(0.0, 1.0),
             Action::Filter { v, .. } => d.filter = v.clamp(0.0, 1.0),
-            Action::JogTouch { down, .. } => {
+            Action::JogTouch { down, spin, .. } => {
                 if d.track.is_some() && d.scratching != down {
                     // Re-anchor so the playhead is continuous either way.
+                    // Touching a spinning record catches it.
                     d.reanchor(t);
                     d.scratching = down;
+                    d.spin = None;
+                    if !down {
+                        // Let go mid-spin: the record runs on by itself.
+                        d.spin = spin::let_go(spin as f64, d.rest_speed(), d.anchor_pos);
+                    }
                 }
             }
             Action::Eq { band, v, .. } => {
@@ -1168,6 +1236,13 @@ impl RoomState {
             h.u64(d.trim.to_bits() as u64);
             h.u64(d.filter.to_bits() as u64);
             h.u64(d.scratching as u64);
+            match d.spin {
+                Some(v) => {
+                    h.u64(1);
+                    h.f64(v);
+                }
+                None => h.u64(0),
+            }
             match &d.grid {
                 Some(g) => {
                     h.u64(g.markers().len() as u64);
@@ -1529,6 +1604,7 @@ mod tests {
             Action::JogTouch {
                 deck: 0,
                 down: true,
+                spin: 0.0,
             },
         ));
         // Hand on the platter: the record stops where it was.
@@ -1551,9 +1627,171 @@ mod tests {
             Action::JogTouch {
                 deck: 0,
                 down: false,
+                spin: 0.0,
             },
         ));
         assert!((s.decks[0].position_at(14_000_000) - 10.5).abs() < 1e-9);
+    }
+
+    /// A room with deck A playing (or paused at) 20 s of a 100 s track, a
+    /// hand on its platter at 10 s, let go at 10 s at `spin` x normal speed.
+    fn let_go_at(spin: f32, playing: bool) -> RoomState {
+        let mut s = RoomState::default();
+        let load = Action::Load {
+            deck: 0,
+            track: tid(3),
+            duration: 100.0,
+            cue: 20.0,
+            grid: None,
+            key: -1,
+        };
+        s.apply(&ev(0, 1, 1, load));
+        if playing {
+            s.apply(&ev(0, 1, 2, Action::Seek { deck: 0, pos: 10.0 }));
+            s.apply(&ev(0, 1, 3, Action::Play { deck: 0 }));
+        }
+        let touch = |down, spin| Action::JogTouch {
+            deck: 0,
+            down,
+            spin,
+        };
+        s.apply(&ev(10_000_000, 1, 4, touch(true, 0.0)));
+        s.apply(&ev(10_000_000, 1, 5, touch(false, spin)));
+        s
+    }
+
+    #[test]
+    fn a_backspin_let_go_runs_on_then_the_deck_plays_on() {
+        let s = let_go_at(-5.5, true);
+        let d = &s.decks[0];
+        assert!((d.position_at(10_000_000) - 20.0).abs() < 1e-9);
+        // It carries on backwards at the hand's speed, slowing down...
+        assert!((d.speed_at(10_000_000) + 5.5).abs() < 1e-9);
+        assert!(d.spinning_at(11_000_000) && d.speed_at(11_000_000) < 0.0);
+        assert!(d.position_at(11_000_000) < 20.0 - 2.0);
+        // ...then the deck plays on at its own speed.
+        assert!(!d.spinning_at(12_000_000));
+        assert_eq!(d.speed_at(12_000_000), 1.0);
+        let p = d.position_at(12_000_000);
+        assert!((d.position_at(13_000_000) - p - 1.0).abs() < 1e-9);
+        assert_eq!(d.next_tempo_change(11_000_000, 10_000_000), None);
+    }
+
+    #[test]
+    fn a_paused_record_flicked_and_let_go_coasts_to_a_stop() {
+        let s = let_go_at(3.0, false);
+        let d = &s.decks[0];
+        assert!(d.spinning_at(10_300_000));
+        let a = d.position_at(10_300_000);
+        assert!(a > 20.3);
+        let stop = d.position_at(15_000_000);
+        assert!(stop > a && !d.spinning_at(15_000_000));
+        assert_eq!(d.position_at(20_000_000), stop);
+        // Let go gently (or held still): it stays where the hand left it.
+        let s = let_go_at(0.3, false);
+        assert_eq!(s.decks[0].spin, None);
+        assert_eq!(s.decks[0].position_at(15_000_000), 20.0);
+    }
+
+    #[test]
+    fn a_spinning_record_keeps_its_path_through_other_changes() {
+        let plain = let_go_at(-5.5, true);
+        let mut s = let_go_at(-5.5, true);
+        // Re-anchoring mid-spin (here: key lock off and on) changes nothing.
+        let same = |s: &RoomState, times: &[i64]| {
+            for &t in times {
+                let (a, b) = (at(&plain, 0, t), at(s, 0, t));
+                assert!((a - b).abs() < 1e-9, "at {t}: {a} vs {b}");
+            }
+        };
+        s.apply(&ev(
+            10_400_000,
+            1,
+            6,
+            Action::KeyLock { deck: 0, on: false },
+        ));
+        same(&s, &[10_500_000, 10_900_000]);
+        s.apply(&ev(10_900_000, 1, 7, Action::KeyLock { deck: 0, on: true }));
+        same(&s, &[11_000_000, 11_500_000, 13_000_000]);
+        // Pausing mid-spin: the record still runs down, then stays stopped.
+        s.apply(&ev(11_000_000, 1, 8, Action::Pause { deck: 0 }));
+        assert!(s.decks[0].spinning_at(11_100_000));
+        assert_eq!(at(&s, 0, 14_000_000), at(&s, 0, 20_000_000));
+    }
+
+    #[test]
+    fn catching_or_jumping_stops_a_spinning_record() {
+        let mut s = let_go_at(4.0, false);
+        let caught = at(&s, 0, 10_200_000);
+        s.apply(&ev(
+            10_200_000,
+            1,
+            6,
+            Action::JogTouch {
+                deck: 0,
+                down: true,
+                spin: 0.0,
+            },
+        ));
+        assert_eq!(at(&s, 0, 12_000_000), caught);
+        let mut s = let_go_at(4.0, false);
+        s.apply(&ev(10_200_000, 1, 6, Action::Seek { deck: 0, pos: 50.0 }));
+        assert_eq!(s.decks[0].spin, None);
+        assert_eq!(at(&s, 0, 12_000_000), 50.0);
+    }
+
+    #[test]
+    fn a_backspin_stops_at_the_start_of_the_track() {
+        let mut s = RoomState::default();
+        let load = Action::Load {
+            deck: 0,
+            track: tid(3),
+            duration: 100.0,
+            cue: 0.4,
+            grid: None,
+            key: -1,
+        };
+        s.apply(&ev(0, 1, 1, load));
+        s.apply(&ev(0, 1, 2, Action::Play { deck: 0 }));
+        let touch = |down, spin| Action::JogTouch {
+            deck: 0,
+            down,
+            spin,
+        };
+        s.apply(&ev(100_000, 1, 3, touch(true, 0.0)));
+        s.apply(&ev(100_000, 1, 4, touch(false, -6.0)));
+        // Runs back to 0:00 and no further, then plays from there.
+        let d = &s.decks[0];
+        let mut lowest = f64::MAX;
+        let mut t = 100_000;
+        while d.spinning_at(t) {
+            lowest = lowest.min(d.position_at(t));
+            t += 1_000;
+        }
+        assert!(lowest.abs() < 1e-6, "lowest {lowest}");
+        assert!(d.position_at(t + 1_000_000) > 0.9);
+    }
+
+    #[test]
+    fn jog_touch_on_the_wire() {
+        let a = Action::JogTouch {
+            deck: 1,
+            down: false,
+            spin: -5.37,
+        };
+        let json = serde_json::to_string(&a).unwrap();
+        assert_eq!(serde_json::from_str::<Action>(&json).unwrap(), a);
+        // The release speed survives the trip exactly (it's an f32).
+        let old = json.replace(",\"spin\":-5.37", "");
+        assert_ne!(old, json);
+        assert_eq!(
+            serde_json::from_str::<Action>(&old).unwrap(),
+            Action::JogTouch {
+                deck: 1,
+                down: false,
+                spin: 0.0
+            }
+        );
     }
 
     fn grid_load(deck: u8, n: u8, bpm: f64, first_beat: f64) -> Action {
@@ -2103,6 +2341,7 @@ mod tests {
             Action::JogTouch {
                 deck: 0,
                 down: true,
+                spin: 0.0,
             },
         );
         go(

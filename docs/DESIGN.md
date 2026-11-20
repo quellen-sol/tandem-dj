@@ -25,7 +25,7 @@ Every control action is an `Event { time, origin, seq, action }` in room time. `
 - **Order-independent:** a late event is inserted at its timestamp, and every later query includes it.
 - **Queryable at any time,** including the past. That's what the delayed broadcast lane needs.
 
-A deck's playhead is analytic: `position(t) = anchor_pos + (t − anchor_time) × rate`. No audio has to run for the position to be known.
+A deck's playhead is analytic: `position(t) = anchor_pos + (t − anchor_time) × rate`. No audio has to run for the position to be known. (A record let go mid-spin follows a curve instead of a line; see [Spinning records](#spinning-records).)
 
 The host sends a digest of the state from 1.5 s ago every 2 s. If the joiner disagrees twice in a row, it asks for a full resync.
 
@@ -55,6 +55,16 @@ A loop is part of the deck's state: an in point, an out point and whether it's l
 Read heads go round loops by themselves. They read the track through the loop: frames past the out point come from the in point, and the last 96 frames (about 2 ms) before the out point fade into the frames just before the in point. Going round is therefore seamless and click-free, through the stretcher too, with no jump and no re-priming. The chase measures its error the short way round the loop.
 
 A loop that appears or changes under audio the head has already read makes the head hard-sync with the usual 2 ms crossfade. That happens with LOOP OUT pressed at the playhead, a partner's loop arriving a little late, and always with a stretched head, because the stretcher reads ahead.
+
+### Spinning records
+
+Let go of the jog platter mid-spin (vinyl mode) and the record runs on and slows down, as in Serato. On the DDJ-FLX6 a hard backspin leaves the hand at about 5–6× normal speed. After the hand leaves, the platter itself keeps turning for 0.3–0.9 s, and even a still hand flicks it about 400 ticks as it lifts off.
+
+- **One event.** The controller measures the hand's speed over the last 20 ms and sends it with the release (`JogTouch { down: false, spin }`, an `f32` so it survives JSON exactly). The deck stores the record's speed at its anchor (`DeckState::spin`), and `spin::motion` gives where it is at any later time. Friction takes `1.6 + 1.2 × speed` off its speed per second, measured from where it settles, so a fast spin fades out gradually and a slow one stops soon. A playing deck's backspin then winds back up to the play speed in 0.2 s, like a motor catching it. Every booth and the broadcast compute the same spin, with no stream of nudges.
+- **Settling.** A release within 0.5× of the resting speed (stopped, or the play speed) doesn't spin, so drops and cue points stay exact. A backspin that would run past 0:00 is slowed so it stops right there.
+- **Momentum carries through.** Anything that re-anchors the deck (tempo, pause, key lock, a relock) keeps the record's current speed, so the curve is unchanged; pausing mid-spin lets it run down and stay stopped. Touching the platter catches it, and jumps (cue, hot cue, seek, load) stop it.
+- **The platter's own turning is ignored.** After a release, `MidiEngine` drops jog ticks until the platter has been still for 50 ms (at most 2 s), so the free-turning platter doesn't also search or bend.
+- **Sound.** While spinning, the read head plays vinyl-style (no key lock), chasing the curve like a scratch. A paused deck is audible until the record stops.
 
 ### Broadcast view
 
@@ -153,5 +163,5 @@ Every peer decodes with the same decoder (symphonia) and the loader's exact dura
 
 | Crate | What |
 |---|---|
-| `tandem-core` | Everything platform-independent: `time`, `clock`, `model`, `render`, `meter` (level meters), `audio` (decode), `net`, `files`, `session`, `library`, `serato`, `mapping` (MIDI learn and soft takeover), `terms`, `selftest`. Tests run anywhere. |
+| `tandem-core` | Everything platform-independent: `time`, `clock`, `model`, `spin` (records let go mid-spin), `render`, `meter` (level meters), `audio` (decode), `net`, `files`, `session`, `library`, `serato`, `mapping` (MIDI learn and soft takeover), `terms`, `selftest`. Tests run anywhere. |
 | `tandem` | The Windows app: egui UI (`ui_*.rs`, including the broadcast window in `ui_broadcast.rs`), sound output via cpal/WASAPI (`output.rs`), MIDI via midir (`midi.rs`). |

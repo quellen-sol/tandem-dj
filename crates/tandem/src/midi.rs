@@ -152,7 +152,7 @@ impl Midi {
                         let s = s2.lock();
                         (s.latest(), s.local)
                     };
-                    let outs = engine.lock().handle(msg, &room, &local);
+                    let outs = engine.lock().handle_at(msg, t, &room, &local);
                     if outs.is_empty() {
                         return;
                     }

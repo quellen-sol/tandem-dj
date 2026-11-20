@@ -13,7 +13,7 @@ use crate::meter::{to_db, Levels};
 use crate::model::{Action, RoomState, BEAT_LOOPS, DECKS};
 use crate::render::LocalParams;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MidiKind {
@@ -490,6 +490,14 @@ pub struct MidiEngine {
     ring_bend: [f64; DECKS],
     /// While calibrating: net jog ticks counted so far.
     pub calibration: Option<i64>,
+    /// Shared time (us) of the MIDI message being handled.
+    now: i64,
+    /// Scratch movement in the last moments, per deck: (time, seconds of
+    /// track). How fast the hand was going when it let go sets the spin.
+    hand: [VecDeque<(i64, f64)>; DECKS],
+    /// Per deck, after the hand let go of the platter: (when, last tick
+    /// since). The platter turns on by itself for a moment.
+    free: [Option<(i64, i64)>; DECKS],
 }
 
 const BEND: f64 = 0.04;
@@ -499,6 +507,12 @@ const SECONDS_PER_TURN: f64 = 60.0 / (100.0 / 3.0);
 /// track up by this fraction (10%). A gentle quarter-turn nudge over a
 /// second shifts the track by about 25 ms.
 const BEND_PER_TURN_PER_SEC: f64 = 0.10;
+/// Letting go of the platter, the hand's speed is taken over this long.
+const HAND_WINDOW_US: i64 = 20_000;
+/// A platter that has sent nothing for this long has stopped.
+const PLATTER_STILL_US: i64 = 50_000;
+/// Longest a released platter is left to turn by itself.
+const FREEWHEEL_MAX_US: i64 = 2_000_000;
 
 impl MidiEngine {
     pub fn new(mapping: Mapping, tempo_range: f64) -> Self {
@@ -515,6 +529,9 @@ impl MidiEngine {
             ring_ticks: [0; DECKS],
             ring_bend: [0.0; DECKS],
             calibration: None,
+            now: 0,
+            hand: std::array::from_fn(|_| VecDeque::new()),
+            free: [None; DECKS],
         }
     }
 
@@ -607,6 +624,18 @@ impl MidiEngine {
     }
 
     pub fn handle(&mut self, bytes: &[u8], room: &RoomState, local: &LocalParams) -> Vec<MidiOut> {
+        self.handle_at(bytes, self.now, room, local)
+    }
+
+    /// Handle a message that arrived at shared time `t` (us).
+    pub fn handle_at(
+        &mut self,
+        bytes: &[u8],
+        t: i64,
+        room: &RoomState,
+        local: &LocalParams,
+    ) -> Vec<MidiOut> {
+        self.now = t;
         let Some(raw) = parse(bytes) else {
             return Vec::new();
         };
@@ -761,9 +790,27 @@ impl MidiEngine {
                 }
                 Target::Pfl { deck } if down => out.push(MidiOut::TogglePfl(deck)),
                 Target::JogTouch { deck } => {
-                    let scratching = room.decks[deck as usize].scratching;
-                    if (down && self.mapping.vinyl && !scratching) || (!down && scratching) {
-                        out.push(MidiOut::Action(Action::JogTouch { deck, down }));
+                    let d = deck as usize;
+                    let scratching = room.decks[d].scratching;
+                    if down && self.mapping.vinyl && !scratching {
+                        self.hand[d].clear();
+                        self.free[d] = None;
+                        out.push(MidiOut::Action(Action::JogTouch {
+                            deck,
+                            down,
+                            spin: 0.0,
+                        }));
+                    } else if !down && scratching {
+                        // Movement not sent yet goes first, so the record is
+                        // let go exactly where the hand left it.
+                        let moved = std::mem::take(&mut self.jog_pos[d]);
+                        if moved != 0.0 {
+                            out.push(MidiOut::Action(Action::Nudge { deck, delta: moved }));
+                        }
+                        let spin = self.hand_speed(d) as f32;
+                        self.hand[d].clear();
+                        self.free[d] = Some((self.now, self.now));
+                        out.push(MidiOut::Action(Action::JogTouch { deck, down, spin }));
                     }
                 }
                 Target::BendDown { deck } => out.push(MidiOut::Action(Action::Bend {
@@ -776,6 +823,46 @@ impl MidiEngine {
                 })),
                 Target::Load { deck } if down => out.push(MidiOut::LoadSelected(deck)),
                 _ => {}
+            }
+        }
+    }
+
+    /// Remember scratch movement, to know how fast the hand let go.
+    fn track_hand(&mut self, d: usize, moved: f64) {
+        let now = self.now;
+        let h = &mut self.hand[d];
+        h.push_back((now, moved));
+        while h.front().is_some_and(|&(t, _)| t < now - HAND_WINDOW_US) {
+            h.pop_front();
+        }
+    }
+
+    /// How fast the hand was moving the record just now (track seconds per
+    /// second, negative = backwards).
+    fn hand_speed(&self, d: usize) -> f64 {
+        let from = self.now - HAND_WINDOW_US;
+        let moved: f64 = self.hand[d]
+            .iter()
+            .filter(|&&(t, _)| t >= from)
+            .map(|&(_, m)| m)
+            .sum();
+        moved / (HAND_WINDOW_US as f64 * 1e-6)
+    }
+
+    /// True while a platter the hand just let go of is still turning by
+    /// itself: until it has been still for a moment.
+    fn freewheeling(&mut self, d: usize) -> bool {
+        let now = self.now;
+        match self.free[d] {
+            Some((since, last))
+                if now - last < PLATTER_STILL_US && now - since < FREEWHEEL_MAX_US =>
+            {
+                self.free[d] = Some((since, now));
+                true
+            }
+            _ => {
+                self.free[d] = None;
+                false
             }
         }
     }
@@ -824,9 +911,16 @@ impl MidiEngine {
                             let turns = ticks as f64 / self.mapping.ticks_per_rev();
                             if st.scratching {
                                 // Hand on the record: it moves exactly with the platter.
-                                self.jog_pos[d] += turns
+                                let moved = turns
                                     * SECONDS_PER_TURN
                                     * self.mapping.scratch_sensitivity as f64;
+                                self.jog_pos[d] += moved;
+                                self.track_hand(d, moved);
+                            } else if self.freewheeling(d) {
+                                // Just let go: the platter turns on by itself
+                                // (even a still hand flicks it as it lifts off).
+                                // That isn't the DJ moving it; a spinning
+                                // record runs on in the room model instead.
                             } else if !st.playing {
                                 // Paused: turning searches through the track.
                                 self.jog_pos[d] += turns * SECONDS_PER_TURN;
@@ -1302,7 +1396,8 @@ mod tests {
             out,
             vec![MidiOut::Action(Action::JogTouch {
                 deck: 0,
-                down: true
+                down: true,
+                spin: 0.0,
             })]
         );
         room.decks[0].scratching = true;
@@ -1316,15 +1411,119 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(e.flush(None).is_empty());
-        // Deck 3 on the FLX6 drives deck A too.
-        let out = e.handle(&[0x82, 0x36, 0], &room, &local);
+        // Deck 3 on the FLX6 drives deck A too. Let go a while after the
+        // hand stopped: no spin.
+        let out = e.handle_at(&[0x82, 0x36, 0], 100_000, &room, &local);
         assert_eq!(
             out,
             vec![MidiOut::Action(Action::JogTouch {
                 deck: 0,
-                down: false
+                down: false,
+                spin: 0.0,
             })]
         );
+    }
+
+    /// The last 30 ms of a hard backspin on a DDJ-FLX6 before the hand let
+    /// go (CC 0x22, two messages every 2 ms, as Windows delivers them).
+    const FLX6_BACKSPIN: [u8; 30] = [
+        0x2C, 0x2B, 0x2C, 0x2B, 0x2C, 0x2B, 0x2B, 0x2B, 0x2B, 0x2B, 0x2A, 0x2B, 0x2A, 0x2A, 0x2B,
+        0x2A, 0x2A, 0x2A, 0x2B, 0x2A, 0x2A, 0x2A, 0x2B, 0x2A, 0x2B, 0x2A, 0x2B, 0x2B, 0x2B, 0x2B,
+    ];
+
+    /// Touch, play the recorded backspin and let go (at 30 ms). Returns what
+    /// letting go sent.
+    fn backspin(e: &mut MidiEngine, room: &mut RoomState) -> Vec<MidiOut> {
+        let local = LocalParams::default();
+        room.decks[0].scratching = false;
+        e.handle_at(&[0x90, 0x36, 127], 0, room, &local);
+        room.decks[0].scratching = true;
+        for (i, &v) in FLX6_BACKSPIN.iter().enumerate() {
+            let t = (i as i64 / 2) * 2_000;
+            assert!(e.handle_at(&[0xb0, 0x22, v], t, room, &local).is_empty());
+        }
+        let out = e.handle_at(&[0x90, 0x36, 0], 30_000, room, &local);
+        room.decks[0].scratching = false;
+        out
+    }
+
+    #[test]
+    fn letting_go_mid_backspin_passes_on_the_hands_speed() {
+        // The user's FLX6 measures 6387 ticks a turn.
+        let mut e = MidiEngine::new(pioneer_ddj("DDJ-FLX6", "test", 4, 6387.0), 0.08);
+        let mut room = RoomState::default();
+        room.decks[0].track = Some(crate::model::TrackId([1; 32]));
+        let out = backspin(&mut e, &mut room);
+        // Movement not sent yet goes out first, then the release with the
+        // hand's speed: about 6x normal speed, backwards.
+        match &out[..] {
+            [MidiOut::Action(Action::Nudge { delta, .. }), MidiOut::Action(Action::JogTouch {
+                down: false, spin, ..
+            })] => {
+                assert!(*delta < 0.0);
+                assert!(*spin < -5.5 && *spin > -6.5, "let go at {spin}x");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(e.flush(None).is_empty());
+    }
+
+    #[test]
+    fn a_platter_let_go_turns_on_by_itself_without_moving_the_deck() {
+        let local = LocalParams::default();
+        for playing in [false, true] {
+            let mut e = MidiEngine::new(pioneer_ddj("DDJ-FLX6", "test", 4, 6387.0), 0.08);
+            let mut room = RoomState::default();
+            room.decks[0].track = Some(crate::model::TrackId([1; 32]));
+            room.decks[0].playing = playing;
+            backspin(&mut e, &mut room);
+            e.flush(Some(0.025));
+            // The platter spins on for 0.4 s after the hand left it (the
+            // record's own spin is the room model's job): no search, no bend.
+            for ms in 31..430 {
+                let out = e.handle_at(&[0xb0, 0x21, 35], ms * 1_000, &room, &local);
+                assert!(out.is_empty());
+                if ms % 5 == 0 {
+                    let acts = e.flush((ms % 25 == 0).then_some(0.025));
+                    assert!(acts.is_empty(), "playing {playing}: {acts:?}");
+                }
+            }
+            // Once it has been still for a moment, the jog works as usual.
+            e.handle_at(&[0xb0, 0x21, 70], 500_000, &room, &local);
+            let acts = e.flush(Some(0.025));
+            if playing {
+                assert!(
+                    matches!(acts[..], [Action::Bend { bend, .. }] if bend > 0.0),
+                    "{acts:?}"
+                );
+            } else {
+                assert!(
+                    matches!(acts[..], [Action::Nudge { delta, .. }] if delta > 0.0),
+                    "{acts:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn letting_go_of_a_still_record_leaves_the_cue_alone() {
+        // Lifting the hand flicks an FLX6 platter about 400 ticks on (seen in
+        // recordings): a paused deck must not search with it.
+        let mut e = MidiEngine::new(pioneer_ddj("DDJ-FLX6", "test", 4, 6387.0), 0.08);
+        let local = LocalParams::default();
+        let mut room = RoomState::default();
+        room.decks[0].track = Some(crate::model::TrackId([1; 32]));
+        e.handle_at(&[0x90, 0x36, 127], 0, &room, &local);
+        room.decks[0].scratching = true;
+        let out = e.handle_at(&[0x90, 0x36, 0], 500_000, &room, &local);
+        assert!(
+            matches!(out[..], [MidiOut::Action(Action::JogTouch { down: false, spin, .. })] if spin == 0.0)
+        );
+        room.decks[0].scratching = false;
+        for ms in 520..720 {
+            e.handle_at(&[0xb0, 0x21, 66], ms * 1_000, &room, &local);
+        }
+        assert!(e.flush(None).is_empty());
     }
 
     #[test]

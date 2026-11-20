@@ -188,6 +188,26 @@ Work through these in order and note anything that fails. `tandem.log` (Settings
 - **Cancel for Analyze BPM.** A **Cancel** button beside "Analysing BPM 12/300" stops the analysis once the tracks it's working on are done; it says "Stopping analysis…" until then. Tracks already analysed keep their BPM and key, and pressing **Analyze BPM** again carries on with the rest.
 - No protocol change: v0.8.0 and v0.8.1 can share a room.
 
+## Round 9 (v0.9): records that spin on
+
+- **Spin the record and let go, and it keeps spinning,** like in Serato. A hard backspin on a playing deck runs back for over a second, slowing down, then the track winds back up and plays on. A record flicked on a paused deck coasts to a stop, and you hear it. Touch the platter to catch it.
+  - Let go with your hand still, or moving with the music, and nothing changes: drops and cue points stay exact.
+  - Lifting your hand off a still FLX6 platter used to nudge a paused deck about 0.1 s, because the platter flicks on a little. It no longer moves the deck.
+  - Both booths and the broadcast hear the same spin.
+- Protocol version 8: v0.9 can't share a room with v0.8 or earlier, so both booths need v0.9.
+
+### Test plan for spinning records
+
+1. Play a track. Touch the platter, spin it back hard and let go.
+   - Does the track keep going backwards, slow down gradually, then wind up and play on?
+   - Does it play on from the right place, with no jump or click?
+2. Pause a deck. Flick the platter forward and let go. Do you hear the track coast and slow to a stop? Flick it backwards too.
+3. While a record is spinning on, touch the platter. Does it stop dead under your hand?
+4. Scratch, then let go on a beat with your hand still. Does the track start exactly as before, with no extra slide?
+5. On a paused deck, scratch to a kick and lift your hand off. Does the playhead stay on the kick?
+6. Backspin hard near the very start of a track. Does it stop at 0:00 without hanging there?
+7. In a room: backspin on one PC. Does the other PC hear the same spin, and does the broadcast recording have it?
+
 ## Next candidates
 
 Rough priority order:

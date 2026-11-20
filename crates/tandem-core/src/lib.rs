@@ -11,6 +11,7 @@
 //! * [`render`] — turns a timeline into audio for one output ("lane"),
 //!   including the delayed broadcast lane.
 //! * [`meter`] — channel and master level meters, measured by the live lane.
+//! * [`spin`] — a record let go mid-spin running on and slowing down.
 //! * [`grid`] — beatgrids: markers, bars, and the edits a DJ can make.
 //! * [`net`] / [`files`] — rooms over TCP and track transfer.
 //! * [`session`] — glue the UI talks to.
@@ -33,6 +34,7 @@ pub mod render;
 pub mod selftest;
 pub mod serato;
 pub mod session;
+pub mod spin;
 pub mod stretch;
 pub mod terms;
 pub mod time;

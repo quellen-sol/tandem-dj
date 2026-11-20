@@ -395,7 +395,9 @@ impl Player {
         let model_pos = st.position_at(ts);
         let target = model_pos * track_sr;
         let has_audio = audio.is_some();
-        let scratching = st.scratching && has_audio;
+        // A record let go mid-spin plays like a scratch until it settles.
+        let spinning = has_audio && st.spinning_at(ts);
+        let scratching = (st.scratching || spinning) && has_audio;
         let want_playing =
             scratching || (st.playing && has_audio && model_pos < st.duration - 1e-3);
         // Key lock / key shift go through the stretcher; scratching is always vinyl.
@@ -438,8 +440,9 @@ impl Player {
         }
 
         if scratching {
-            // Vinyl: the read head follows the hand, forwards or backwards,
-            // with eased velocity so grabbing and releasing sound natural.
+            // Vinyl: the read head follows the hand (or the spinning record),
+            // forwards or backwards, with eased velocity so grabbing and
+            // releasing sound natural.
             let outside = lp.is_some_and(|l| self.cur.pos >= l.end);
             let err = fold(target - self.cur.pos, lp);
             if err.abs() > 2.0 * track_sr || outside {
@@ -1308,6 +1311,7 @@ mod tests {
             Action::JogTouch {
                 deck: 0,
                 down: true,
+                spin: 0.0,
             },
         );
         // Drag the record back 0.3 s over 100 ms.
@@ -1340,6 +1344,97 @@ mod tests {
             (pos_s - 5.7).abs() < 0.01,
             "ended at {pos_s} s, expected 5.7"
         );
+    }
+
+    #[test]
+    fn a_record_let_go_mid_backspin_plays_on_then_settles() {
+        let a = track();
+        let mut tl = Timeline::new(0);
+        let mut seq = 0;
+        let mut push = |tl: &mut Timeline, t: i64, action: Action| {
+            seq += 1;
+            tl.insert(Event {
+                time: t,
+                origin: 1,
+                seq,
+                action,
+            });
+        };
+        push(
+            &mut tl,
+            0,
+            Action::Load {
+                deck: 0,
+                track: a.id,
+                duration: a.duration(),
+                cue: 0.0,
+                grid: None,
+                key: -1,
+            },
+        );
+        push(&mut tl, 0, Action::Seek { deck: 0, pos: 6.0 });
+        push(&mut tl, 0, Action::Play { deck: 0 });
+        let touch = |down, spin| Action::JogTouch {
+            deck: 0,
+            down,
+            spin,
+        };
+        push(&mut tl, 1_000_000, touch(true, 0.0));
+        // Spin it back at 5.5x for 100 ms, and let go.
+        for i in 0..20 {
+            push(
+                &mut tl,
+                1_000_000 + i * 5_000,
+                Action::Nudge {
+                    deck: 0,
+                    delta: -0.0275,
+                },
+            );
+        }
+        push(&mut tl, 1_100_000, touch(false, -5.5));
+        let snap = snap_with(tl, a.clone());
+        let mut lane = Lane::new(48_000.0, 0, LaneKind::Live);
+        let (mut m, mut c) = (vec![0.0; 960], vec![0.0; 960]);
+        let mut t = 900_000;
+        let mut syncs = None;
+        let mut steps = Vec::new();
+        while t < 4_000_000 {
+            lane.render(&snap, t, &mut m, &mut c);
+            t += 10_000;
+            let p = &lane.players[0];
+            if t == 1_100_000 {
+                syncs = Some(p.syncs);
+            }
+            if t > 1_100_000 {
+                steps.push(p.cur.step);
+            }
+
+            let st = snap.timeline.state_at(t).decks[0];
+            if t > 1_100_000 && st.spinning_at(t) {
+                // While it runs on, the head plays it through: no jumps.
+                assert_eq!(Some(p.syncs), syncs, "jumped at {t}");
+                assert!(p.cur.playing);
+            }
+        }
+        let speed = 44_100.0 / 48_000.0;
+        // Straight after letting go it's still going back at about the
+        // hand's speed, and it slows down gradually...
+        assert!(
+            steps[..5].iter().all(|&s| s < -4.0 * speed),
+            "{:?}",
+            &steps[..5]
+        );
+        assert!(steps[50] < 0.0 && steps[50] > steps[5]);
+        let jerk = steps
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0, f64::max);
+        assert!(jerk < 0.6, "speed jumped by {jerk} in 10 ms");
+        // ...then plays on at normal speed, where the model says.
+        assert!((steps.last().unwrap() - speed).abs() < 0.01);
+        let model = snap.timeline.state_at(t).decks[0].position_at(t) * 44_100.0;
+        let err_ms = (model - lane.players[0].cur.heard()).abs() / 44.1;
+        assert!(err_ms < 2.0, "{err_ms} ms off");
     }
 
     /// Render deck A alone (crossfader hard left) for `secs` from shared time 0.
