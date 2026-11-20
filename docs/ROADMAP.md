@@ -284,11 +284,17 @@ Work through these in order and note anything that fails. `tandem.log` (Settings
   - Test: search for an artist, pick the third result, then click **✖**. Is the whole list back, with that track still highlighted and on screen? Search again and press Escape: the same?
 - No protocol change: v0.11.2 and v0.11.3 can share a room.
 
+### v0.11.4
+
+- **Loop IN and OUT are quantized.** IN goes on the nearest beat, and OUT makes the loop 1 bar, ½ bar, ¼ bar … or 2, 4, 8 bars …, whichever is nearest to when you press it. IN, then OUT about a bar later, is exactly 1 bar, even if you're a little late, and the deck goes round on the beat. While looping, IN moves the start to the nearest beat and OUT sets the length the same way. Turn it off in Settings › General (**Quantize loop IN and OUT**) to loop exactly at the playhead; it's each DJ's own setting. Tracks without a beatgrid loop exactly, as before.
+  - Test: press IN off the beat, then OUT about a bar later. Does the green band start on a beat line and end exactly a bar later, with the **4** pad lit? Does OUT about half a bar after IN give ½ bar (the **2** pad)? With quantize off, does the loop start right where you pressed?
+- Protocol version 11: v0.11.4 can't share a room with earlier versions, so every booth needs v0.11.4.
+
 ## Next candidates
 
 Rough priority order:
 
-1. **Automatic downbeats (bars)** in the detected beatgrid, plus quantize for hot cues, play and loop IN/OUT. Grids already have bars; for now you set bar 1 by hand.
+1. **Automatic downbeats (bars)** in the detected beatgrid, plus quantize for hot cues and play (loop IN/OUT are quantized). Grids already have bars; for now you set bar 1 by hand.
 2. **Beatgrid editing from the controller**, and placing markers by clicking the waveform.
 3. **More loop tools:** BEAT JUMP pads, slip mode and loop rolls, and fine-adjusting IN/OUT with the jog wheel.
 4. **Lower UI CPU:** redraw waveforms only when they change (the frame rate cap is done).
