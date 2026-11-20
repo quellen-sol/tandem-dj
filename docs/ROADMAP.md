@@ -272,6 +272,12 @@ Work through these in order and note anything that fails. `tandem.log` (Settings
   - Test: in a room, unplug one PC's network for about 5 seconds. Does **⚠ no reply** appear after about 3 seconds on both PCs, and the round trip come back once it's plugged in?
 - No protocol change: v0.11.0 and v0.11.1 can share a room.
 
+### v0.11.2
+
+- **Pressing the browse knob switches between the lists and the tracks.** Turn it on the lists (All Music, folders, Serato crates…) to see each one's tracks, and press it again to go into one and pick a track. **BACK** also goes to the lists. A blue outline shows which side the knob is on, and clicking a list puts the knob on its tracks. Saved FLX6 mappings pick up the press and BACK by themselves, and other controllers can learn them.
+  - Test: on the FLX6, press the browse knob, turn to a crate, press again, turn to a track and press LOAD. Does the outline move each time, and does the track load? Does BACK go to the lists?
+- No protocol change: v0.11.1 and v0.11.2 can share a room.
+
 ## Next candidates
 
 Rough priority order:
