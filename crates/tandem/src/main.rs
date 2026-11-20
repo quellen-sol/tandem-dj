@@ -61,6 +61,7 @@ fn main() {
         join: arg_after("--dev-join").map(|p| p.to_string_lossy().to_string()),
         join_broadcaster: args.iter().any(|a| a == "--dev-broadcaster"),
         late_ms: arg_after("--dev-late").and_then(|p| p.to_string_lossy().parse().ok()),
+        cut_frame: arg_after("--dev-cut").and_then(|p| p.to_string_lossy().parse().ok()),
         search: arg_after("--dev-search").map(|p| p.to_string_lossy().to_string()),
         broadcast_view: args.iter().any(|a| a == "--broadcast-view"),
         shared: false,

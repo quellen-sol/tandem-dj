@@ -9,12 +9,17 @@
 //! host relays the DJ's events and tracks to them), so they can play the
 //! broadcast feed and show the broadcast window. They can't change anything:
 //! the host answers their pings and resync requests and ignores the rest.
+//!
+//! A booth whose link to the host drops without anyone leaving (no `Bye`)
+//! gets back in by itself: see [`rejoin`]. The host knows it's the same
+//! booth by its id and booth key, and gives it its seat back.
 
 use crate::clock::ClockEstimator;
+use crate::model::Timeline;
 use crate::protocol::{
-    read_msg, write_msg, ConnKind, Msg, PeerInfo, DEFAULT_PORT, PROTOCOL_VERSION,
+    read_msg, write_msg, ConnKind, Msg, PeerInfo, TrackInfo, DEFAULT_PORT, PROTOCOL_VERSION,
 };
-use crate::session::SessionHandle;
+use crate::session::{LinkEnd, Session, SessionHandle};
 use anyhow::{anyhow, bail, Context};
 use std::io::BufWriter;
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
@@ -41,7 +46,14 @@ impl PeerConn {
             .name("tandem-net-writer".into())
             .spawn(move || {
                 for m in rx {
+                    let bye = matches!(m, Msg::Bye);
                     if write_msg(&mut w, &m, &[]).is_err() {
+                        break;
+                    }
+                    // Nothing follows a Bye: end the connection behind it,
+                    // so the other end reads it before the connection closes.
+                    if bye {
+                        let _ = w.get_ref().shutdown(Shutdown::Write);
                         break;
                     }
                 }
@@ -59,6 +71,8 @@ impl PeerConn {
         self.tx.clone()
     }
 
+    /// False once the writer has stopped: after a Bye, or when the
+    /// connection broke.
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Relaxed)
     }
@@ -78,6 +92,42 @@ pub const LINK_TIMEOUT: Duration = Duration::from_secs(15);
 /// After this long without a Ping or Pong, the link has stalled and the last
 /// round trip is out of date (Pings run about once a second).
 pub const LINK_QUIET: Duration = Duration::from_secs(3);
+
+/// How long a booth whose link dropped keeps trying to get back in.
+pub const REJOIN_FOR: Duration = Duration::from_secs(5 * 60);
+
+/// The wait before the first try to get back in. It doubles after each
+/// failed try, up to [`REJOIN_MAX_WAIT`].
+const REJOIN_FIRST_WAIT: Duration = Duration::from_secs(1);
+const REJOIN_MAX_WAIT: Duration = Duration::from_secs(5);
+
+/// A host from before booth keys keeps a booth's old link (and so its seat)
+/// until that link times out, and turns the booth away as "room full" until
+/// then. Keep trying that long before taking it as a real answer.
+const SEAT_GRACE: Duration = Duration::from_secs(25);
+
+/// The host turned this booth away (wrong room code, another version, room
+/// full). A booth getting back into a room stops trying at one of these.
+#[derive(Debug)]
+pub struct Rejected(pub String);
+
+impl std::fmt::Display for Rejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Rejected {}
+
+impl Rejected {
+    /// The seat was taken (see [`Session::seat_for`]).
+    fn seat_taken(&self) -> bool {
+        self.0.starts_with(ROOM_FULL)
+    }
+}
+
+/// How every "room full" answer starts.
+pub(crate) const ROOM_FULL: &str = "This room already has";
 
 pub fn random_room_code() -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -139,6 +189,7 @@ fn handle_incoming(h: SessionHandle, mut s: TcpStream, room: &str) -> anyhow::Re
         room: their_room,
         peer_id,
         broadcaster,
+        booth_key,
     } = hello
     else {
         bail!("expected hello")
@@ -166,26 +217,45 @@ fn handle_incoming(h: SessionHandle, mut s: TcpStream, room: &str) -> anyhow::Re
     let info = PeerInfo { id: peer_id, name };
     match kind {
         ConnKind::Files => crate::files::serve(&h, s, broadcaster),
-        ConnKind::Control => host_control(h, s, info, broadcaster),
+        ConnKind::Control if closed_already(&s) => {
+            log::debug!(
+                "{} gave up on this connection before it got here",
+                info.name
+            );
+            Ok(())
+        }
+        ConnKind::Control => host_control(h, s, info, booth_key, broadcaster),
     }
+}
+
+/// True if the booth has already closed this connection. When this host was
+/// stalled (frozen, or its PC busy), a booth trying to get back in leaves a
+/// connection behind at each try that timed out, and they all arrive at
+/// once. Seating one would throw out the booth's live try.
+fn closed_already(s: &TcpStream) -> bool {
+    if s.set_nonblocking(true).is_err() {
+        return false;
+    }
+    // A booth that's waiting for its Welcome sends nothing more.
+    let closed = match s.peek(&mut [0u8; 1]) {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(e) => is_disconnect(&e),
+    };
+    let _ = s.set_nonblocking(false);
+    closed
 }
 
 fn host_control(
     h: SessionHandle,
     mut s: TcpStream,
     info: PeerInfo,
+    key: u64,
     broadcaster: bool,
 ) -> anyhow::Result<()> {
-    let (clock, reply, serial) = {
+    let (clock, reply, serial, timeout) = {
         let mut ses = h.lock();
-        let full = if broadcaster {
-            (ses.broadcaster_count() >= MAX_BROADCASTERS)
-                .then(|| format!("This room already has {MAX_BROADCASTERS} broadcasters."))
-        } else {
-            ses.has_peer()
-                .then(|| "This room already has two DJs. Tick \"Broadcaster only\" to join just to stream it.".to_string())
-        };
-        if let Some(reason) = full {
+        if let Err(reason) = ses.seat_for(info.id, key, broadcaster) {
             drop(ses);
             let _ = write_msg(&mut s, &Msg::Reject { reason }, &[]);
             bail!("room full");
@@ -194,42 +264,35 @@ fn host_control(
         let reply = conn.sender();
         conn.send(ses.welcome());
         let serial = if broadcaster {
-            Some(ses.add_broadcaster(conn, info.clone()))
+            ses.add_broadcaster(conn, info.clone(), key)
         } else {
-            ses.add_peer(conn, info.clone());
-            None
+            ses.add_peer(conn, info.clone(), key)
         };
-        (ses.clock(), reply, serial)
+        (ses.clock(), reply, serial, ses.link_timeout)
     };
-    s.set_read_timeout(Some(LINK_TIMEOUT))?;
-    let result = loop {
+    s.set_read_timeout(Some(timeout))?;
+    let end = loop {
         match read_msg(&mut s) {
             Ok((Msg::Ping { id, t1, rtt }, _)) => {
                 let remote = clock.now();
                 let _ = reply.send(Msg::Pong { id, t1, remote });
-                if serial.is_none() {
-                    h.lock().on_peer_ping(rtt);
-                }
+                h.lock().on_peer_ping(serial, rtt);
             }
-            Ok((Msg::Bye, _)) => break Ok(()),
-            Ok((Msg::ResyncRequest, _)) if serial.is_some() => {
+            Ok((Msg::Bye, _)) => break LinkEnd::Bye,
+            Ok((Msg::ResyncRequest, _)) if broadcaster => {
                 let timeline = h.lock().timeline().clone();
                 let _ = reply.send(Msg::Resync { timeline });
             }
             // A broadcaster can't change the room, whatever it sends.
-            Ok((m, _)) if serial.is_some() => {
+            Ok((m, _)) if broadcaster => {
                 log::debug!("ignoring {m:?} from broadcaster {}", info.name)
             }
             Ok((m, _)) => h.lock().on_control_msg(m),
-            Err(e) if is_disconnect(&e) => break Ok(()),
-            Err(e) => break Err(anyhow!(e)),
+            Err(e) => break LinkEnd::Lost(why_lost(&e, timeout)),
         }
     };
-    match serial {
-        Some(serial) => h.lock().on_broadcaster_left(serial),
-        None => h.lock().on_peer_left(info.id),
-    }
-    result
+    h.lock().on_link_ended(serial, end);
+    Ok(())
 }
 
 fn is_disconnect(e: &std::io::Error) -> bool {
@@ -247,6 +310,18 @@ pub fn is_disconnect_err(e: &anyhow::Error) -> bool {
             .map(is_disconnect)
             .unwrap_or(false)
     })
+}
+
+/// Why a link broke, in a few words for the log.
+fn why_lost(e: &std::io::Error, timeout: Duration) -> String {
+    use std::io::ErrorKind::*;
+    if matches!(e.kind(), WouldBlock | TimedOut) {
+        format!("nothing heard for {} s", timeout.as_secs())
+    } else if is_disconnect(e) {
+        "connection closed".into()
+    } else {
+        e.to_string()
+    }
 }
 
 /// Parse "host", "host:port" or "[v6]:port".
@@ -273,6 +348,7 @@ pub(crate) fn connect(
     kind: ConnKind,
     room: &str,
     me: &PeerInfo,
+    booth_key: u64,
     broadcaster: bool,
 ) -> anyhow::Result<TcpStream> {
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(6))
@@ -289,27 +365,59 @@ pub(crate) fn connect(
             room: room.trim().to_uppercase(),
             peer_id: me.id,
             broadcaster,
+            booth_key,
         },
         &[],
     )?;
     Ok(s)
 }
 
-/// Join a host's room, as the second DJ or, with `broadcaster`, only to
-/// play and show the set for a stream. Blocks for the handshake and initial
-/// clock sync (about a second), then runs in the background.
-pub fn join(
-    h: &SessionHandle,
-    addr_text: &str,
-    room: &str,
-    broadcaster: bool,
-) -> anyhow::Result<()> {
-    let addr = resolve(addr_text)?;
-    let (me, clock) = {
+/// Where a joining booth's room is.
+#[derive(Clone, Debug)]
+pub struct RoomAddr {
+    pub addr: SocketAddr,
+    /// The room code, upper case.
+    pub room: String,
+    /// Joined only to broadcast.
+    pub broadcaster: bool,
+}
+
+/// A control connection the host has welcomed, with the clock measured,
+/// ready to become this booth's link to the room.
+struct Welcomed {
+    stream: TcpStream,
+    host: PeerInfo,
+    timeline: Timeline,
+    tracks: Vec<TrackInfo>,
+    est: ClockEstimator,
+    offset_us: i64,
+    /// What arrived while the clock was being measured.
+    buffered: Vec<Msg>,
+}
+
+impl Welcomed {
+    /// Not wanted after all: tell the host, so it doesn't keep the seat.
+    fn abandon(mut self) {
+        let _ = write_msg(&mut self.stream, &Msg::Bye, &[]);
+        let _ = self.stream.shutdown(Shutdown::Write);
+    }
+}
+
+/// Say hello, get the room, and measure the clock offset (about a second).
+/// Changes nothing in the session: [`start_link`] does that.
+fn handshake(h: &SessionHandle, to: &RoomAddr) -> anyhow::Result<Welcomed> {
+    let (me, key, clock) = {
         let s = h.lock();
-        (s.me.clone(), s.clock())
+        (s.me.clone(), s.booth_key(), s.clock())
     };
-    let mut s = connect(addr, ConnKind::Control, room, &me, broadcaster)?;
+    let mut s = connect(
+        to.addr,
+        ConnKind::Control,
+        &to.room,
+        &me,
+        key,
+        to.broadcaster,
+    )?;
     s.set_read_timeout(Some(Duration::from_secs(10)))?;
     let (first, _) = read_msg(&mut s).context("no answer from host")?;
     let (host, timeline, tracks) = match first {
@@ -318,7 +426,7 @@ pub fn join(
             timeline,
             tracks,
         } => (host, timeline, tracks),
-        Msg::Reject { reason } => bail!(reason),
+        Msg::Reject { reason } => return Err(Rejected(reason).into()),
         other => bail!("unexpected reply {other:?}"),
     };
 
@@ -349,55 +457,74 @@ pub fn join(
         thread::sleep(Duration::from_millis(30));
     }
     let best = est.best().ok_or_else(|| anyhow!("clock sync failed"))?;
-    clock.set_offset(best.offset_us);
     log::info!(
         "Clock synced to {}: round trip {:.1} ms",
         host.name,
         best.rtt_us as f64 / 1000.0
     );
-
-    let conn = PeerConn::new(s.try_clone()?)?;
-    let alive = conn.alive.clone();
-    let alive_r = conn.alive.clone();
-    let host_id = host.id;
-    h.lock().on_joined(
-        conn,
+    Ok(Welcomed {
+        stream: s,
         host,
         timeline,
         tracks,
         est,
-        addr,
-        room.trim().to_uppercase(),
-        broadcaster,
-    );
+        offset_us: best.offset_us,
+        buffered,
+    })
+}
+
+/// Make a welcomed connection this booth's link to the room: take the room
+/// state and start the reader and pinger. `rejoin` when getting back in
+/// after the link dropped.
+fn start_link(
+    h: &SessionHandle,
+    ses: &mut Session,
+    w: Welcomed,
+    to: RoomAddr,
+    rejoin: bool,
+) -> anyhow::Result<()> {
+    let Welcomed {
+        stream,
+        host,
+        timeline,
+        tracks,
+        est,
+        offset_us,
+        buffered,
+    } = w;
+    let conn = PeerConn::new(stream.try_clone()?)?;
+    let timeout = ses.link_timeout;
+    let mut reader = stream;
+    reader.set_read_timeout(Some(timeout))?;
+    let clock = ses.clock();
+    clock.set_offset(offset_us);
+    let serial = ses.on_joined(conn, host, timeline, tracks, est, to.clone(), rejoin);
     for m in buffered {
-        h.lock().on_control_msg(m);
+        ses.on_control_msg(m);
     }
 
-    // Reader.
-    s.set_read_timeout(Some(LINK_TIMEOUT))?;
+    // Reader. When the link breaks without a Bye, it stays on to get the
+    // booth back into the room.
     let (h2, clock2) = (h.clone(), clock.clone());
-    let mut reader = s.try_clone()?;
     thread::Builder::new()
         .name("tandem-net-reader".into())
         .spawn(move || {
-            loop {
+            let end = loop {
                 match read_msg(&mut reader) {
                     Ok((Msg::Pong { t1, remote, .. }, _)) => {
                         let t2 = clock2.local();
                         h2.lock().on_pong(t1, remote, t2);
                     }
-                    Ok((Msg::Bye, _)) => break,
+                    Ok((Msg::Bye, _)) => break LinkEnd::Bye,
                     Ok((m, _)) => h2.lock().on_control_msg(m),
-                    Err(e) => {
-                        if !is_disconnect(&e) && alive_r.load(Ordering::Relaxed) {
-                            log::warn!("Lost connection to host: {e}");
-                        }
-                        break;
-                    }
+                    Err(e) => break LinkEnd::Lost(why_lost(&e, timeout)),
                 }
+            };
+            drop(reader);
+            let again = h2.lock().on_link_ended(serial, end);
+            if let Some(gen) = again {
+                rejoin_loop(&h2, gen, to);
             }
-            h2.lock().on_peer_left(host_id);
         })?;
 
     // Pinger: fast at first, then once a second.
@@ -414,11 +541,8 @@ pub fn join(
                     1000
                 };
                 thread::sleep(Duration::from_millis(period));
-                if !alive.load(Ordering::Relaxed) {
-                    break;
-                }
                 let ses = h3.lock();
-                let Some(conn) = ses.peer_conn() else { break };
+                let Some(conn) = ses.link(serial) else { break };
                 if !conn.is_alive() {
                     break;
                 }
@@ -431,4 +555,591 @@ pub fn join(
             }
         })?;
     Ok(())
+}
+
+/// Join a host's room, as the second DJ or, with `broadcaster`, only to
+/// play and show the set for a stream. Blocks for the handshake and initial
+/// clock sync (about a second), then runs in the background.
+pub fn join(
+    h: &SessionHandle,
+    addr_text: &str,
+    room: &str,
+    broadcaster: bool,
+) -> anyhow::Result<()> {
+    let to = RoomAddr {
+        addr: resolve(addr_text)?,
+        room: room.trim().to_uppercase(),
+        broadcaster,
+    };
+    let w = handshake(h, &to)?;
+    let mut ses = h.lock();
+    start_link(h, &mut ses, w, to, false)
+}
+
+/// Get a booth whose link dropped back into the same room. It tries again
+/// and again, waiting a little longer each time (1, 2, 4, then every 5 s),
+/// for the session's `rejoin_for` ([`REJOIN_FOR`]). Getting back in is a
+/// fresh join with the same booth id and key: the host gives the booth its
+/// seat back and the room as it is now. It stops at an answer from the host
+/// that won't change (wrong room code, another version, someone else in the
+/// seat), or when this booth leaves or gives up (`gen` no longer current).
+fn rejoin_loop(h: &SessionHandle, gen: u64, to: RoomAddr) {
+    let since = Instant::now();
+    let mut wait = REJOIN_FIRST_WAIT;
+    loop {
+        let wake = Instant::now() + wait;
+        while Instant::now() < wake {
+            thread::sleep(Duration::from_millis(50));
+            if !h.lock().rejoin_wanted(gen) {
+                return;
+            }
+        }
+        let Some(rejoin_for) = h.lock().rejoin_attempt(gen) else {
+            return;
+        };
+        let res = handshake(h, &to);
+        let mut ses = h.lock();
+        let failed = match res {
+            Ok(w) if !ses.rejoin_wanted(gen) => {
+                drop(ses);
+                w.abandon();
+                return;
+            }
+            Ok(w) => match start_link(h, &mut ses, w, to.clone(), true) {
+                Ok(()) => return,
+                Err(e) => e,
+            },
+            Err(e) => e,
+        };
+        let refused = failed.downcast_ref::<Rejected>();
+        let give_up = refused.is_some_and(|r| !r.seat_taken() || since.elapsed() > SEAT_GRACE)
+            || since.elapsed() >= rejoin_for;
+        ses.rejoin_failed(gen, why_not_back(&failed, &to), give_up);
+        if give_up {
+            return;
+        }
+        wait = (wait * 2).min(REJOIN_MAX_WAIT);
+    }
+}
+
+/// Why a try to get back in failed, in a few words for the top bar.
+fn why_not_back(e: &anyhow::Error, to: &RoomAddr) -> String {
+    use std::io::ErrorKind::*;
+    if let Some(r) = e.downcast_ref::<Rejected>() {
+        return r.0.clone();
+    }
+    let io = e.chain().find_map(|c| c.downcast_ref::<std::io::Error>());
+    match io.map(|e| e.kind()) {
+        Some(ConnectionRefused) => format!("nothing is hosting at {}", to.addr),
+        Some(TimedOut | WouldBlock) => format!("no answer from {}", to.addr),
+        Some(UnexpectedEof | ConnectionReset | ConnectionAborted | BrokenPipe) => {
+            "the connection closed".into()
+        }
+        _ => format!("{e:#}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Paths;
+    use crate::library::Library;
+    use crate::model::Action;
+    use crate::session::{RoleView, TrackStatus};
+    use crate::time::SharedClock;
+    use parking_lot::Mutex;
+    use std::io::{Read, Write};
+
+    fn wait_for(what: &str, timeout: Duration, mut f: impl FnMut() -> bool) {
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            if f() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    struct Rig {
+        root: std::path::PathBuf,
+    }
+
+    impl Rig {
+        fn new(tag: &str) -> Self {
+            let root = std::env::temp_dir().join(format!("tandem-{tag}-{}", fastrand::u64(..)));
+            std::fs::create_dir_all(&root).unwrap();
+            Self { root }
+        }
+
+        /// A booth whose links time out after `timeout`.
+        fn booth(&self, name: &str, skew_us: i64, timeout: Duration) -> SessionHandle {
+            let paths = Paths::under(&self.root.join(name));
+            paths.ensure().unwrap();
+            let lib = Arc::new(parking_lot::Mutex::new(Library::new(
+                paths.shared_dir.clone(),
+                paths.library_cache.clone(),
+            )));
+            let h = Session::create(
+                name.into(),
+                paths,
+                lib,
+                Arc::new(SharedClock::with_skew(skew_us)),
+            );
+            h.lock().link_timeout = timeout;
+            h
+        }
+    }
+
+    impl Drop for Rig {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// A TCP relay between booths and the host that fails the way the
+    /// internet does: it can close every connection through it (`sever`),
+    /// or go dark (`blackhole`), when the connections through it go silent
+    /// for good without closing and new ones are dropped until `restore`.
+    struct Relay {
+        port: u16,
+        state: Arc<Mutex<RelayState>>,
+        stop: Arc<AtomicBool>,
+    }
+
+    struct RelayState {
+        up: bool,
+        upstream: u16,
+        /// Both sockets of every connection, and whether it went dark.
+        pipes: Vec<(TcpStream, TcpStream, Arc<AtomicBool>)>,
+    }
+
+    impl Relay {
+        fn new(upstream: u16) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let state = Arc::new(Mutex::new(RelayState {
+                up: true,
+                upstream,
+                pipes: Vec::new(),
+            }));
+            let stop = Arc::new(AtomicBool::new(false));
+            let (st, stop2) = (state.clone(), stop.clone());
+            thread::spawn(move || {
+                while !stop2.load(Ordering::Relaxed) {
+                    let Ok((down, _)) = listener.accept() else {
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    };
+                    down.set_nonblocking(false).unwrap();
+                    let mut s = st.lock();
+                    if !s.up {
+                        continue; // dropped: the booth sees the connection close
+                    }
+                    let Ok(up) = TcpStream::connect(("127.0.0.1", s.upstream)) else {
+                        continue;
+                    };
+                    let dark = Arc::new(AtomicBool::new(false));
+                    for (a, b) in [(&down, &up), (&up, &down)] {
+                        let (mut a, mut b) = (a.try_clone().unwrap(), b.try_clone().unwrap());
+                        let dark = dark.clone();
+                        a.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+                        thread::spawn(move || {
+                            let mut buf = vec![0u8; 64 * 1024];
+                            loop {
+                                if dark.load(Ordering::Relaxed) {
+                                    return; // silent, never closed
+                                }
+                                match a.read(&mut buf) {
+                                    Ok(0) => {
+                                        let _ = b.shutdown(Shutdown::Write);
+                                        return;
+                                    }
+                                    Ok(n) => {
+                                        if dark.load(Ordering::Relaxed) {
+                                            return;
+                                        }
+                                        if b.write_all(&buf[..n]).is_err() {
+                                            return;
+                                        }
+                                    }
+                                    Err(e)
+                                        if matches!(
+                                            e.kind(),
+                                            std::io::ErrorKind::WouldBlock
+                                                | std::io::ErrorKind::TimedOut
+                                        ) => {}
+                                    Err(_) => {
+                                        let _ = b.shutdown(Shutdown::Both);
+                                        return;
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    s.pipes.push((down, up, dark));
+                }
+            });
+            Self { port, state, stop }
+        }
+
+        fn addr(&self) -> String {
+            format!("127.0.0.1:{}", self.port)
+        }
+
+        /// Close every connection through the relay, as a router that drops
+        /// its connections does: both ends see it close at once.
+        fn sever(&self) {
+            for (a, b, _) in self.state.lock().pipes.drain(..) {
+                let _ = a.shutdown(Shutdown::Both);
+                let _ = b.shutdown(Shutdown::Both);
+            }
+        }
+
+        /// The connection drops out: nothing more gets through either way,
+        /// neither end hears it close, and new connections fail.
+        fn blackhole(&self) {
+            let mut s = self.state.lock();
+            s.up = false;
+            for (_, _, dark) in &s.pipes {
+                dark.store(true, Ordering::Relaxed);
+            }
+        }
+
+        fn restore(&self) {
+            self.state.lock().up = true;
+        }
+
+        /// Send new connections to another host.
+        fn retarget(&self, port: u16) {
+            self.state.lock().upstream = port;
+        }
+    }
+
+    impl Drop for Relay {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            self.sever();
+        }
+    }
+
+    fn digests_match(a: &SessionHandle, b: &SessionHandle) -> bool {
+        let t = a.lock().now() - 100_000;
+        let da = a.lock().state_at(t).digest();
+        let db = b.lock().state_at(t).digest();
+        da == db
+    }
+
+    fn rejoining(h: &SessionHandle) -> bool {
+        h.lock().view().link.rejoin.is_some()
+    }
+
+    /// In the room with its link up, and not getting back in.
+    fn linked(h: &SessionHandle) -> bool {
+        let v = h.lock().view();
+        v.link.peer.is_some() && v.link.rejoin.is_none()
+    }
+
+    fn names(v: &[PeerInfo]) -> Vec<String> {
+        v.iter().map(|p| p.name.clone()).collect()
+    }
+
+    /// The router drops the connection: both ends see it close. The host
+    /// drops the joiner and waits for it; the joiner gets back in by itself
+    /// and takes the room as the host has it, including what the host did
+    /// meanwhile, and its own moves reach the host again.
+    #[test]
+    fn rejoins_after_the_connection_closes() {
+        let rig = Rig::new("rejoin-close");
+        let t = Duration::from_secs(2);
+        let alice = rig.booth("Alice", 0, t);
+        let bob = rig.booth("Bob", 3_600_000_000, t);
+        let port = host(&alice, 0, "CLOSE1").unwrap();
+        let relay = Relay::new(port);
+        join(&bob, &relay.addr(), "close1", false).unwrap();
+        let bob_id = bob.lock().me.id;
+        alice.lock().act(Action::Volume { deck: 0, v: 0.5 });
+        bob.lock().act(Action::Crossfader { v: 0.25 });
+        wait_for("both booths to agree", Duration::from_secs(5), || {
+            alice.lock().latest().crossfader == 0.25 && bob.lock().latest().decks[0].volume == 0.5
+        });
+
+        relay.sever();
+        wait_for("Bob to notice", Duration::from_secs(5), || rejoining(&bob));
+        wait_for("Alice to notice", Duration::from_secs(5), || {
+            alice.lock().view().link.awaiting.as_deref() == Some("Bob")
+        });
+        assert!(matches!(
+            bob.lock().view().link.role,
+            RoleView::Joined { .. }
+        ));
+        alice.lock().act(Action::Volume { deck: 1, v: 0.75 });
+
+        wait_for("Bob to get back in", Duration::from_secs(10), || {
+            linked(&bob)
+        });
+        wait_for("Alice to see Bob back", Duration::from_secs(5), || {
+            let v = alice.lock().view();
+            v.link.peer.as_ref().map(|p| p.id) == Some(bob_id) && v.link.awaiting.is_none()
+        });
+        assert_eq!(bob.lock().latest().decks[1].volume, 0.75);
+        assert!(
+            digests_match(&alice, &bob),
+            "room state differs after rejoining"
+        );
+        let r = alice.lock().roster();
+        assert_eq!(names(&r.djs), ["Alice", "Bob"]);
+
+        bob.lock().act(Action::Crossfader { v: 0.5 });
+        wait_for("Bob's move to reach Alice", Duration::from_secs(5), || {
+            alice.lock().latest().crossfader == 0.5
+        });
+        bob.lock().leave();
+        alice.lock().leave();
+    }
+
+    /// The connection goes silent, and the host still holds the joiner's
+    /// old link when it comes back. The returning booths (a DJ and a
+    /// broadcaster) take their own seats back: no second Bob or Carol, and
+    /// the old link closing later doesn't throw them out. Moves the DJ
+    /// made while cut off never reached the room, so they're gone; the
+    /// track it already had is still there, without downloading it again.
+    #[test]
+    fn rejoins_after_a_silent_stall_replacing_the_old_link() {
+        let rig = Rig::new("rejoin-stall");
+        // The host gives up on a silent link only after the booths are back.
+        let alice = rig.booth("Alice", 0, Duration::from_secs(7));
+        let bob = rig.booth("Bob", -7_200_000_000, Duration::from_secs(2));
+        let carol = rig.booth("Carol", 1_800_000_000, Duration::from_secs(2));
+        let port = host(&alice, 0, "STALL1").unwrap();
+        let relay = Relay::new(port);
+        join(&bob, &relay.addr(), "STALL1", false).unwrap();
+        join(&carol, &relay.addr(), "STALL1", true).unwrap();
+
+        let music = rig.root.join("music");
+        std::fs::create_dir_all(&music).unwrap();
+        let wav = music.join("Tone.wav");
+        crate::audio::write_wav(&wav, 44_100, &crate::audio::test_signal(44_100, 4.0, 440.0))
+            .unwrap();
+        alice.lock().load_path(0, wav);
+        let mut id = None;
+        wait_for("Alice to load", Duration::from_secs(20), || {
+            id = alice.lock().latest().decks[0].track;
+            id.is_some()
+        });
+        let id = id.unwrap();
+        wait_for(
+            "Bob and Carol to get the track",
+            Duration::from_secs(30),
+            || {
+                bob.lock().track_status(id) == Some(TrackStatus::Ready)
+                    && carol.lock().track_status(id) == Some(TrackStatus::Ready)
+            },
+        );
+        alice.lock().act(Action::Play { deck: 0 });
+        wait_for("everyone to play it", Duration::from_secs(5), || {
+            bob.lock().latest().decks[0].playing
+                && carol.lock().latest().decks[0].playing
+                && digests_match(&alice, &bob)
+                && digests_match(&alice, &carol)
+        });
+
+        relay.blackhole();
+        wait_for("Bob and Carol to notice", Duration::from_secs(5), || {
+            rejoining(&bob) && rejoining(&carol)
+        });
+        // Cut off: Bob's move stays on his booth, Alice's can't reach him,
+        // and Carol keeps playing the room as it was.
+        bob.lock().act(Action::Volume { deck: 1, v: 0.3 });
+        alice.lock().act(Action::Crossfader { v: 0.8 });
+        {
+            let c = carol.lock();
+            assert!(c.is_broadcaster());
+            assert!(c.latest().decks[0].playing, "Carol stopped playing");
+        }
+        assert!(
+            alice.lock().view().link.peer.is_some(),
+            "Alice dropped Bob before the test could check the replacement"
+        );
+
+        relay.restore();
+        wait_for(
+            "Bob and Carol to get back in",
+            Duration::from_secs(10),
+            || linked(&bob) && linked(&carol),
+        );
+        {
+            let b = bob.lock();
+            assert_eq!(
+                b.latest().decks[1].volume,
+                1.0,
+                "Bob's cut-off move survived"
+            );
+            assert_eq!(b.latest().crossfader, 0.8);
+            assert_eq!(b.track_status(id), Some(TrackStatus::Ready));
+        }
+        assert!(digests_match(&alice, &bob), "Bob's room differs");
+        assert!(digests_match(&alice, &carol), "Carol's room differs");
+        let r = alice.lock().roster();
+        assert_eq!(names(&r.djs), ["Alice", "Bob"]);
+        assert_eq!(names(&r.broadcasters), ["Carol"]);
+
+        // Past the host's timeout for the old links: nobody is thrown out.
+        thread::sleep(Duration::from_secs(8));
+        assert!(linked(&bob) && linked(&carol));
+        let r = alice.lock().roster();
+        assert_eq!(names(&r.djs), ["Alice", "Bob"]);
+        assert_eq!(names(&r.broadcasters), ["Carol"]);
+        bob.lock().act(Action::Crossfader { v: 0.4 });
+        wait_for(
+            "Bob's move to reach everyone",
+            Duration::from_secs(5),
+            || alice.lock().latest().crossfader == 0.4 && carol.lock().latest().crossfader == 0.4,
+        );
+        for h in [&bob, &carol, &alice] {
+            h.lock().leave();
+        }
+    }
+
+    /// A connection whose booth already gave up on it isn't seated; one
+    /// whose booth is waiting for its Welcome is.
+    #[test]
+    fn spots_connections_their_booth_already_closed() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut live = TcpStream::connect(addr).unwrap();
+        let mut gone = TcpStream::connect(addr).unwrap();
+        let me = PeerInfo {
+            id: 7,
+            name: "Bob".into(),
+        };
+        let hello = Msg::Hello {
+            proto: PROTOCOL_VERSION,
+            kind: ConnKind::Control,
+            name: me.name.clone(),
+            room: "ROOM12".into(),
+            peer_id: me.id,
+            broadcaster: false,
+            booth_key: 9,
+        };
+        write_msg(&mut live, &hello, &[]).unwrap();
+        write_msg(&mut gone, &hello, &[]).unwrap();
+        gone.shutdown(Shutdown::Both).unwrap();
+        drop(gone);
+        for want in [false, true] {
+            let (mut s, _) = listener.accept().unwrap();
+            assert!(matches!(read_msg(&mut s).unwrap().0, Msg::Hello { .. }));
+            thread::sleep(Duration::from_millis(50));
+            assert_eq!(closed_already(&s), want);
+        }
+        drop(live);
+    }
+
+    /// Someone in the room who knows Bob's id (every event carries it) but
+    /// not his booth key can't take his seat.
+    #[test]
+    fn a_booth_id_alone_doesnt_take_a_seat() {
+        let rig = Rig::new("rejoin-key");
+        let alice = rig.booth("Alice", 0, LINK_TIMEOUT);
+        let bob = rig.booth("Bob", 0, LINK_TIMEOUT);
+        let port = host(&alice, 0, "KEYS12").unwrap();
+        let addr = format!("127.0.0.1:{port}");
+        join(&bob, &addr, "KEYS12", false).unwrap();
+        let fake = bob.lock().me.clone();
+        for key in [0, 12345] {
+            let mut s = connect(
+                resolve(&addr).unwrap(),
+                ConnKind::Control,
+                "KEYS12",
+                &fake,
+                key,
+                false,
+            )
+            .unwrap();
+            match read_msg(&mut s).unwrap().0 {
+                Msg::Reject { reason } => assert!(reason.starts_with(ROOM_FULL), "{reason}"),
+                other => panic!("got in with key {key}: {other:?}"),
+            }
+        }
+        assert!(linked(&bob));
+        bob.lock().leave();
+        alice.lock().leave();
+    }
+
+    /// Leaving on purpose is never taken for a dropped link: neither the
+    /// host closing the room nor the joiner giving up starts a rejoin.
+    #[test]
+    fn no_rejoin_after_leaving() {
+        let rig = Rig::new("rejoin-leave");
+        let t = Duration::from_secs(2);
+        let alice = rig.booth("Alice", 0, t);
+        let bob = rig.booth("Bob", 0, t);
+        let carol = rig.booth("Carol", 0, t);
+        let port = host(&alice, 0, "LEAVE1").unwrap();
+        let addr = format!("127.0.0.1:{port}");
+        join(&bob, &addr, "LEAVE1", false).unwrap();
+        join(&carol, &addr, "LEAVE1", true).unwrap();
+        alice.lock().leave();
+        wait_for(
+            "Bob and Carol to be on their own",
+            Duration::from_secs(5),
+            || {
+                matches!(bob.lock().view().link.role, RoleView::Solo)
+                    && matches!(carol.lock().view().link.role, RoleView::Solo)
+            },
+        );
+        assert!(!rejoining(&bob) && !rejoining(&carol));
+        assert!(
+            carol
+                .lock()
+                .latest()
+                .decks
+                .iter()
+                .all(|d| d.track.is_none()),
+            "the broadcaster kept the room"
+        );
+
+        // Giving up while getting back in stops it for good.
+        let port = host(&alice, 0, "LEAVE2").unwrap();
+        let relay = Relay::new(port);
+        join(&bob, &relay.addr(), "LEAVE2", false).unwrap();
+        relay.blackhole();
+        wait_for("Bob to notice", Duration::from_secs(5), || rejoining(&bob));
+        bob.lock().leave();
+        assert!(matches!(bob.lock().view().link.role, RoleView::Solo));
+        relay.restore();
+        thread::sleep(Duration::from_secs(3));
+        assert!(!rejoining(&bob));
+        assert!(
+            bob.lock().view().link.peer.is_none(),
+            "Bob got back in after giving up"
+        );
+        alice.lock().leave();
+    }
+
+    /// The host is gone and a new room answers at its address (a restart
+    /// with another room code): the booth stops trying and is on its own.
+    #[test]
+    fn stops_when_the_host_turns_it_away() {
+        let rig = Rig::new("rejoin-refused");
+        let t = Duration::from_secs(2);
+        let alice = rig.booth("Alice", 0, t);
+        let bob = rig.booth("Bob", 0, t);
+        let dave = rig.booth("Dave", 0, t);
+        let port = host(&alice, 0, "FIRST1").unwrap();
+        let relay = Relay::new(port);
+        join(&bob, &relay.addr(), "FIRST1", false).unwrap();
+        let other = host(&dave, 0, "OTHER1").unwrap();
+        relay.retarget(other);
+        relay.sever();
+        wait_for("Bob to give up", Duration::from_secs(10), || {
+            matches!(bob.lock().view().link.role, RoleView::Solo)
+        });
+        assert!(!rejoining(&bob));
+        assert!(dave.lock().view().link.peer.is_none());
+        for h in [&alice, &bob, &dave] {
+            h.lock().leave();
+        }
+    }
 }

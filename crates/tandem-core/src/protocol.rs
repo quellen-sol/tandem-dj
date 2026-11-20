@@ -76,6 +76,13 @@ pub enum Msg {
         /// everything the room does and can change nothing.
         #[serde(default)]
         broadcaster: bool,
+        /// A secret this booth picked when it started, the same on every
+        /// connection it makes. A booth coming back after its link dropped
+        /// sends the same `peer_id` and key, so the host knows it's the same
+        /// booth (its id alone is no secret: every event carries it). 0 from
+        /// booths older than this field.
+        #[serde(default)]
+        booth_key: u64,
     },
     Welcome {
         host: PeerInfo,

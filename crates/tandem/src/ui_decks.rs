@@ -7,8 +7,8 @@ use tandem_core::audio::PEAK_BLOCK;
 use tandem_core::grid::{BeatGrid, Marker, MAX_MARKERS};
 use tandem_core::mapping::beats_label;
 use tandem_core::model::{Action, DeckState, XfCurve, XfSide, BEAT_LOOPS, DECKS, HOT_CUES};
-use tandem_core::net::{LINK_QUIET, LINK_TIMEOUT};
-use tandem_core::session::{deck_letter, DeckView, RoleView, SessionView, TrackStatus};
+use tandem_core::net::{LINK_QUIET, LINK_TIMEOUT, REJOIN_FOR};
+use tandem_core::session::{deck_letter, DeckView, RejoinView, RoleView, SessionView, TrackStatus};
 
 pub const DECK_COLORS: [Color32; DECKS] = [
     Color32::from_rgb(255, 146, 60),
@@ -112,30 +112,38 @@ impl TandemApp {
                     RoleView::Joined { addr, room } => {
                         ui.label(RichText::new(format!("In room {room}")).strong());
                         ui.label(RichText::new(addr.as_str()).weak());
-                        self.peer_status(ui, view);
-                        broadcasters(ui, view);
-                        if ui.button("Leave").clicked() {
-                            self.session.lock().leave();
+                        if let Some(r) = &view.link.rejoin {
+                            self.rejoin_status(ui, r, false);
+                        } else {
+                            self.peer_status(ui, view);
+                            broadcasters(ui, view);
+                            if ui.button("Leave").clicked() {
+                                self.session.lock().leave();
+                            }
                         }
                     }
                     RoleView::Broadcasting { addr, room } => {
                         ui.label(RichText::new(format!("📡 Broadcasting room {room}")).strong());
                         ui.label(RichText::new(addr.as_str()).weak());
-                        self.peer_status(ui, view);
-                        let delay = self.bcast_delay_ms();
-                        if let Some(late) = view
-                            .link
-                            .late_us
-                            .filter(|&l| crate::ui_broadcaster::late_warning(l, delay))
-                        {
-                            ui.label(
-                                RichText::new(format!("⚠ moves {:.0} ms late", late as f64 / 1000.0))
-                                    .color(AMBER),
-                            )
-                            .on_hover_text(format!("The DJs' moves are getting here too close to the {delay} ms broadcast delay, so some land late on the stream. TIMING, in this window, can raise the delay."));
-                        }
-                        if ui.button("Leave").clicked() {
-                            self.session.lock().leave();
+                        if let Some(r) = &view.link.rejoin {
+                            self.rejoin_status(ui, r, true);
+                        } else {
+                            self.peer_status(ui, view);
+                            let delay = self.bcast_delay_ms();
+                            if let Some(late) = view
+                                .link
+                                .late_us
+                                .filter(|&l| crate::ui_broadcaster::late_warning(l, delay))
+                            {
+                                ui.label(
+                                    RichText::new(format!("⚠ moves {:.0} ms late", late as f64 / 1000.0))
+                                        .color(AMBER),
+                                )
+                                .on_hover_text(format!("The DJs' moves are getting here too close to the {delay} ms broadcast delay, so some land late on the stream. TIMING, in this window, can raise the delay."));
+                            }
+                            if ui.button("Leave").clicked() {
+                                self.session.lock().leave();
+                            }
                         }
                     }
                 }
@@ -179,9 +187,45 @@ impl TandemApp {
         });
     }
 
+    /// The link dropped and this booth is getting back in.
+    fn rejoin_status(&mut self, ui: &mut egui::Ui, r: &RejoinView, broadcasting: bool) {
+        let (dot, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
+        ui.painter().circle_filled(dot.center(), 4.0, AMBER);
+        let text = match r.attempt {
+            0 => format!("Reconnecting to {}…", r.host),
+            n => format!("Reconnecting to {}… attempt {n}", r.host),
+        };
+        let mins = REJOIN_FOR.as_secs() / 60;
+        let mut tip = if broadcasting {
+            format!("The link to the room dropped, so Tandem is getting this booth back in. It keeps trying for {mins} minutes. The stream plays on as the room last was, and follows the room again once it's back.")
+        } else {
+            format!("The link to the room dropped, so Tandem is getting you back in. It keeps trying for {mins} minutes. Your decks play on meanwhile, but nothing you change reaches the room, and once you're back they follow the room again.")
+        };
+        if let Some(e) = &r.error {
+            tip.push_str(&format!("\n\nLast try: {e}"));
+        }
+        ui.label(RichText::new(text).color(AMBER))
+            .on_hover_text(tip);
+        if ui
+            .button("Give up")
+            .on_hover_text("Stop trying and leave the room.")
+            .clicked()
+        {
+            self.session.lock().leave();
+        }
+    }
+
     fn peer_status(&mut self, ui: &mut egui::Ui, view: &SessionView) {
         let Some(peer) = &view.link.peer else {
-            ui.label(RichText::new("Waiting for your partner to join…").color(AMBER));
+            match &view.link.awaiting {
+                Some(name) => {
+                    ui.label(RichText::new(format!("Waiting for {name} to reconnect…")).color(AMBER))
+                        .on_hover_text(format!("The link to {name} dropped. Their Tandem keeps trying to get back in for {} minutes, and the room carries on meanwhile.", REJOIN_FOR.as_secs() / 60));
+                }
+                None => {
+                    ui.label(RichText::new("Waiting for your partner to join…").color(AMBER));
+                }
+            }
             return;
         };
         let broadcasting = matches!(view.link.role, RoleView::Broadcasting { .. });
@@ -207,14 +251,14 @@ impl TandemApp {
         };
         ui.label(RichText::new(name).color(GREEN).strong());
         if let Some(q) = quiet {
-            let other = if broadcasting {
-                "the host"
-            } else {
-                "your partner"
+            let (other, after) = match &view.link.role {
+                RoleView::Broadcasting { .. } => ("the host", "this booth reconnects by itself"),
+                RoleView::Joined { .. } => ("your partner", "Tandem reconnects you by itself"),
+                _ => ("your partner", "their Tandem reconnects by itself"),
             };
             ui.label(RichText::new(format!("⚠ no reply for {} s", q.as_secs())).color(AMBER))
                 .on_hover_text(format!(
-                    "Nothing has arrived from {other} for a while: their connection may have dropped. The room carries on if it comes back within {} s.",
+                    "Nothing has arrived from {other} for a while: a connection may have dropped. If it comes back within {} s the room carries on as before; after that, {after}.",
                     LINK_TIMEOUT.as_secs()
                 ));
             return;

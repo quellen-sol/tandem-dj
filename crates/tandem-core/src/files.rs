@@ -150,7 +150,8 @@ pub fn fetch(
     id: TrackId,
     dest: &Path,
 ) -> anyhow::Result<()> {
-    let mut s = connect(addr, ConnKind::Files, room, me, broadcaster)?;
+    let key = h.lock().booth_key();
+    let mut s = connect(addr, ConnKind::Files, room, me, key, broadcaster)?;
     write_msg(&mut s, &Msg::FileGet { id }, &[])?;
     let (m, _) = read_msg(&mut s)?;
     let size = match m {
@@ -175,7 +176,8 @@ pub fn push(
     let size = std::fs::metadata(path)?.len();
     let name = file_name(path);
     let rate = h.lock().max_upload_bytes_s;
-    let mut s = connect(addr, ConnKind::Files, room, me, false)?;
+    let key = h.lock().booth_key();
+    let mut s = connect(addr, ConnKind::Files, room, me, key, false)?;
     write_msg(
         &mut s,
         &Msg::FilePut {

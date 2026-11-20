@@ -242,7 +242,9 @@ pub struct UiState {
 /// `--broadcast-view` opens the broadcast window at start;
 /// `--dev-host <port>` / `--dev-join <addr>` host or join room DEVTEST,
 /// with `--dev-broadcaster` joining it as a broadcaster;
-/// `--dev-late <ms>` shows moves arriving that late, to see the warnings.
+/// `--dev-late <ms>` shows moves arriving that late, to see the warnings;
+/// `--dev-cut <frame>` drops the room link at that frame, as a network
+/// failure would (no goodbye), to see the booth get back in.
 pub struct DevOpts {
     pub screenshot: Option<PathBuf>,
     pub shot_frame: u64,
@@ -252,6 +254,7 @@ pub struct DevOpts {
     pub join: Option<String>,
     pub join_broadcaster: bool,
     pub late_ms: Option<i64>,
+    pub cut_frame: Option<u64>,
     pub search: Option<String>,
     pub broadcast_view: bool,
     pub shared: bool,
@@ -955,6 +958,9 @@ impl TandemApp {
                     log::error!("dev join: {e:#}");
                 }
             });
+        }
+        if self.dev.cut_frame == Some(f) {
+            self.session.lock().cut_link();
         }
         if self.dev.demo
             && self.dev.host_port.is_some()

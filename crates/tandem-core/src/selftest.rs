@@ -6,8 +6,8 @@
 //! transferred and verified (the joining DJ's tracks reach the broadcaster
 //! through the host), that every booth's room state stays identical, that
 //! the booths render bit-identical audio for the same moment, that a
-//! broadcaster can't change the room, and that a share can be offered,
-//! accepted and downloaded.
+//! broadcaster can't change the room, that a share can be offered,
+//! accepted and downloaded, and that a booth whose link drops gets back in.
 
 use crate::config::Paths;
 use crate::library::Library;
@@ -206,6 +206,7 @@ fn run(root: &std::path::Path, say: &mut dyn FnMut(&str)) -> anyhow::Result<()> 
         ConnKind::Control,
         "TEST42",
         &mallory,
+        0,
         true,
     )?;
     ensure!(
@@ -351,6 +352,35 @@ fn run(root: &std::path::Path, say: &mut dyn FnMut(&str)) -> anyhow::Result<()> 
         "consent wasn't recorded"
     );
     say("share offered, accepted (consent logged), downloaded and verified");
+
+    // A dropped link: Bob gets back in by himself, with the host's room.
+    bob.lock().cut_link();
+    wait_for(
+        "Bob to notice his link dropped",
+        Duration::from_secs(5),
+        || bob.lock().view().link.rejoin.is_some(),
+    )?;
+    alice.lock().act(Action::Crossfader { v: 0.6 });
+    let took = wait_for("Bob to get back in", Duration::from_secs(15), || {
+        let v = bob.lock().view();
+        v.link.peer.is_some() && v.link.rejoin.is_none()
+    })?;
+    wait_for("the host to see Bob back", Duration::from_secs(5), || {
+        alice.lock().roster().djs.len() == 2
+    })?;
+    let t = alice.lock().clock().now() - 100_000;
+    ensure!(
+        alice.lock().state_at(t).digest() == bob.lock().state_at(t).digest(),
+        "room state differs after Bob got back in"
+    );
+    ensure!(
+        bob.lock().latest().crossfader == 0.6,
+        "Bob missed what happened while he was out"
+    );
+    say(&format!(
+        "a dropped link: Bob gets back in by himself after {:.1} s, with the room as it is",
+        took.as_secs_f64()
+    ));
 
     // A broadcaster that loses the room stops playing it.
     alice.lock().leave();

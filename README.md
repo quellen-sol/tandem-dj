@@ -140,6 +140,8 @@ The room has one curve, like the curve switch on a club mixer, so changing it ch
 3. **Join.** The other clicks **Join a room**, enters the address and code, and joins.
 4. **Check the connection.** The top bar shows your partner, the round-trip time and **✔ in sync**. If it says **⚠ no reply for N s** instead, nothing has arrived from the other PC for a while: its connection has stalled. The room carries on if it comes back within 15 seconds.
 
+**If the connection drops,** the joining PC gets back into the room by itself. Its top bar says **Reconnecting to … attempt N** while it tries (for up to 5 minutes), and the host's says **Waiting for … to reconnect**. The decks play on meanwhile, but what the joining DJ changes doesn't reach the room: once it's back, its decks follow the room again, as on a fresh join. **Give up** stops trying. Leaving on purpose, or the host closing the room, never starts this.
+
 **Sync click** in the top bar plays a metronome on the shared room clock. Put both laptops side by side, or on a phone call, and the clicks should line up.
 
 ### Sharing crates
@@ -184,7 +186,7 @@ What a broadcaster can and can't do:
 - **It runs 1000 ms behind the room,** twice a DJ's broadcast delay, because the joining DJ's moves reach it through the host. That leaves room for slow connections, and viewers can't tell. It's its own setting: Settings → Audio → Broadcast delay changes it while you're broadcasting, and your delay as a DJ stays as it was.
 - **TIMING,** in its main window, shows how long the DJs' moves take to get there (the longest in the last minute). If that gets too close to the delay, some moves land late on the stream: TIMING turns amber, the top bar warns, and one click raises the delay enough. The stream repeats that much once as it changes, so do it between tracks if you can.
 - **Both DJs see it** in the top bar (📡 and its name). Up to 4 broadcasters can join a room, alongside the two DJs. Tandem remembers the **Broadcaster only** tick for next time.
-- **If the host leaves or the connection drops,** the broadcaster's decks empty and it goes quiet. Join again to carry on.
+- **If the connection drops,** it gets back into the room by itself, and the stream plays on meanwhile as the room last was. **If the host leaves,** or it can't get back in within 5 minutes, its decks empty and it goes quiet. Join again to carry on.
 
 ## Trying it on one PC
 

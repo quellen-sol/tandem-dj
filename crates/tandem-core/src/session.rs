@@ -15,7 +15,7 @@ use crate::library::{self, Library};
 use crate::meter::LevelMeters;
 pub use crate::model::deck_letter;
 use crate::model::{Action, DeckState, Event, RoomState, Timeline, TrackId, DECKS};
-use crate::net::PeerConn;
+use crate::net::{PeerConn, RoomAddr};
 use crate::protocol::{Msg, PeerInfo, ShareOffer, TrackInfo};
 use crate::render::{AudioSnapshot, LocalParams};
 use crate::terms::{self, ConsentRecord, TERMS_VERSION};
@@ -117,6 +117,10 @@ pub struct Peer {
     /// When the link last showed it's alive: a Ping arriving (host) or a
     /// Pong (joiner). They come about once a second.
     heard: Instant,
+    /// Tells this link apart from an earlier or later one to the same booth.
+    serial: u64,
+    /// Host: the joining booth's key (see [`Session::seat_for`]).
+    key: u64,
 }
 
 /// Host: a booth that joined only to broadcast. It gets everything the room
@@ -126,6 +130,38 @@ struct Broadcaster {
     info: PeerInfo,
     /// Tells a rejoin apart from the connection it replaces.
     serial: u64,
+    key: u64,
+}
+
+/// How a link to another booth ended.
+#[derive(Clone, Debug)]
+pub enum LinkEnd {
+    /// The other end said goodbye: it left, or closed the room.
+    Bye,
+    /// It broke without one (why, for the log).
+    Lost(String),
+}
+
+/// Client: the link to the host dropped without anyone leaving, and this
+/// booth is getting back in (see `net::rejoin_loop`).
+struct Rejoin {
+    /// Who this booth was in the room with.
+    host: PeerInfo,
+    /// When the link dropped.
+    since: Instant,
+    /// Tries so far.
+    attempt: u32,
+    /// Why the last try failed.
+    error: Option<String>,
+    /// Tells this rejoin apart from a later one.
+    gen: u64,
+}
+
+/// Host: the other DJ's link dropped, and their booth is expected back.
+struct Awaiting {
+    info: PeerInfo,
+    key: u64,
+    since: Instant,
 }
 
 /// Who's in the room.
@@ -186,6 +222,19 @@ pub enum RoleView {
     },
 }
 
+/// Getting back into a room after the link dropped.
+#[derive(Clone, Debug)]
+pub struct RejoinView {
+    /// The host's name.
+    pub host: String,
+    /// Tries so far: 0 while waiting for the first.
+    pub attempt: u32,
+    /// How long since the link dropped.
+    pub since: Duration,
+    /// Why the last try failed.
+    pub error: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct LinkView {
     pub role: RoleView,
@@ -203,6 +252,11 @@ pub struct LinkView {
     pub quiet_for: Option<Duration>,
     pub clock_spread_us: Option<i64>,
     pub in_sync: Option<bool>,
+    /// The link dropped and this booth is getting back in. `role` is still
+    /// the room's meanwhile, and `peer` is `None`.
+    pub rejoin: Option<RejoinView>,
+    /// Host: the other DJ's link dropped and their booth is expected back.
+    pub awaiting: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -278,6 +332,10 @@ impl SessionView {
 
 pub struct Session {
     pub me: PeerInfo,
+    /// A secret only this booth and the host it joins know, the same for
+    /// every connection it makes (see `Msg::Hello::booth_key`). With `me.id`
+    /// it's the booth's identity across rejoins.
+    booth_key: u64,
     pub paths: Paths,
     clock: Arc<SharedClock>,
     library: Arc<Mutex<Library>>,
@@ -301,6 +359,17 @@ pub struct Session {
     next_serial: u64,
     /// Client: who's in the room, as the host last said.
     roster: Roster,
+    /// Client: getting back into the room after the link dropped.
+    rejoin: Option<Rejoin>,
+    rejoin_gen: u64,
+    /// Host: the other DJ whose link dropped, while they're expected back.
+    awaiting: Option<Awaiting>,
+    /// A link that hears nothing for this long is dropped
+    /// ([`crate::net::LINK_TIMEOUT`]; tests shorten it).
+    pub link_timeout: Duration,
+    /// How long a booth whose link dropped tries to get back in
+    /// ([`crate::net::REJOIN_FOR`]).
+    pub rejoin_for: Duration,
     /// Moves that happened from this (shared) time on count towards
     /// lateness: those since joining. `i64::MAX` when not in a room.
     late_from: i64,
@@ -353,6 +422,7 @@ impl Session {
                     id: fastrand::u64(1..),
                     name,
                 },
+                booth_key: secret_u64(),
                 paths,
                 clock,
                 library,
@@ -374,6 +444,11 @@ impl Session {
                 broadcasters: Vec::new(),
                 next_serial: 0,
                 roster: Roster::default(),
+                rejoin: None,
+                rejoin_gen: 0,
+                awaiting: None,
+                link_timeout: crate::net::LINK_TIMEOUT,
+                rejoin_for: crate::net::REJOIN_FOR,
                 late_from: i64::MAX,
                 late: VecDeque::new(),
                 upload_pacer: Arc::default(),
@@ -1177,47 +1252,119 @@ impl Session {
         self.peer.is_some()
     }
 
-    pub fn peer_conn(&self) -> Option<&PeerConn> {
-        self.peer.as_ref().map(|p| &p.conn)
+    /// The link with this serial, while it's still the current one.
+    pub fn link(&self, serial: u64) -> Option<&PeerConn> {
+        self.peer
+            .as_ref()
+            .filter(|p| p.serial == serial)
+            .map(|p| &p.conn)
     }
 
-    /// Host: a DJ joined.
-    pub fn add_peer(&mut self, conn: PeerConn, info: PeerInfo) {
-        log::info!("{} joined the room", info.name);
+    /// The secret this booth sends in every Hello.
+    pub fn booth_key(&self) -> u64 {
+        self.booth_key
+    }
+
+    /// Host: can this booth come in? `Err` is the reason to give it. A
+    /// booth coming back after its link dropped (the same id and booth key)
+    /// gets its seat back, even before its old link has timed out here.
+    pub fn seat_for(&self, id: u64, key: u64, broadcaster: bool) -> Result<(), String> {
+        let same = |pid: u64, pkey: u64| key != 0 && pid == id && pkey == key;
+        use crate::net::{MAX_BROADCASTERS, ROOM_FULL};
+        if broadcaster {
+            let others = self
+                .broadcasters
+                .iter()
+                .filter(|b| !same(b.info.id, b.key))
+                .count();
+            if others >= MAX_BROADCASTERS {
+                return Err(format!("{ROOM_FULL} {MAX_BROADCASTERS} broadcasters."));
+            }
+        } else if self.peer.as_ref().is_some_and(|p| !same(p.info.id, p.key)) {
+            return Err(format!(
+                "{ROOM_FULL} two DJs. Tick \"Broadcaster only\" to join just to stream it."
+            ));
+        }
+        Ok(())
+    }
+
+    /// Host: close any link this booth still has here, because it's coming
+    /// back before the old one timed out. True if there was one.
+    fn evict(&mut self, id: u64, key: u64) -> bool {
+        if key == 0 {
+            return false;
+        }
+        let same = |pid: u64, pkey: u64| pid == id && pkey == key;
+        let mut found = false;
+        if self.peer.as_ref().is_some_and(|p| same(p.info.id, p.key)) {
+            self.unlink("connection replaced");
+            found = true;
+        }
+        self.broadcasters.retain(|b| {
+            let old = same(b.info.id, b.key);
+            if old {
+                b.conn.close();
+                found = true;
+            }
+            !old
+        });
+        found
+    }
+
+    /// Host: a DJ joined, or came back after their link dropped. Returns the
+    /// link's serial.
+    pub fn add_peer(&mut self, conn: PeerConn, info: PeerInfo, key: u64) -> u64 {
+        let expected = self
+            .awaiting
+            .take()
+            .is_some_and(|a| key != 0 && a.info.id == info.id && a.key == key);
+        let back = self.evict(info.id, key) || expected;
+        if back {
+            log::info!("{} is back in the room", info.name);
+        } else {
+            log::info!("{} joined the room", info.name);
+        }
+        self.next_serial += 1;
+        let serial = self.next_serial;
         self.peer = Some(Peer {
             conn,
             info,
             rtt_us: None,
             heard: Instant::now(),
+            serial,
+            key,
         });
         self.in_sync = None;
         self.last_digest = Instant::now();
         self.announce_members();
+        // Ask again for tracks on a deck that didn't arrive from them before
+        // (a rejoin is where interrupted uploads to here would resume).
+        self.ensure_room_tracks();
+        serial
     }
 
     pub fn broadcaster_count(&self) -> usize {
         self.broadcasters.len()
     }
 
-    /// Host: a booth joined to broadcast. Returns its connection's serial.
-    pub fn add_broadcaster(&mut self, conn: PeerConn, info: PeerInfo) -> u64 {
-        log::info!("{} joined to broadcast", info.name);
+    /// Host: a booth joined to broadcast, or came back. Returns its link's
+    /// serial.
+    pub fn add_broadcaster(&mut self, conn: PeerConn, info: PeerInfo, key: u64) -> u64 {
+        if self.evict(info.id, key) {
+            log::info!("{} is back, broadcasting", info.name);
+        } else {
+            log::info!("{} joined to broadcast", info.name);
+        }
         self.next_serial += 1;
         let serial = self.next_serial;
-        self.broadcasters.push(Broadcaster { conn, info, serial });
+        self.broadcasters.push(Broadcaster {
+            conn,
+            info,
+            serial,
+            key,
+        });
         self.announce_members();
         serial
-    }
-
-    /// Host: a broadcaster's connection ended.
-    pub fn on_broadcaster_left(&mut self, serial: u64) {
-        let Some(i) = self.broadcasters.iter().position(|b| b.serial == serial) else {
-            return;
-        };
-        let b = self.broadcasters.remove(i);
-        b.conn.close();
-        log::info!("{} stopped broadcasting", b.info.name);
-        self.announce_members();
     }
 
     /// Who's in the room. A client knows from the host's last word.
@@ -1254,7 +1401,12 @@ impl Session {
         }
     }
 
-    /// Client: we joined a host's room.
+    /// Client: we joined a host's room, or got back in after the link
+    /// dropped (`rejoin`). Either way the room is taken exactly as the host
+    /// has it now: moves this booth made while cut off never reached the
+    /// room, so they go. Its own settings, library and the tracks it has
+    /// stay, and tracks on the decks it doesn't have yet are fetched again.
+    /// Returns the link's serial.
     #[allow(clippy::too_many_arguments)]
     pub fn on_joined(
         &mut self,
@@ -1263,37 +1415,51 @@ impl Session {
         timeline: Timeline,
         tracks: Vec<TrackInfo>,
         est: ClockEstimator,
-        addr: SocketAddr,
-        room: String,
-        broadcaster: bool,
-    ) {
-        if broadcaster {
+        to: RoomAddr,
+        rejoin: bool,
+    ) -> u64 {
+        if rejoin {
+            let down = self.rejoin.as_ref().map(|r| r.since.elapsed().as_secs());
+            log::info!(
+                "Back in {}'s room ({} s after the link dropped)",
+                host.name,
+                down.unwrap_or(0)
+            );
+        } else if to.broadcaster {
             log::info!("Joined {}'s room to broadcast", host.name);
         } else {
             log::info!("Joined {}'s room", host.name);
         }
+        self.rejoin = None;
         self.role = Role::Client {
-            addr,
-            room,
-            broadcaster,
+            addr: to.addr,
+            room: to.room,
+            broadcaster: to.broadcaster,
         };
         self.roster = Roster::default();
         self.late_from = self.now();
         self.late.clear();
+        self.next_serial += 1;
+        let serial = self.next_serial;
         self.peer = Some(Peer {
             conn,
             info: host,
             rtt_us: est.last_rtt(),
             heard: Instant::now(),
+            serial,
+            key: 0,
         });
         self.est = est;
         self.in_sync = None;
+        self.digest_mismatch = 0;
         self.timeline = timeline;
         for t in tracks {
             self.track_meta.insert(t.id, t);
         }
+        // After a rejoin, this is where interrupted downloads start again.
         self.ensure_room_tracks();
         self.publish();
+        serial
     }
 
     fn ensure_room_tracks(&mut self) {
@@ -1327,9 +1493,10 @@ impl Session {
         }
     }
 
-    /// Host: the other DJ's Ping arrived, carrying its latest round trip.
-    pub fn on_peer_ping(&mut self, rtt: Option<i64>) {
-        if let Some(p) = &mut self.peer {
+    /// Host: a Ping arrived on link `serial`, carrying its latest round trip.
+    /// Only the other DJ's count (a broadcaster's link is to this booth only).
+    pub fn on_peer_ping(&mut self, serial: u64, rtt: Option<i64>) {
+        if let Some(p) = self.peer.as_mut().filter(|p| p.serial == serial) {
             if rtt.is_some() {
                 p.rtt_us = rtt;
             }
@@ -1341,38 +1508,80 @@ impl Session {
         self.est.last_rtt()
     }
 
-    /// The link to the partner dropped (either side).
-    pub fn on_peer_left(&mut self, peer_id: u64) {
-        self.drop_peer(peer_id, true);
+    /// The link with this serial ended (a link that was already replaced
+    /// or left is ignored). On a client whose link broke without a Bye, it
+    /// starts getting back in: the caller runs the rejoin for the returned
+    /// generation.
+    pub fn on_link_ended(&mut self, serial: u64, end: LinkEnd) -> Option<u64> {
+        if let Some(i) = self.broadcasters.iter().position(|b| b.serial == serial) {
+            let b = self.broadcasters.remove(i);
+            b.conn.close();
+            match end {
+                LinkEnd::Bye => log::info!("{} stopped broadcasting", b.info.name),
+                LinkEnd::Lost(why) => log::info!(
+                    "Lost the link to {}, who was broadcasting ({why})",
+                    b.info.name
+                ),
+            }
+            self.announce_members();
+            return None;
+        }
+        let p = self.peer.as_ref().filter(|p| p.serial == serial)?;
+        let (info, key) = (p.info.clone(), p.key);
+        let client = matches!(self.role, Role::Client { .. });
+        let broadcaster = self.is_broadcaster();
+        match end {
+            LinkEnd::Bye if broadcaster => log::info!(
+                "{} closed the room. Join again to keep broadcasting.",
+                info.name
+            ),
+            LinkEnd::Bye => log::info!("{} left the room. You can keep playing.", info.name),
+            LinkEnd::Lost(why) if client => {
+                log::warn!(
+                    "Lost the link to {}'s room ({why}). Reconnecting…",
+                    info.name
+                );
+                self.unlink("connection lost");
+                self.rejoin_gen += 1;
+                self.rejoin = Some(Rejoin {
+                    host: info,
+                    since: Instant::now(),
+                    attempt: 0,
+                    error: None,
+                    gen: self.rejoin_gen,
+                });
+                return Some(self.rejoin_gen);
+            }
+            LinkEnd::Lost(why) if key != 0 => {
+                log::warn!(
+                    "Lost the link to {} ({why}). You can keep playing while they reconnect.",
+                    info.name
+                );
+                self.awaiting = Some(Awaiting {
+                    info,
+                    key,
+                    since: Instant::now(),
+                });
+            }
+            LinkEnd::Lost(why) => log::warn!(
+                "Lost the link to {} ({why}). You can keep playing.",
+                info.name
+            ),
+        }
+        self.unlink("partner left");
+        self.end_client();
+        None
     }
 
-    fn drop_peer(&mut self, peer_id: u64, announce: bool) {
-        let Some(p) = &self.peer else { return };
-        if p.info.id != peer_id {
-            return;
+    /// Forget the link to the other DJ (or, on a client, the host), however
+    /// it ended: transfers through it fail.
+    fn unlink(&mut self, why: &str) {
+        if let Some(p) = self.peer.take() {
+            p.conn.close();
         }
-        let broadcaster = self.is_broadcaster();
-        if announce && broadcaster {
-            log::info!(
-                "Lost {}'s room. Join again to keep broadcasting.",
-                p.info.name
-            );
-        } else if announce {
-            log::info!("{} left the room. You can keep playing.", p.info.name);
-        }
-        self.peer = None;
         self.in_sync = None;
-        self.roster = Roster::default();
         self.late_from = i64::MAX;
         self.late.clear();
-        if matches!(self.role, Role::Client { .. }) {
-            self.role = Role::Solo;
-        }
-        if broadcaster {
-            // It only ever played the DJs' room: don't carry on with it.
-            self.timeline = Timeline::new(self.now() - 10_000_000);
-            self.publish();
-        }
         self.announce_members();
         let pending: Vec<(TrackId, Purpose)> = self
             .active_fetch
@@ -1380,31 +1589,102 @@ impl Session {
             .chain(self.fetch_queue.drain(..))
             .collect();
         for (id, purpose) in pending {
-            self.finish_fetch(id, purpose, Err("partner left".into()));
+            self.finish_fetch(id, purpose, Err(why.into()));
         }
         for t in self
             .transfers
             .iter_mut()
             .filter(|t| t.state == TransferState::Active)
         {
-            t.state = TransferState::Failed("partner left".into());
+            t.state = TransferState::Failed(why.into());
+        }
+    }
+
+    /// Client: out of the room, back on its own.
+    fn end_client(&mut self) {
+        if !matches!(self.role, Role::Client { .. }) {
+            return;
+        }
+        let broadcaster = self.is_broadcaster();
+        self.rejoin = None;
+        self.roster = Roster::default();
+        self.role = Role::Solo;
+        if broadcaster {
+            // It only ever played the DJs' room: don't carry on with it.
+            self.timeline = Timeline::new(self.now() - 10_000_000);
+            self.publish();
+        }
+    }
+
+    /// Is rejoin `gen` still wanted (this booth hasn't left, given up or
+    /// joined again)?
+    pub fn rejoin_wanted(&self, gen: u64) -> bool {
+        self.rejoin.as_ref().is_some_and(|r| r.gen == gen)
+    }
+
+    /// Rejoin `gen` is about to try again. Returns how long to keep trying
+    /// in all, or `None` if it's no longer wanted.
+    pub fn rejoin_attempt(&mut self, gen: u64) -> Option<Duration> {
+        let r = self.rejoin.as_mut().filter(|r| r.gen == gen)?;
+        r.attempt += 1;
+        log::info!("Reconnecting to {}'s room: try {}", r.host.name, r.attempt);
+        Some(self.rejoin_for)
+    }
+
+    /// A try to get back in failed. With `give_up`, the booth stops trying
+    /// and is on its own (a broadcaster's decks empty).
+    pub fn rejoin_failed(&mut self, gen: u64, why: String, give_up: bool) {
+        let Some(r) = self.rejoin.as_mut().filter(|r| r.gen == gen) else {
+            return;
+        };
+        if give_up {
+            log::warn!(
+                "Couldn't get back into {}'s room: {why}. Join again to carry on.",
+                r.host.name
+            );
+            self.end_client();
+        } else {
+            log::info!("Couldn't get back in yet: {why}");
+            r.error = Some(why);
+        }
+    }
+
+    /// Drop the room link the way a network failure does: no Bye, the
+    /// connection just closes. For trying out getting back in.
+    pub fn cut_link(&mut self) {
+        if let Some(p) = &self.peer {
+            log::warn!("Cutting the link to {} (test)", p.info.name);
+            p.conn.close();
         }
     }
 
     pub fn leave(&mut self) {
+        if let Some(r) = &self.rejoin {
+            log::info!("Stopped reconnecting to {}'s room", r.host.name);
+        }
         self.send_all(Msg::Bye);
+        // Give the Byes a moment to go out, so the others know this was on
+        // purpose (the app may be closing).
+        let deadline = Instant::now() + Duration::from_millis(300);
+        let conns = self
+            .peer
+            .iter()
+            .map(|p| &p.conn)
+            .chain(self.broadcasters.iter().map(|b| &b.conn));
+        for c in conns {
+            while c.is_alive() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
         for b in self.broadcasters.drain(..) {
             b.conn.close();
         }
-        if let Some(p) = self.peer.take() {
-            p.conn.close();
-            let id = p.info.id;
-            self.peer = Some(p);
-            self.drop_peer(id, false);
-        }
+        self.unlink("partner left");
+        self.awaiting = None;
         if let Role::Host { stop, .. } = &self.role {
             stop.store(true, Ordering::Relaxed);
         }
+        self.end_client();
         self.role = Role::Solo;
         log::info!("Left the room");
     }
@@ -1778,6 +2058,19 @@ impl Session {
                 quiet_for: self.peer.as_ref().map(|p| p.heard.elapsed()),
                 clock_spread_us: self.est.spread(),
                 in_sync: self.in_sync,
+                rejoin: self.rejoin.as_ref().map(|r| RejoinView {
+                    host: r.host.name.clone(),
+                    attempt: r.attempt,
+                    since: r.since.elapsed(),
+                    error: r.error.clone(),
+                }),
+                // The other booth gives up after `rejoin_for` from when it
+                // noticed, which can be up to a link timeout after this one.
+                awaiting: self
+                    .awaiting
+                    .as_ref()
+                    .filter(|a| a.since.elapsed() < self.rejoin_for + self.link_timeout)
+                    .map(|a| a.info.name.clone()),
             },
             transfers: self.transfers.clone(),
             incoming: self
@@ -1822,6 +2115,15 @@ impl Session {
             preparing_share: self.preparing_share.clone(),
         }
     }
+}
+
+/// A random number nobody can work out from this booth's other ones (its
+/// id, say): std seeds every hasher from the operating system's randomness.
+fn secret_u64() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u64(fastrand::u64(..));
+    h.finish().max(1)
 }
 
 fn decode_into(h: &SessionHandle, id: TrackId, path: &Path) {
