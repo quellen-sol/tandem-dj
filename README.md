@@ -4,7 +4,7 @@ Back-to-back DJing with friends, from anywhere. Up to four DJs in different plac
 
 **Personal, non-commercial use only.** See [TERMS.md](TERMS.md).
 
-> **Status: v0.12.** Windows only. Rooms of up to four DJs, four decks, BPM and key detection, beatgrid editing, sync, key lock, loops, level meters, crossfader curves, jog wheels that spin on like Serato, a broadcast view for streams, broadcaster-only booths and a ready-made DDJ-FLX6 mapping all work, and there are ready-made Denon SC Live 4 and Hercules DJControl Inpulse 200 MK2 mappings, not yet tried on the hardware; this is still an early version for a few friends (and a broadcaster) to try. See [docs/ROADMAP.md](docs/ROADMAP.md) for what's next and a test plan.
+> **Status: v0.13.** Windows only. Rooms of up to four DJs, your own crates shared live with the room, four decks, BPM and key detection, beatgrid editing, sync, key lock, loops, level meters, crossfader curves, jog wheels that spin on like Serato, a broadcast view for streams, broadcaster-only booths and a ready-made DDJ-FLX6 mapping all work, and there are ready-made Denon SC Live 4 and Hercules DJControl Inpulse 200 MK2 mappings, not yet tried on the hardware; this is still an early version for a few friends (and a broadcaster) to try. See [docs/ROADMAP.md](docs/ROADMAP.md) for what's next and a test plan.
 
 ## How it works
 
@@ -239,7 +239,7 @@ tandem.exe --data-dir C:\temp\tandem-bob
 
 Host in one window and join `127.0.0.1` from the other.
 
-## Known limits in v0.12
+## Known limits in v0.13
 
 - **Decks and DJs:** 4 decks and up to 4 DJs per room, plus up to 4 broadcasters. Every DJ can touch every deck: there are no deck assignments. There's one sync master: you can't sync two groups of decks to two different tempos. The host's PC carries everyone's moves and tracks, so its connection matters most.
 - **Beatgrids:** detection finds big, steady tempo changes but not gradual drifts, and doesn't find bars (the "1"). Some tracks come out at half or double time (87 instead of 174, say): **½** and **×2** under GRID fix that. Set markers by hand for both: see [Fixing a beatgrid](#fixing-a-beatgrid). A grid can have up to 32 markers, and every bar is 4 beats. Hot cues and play aren't snapped to the beat, except on a synced deck (loops are: see [Loops](#loops)). Quantized loops count bars from the beat you press IN on, not from the grid's bar 1.
