@@ -16,6 +16,7 @@
 //! even through the time-stretcher, and needs no jump.
 
 use crate::audio::TrackAudio;
+use crate::fx::FxChain;
 use crate::meter::{Ballistics, LevelMeters, Levels};
 use crate::model::{DeckState, RoomState, Timeline, TrackId, XfCurve, XfSide, DECKS};
 use crate::stretch::Stretcher;
@@ -847,6 +848,8 @@ pub struct Lane {
     players: [Player; DECKS],
     iso: [Isolator; DECKS],
     filt: [DjFilter; DECKS],
+    /// Each deck's effects, after its fader and the crossfader.
+    fx: [FxChain; DECKS],
     deck_buf: [[[f32; 2]; SUB]; DECKS],
     vol: [f32; DECKS],
     trim: [f32; DECKS],
@@ -870,6 +873,7 @@ impl Lane {
             players: std::array::from_fn(|_| Player::new(sample_rate)),
             iso: std::array::from_fn(|_| Isolator::new(sample_rate)),
             filt: std::array::from_fn(|_| DjFilter::new(sample_rate)),
+            fx: std::array::from_fn(|_| FxChain::new(sample_rate)),
             deck_buf: [[[0.0; 2]; SUB]; DECKS],
             vol: [0.0; DECKS],
             trim: [1.0; DECKS],
@@ -916,7 +920,8 @@ impl Lane {
             self.render_block(snap, &state, ts, n);
 
             let targets = self.targets(&state);
-            if !self.primed {
+            let first = !self.primed;
+            if first {
                 self.vol = targets.0;
                 self.eqg = targets.1;
                 self.trim = targets.2;
@@ -924,11 +929,12 @@ impl Lane {
             }
             for d in 0..DECKS {
                 self.filt[d].update(state.decks[d].filter, self.sr);
+                self.fx[d].prepare(&state.decks[d], ts, n, first);
             }
             let mut peaks = Levels::default();
-            for i in 0..n {
-                let mut m = [0.0f32; 2];
-                let mut c = [0.0f32; 2];
+            // Each deck after its fader, in place, and the headphone cue.
+            let mut cues = [[0.0f32; 2]; SUB];
+            for (i, c) in cues.iter_mut().enumerate().take(n) {
                 for d in 0..DECKS {
                     self.vol[d] += (targets.0[d] - self.vol[d]) * self.smooth;
                     for b in 0..3 {
@@ -943,12 +949,25 @@ impl Lane {
                         let p = &mut peaks.channels[d];
                         *p = p.max(s[0].abs()).max(s[1].abs());
                     }
-                    m[0] += s[0] * self.vol[d];
-                    m[1] += s[1] * self.vol[d];
+                    self.deck_buf[d][i] = [s[0] * self.vol[d], s[1] * self.vol[d]];
                     if local.pfl[d] {
                         c[0] += s[0];
                         c[1] += s[1];
                     }
+                }
+            }
+            // Then its effects. While they're all off and quiet, the
+            // signal doesn't go near them.
+            for d in 0..DECKS {
+                if self.fx[d].busy() {
+                    self.fx[d].run_block(&mut self.deck_buf[d][..n]);
+                }
+            }
+            for (i, c) in cues.iter().enumerate().take(n) {
+                let mut m = [0.0f32; 2];
+                for d in 0..DECKS {
+                    m[0] += self.deck_buf[d][i][0];
+                    m[1] += self.deck_buf[d][i][1];
                 }
                 if metering {
                     peaks.master[0] = peaks.master[0].max(m[0].abs());
@@ -969,6 +988,9 @@ impl Lane {
             }
             if metering {
                 self.ballistics.block(&peaks, n);
+            }
+            for chain in &mut self.fx {
+                chain.settle();
             }
             f += n;
         }
@@ -1421,6 +1443,224 @@ mod tests {
             .map(|(x, y)| (x - y).abs())
             .fold(0.0, f32::max);
         assert!(max_diff < 1e-6, "lanes differ by {max_diff}");
+    }
+
+    /// Render `secs` of the master from shared time `t0` through a fresh
+    /// lane at 48 kHz, in 480-frame callbacks.
+    fn master(snap: &AudioSnapshot, delay_us: i64, t0: i64, secs: f64) -> Vec<f32> {
+        let mut lane = Lane::new(48_000.0, delay_us, LaneKind::Live);
+        let n = 480;
+        let mut out = Vec::new();
+        let (mut m, mut c) = (vec![0.0; n * 2], vec![0.0; n * 2]);
+        for i in 0..(secs * 100.0) as i64 {
+            lane.render(snap, t0 + i * 10_000, &mut m, &mut c);
+            out.extend_from_slice(&m);
+        }
+        out
+    }
+
+    fn fx_ev(time: i64, seq: u64, action: Action) -> Event {
+        Event {
+            time,
+            origin: 2,
+            seq,
+            action,
+        }
+    }
+
+    /// Deck A playing a 30 s tone from the start, on a 120 BPM grid.
+    fn playing_tone() -> (Timeline, Arc<TrackAudio>) {
+        let a = Arc::new(TrackAudio::new(
+            TrackId([3; 32]),
+            44_100,
+            test_signal(44_100, 30.0, 440.0),
+        ));
+        let mut tl = Timeline::new(0);
+        tl.insert(Event {
+            time: 0,
+            origin: 1,
+            seq: 1,
+            action: Action::Load {
+                deck: 0,
+                track: a.id,
+                duration: a.duration(),
+                cue: 0.0,
+                grid: crate::grid::BeatGrid::new(0.0, 120.0).map(Box::new),
+                key: -1,
+            },
+        });
+        tl.insert(Event {
+            time: 0,
+            origin: 1,
+            seq: 2,
+            action: Action::Play { deck: 0 },
+        });
+        (tl, a)
+    }
+
+    #[test]
+    fn effects_left_off_leave_the_audio_bit_identical() {
+        let (plain, a) = playing_tone();
+        // Every effect setting changed, but nothing switched on.
+        let mut moved = plain.clone();
+        let moves = [
+            Action::FxDepth {
+                deck: 0,
+                slot: 0,
+                v: 0.9,
+            },
+            Action::FxBeats { deck: 0, beats: 2 },
+            Action::FxSelect {
+                deck: 0,
+                slot: 1,
+                kind: crate::model::FxKind::Phaser,
+            },
+        ];
+        for (i, m) in moves.into_iter().enumerate() {
+            moved.insert(fx_ev(100_000 * (i as i64 + 1), i as u64 + 1, m));
+        }
+        let want = master(&snap_with(plain.clone(), a.clone()), 0, 0, 1.0);
+        assert!(want.iter().any(|v| v.abs() > 0.1));
+        assert_eq!(master(&snap_with(moved, a.clone()), 0, 0, 1.0), want);
+        // An echo used and switched off: once its tail has died, the deck
+        // is exactly what it would be without it.
+        let mut used = plain.clone();
+        used.insert(fx_ev(
+            100_000,
+            1,
+            Action::FxOn {
+                deck: 0,
+                slot: 0,
+                on: true,
+            },
+        ));
+        used.insert(fx_ev(
+            300_000,
+            2,
+            Action::FxOn {
+                deck: 0,
+                slot: 0,
+                on: false,
+            },
+        ));
+        let full = master(&snap_with(plain, a.clone()), 0, 0, 22.0);
+        let after = master(&snap_with(used, a), 0, 0, 22.0);
+        assert_ne!(after[48_000..96_000], full[48_000..96_000], "no echo");
+        let tail = 20 * 48_000 * 2;
+        assert_eq!(after[tail..], full[tail..]);
+    }
+
+    #[test]
+    fn an_echo_rings_on_after_the_fader_closes() {
+        // A click at 0.2 s on deck A, echoing every beat (0.5 s).
+        let mut frames = vec![[0i16; 2]; 44_100 * 4];
+        for f in &mut frames[8_820..8_830] {
+            *f = [20_000; 2];
+        }
+        let a = Arc::new(TrackAudio::new(TrackId([4; 32]), 44_100, frames));
+        let mut tl = Timeline::new(0);
+        let mut seq = 0;
+        let mut at = |time: i64, action: Action| {
+            seq += 1;
+            tl.insert(Event {
+                time,
+                origin: 1,
+                seq,
+                action,
+            });
+        };
+        at(
+            0,
+            Action::Load {
+                deck: 0,
+                track: a.id,
+                duration: a.duration(),
+                cue: 0.0,
+                grid: crate::grid::BeatGrid::new(0.0, 120.0).map(Box::new),
+                key: -1,
+            },
+        );
+        at(0, Action::Play { deck: 0 });
+        at(
+            0,
+            Action::FxOn {
+                deck: 0,
+                slot: 0,
+                on: true,
+            },
+        );
+        // The fader closes, then the crossfader cuts the deck too, and the
+        // echo is switched off: the tail rings on.
+        at(300_000, Action::Volume { deck: 0, v: 0.0 });
+        at(350_000, Action::Crossfader { v: 1.0 });
+        at(
+            400_000,
+            Action::FxOn {
+                deck: 0,
+                slot: 0,
+                on: false,
+            },
+        );
+        let out = master(&snap_with(tl, a), 0, 0, 1.5);
+        let peak = |from: f64, to: f64| {
+            out[(from * 96_000.0) as usize..(to * 96_000.0) as usize]
+                .iter()
+                .fold(0.0f32, |m, v| m.max(v.abs()))
+        };
+        let click = peak(0.19, 0.25);
+        assert!(click > 0.1, "{click}");
+        assert!(
+            peak(0.69, 0.75) > click * 0.1,
+            "first echo {}",
+            peak(0.69, 0.75)
+        );
+        assert!(
+            peak(1.19, 1.25) > click * 0.03,
+            "second echo {}",
+            peak(1.19, 1.25)
+        );
+        // Between the echoes, nothing: the deck itself is shut.
+        assert!(peak(0.8, 1.15) < click * 0.01);
+    }
+
+    #[test]
+    fn two_lanes_hear_the_same_effects() {
+        let (mut tl, a) = playing_tone();
+        for (slot, seq) in [(0u8, 1u64), (1, 2), (2, 3)] {
+            tl.insert(fx_ev(
+                200_000,
+                seq,
+                Action::FxOn {
+                    deck: 0,
+                    slot,
+                    on: true,
+                },
+            ));
+        }
+        tl.insert(fx_ev(
+            600_000,
+            4,
+            Action::Tempo {
+                deck: 0,
+                tempo: 1.03,
+            },
+        ));
+        tl.insert(fx_ev(
+            900_000,
+            5,
+            Action::FxOn {
+                deck: 0,
+                slot: 0,
+                on: false,
+            },
+        ));
+        let snap = snap_with(tl, a);
+        // The live lane and a broadcast lane half a second behind it.
+        let live = master(&snap, 0, 0, 2.0);
+        let late = master(&snap, 500_000, 500_000, 2.0);
+        assert_eq!(live, late);
+        let (plain, a) = playing_tone();
+        assert_ne!(live, master(&snap_with(plain, a), 0, 0, 2.0));
     }
 
     #[test]

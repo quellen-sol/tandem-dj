@@ -10,6 +10,7 @@
 //!   state at any moment is a pure function of the events before it.
 //! * [`render`] — turns a timeline into audio for one output ("lane"),
 //!   including the delayed broadcast lane.
+//! * [`fx`] — effects (echo, reverb, phaser) after each deck's fader.
 //! * [`meter`] — channel and master level meters, measured by the live lane.
 //! * [`spin`] — a record let go mid-spin running on and slowing down.
 //! * [`grid`] — beatgrids: markers, bars, and the edits a DJ can make.
@@ -21,6 +22,7 @@ pub mod audio;
 pub mod clock;
 pub mod config;
 pub mod files;
+pub mod fx;
 pub mod grid;
 pub mod keys;
 pub mod library;
