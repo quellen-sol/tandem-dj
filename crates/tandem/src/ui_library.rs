@@ -59,14 +59,17 @@ pub(crate) const CENTRAL_MARGIN: f32 = 16.0;
 /// the library and the decks area share, `decks_w` the decks area's width,
 /// `strip` the FX strip's height. With room, it's 330 points; on a shorter
 /// window it gives up height first, down to 180, then the two-deck view
-/// takes compact panels, which leave it more; it never goes under 150. The
-/// FX strip takes what the waveforms have to spare first, then the
-/// library's height.
+/// takes compact panels, which leave it more; it never goes under 150.
+///
+/// The FX strip pushes the library down by its own height, never under
+/// those 150 points (past that, the strip takes what the waveforms and the
+/// four-deck panels can give up, see `FxStrip::pick`). It doesn't change
+/// which panels the decks get: that's decided as if it weren't there.
 pub(crate) fn library_height(room: f32, decks_w: f32, four: bool, strip: f32) -> f32 {
     if !four && DeckLayout::full_fits_width(decks_w) {
-        let h = room - DeckLayout::Full.roomy_h(strip);
+        let h = room - DeckLayout::Full.roomy_h();
         if h >= LIBRARY_ROOMY_H {
-            return h.min(LIBRARY_H);
+            return (h - strip).clamp(LIBRARY_MIN_H, LIBRARY_H);
         }
     }
     let layout = if four {
@@ -74,7 +77,7 @@ pub(crate) fn library_height(room: f32, decks_w: f32, four: bool, strip: f32) ->
     } else {
         DeckLayout::Compact
     };
-    (room - layout.roomy_h(strip)).clamp(LIBRARY_MIN_H, LIBRARY_H)
+    (room - layout.roomy_h() - strip).clamp(LIBRARY_MIN_H, LIBRARY_H)
 }
 
 /// The most the library can be dragged up to, leaving the decks area its

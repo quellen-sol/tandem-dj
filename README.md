@@ -184,7 +184,7 @@ Tandem fits laptop screens, down to a 1080p laptop at 175% display scaling.
 - **It opens maximised** when its usual window doesn't fit the screen.
 - **On a short window the library gets less height first.** Then the two decks switch to compact panels with a shorter mixer: each channel's knobs sit beside its fader, and **🎧 LEVELS** opens your headphone and master levels.
 - **Every scrolling waveform stays on screen.** With four decks on a very short window, the deck panels and mixer scroll instead (a scroll bar shows beside them).
-- **The FX strip takes its height from the waveforms first, then the library,** which keeps its 150 points. Where its rows don't fit without making the deck controls scroll, it folds to one line naming the effects that are on; on the smallest windows (two decks under about 535 points tall, four decks under about 660) the line goes too, and the effects that are on show in the corner of each waveform: click one to work that deck's effects.
+- **The FX strip pushes the library down,** by about 20 points with two decks and 45 with four, and never under the library's 150 points: fold it with the triangle at its left to give the library the height back. Where its rows don't fit without making the deck controls scroll, it folds to one line naming the effects that are on; on the smallest windows (two decks under about 535 points tall, four decks under about 660) the line goes too, and the effects that are on show in the corner of each waveform: click one to work that deck's effects.
 - **Drag the top edge of the library** to change its height. Tandem keeps your height from then on, but the library never covers the waveforms.
 
 ## Play together

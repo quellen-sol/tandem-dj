@@ -63,13 +63,14 @@ const TOP_BAR_FULL_W: f32 = 1300.0;
 const WAVE_MAX_H: [f32; 2] = [90.0, 80.0];
 const WAVE_ROOMY_H: [f32; 2] = [60.0, 40.0];
 const WAVE_MIN_H: [f32; 2] = [46.0, 28.0];
-/// Waveforms shorter than this make two decks take compact panels, and the
-/// least the library leaves them with the full panels and the FX strip.
-const FULL_WAVE_MIN_H: f32 = 48.0;
-const FULL_WAVE_ROOMY_MIN_H: f32 = 52.0;
-/// A row of the FX strip (two decks' banks), and its folded line. Each
-/// takes this plus the spacing before it.
-const FX_ROW_H: f32 = 16.0;
+/// Waveforms shorter than this make two decks take compact panels.
+const FULL_WAVE_MIN_H: f32 = 52.0;
+/// A row of the FX strip (two decks' banks), about as tall as the loop
+/// buttons (at 19 the strip still opens on the smallest two-deck laptop
+/// window, 1097 × 538), and the strip folded to one line. Each takes this
+/// plus the spacing before it.
+const FX_ROW_H: f32 = 19.0;
+const FX_LINE_H: f32 = 16.0;
 /// The FX strip's fold toggle, at its left, and a slot's effect menu.
 const FX_TOGGLE_W: f32 = 16.0;
 const FX_MENU_W: f32 = 6.0;
@@ -115,11 +116,13 @@ pub(crate) enum DeckLayout {
 
 impl DeckLayout {
     /// The layout for a decks area of `width` × `height` points, `strip` of
-    /// it taken by the FX strip.
+    /// it taken by the FX strip. The strip's height comes from the library,
+    /// so it doesn't change which panels the decks get.
     pub(crate) fn pick(four: bool, width: f32, height: f32, strip: f32) -> Self {
         if four {
             DeckLayout::Four
-        } else if Self::full_fits_width(width) && height >= DeckLayout::Full.least_full_h(strip) {
+        } else if Self::full_fits_width(width) && height - strip >= DeckLayout::Full.least_full_h()
+        {
             DeckLayout::Full
         } else {
             DeckLayout::Compact
@@ -166,25 +169,16 @@ impl DeckLayout {
         8.0 + (self.decks() - 2) as f32 * 1.5 * ITEM_SPACING_Y
     }
 
-    /// The decks area's height with the controls at their natural height,
-    /// roomy waveforms and an FX strip `strip` tall: what the library
-    /// leaves when there's room. The strip takes what the roomy waveforms
-    /// have over their least first (with the full panels, over 52 points).
-    pub(crate) fn roomy_h(self, strip: f32) -> f32 {
-        let w = self.wave_idx();
-        let floor = match self {
-            DeckLayout::Full => FULL_WAVE_ROOMY_MIN_H,
-            _ => WAVE_MIN_H[w],
-        };
-        let waves = self
-            .waves_h(WAVE_ROOMY_H[w])
-            .max(self.waves_h(floor) + strip);
-        self.row_h().0 + waves
+    /// The decks area's height with the controls at their natural height
+    /// and roomy waveforms, before the FX strip: what the library leaves
+    /// when there's room.
+    pub(crate) fn roomy_h(self) -> f32 {
+        self.row_h().0 + self.waves_h(WAVE_ROOMY_H[self.wave_idx()])
     }
 
-    /// The least height the full panels are used at.
-    fn least_full_h(self, strip: f32) -> f32 {
-        FULL_ROW_H + self.waves_h(FULL_WAVE_MIN_H) + strip
+    /// The least height the full panels are used at, before the FX strip.
+    fn least_full_h(self) -> f32 {
+        FULL_ROW_H + self.waves_h(FULL_WAVE_MIN_H)
     }
 
     /// The least height of the decks area: waveforms at their least, a
@@ -210,17 +204,19 @@ pub(crate) enum FxStrip {
 impl FxStrip {
     /// The height it takes in the decks area, with four decks or two.
     pub(crate) fn height(self, four: bool) -> f32 {
-        let rows = match self {
-            FxStrip::Open if four => 2.0,
-            FxStrip::Open | FxStrip::Folded => 1.0,
+        match self {
+            FxStrip::Open if four => 2.0 * (FX_ROW_H + ITEM_SPACING_Y),
+            FxStrip::Open => FX_ROW_H + ITEM_SPACING_Y,
+            FxStrip::Folded => FX_LINE_H + ITEM_SPACING_Y,
             FxStrip::Hidden => 0.0,
-        };
-        rows * (FX_ROW_H + ITEM_SPACING_Y)
+        }
     }
 
     /// How it shows on a window whose library and decks area share `room`
-    /// points, `decks_w` wide: open if the DJ left it `open` and it fits
-    /// with the library at its least and the controls at their least
+    /// points, `decks_w` wide. Its height comes from the library first (see
+    /// `library_height`), then from what the waveforms and the four-deck
+    /// panels can give up. So it's open if the DJ left it `open` and it
+    /// fits with the library at its least and the controls at their least
     /// without scrolling (compact panels, or four squeezed); otherwise
     /// folded, if that fits.
     pub(crate) fn pick(open: bool, room: f32, decks_w: f32, four: bool) -> Self {
@@ -693,7 +689,7 @@ impl TandemApp {
     /// effects that are on.
     fn fx_line(&mut self, ui: &mut egui::Ui, view: &SessionView, n: usize) {
         let (rect, _) =
-            ui.allocate_exact_size(vec2(ui.available_width(), FX_ROW_H), Sense::hover());
+            ui.allocate_exact_size(vec2(ui.available_width(), FX_LINE_H), Sense::hover());
         let mut line = ui.new_child(
             egui::UiBuilder::new()
                 .id_salt("fx-line")
@@ -701,6 +697,7 @@ impl TandemApp {
                 .layout(Layout::left_to_right(Align::Center)),
         );
         fx_spacing(&mut line);
+        line.spacing_mut().interact_size.y = FX_LINE_H;
         self.fx_toggle(&mut line);
         line.label(RichText::new("FX").small().strong().weak());
         for (d, (st, col)) in view.room.decks.iter().zip(DECK_COLORS).enumerate().take(n) {
@@ -737,7 +734,10 @@ impl TandemApp {
             "Open the FX strip: every deck's effects"
         };
         let can = open || self.ui.fx_strip_fits;
-        let size = vec2(FX_TOGGLE_W - ui.spacing().item_spacing.x, FX_ROW_H);
+        let size = vec2(
+            FX_TOGGLE_W - ui.spacing().item_spacing.x,
+            ui.spacing().interact_size.y,
+        );
         let sense = if can { Sense::click() } else { Sense::hover() };
         let (rect, r) = ui.allocate_exact_size(size, sense);
         let colour = if !can {
@@ -3067,9 +3067,6 @@ mod tests {
         for (w, h) in [(1280.0, 641.0), (1097.0, 538.0)] {
             assert_eq!(plan_strip(w, h, false, true).3, FxStrip::Open, "{w}×{h}");
         }
-        // It takes what the waveforms had to spare before the library's
-        // height: at the usual window the library stays at 330.
-        assert_eq!(plan_strip(1440.0, 930.0, true, true).0, LIBRARY_H);
         assert_eq!(FxStrip::Open.height(false), FX_ROW_H + ITEM_SPACING_Y);
         assert_eq!(
             FxStrip::Open.height(true),
@@ -3079,13 +3076,17 @@ mod tests {
 
     #[test]
     fn the_fx_strip_folds_then_hides_rather_than_make_the_controls_scroll() {
-        // Folded by hand: one line, whatever the view, and the room goes
-        // back to the waveforms (or the library).
+        // Folded by hand: one line, whatever the view, and the library gets
+        // the height back.
         let (lib, _, open, _) = plan_strip(1440.0, 930.0, true, true);
         let (folded_lib, _, folded, strip) = plan_strip(1440.0, 930.0, true, false);
         assert_eq!(strip, FxStrip::Folded);
-        assert_eq!(folded_lib, lib);
-        assert_eq!(folded - open, FX_ROW_H + ITEM_SPACING_Y);
+        assert_eq!(
+            folded_lib - lib,
+            FxStrip::Open.height(true) - FxStrip::Folded.height(true)
+        );
+        assert_eq!(folded, open);
+        assert_eq!(FxStrip::Folded.height(true), FX_LINE_H + ITEM_SPACING_Y);
         // Four decks on a window short of room for both rows: one line.
         let (lib, layout, controls, strip) = plan_strip(1366.0, 670.0, true, true);
         assert_eq!(strip, FxStrip::Folded);
@@ -3137,15 +3138,34 @@ mod tests {
 
     #[test]
     fn big_window_keeps_its_layout() {
-        // The usual 1440 × 930 window, and bigger: the library at 330, the
-        // full panels, nothing squeezed.
+        // The usual 1440 × 930 window, and bigger: the full panels, nothing
+        // squeezed, roomy waveforms.
         for (w, h) in [(1440.0, 930.0), (2560.0, 1369.0)] {
-            let (lib, layout, controls) = plan(w, h, false);
-            assert_eq!((lib, layout), (LIBRARY_H, DeckLayout::Full));
-            assert!(controls >= FULL_ROW_H);
-            let (lib, layout, controls) = plan(w, h, true);
-            assert_eq!((lib, layout), (LIBRARY_H, DeckLayout::Four));
-            assert!(controls >= FOUR_ROW_H);
+            for (four, panels, row) in [
+                (false, DeckLayout::Full, FULL_ROW_H),
+                (true, DeckLayout::Four, FOUR_ROW_H),
+            ] {
+                let (lib, layout, controls, strip) = plan_strip(w, h, four, true);
+                assert_eq!((layout, strip), (panels, FxStrip::Open));
+                let roomy = WAVE_ROOMY_H[layout.wave_idx()] - WAVE_MIN_H[layout.wave_idx()];
+                assert!(controls >= row + layout.decks() as f32 * roomy);
+                assert!(lib <= LIBRARY_H);
+                // Without the FX strip the library is the 330 it always was.
+                let (decks_w, room) = space(w, h);
+                assert_eq!(library_height(room, decks_w, four, 0.0), LIBRARY_H);
+            }
+        }
+        // At 1440 × 930 the FX strip pushes the library down by its height
+        // (less the few points the window had to spare), and nothing else
+        // moves. A bigger window has room for both.
+        for four in [false, true] {
+            let s = FxStrip::Open.height(four);
+            let lib = plan(1440.0, 930.0, four).0;
+            assert!(
+                lib < LIBRARY_H && lib >= LIBRARY_H - s,
+                "four {four}: {lib}"
+            );
+            assert_eq!(plan(2560.0, 1369.0, four).0, LIBRARY_H);
         }
     }
 
@@ -3162,10 +3182,15 @@ mod tests {
                 );
             }
         }
-        // 1080p at 125% keeps the full two-deck panels, with less library.
-        let (lib, layout, _) = plan(1536.0, 785.0, false);
-        assert_eq!(layout, DeckLayout::Full);
-        assert!((LIBRARY_ROOMY_H..LIBRARY_H).contains(&lib), "{lib}");
+        // 1080p at 125% keeps the full two-deck panels, with less library:
+        // the FX strip pushes it under 180 there, and the panels stay full.
+        let (lib, layout, _, strip) = plan_strip(1536.0, 785.0, false, true);
+        assert_eq!((layout, strip), (DeckLayout::Full, FxStrip::Open));
+        let s = strip.height(false);
+        assert!(
+            (LIBRARY_ROOMY_H - s..LIBRARY_H).contains(&lib) && lib >= LIBRARY_MIN_H,
+            "{lib}"
+        );
         // Shorter ones swap to compact panels and keep a roomier library.
         let (lib, layout, _) = plan(1280.0, 641.0, false);
         assert_eq!(layout, DeckLayout::Compact);
