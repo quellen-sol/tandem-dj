@@ -357,6 +357,12 @@ Work through these in order and note anything that fails. `tandem.log` (Settings
   - Test (FLX6, master through the FLX6, Headphones on Auto): play deck 1 with its fader down and CH1 CUE on, and deck 2 with its fader up. Sweep HEADPHONES MIX from CUE to MASTER: does it go from deck 1 to deck 2? (Checked on the laptop's FLX6 with a test build.) On a four-deck FLX6, does CH3 and CH4 CUE work the same?
 - No protocol change: v0.11.13 and v0.11.14 can share a room.
 
+### v0.11.15
+
+- **Switching decks on the FLX6 no longer makes the tempo jump.** One tempo fader drives decks 1 and 3 (or 2 and 4). Move it on deck 3, switch back to deck 1, and deck 1's first move used to jump by however far the fader had gone on deck 3. Now, after a DECK switch, the fader moves the deck you switched to by exactly as much as you move it, starting from that deck's own tempo, as it does after SYNC. The fader then usually doesn't sit where that deck's tempo is; the screen shows the real tempo, and **SHIFT + SYNC** puts the deck back on the fader. Saved FLX6 mappings pick it up by themselves.
+  - Test (four-deck FLX6): set deck 1 to −4% with the tempo fader, press DECK to switch to deck 3 and push the fader up to +4%, then switch back to deck 1 and nudge the fader up a little. Does deck 1 go up a little from −4%, with no jump? Does deck 3 stay where you left it?
+- No protocol change: v0.11.14 and v0.11.15 can share a room.
+
 ## Next candidates
 
 Rough priority order:
