@@ -1083,7 +1083,7 @@ impl TandemApp {
             && self.dev.host_port.is_some()
             && !self.dev.shared
             && f > 200
-            && view.link.peer.is_some()
+            && view.link.linked()
         {
             self.dev.shared = true;
             let paths: Vec<PathBuf> = {

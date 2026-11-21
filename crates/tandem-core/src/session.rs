@@ -1,7 +1,8 @@
 //! The session: one booth's view of the room.
 //!
-//! Owns the event timeline, the decoded tracks, the link to the other DJ
-//! (and, on the host, to any broadcasters), transfers and shares. The UI,
+//! Owns the event timeline, the decoded tracks, the links to the room (on a
+//! joining booth, to the host; on the host, to the other DJs and any
+//! broadcasters), transfers and shares. The UI,
 //! MIDI and network threads all talk to it through a [`SessionHandle`] (a
 //! mutex). The audio threads never lock it: they read an [`AudioSnapshot`]
 //! that is swapped in atomically after every change.
@@ -75,6 +76,9 @@ pub enum Purpose {
     Session,
     /// Part of a share we accepted; saved to `dir`.
     Share { share_id: u64, dir: PathBuf },
+    /// Host: a temporary copy of a track another DJ offered in a share, only
+    /// to pass on to the DJs who accepted it. Not decoded.
+    Relay,
 }
 
 /// A download this booth has started.
@@ -83,9 +87,28 @@ struct Fetch {
     /// Tells this try apart from an earlier one of the same track, whose
     /// thread may still be finishing. 0 for one that hasn't started.
     serial: u64,
+    /// The booth it comes from: the host, or on the host the DJ who has it.
+    from: u64,
 }
 
-/// Host: an upload from the joining DJ that this booth asked for.
+/// A download a dropped link cut off. It carries on from where it got to
+/// when the booth it comes from (`fetch.from`) is back.
+struct Paused {
+    id: TrackId,
+    fetch: Fetch,
+    since: Instant,
+}
+
+/// Where the host can get a track it hasn't got.
+enum Source {
+    /// From this DJ, who is linked.
+    Linked(u64),
+    /// From this DJ, whose link dropped: once they're back.
+    Awaited(u64),
+    Nobody,
+}
+
+/// Host: an upload from a joining DJ that this booth asked for.
 pub struct Expected {
     /// The download it's for (see `Fetch::serial`).
     pub serial: u64,
@@ -185,7 +208,7 @@ struct Rejoin {
     gen: u64,
 }
 
-/// Host: the other DJ's link dropped, and their booth is expected back.
+/// Host: a DJ's link dropped, and their booth is expected back.
 struct Awaiting {
     info: PeerInfo,
     key: u64,
@@ -286,28 +309,43 @@ pub struct RejoinView {
     pub error: Option<String>,
 }
 
+/// A link to another booth in the room.
+#[derive(Clone, Debug)]
+pub struct PeerLink {
+    pub info: PeerInfo,
+    pub rtt_us: Option<i64>,
+    /// How long since the other end was last heard from. Pings run about
+    /// once a second, so a few seconds of quiet means the link has stalled
+    /// and `rtt_us` is out of date.
+    pub quiet_for: Duration,
+}
+
 #[derive(Clone, Debug)]
 pub struct LinkView {
     pub role: RoleView,
-    /// The other DJ; a broadcaster's link is to the host.
-    pub peer: Option<PeerInfo>,
+    /// The booths this one is linked to: a joining booth's (a DJ's or a
+    /// broadcaster's) one link is to the host, and the host's are to the
+    /// other DJs. Empty while not linked.
+    pub links: Vec<PeerLink>,
     pub roster: Roster,
     /// How late the other booths' moves have reached this one at most, in
     /// the last [`LATE_WINDOW`]: from when they happened to when they got
     /// here. `None` until one has, or not in a room.
     pub late_us: Option<i64>,
-    pub rtt_us: Option<i64>,
-    /// How long since the other end was last heard from. Pings run about once
-    /// a second, so a few seconds of quiet means the link has stalled and
-    /// `rtt_us` is out of date. `None` when not linked.
-    pub quiet_for: Option<Duration>,
     pub clock_spread_us: Option<i64>,
     pub in_sync: Option<bool>,
     /// The link dropped and this booth is getting back in. `role` is still
-    /// the room's meanwhile, and `peer` is `None`.
+    /// the room's meanwhile, and `links` is empty.
     pub rejoin: Option<RejoinView>,
-    /// Host: the other DJ's link dropped and their booth is expected back.
-    pub awaiting: Option<String>,
+    /// Host: DJs whose link dropped and whose booths are expected back.
+    pub awaiting: Vec<String>,
+}
+
+impl LinkView {
+    /// Linked to the room: to the host, or on the host to another DJ.
+    pub fn linked(&self) -> bool {
+        !self.links.is_empty()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -372,9 +410,10 @@ impl SessionView {
             Some("you".into())
         } else {
             self.link
-                .peer
-                .as_ref()
-                .filter(|p| p.id == id)
+                .roster
+                .djs
+                .iter()
+                .find(|p| p.id == id)
                 .map(|p| p.name.clone())
                 .or(Some("partner".into()))
         }
@@ -401,10 +440,8 @@ pub struct Session {
     fetch_queue: VecDeque<(TrackId, Purpose)>,
     active_fetch: HashMap<TrackId, Fetch>,
     /// Downloads a dropped link cut off. They carry on from where they got
-    /// to when the booth they come from (`paused_from`) is back.
-    paused: Vec<(TrackId, Fetch)>,
-    paused_from: u64,
-    paused_since: Instant,
+    /// to when the booth each comes from is back.
+    paused: Vec<Paused>,
     fetch_serial: u64,
     transfer_serial: u64,
     /// Every transfer running in this booth (see [`crate::files`]).
@@ -415,7 +452,10 @@ pub struct Session {
     keepalive: VecDeque<Arc<AudioSnapshot>>,
     meters: Arc<LevelMeters>,
     role: Role,
-    peer: Option<Peer>,
+    /// The DJs' booths this one is linked to: on a joining booth (a DJ's or
+    /// a broadcaster's), the host; on the host, every other DJ, in the order
+    /// they joined.
+    peers: Vec<Peer>,
     /// Host: booths that joined only to broadcast.
     broadcasters: Vec<Broadcaster>,
     next_serial: u64,
@@ -424,15 +464,22 @@ pub struct Session {
     /// Client: getting back into the room after the link dropped.
     rejoin: Option<Rejoin>,
     rejoin_gen: u64,
-    /// Host: the other DJ whose link dropped, while they're expected back.
-    awaiting: Option<Awaiting>,
+    /// Host: DJs whose link dropped, while they're expected back.
+    awaiting: Vec<Awaiting>,
+    /// Host: which DJ's booth told the room about each track (it loaded it,
+    /// or offered it in a share), so the host knows whom to ask for it.
+    track_from: HashMap<TrackId, u64>,
+    /// Host: tracks other DJs offered in a share, so the host can pass them
+    /// on to the DJs who accept without taking them itself.
+    offered: HashMap<TrackId, TrackInfo>,
     /// Host: the room with its history kept further back than `timeline`
-    /// keeps it, to [`HELD_MARGIN_US`] before the other DJ was last heard
-    /// from, while they're linked or expected back. It gets every event
-    /// `timeline` gets, so `timeline` is always this compacted to its own
-    /// base. A DJ coming back after their link dropped has the moves they
-    /// made meanwhile put in here at their own times, and the room is taken
-    /// from it. Never published: the audio threads only see `timeline`.
+    /// keeps it, to [`HELD_MARGIN_US`] before the DJ heard from longest ago
+    /// was last heard from, while any other DJ is linked or expected back.
+    /// It gets every event `timeline` gets, so `timeline` is always this
+    /// compacted to its own base. A DJ coming back after their link dropped
+    /// has the moves they made meanwhile put in here at their own times,
+    /// and the room is taken from it. Never published: the audio threads
+    /// only see `timeline`.
     held: Option<Timeline>,
     /// Host: a move arrived too late for `timeline` but not for `held`.
     rebuild_due: bool,
@@ -448,6 +495,10 @@ pub struct Session {
     /// How long a booth whose link dropped tries to get back in
     /// ([`crate::net::REJOIN_FOR`]).
     pub rejoin_for: Duration,
+    /// Host: how long a booth asking for a track this one is still getting
+    /// waits before it's told to ask again ([`crate::files::PENDING_WAIT`];
+    /// tests shorten it).
+    pub pending_wait: Duration,
     /// Moves that happened from this (shared) time on count towards
     /// lateness: those since joining. `i64::MAX` when not in a room.
     late_from: i64,
@@ -529,8 +580,6 @@ impl Session {
                 fetch_queue: VecDeque::new(),
                 active_fetch: HashMap::new(),
                 paused: Vec::new(),
-                paused_from: 0,
-                paused_since: Instant::now(),
                 fetch_serial: 0,
                 transfer_serial: 0,
                 running: Arc::default(),
@@ -540,19 +589,22 @@ impl Session {
                 keepalive: VecDeque::new(),
                 meters: Arc::new(LevelMeters::new()),
                 role: Role::Solo,
-                peer: None,
+                peers: Vec::new(),
                 broadcasters: Vec::new(),
                 next_serial: 0,
                 roster: Roster::default(),
                 rejoin: None,
                 rejoin_gen: 0,
-                awaiting: None,
+                awaiting: Vec::new(),
+                track_from: HashMap::new(),
+                offered: HashMap::new(),
                 held: None,
                 rebuild_due: false,
                 own_moves: VecDeque::new(),
                 lost: None,
                 link_timeout: crate::net::LINK_TIMEOUT,
                 rejoin_for: crate::net::REJOIN_FOR,
+                pending_wait: crate::files::PENDING_WAIT,
                 late_from: i64::MAX,
                 late: VecDeque::new(),
                 upload_pacer: Arc::default(),
@@ -620,8 +672,22 @@ impl Session {
         &self.timeline
     }
 
+    /// Linked to the room: to the host, or on the host to another DJ.
     pub fn is_connected(&self) -> bool {
-        self.peer.is_some()
+        !self.peers.is_empty()
+    }
+
+    /// Is the DJ (or host) with this id linked to this booth?
+    fn linked(&self, id: u64) -> bool {
+        self.peers.iter().any(|p| p.info.id == id)
+    }
+
+    /// Host: is the DJ with this id expected back after their link dropped?
+    fn expected_back(&self, id: u64) -> bool {
+        let window = self.rejoin_for + self.link_timeout;
+        self.awaiting
+            .iter()
+            .any(|a| a.info.id == id && a.since.elapsed() < window)
     }
 
     pub fn track_status(&self, id: TrackId) -> Option<TrackStatus> {
@@ -644,24 +710,50 @@ impl Session {
         )
     }
 
-    /// To the other DJ (a broadcaster's link is to the host).
+    /// To the DJs' booths this one is linked to: the host, or on the host
+    /// every other DJ (a broadcaster's link is to the host).
     fn send(&self, m: Msg) {
-        if let Some(p) = &self.peer {
+        for p in &self.peers {
+            p.conn.send(m.clone());
+        }
+    }
+
+    /// To the linked DJ (or host) with this id only.
+    fn send_to(&self, id: u64, m: Msg) {
+        if let Some(p) = self.peers.iter().find(|p| p.info.id == id) {
             p.conn.send(m);
         }
     }
 
-    /// To everyone this booth is linked to: the other DJ and, on the host,
-    /// the broadcasters.
+    /// To everyone this booth is linked to: the host or, on the host, the
+    /// other DJs and the broadcasters.
     fn send_all(&self, m: Msg) {
-        self.relay(&m);
+        for b in &self.broadcasters {
+            b.conn.send(m.clone());
+        }
         self.send(m);
     }
 
-    /// Host: pass something from the joining DJ on to the broadcasters.
-    fn relay(&self, m: &Msg) {
+    /// Host: pass something a DJ sent on link `from` on to everyone else in
+    /// the room: the other DJs and the broadcasters. `from` 0 is no link, so
+    /// it goes to everyone.
+    fn relay(&self, from: u64, m: &Msg) {
+        if !matches!(self.role, Role::Host { .. }) {
+            return;
+        }
         for b in &self.broadcasters {
             b.conn.send(m.clone());
+        }
+        self.relay_to_djs(from, m);
+    }
+
+    /// Host: pass something a DJ sent on link `from` on to the other DJs.
+    fn relay_to_djs(&self, from: u64, m: &Msg) {
+        if !matches!(self.role, Role::Host { .. }) {
+            return;
+        }
+        for p in self.peers.iter().filter(|p| p.serial != from) {
+            p.conn.send(m.clone());
         }
     }
 
@@ -845,18 +937,22 @@ impl Session {
     }
 
     /// Host: make the live timeline again from the held room, after moves
-    /// went in further back than it reaches, and send it to the
-    /// broadcasters, whose rooms reach back no further.
+    /// went in further back than it reaches, and send it to everyone else
+    /// in the room, whose rooms reach back no further: the broadcasters and
+    /// the other DJs (each keeps its own moves the room hasn't got yet).
     fn rebuild_from_held(&mut self) {
         self.rebuild_due = false;
         let Some(held) = &self.held else { return };
         let mut tl = held.clone();
         tl.compact(self.timeline.base_time());
         self.timeline = tl;
-        if !self.broadcasters.is_empty() {
-            self.relay(&Msg::Resync {
-                timeline: self.timeline.clone(),
-            });
+        if !self.broadcasters.is_empty() || !self.peers.is_empty() {
+            self.relay(
+                0,
+                &Msg::Resync {
+                    timeline: self.timeline.clone(),
+                },
+            );
         }
     }
 
@@ -910,13 +1006,13 @@ impl Session {
         let window = self.rejoin_for + self.link_timeout;
         let name = self
             .awaiting
-            .as_ref()
-            .filter(|a| same(a.info.id, a.key) && a.since.elapsed() < window)
+            .iter()
+            .find(|a| same(a.info.id, a.key) && a.since.elapsed() < window)
             .map(|a| a.info.name.clone())
             .or_else(|| {
-                self.peer
-                    .as_ref()
-                    .filter(|p| same(p.info.id, p.key))
+                self.peers
+                    .iter()
+                    .find(|p| same(p.info.id, p.key))
                     .map(|p| p.info.name.clone())
             });
         let (Some(name), Some(held)) = (name, self.held.as_mut()) else {
@@ -926,8 +1022,9 @@ impl Session {
         let events = cut_off.events.into_iter().filter(|e| e.origin == id);
         let added = held.merge(events.collect());
         for info in cut_off.tracks {
+            self.track_from.insert(info.id, id);
             if !self.track_meta.contains_key(&info.id) {
-                self.relay(&Msg::Track { info: info.clone() });
+                self.relay(0, &Msg::Track { info: info.clone() });
                 self.track_meta.insert(info.id, info);
             }
         }
@@ -1164,7 +1261,7 @@ impl Session {
     }
 
     fn on_track_missing(&mut self, id: TrackId) {
-        if self.peer.is_some() {
+        if !self.peers.is_empty() {
             self.set_status(id, TrackStatus::Fetching);
             self.request_fetch(id, Purpose::Session);
         } else {
@@ -1230,7 +1327,7 @@ impl Session {
         self.servable.get(&id).cloned()
     }
 
-    /// Host: can this track go to a booth that asks for it? A track the
+    /// Host: can this track go to a booth that asks for it? A track a
     /// joining DJ just loaded is pending while it's on its way here.
     pub fn servable(&self, id: TrackId) -> Servable {
         if let Some(p) = self.servable.get(&id) {
@@ -1243,6 +1340,7 @@ impl Session {
         if busy
             || self.active_fetch.contains_key(&id)
             || self.fetch_queue.iter().any(|(i, _)| *i == id)
+            || self.paused.iter().any(|p| p.id == id)
         {
             Servable::Pending
         } else {
@@ -1250,16 +1348,38 @@ impl Session {
         }
     }
 
+    /// Host: booth `asker` (a broadcaster's, with `broadcaster`) asks for a
+    /// track. [`Session::servable`], except that a track another DJ offered
+    /// in a share, which this booth didn't take, is fetched from them now to
+    /// pass on to a DJ who accepted it.
+    pub fn servable_for(&mut self, id: TrackId, asker: u64, broadcaster: bool) -> Servable {
+        match self.servable(id) {
+            Servable::No if !broadcaster && self.offered.contains_key(&id) => {}
+            s => return s,
+        }
+        let from = self.track_from.get(&id).copied();
+        if from.is_none_or(|f| f == asker || !self.linked(f)) {
+            return Servable::No;
+        }
+        self.request_fetch(id, Purpose::Relay);
+        self.servable(id)
+    }
+
+    /// What this booth knows about a track: from the room, or on the host
+    /// from a share another DJ offered.
+    fn meta(&self, id: TrackId) -> Option<&TrackInfo> {
+        self.track_meta.get(&id).or_else(|| self.offered.get(&id))
+    }
+
     fn request_fetch(&mut self, id: TrackId, purpose: Purpose) {
         if self.active_fetch.contains_key(&id) || self.fetch_queue.iter().any(|(i, _)| *i == id) {
             return;
         }
         let name = self
-            .track_meta
-            .get(&id)
+            .meta(id)
             .map(|m| m.file_name.clone())
             .unwrap_or_else(|| id.short());
-        let total = self.track_meta.get(&id).map(|m| m.size).unwrap_or(0);
+        let total = self.meta(id).map(|m| m.size).unwrap_or(0);
         // One the link cut off shows where it will carry on from.
         let done = self
             .transfers
@@ -1270,9 +1390,29 @@ impl Session {
         self.transfer_set(id, false, &name, done, total, TransferState::Queued);
         match purpose {
             Purpose::Session => self.fetch_queue.push_front((id, purpose)),
-            Purpose::Share { .. } => self.fetch_queue.push_back((id, purpose)),
+            Purpose::Share { .. } | Purpose::Relay => self.fetch_queue.push_back((id, purpose)),
         }
         self.pump_fetches();
+    }
+
+    /// Where to get a track this booth hasn't got: from the host, or on the
+    /// host from the DJ who told the room about it (any linked DJ when it
+    /// doesn't know who did).
+    fn source_for(&self, id: TrackId) -> Source {
+        if matches!(self.role, Role::Host { .. }) {
+            if let Some(&from) = self.track_from.get(&id) {
+                if self.linked(from) {
+                    return Source::Linked(from);
+                }
+                if self.expected_back(from) {
+                    return Source::Awaited(from);
+                }
+            }
+        }
+        match self.peers.first() {
+            Some(p) if !matches!(self.role, Role::Solo) => Source::Linked(p.info.id),
+            _ => Source::Nobody,
+        }
     }
 
     fn pump_fetches(&mut self) {
@@ -1280,14 +1420,34 @@ impl Session {
             let Some((id, purpose)) = self.fetch_queue.pop_front() else {
                 break;
             };
-            let Some(peer) = self.peer.as_ref().map(|p| p.info.id) else {
-                self.finish_fetch(id, purpose, Err("not connected".into()));
-                continue;
+            let from = match self.source_for(id) {
+                Source::Linked(from) => from,
+                // It carries on when they're back.
+                Source::Awaited(from) => {
+                    let fetch = Fetch {
+                        purpose,
+                        serial: 0,
+                        from,
+                    };
+                    self.pause(vec![(id, fetch)]);
+                    continue;
+                }
+                Source::Nobody => {
+                    self.finish_fetch(id, purpose, Err("not connected".into()));
+                    continue;
+                }
             };
             let landing = self.landing(id, &purpose);
             self.fetch_serial += 1;
             let serial = self.fetch_serial;
-            self.active_fetch.insert(id, Fetch { purpose, serial });
+            self.active_fetch.insert(
+                id,
+                Fetch {
+                    purpose,
+                    serial,
+                    from,
+                },
+            );
             self.transfer_state(id, false, TransferState::Active);
             match &self.role {
                 Role::Client {
@@ -1304,7 +1464,7 @@ impl Session {
                     );
                     std::thread::spawn(move || {
                         let Some(h) = weak.upgrade() else { return };
-                        let res = crate::files::fetch(&h, addr, &room, &me, bc, peer, id, &landing);
+                        let res = crate::files::fetch(&h, addr, &room, &me, bc, from, id, &landing);
                         match res {
                             // Its link dropped (it's paused) or a newer try
                             // took over.
@@ -1312,6 +1472,9 @@ impl Session {
                             Err(e) if crate::files::interrupted(&e) => {
                                 h.lock().fetch_interrupted(id, serial)
                             }
+                            // The host is still getting it from the DJ who
+                            // has it.
+                            Err(e) if crate::files::not_yet(&e) => h.lock().fetch_later(id, serial),
                             res => h.lock().file_received(
                                 id,
                                 serial,
@@ -1320,33 +1483,32 @@ impl Session {
                         }
                     });
                 }
-                Role::Host { .. } => self.send(Msg::PushRequest { id }),
+                Role::Host { .. } => self.send_to(from, Msg::PushRequest { id }),
                 Role::Solo => {}
             }
         }
     }
 
     /// Where a downloaded track goes once it checks out: a session copy in
-    /// the cache, or a new file in the share's folder.
+    /// the cache (a copy to pass on too), or a new file in the share's folder.
     fn landing(&self, id: TrackId, purpose: &Purpose) -> Landing {
         let name = self
-            .track_meta
-            .get(&id)
+            .meta(id)
             .map(|m| m.file_name.clone())
             .unwrap_or_else(|| format!("{}.bin", id.short()));
         let name = sanitize_file_name(&name);
         match purpose {
-            Purpose::Session => {
+            Purpose::Session | Purpose::Relay => {
                 Landing::At(self.paths.cache_dir.join(format!("{}-{name}", id.short())))
             }
             Purpose::Share { dir, .. } => Landing::NewIn(dir.clone(), name),
         }
     }
 
-    /// Host side of an upload from the client: is it one this booth asked
-    /// for, and where does it go?
-    pub fn accept_push(&mut self, id: TrackId) -> Option<Expected> {
-        let f = self.active_fetch.get(&id)?;
+    /// Host side of an upload from DJ `from`: is it one this booth asked
+    /// them for, and where does it go?
+    pub fn accept_push(&mut self, id: TrackId, from: u64) -> Option<Expected> {
+        let f = self.active_fetch.get(&id).filter(|f| f.from == from)?;
         Some(Expected {
             serial: f.serial,
             part: self.part_path(id),
@@ -1354,16 +1516,12 @@ impl Session {
         })
     }
 
-    /// Host: the joining DJ's upload of a track carried on from a partial
-    /// file that didn't check out. That file is cleared now, so ask for the
-    /// whole track again.
+    /// Host: a DJ's upload of a track carried on from a partial file that
+    /// didn't check out. That file is cleared now, so ask for the whole
+    /// track again.
     pub fn push_again(&mut self, id: TrackId, serial: u64) {
-        if self
-            .active_fetch
-            .get(&id)
-            .is_some_and(|f| f.serial == serial)
-        {
-            self.send(Msg::PushRequest { id });
+        if let Some(f) = self.active_fetch.get(&id).filter(|f| f.serial == serial) {
+            self.send_to(f.from, Msg::PushRequest { id });
         }
     }
 
@@ -1384,10 +1542,10 @@ impl Session {
             if let Some(i) = self
                 .paused
                 .iter()
-                .position(|(i, f)| *i == id && f.serial == serial)
+                .position(|p| p.id == id && p.fetch.serial == serial)
             {
-                let (_, f) = self.paused.remove(i);
-                self.finish_fetch(id, f.purpose, res);
+                let p = self.paused.remove(i);
+                self.finish_fetch(id, p.fetch.purpose, res);
             }
         }
     }
@@ -1397,9 +1555,6 @@ impl Session {
     /// waits with the paused ones: it carries on when the link is back, or
     /// in a moment if the link is fine.
     pub fn fetch_interrupted(&mut self, id: TrackId, serial: u64) {
-        let Some(peer) = self.peer.as_ref().map(|p| p.info.id) else {
-            return;
-        };
         if !self
             .active_fetch
             .get(&id)
@@ -1408,13 +1563,31 @@ impl Session {
             return;
         }
         if let Some(f) = self.active_fetch.remove(&id) {
-            self.pause(peer, vec![(id, f)]);
+            self.pause(vec![(id, f)]);
         }
         self.pump_fetches();
     }
 
-    /// The current download of a track failed (the partner hasn't got it,
-    /// or it stalled).
+    /// Download `serial` of a track asked the host too soon: the host is
+    /// still getting it from the DJ who has it. It goes to the back of the
+    /// queue and asks again.
+    pub fn fetch_later(&mut self, id: TrackId, serial: u64) {
+        if !self
+            .active_fetch
+            .get(&id)
+            .is_some_and(|f| f.serial == serial)
+        {
+            return;
+        }
+        if let Some(f) = self.active_fetch.remove(&id) {
+            self.transfer_state(id, false, TransferState::Queued);
+            self.fetch_queue.push_back((id, f.purpose));
+        }
+        self.pump_fetches();
+    }
+
+    /// The current download of a track failed (the booth it comes from
+    /// hasn't got it, or it stalled).
     fn fetch_failed(&mut self, id: TrackId, why: &str) {
         if let Some(f) = self.active_fetch.remove(&id) {
             self.finish_fetch(id, f.purpose, Err(why.into()));
@@ -1422,29 +1595,59 @@ impl Session {
         }
     }
 
-    /// The link dropped: the downloads through it stop where they are, and
-    /// carry on from there when booth `from` is back.
+    /// The link to booth `from` dropped: the downloads from it stop where
+    /// they are, and carry on from there when it's back. A joining booth's
+    /// queued ones come from the host too, so they wait with them.
     fn pause_fetches(&mut self, from: u64) {
-        let cut: Vec<(TrackId, Fetch)> = self
-            .active_fetch
-            .drain()
-            .chain(
-                self.fetch_queue
-                    .drain(..)
-                    .map(|(id, purpose)| (id, Fetch { purpose, serial: 0 })),
-            )
-            .collect();
-        self.pause(from, cut);
+        let mut cut = self.take_fetches_from(from);
+        if matches!(self.role, Role::Client { .. }) {
+            let queued = self.fetch_queue.drain(..).map(|(id, purpose)| {
+                let fetch = Fetch {
+                    purpose,
+                    serial: 0,
+                    from,
+                };
+                (id, fetch)
+            });
+            cut.extend(queued);
+        }
+        self.pause(cut);
     }
 
-    /// Hold these downloads from booth `from` where they got to.
-    fn pause(&mut self, from: u64, cut: Vec<(TrackId, Fetch)>) {
-        if self.paused_from != from {
-            self.fail_paused("connection lost");
+    /// The link to booth `from` ended for good: the downloads from it fail.
+    /// A joining booth's queued ones come from the host too.
+    fn fail_fetches(&mut self, from: u64, why: &str) {
+        let mut gone: Vec<(TrackId, Purpose)> = self
+            .take_fetches_from(from)
+            .into_iter()
+            .map(|(id, f)| (id, f.purpose))
+            .collect();
+        if matches!(self.role, Role::Client { .. }) {
+            gone.extend(self.fetch_queue.drain(..));
         }
-        self.paused_from = from;
-        self.paused_since = Instant::now();
-        for (id, f) in cut {
+        for (id, purpose) in gone {
+            self.finish_fetch(id, purpose, Err(why.into()));
+        }
+        self.fail_paused(why, |p| p.fetch.from == from);
+    }
+
+    /// Take the running downloads from booth `from` out of `active_fetch`.
+    fn take_fetches_from(&mut self, from: u64) -> Vec<(TrackId, Fetch)> {
+        let ids: Vec<TrackId> = self
+            .active_fetch
+            .iter()
+            .filter(|(_, f)| f.from == from)
+            .map(|(id, _)| *id)
+            .collect();
+        ids.into_iter()
+            .filter_map(|id| self.active_fetch.remove(&id).map(|f| (id, f)))
+            .collect()
+    }
+
+    /// Hold these downloads where they got to, until the booth each comes
+    /// from is back.
+    fn pause(&mut self, cut: Vec<(TrackId, Fetch)>) {
+        for (id, fetch) in cut {
             if let Some(t) = self.transfers.iter_mut().find(|t| t.id == id && !t.upload) {
                 if t.total > 0 && t.done > 0 {
                     log::info!(
@@ -1458,41 +1661,52 @@ impl Session {
                 t.state = TransferState::Paused;
                 t.updated = Instant::now();
             }
-            self.paused.push((id, f));
+            self.paused.push(Paused {
+                id,
+                fetch,
+                since: Instant::now(),
+            });
         }
     }
 
     /// Booth `peer` is linked again: carry on with the downloads from it
-    /// that a dropped link cut off. Any from another booth have failed.
+    /// that a dropped link cut off. A joining booth's link is only ever to
+    /// one host, so any from another booth have failed.
     fn resume_fetches(&mut self, peer: u64) {
-        if self.paused.is_empty() {
+        if matches!(self.role, Role::Client { .. }) {
+            self.fail_paused("connection lost", |p| p.fetch.from != peer);
+        }
+        let (back, rest) = std::mem::take(&mut self.paused)
+            .into_iter()
+            .partition::<Vec<Paused>, _>(|p| p.fetch.from == peer);
+        self.paused = rest;
+        if back.is_empty() {
             return;
         }
-        if peer != self.paused_from {
-            self.fail_paused("connection lost");
-            return;
-        }
-        let paused = std::mem::take(&mut self.paused);
         log::info!(
             "Carrying on with {} download{} from where the link dropped",
-            paused.len(),
-            if paused.len() == 1 { "" } else { "s" }
+            back.len(),
+            if back.len() == 1 { "" } else { "s" }
         );
-        for (id, f) in paused {
-            self.request_fetch(id, f.purpose);
+        for p in back {
+            self.request_fetch(p.id, p.fetch.purpose);
         }
     }
 
-    fn fail_paused(&mut self, why: &str) {
-        for (id, f) in std::mem::take(&mut self.paused) {
-            self.finish_fetch(id, f.purpose, Err(why.into()));
+    /// Fail the paused downloads `which` picks.
+    fn fail_paused(&mut self, why: &str, which: impl Fn(&Paused) -> bool) {
+        let (gone, keep) = std::mem::take(&mut self.paused)
+            .into_iter()
+            .partition::<Vec<Paused>, _>(which);
+        self.paused = keep;
+        for p in gone {
+            self.finish_fetch(p.id, p.fetch.purpose, Err(why.into()));
         }
     }
 
     fn finish_fetch(&mut self, id: TrackId, purpose: Purpose, res: Result<PathBuf, String>) {
         let name = self
-            .track_meta
-            .get(&id)
+            .meta(id)
             .map(|m| m.file_name.clone())
             .unwrap_or_else(|| id.short());
         match &res {
@@ -1502,57 +1716,61 @@ impl Session {
                 self.transfer_state(id, false, TransferState::Failed(e.clone()));
             }
         }
-        match purpose {
-            Purpose::Session => match res {
-                Ok(path) => {
-                    // The host passes a partner's track on to broadcasters.
-                    self.servable.insert(id, path.clone());
+        // Whatever it came for, a deck waiting for the track gets it.
+        let deck = matches!(purpose, Purpose::Session)
+            || self.track_status(id) == Some(TrackStatus::Fetching);
+        match &res {
+            Ok(path) => {
+                // The host passes a track it got on to the booths that ask.
+                self.servable.insert(id, path.clone());
+                if deck {
                     self.set_status(id, TrackStatus::Decoding);
-                    let weak = self.weak.clone();
+                    let (weak, path) = (self.weak.clone(), path.clone());
                     std::thread::spawn(move || {
                         if let Some(h) = weak.upgrade() {
                             decode_into(&h, id, &path);
                         }
                     });
                 }
-                Err(e) => {
-                    self.set_status(id, TrackStatus::Failed(e));
-                    if matches!(self.role, Role::Client { .. }) {
-                        if let Some(s) = self.tracks.get_mut(&id) {
-                            s.retry_at = Some(Instant::now() + FETCH_RETRY);
-                        }
+            }
+            Err(e) if deck => {
+                self.set_status(id, TrackStatus::Failed(e.clone()));
+                if matches!(self.role, Role::Client { .. }) {
+                    if let Some(s) = self.tracks.get_mut(&id) {
+                        s.retry_at = Some(Instant::now() + FETCH_RETRY);
                     }
                 }
-            },
-            Purpose::Share { share_id, .. } => {
-                if let Ok(path) = &res {
-                    self.library.lock().record_hash(path, id);
+            }
+            Err(_) => {}
+        }
+        if let Purpose::Share { share_id, .. } = purpose {
+            if let Ok(path) = &res {
+                self.library.lock().record_hash(path, id);
+            }
+            if let Some(s) = self
+                .incoming
+                .iter_mut()
+                .find(|s| s.offer.share_id == share_id)
+            {
+                if res.is_ok() {
+                    s.received += 1;
+                } else {
+                    s.failed += 1;
                 }
-                if let Some(s) = self
-                    .incoming
-                    .iter_mut()
-                    .find(|s| s.offer.share_id == share_id)
-                {
-                    if res.is_ok() {
-                        s.received += 1;
-                    } else {
-                        s.failed += 1;
-                    }
-                    if s.received + s.already_had + s.failed == s.offer.tracks.len() {
-                        log::info!(
-                            "Share \"{}\" finished: {} new, {} already had, {} failed",
-                            s.offer.title,
-                            s.received,
-                            s.already_had,
-                            s.failed
-                        );
-                        library::scan(
-                            &self.library,
-                            library::KEY_SHARED.into(),
-                            library::SourceKind::Shared,
-                        );
-                        library::refresh_all(&self.library);
-                    }
+                if s.received + s.already_had + s.failed == s.offer.tracks.len() {
+                    log::info!(
+                        "Share \"{}\" finished: {} new, {} already had, {} failed",
+                        s.offer.title,
+                        s.received,
+                        s.already_had,
+                        s.failed
+                    );
+                    library::scan(
+                        &self.library,
+                        library::KEY_SHARED.into(),
+                        library::SourceKind::Shared,
+                    );
+                    library::refresh_all(&self.library);
                 }
             }
         }
@@ -1638,8 +1856,7 @@ impl Session {
     }
 
     pub fn track_file_name(&self, id: TrackId) -> String {
-        self.track_meta
-            .get(&id)
+        self.meta(id)
             .map(|m| m.file_name.clone())
             .unwrap_or_else(|| id.short())
     }
@@ -1648,7 +1865,7 @@ impl Session {
 
     /// Offer a list of files to the room (hashing happens in the background).
     pub fn offer_share(&mut self, title: String, paths: Vec<PathBuf>) {
-        if self.peer.is_none() || self.is_broadcaster() {
+        if self.peers.is_empty() || self.is_broadcaster() {
             log::warn!("Join or host a room before sharing");
             return;
         }
@@ -1714,6 +1931,12 @@ impl Session {
             self.track_meta.entry(t.id).or_insert_with(|| t.clone());
         }
         let statement = terms::sender_pledge(offer.tracks.len());
+        // The other DJs in the room, who each get the offer.
+        let others: Vec<String> = (self.roster().djs.into_iter())
+            .filter(|p| p.id != self.me.id)
+            .map(|p| p.name)
+            .collect();
+        let others = others.join(", ");
         terms::append_consent(
             &self.paths.consent_log,
             &ConsentRecord {
@@ -1721,7 +1944,7 @@ impl Session {
                 kind: "share-sent",
                 terms_version: TERMS_VERSION,
                 me: &self.me.name,
-                other: self.peer.as_ref().map(|p| p.info.name.as_str()),
+                other: Some(others.as_str()).filter(|o| !o.is_empty()),
                 share_title: Some(&title),
                 statement: Some(&statement),
                 tracks: offer.tracks.iter().map(|t| t.file_name.clone()).collect(),
@@ -1845,14 +2068,14 @@ impl Session {
     }
 
     pub fn has_peer(&self) -> bool {
-        self.peer.is_some()
+        !self.peers.is_empty()
     }
 
-    /// The link with this serial, while it's still the current one.
+    /// The link with this serial, while it's still a current one.
     pub fn link(&self, serial: u64) -> Option<&PeerConn> {
-        self.peer
-            .as_ref()
-            .filter(|p| p.serial == serial)
+        self.peers
+            .iter()
+            .find(|p| p.serial == serial)
             .map(|p| &p.conn)
     }
 
@@ -1863,10 +2086,23 @@ impl Session {
 
     /// Host: can this booth come in? `Err` is the reason to give it. A
     /// booth coming back after its link dropped (the same id and booth key)
-    /// gets its seat back, even before its old link has timed out here.
+    /// gets its seat back, even before its old link has timed out here, and
+    /// a DJ's seat is kept for them while they're expected back. Every booth
+    /// in the room has its own id: one that knows another's (every event
+    /// carries it) but not its key can't come in as them.
     pub fn seat_for(&self, id: u64, key: u64, broadcaster: bool) -> Result<(), String> {
         let same = |pid: u64, pkey: u64| key != 0 && pid == id && pkey == key;
-        use crate::net::{MAX_BROADCASTERS, ROOM_FULL};
+        let other = |pid: u64, pkey: u64| pid == id && !same(pid, pkey);
+        use crate::net::{MAX_BROADCASTERS, MAX_DJS, ROOM_FULL};
+        let window = self.rejoin_for + self.link_timeout;
+        let awaited = || self.awaiting.iter().filter(|a| a.since.elapsed() < window);
+        if id == self.me.id
+            || self.peers.iter().any(|p| other(p.info.id, p.key))
+            || awaited().any(|a| other(a.info.id, a.key))
+            || self.broadcasters.iter().any(|b| other(b.info.id, b.key))
+        {
+            return Err(format!("{ROOM_FULL} a booth with this one's id."));
+        }
         if broadcaster {
             let others = self
                 .broadcasters
@@ -1876,9 +2112,19 @@ impl Session {
             if others >= MAX_BROADCASTERS {
                 return Err(format!("{ROOM_FULL} {MAX_BROADCASTERS} broadcasters."));
             }
-        } else if self.peer.as_ref().is_some_and(|p| !same(p.info.id, p.key)) {
+            return Ok(());
+        }
+        // The host is one of the DJs.
+        let djs = 1
+            + self
+                .peers
+                .iter()
+                .filter(|p| !same(p.info.id, p.key))
+                .count()
+            + awaited().filter(|a| !same(a.info.id, a.key)).count();
+        if djs >= MAX_DJS {
             return Err(format!(
-                "{ROOM_FULL} two DJs. Tick \"Broadcaster only\" to join just to stream it."
+                "{ROOM_FULL} {MAX_DJS} DJs. Tick \"Broadcaster only\" to join just to stream it."
             ));
         }
         Ok(())
@@ -1892,9 +2138,15 @@ impl Session {
         }
         let same = |pid: u64, pkey: u64| pid == id && pkey == key;
         let mut found = false;
-        if self.peer.as_ref().is_some_and(|p| same(p.info.id, p.key)) {
+        let old: Vec<u64> = self
+            .peers
+            .iter()
+            .filter(|p| same(p.info.id, p.key))
+            .map(|p| p.serial)
+            .collect();
+        for serial in old {
             // Its downloads here carry on over the new link.
-            self.unlink("connection replaced", true);
+            self.unlink(serial, "connection replaced", true);
             found = true;
         }
         let running = self.running.clone();
@@ -1915,8 +2167,10 @@ impl Session {
     pub fn add_peer(&mut self, conn: PeerConn, info: PeerInfo, key: u64) -> u64 {
         let expected = self
             .awaiting
-            .take()
-            .is_some_and(|a| key != 0 && a.info.id == info.id && a.key == key);
+            .iter()
+            .position(|a| key != 0 && a.info.id == info.id && a.key == key)
+            .map(|i| self.awaiting.remove(i))
+            .is_some();
         let back = self.evict(info.id, key) || expected;
         if back {
             log::info!("{} is back in the room", info.name);
@@ -1926,7 +2180,7 @@ impl Session {
         self.next_serial += 1;
         let serial = self.next_serial;
         let info_id = info.id;
-        self.peer = Some(Peer {
+        self.peers.push(Peer {
             conn,
             info,
             rtt_us: None,
@@ -1940,8 +2194,8 @@ impl Session {
         self.held.get_or_insert_with(|| self.timeline.clone());
         self.announce_members();
         // Uploads from them the dropped link cut off carry on from where
-        // they got to, and tracks on a deck that didn't arrive from them
-        // before are asked for again.
+        // they got to, and tracks on a deck that didn't arrive before are
+        // asked for again.
         self.resume_fetches(info_id);
         self.ensure_room_tracks();
         serial
@@ -1979,7 +2233,7 @@ impl Session {
                     return self.roster.clone();
                 }
                 // Before the host's first word: the host, and this booth if a DJ.
-                let mut djs: Vec<PeerInfo> = self.peer.iter().map(|p| p.info.clone()).collect();
+                let mut djs: Vec<PeerInfo> = self.peers.iter().map(|p| p.info.clone()).collect();
                 if !broadcaster {
                     djs.push(self.me.clone());
                 }
@@ -1990,7 +2244,7 @@ impl Session {
             }
             Role::Host { .. } | Role::Solo => Roster {
                 djs: std::iter::once(self.me.clone())
-                    .chain(self.peer.iter().map(|p| p.info.clone()))
+                    .chain(self.peers.iter().map(|p| p.info.clone()))
                     .collect(),
                 broadcasters: self.broadcasters.iter().map(|b| b.info.clone()).collect(),
             },
@@ -2050,14 +2304,14 @@ impl Session {
         self.next_serial += 1;
         let serial = self.next_serial;
         let host_id = host.id;
-        self.peer = Some(Peer {
+        self.peers = vec![Peer {
             conn,
             info: host,
             rtt_us: est.last_rtt(),
             heard: Instant::now(),
             serial,
             key: 0,
-        });
+        }];
         self.est = est;
         self.in_sync = None;
         self.digest_mismatch = 0;
@@ -2114,16 +2368,16 @@ impl Session {
             self.clock.set_offset(best.offset_us);
         }
         let rtt = self.est.last_rtt();
-        if let Some(p) = &mut self.peer {
+        if let Some(p) = self.peers.first_mut() {
             p.rtt_us = rtt;
             p.heard = Instant::now();
         }
     }
 
     /// Host: a Ping arrived on link `serial`, carrying its latest round trip.
-    /// Only the other DJ's count (a broadcaster's link is to this booth only).
+    /// Only the other DJs' count (a broadcaster's link is to this booth only).
     pub fn on_peer_ping(&mut self, serial: u64, rtt: Option<i64>) {
-        if let Some(p) = self.peer.as_mut().filter(|p| p.serial == serial) {
+        if let Some(p) = self.peers.iter_mut().find(|p| p.serial == serial) {
             if rtt.is_some() {
                 p.rtt_us = rtt;
             }
@@ -2138,7 +2392,7 @@ impl Session {
     /// The link with this serial ended (a link that was already replaced
     /// or left is ignored). On a client whose link broke without a Bye, it
     /// starts getting back in: the caller runs the rejoin for the returned
-    /// generation.
+    /// generation. On the host, the room carries on with the others.
     pub fn on_link_ended(&mut self, serial: u64, end: LinkEnd) -> Option<u64> {
         if let Some(i) = self.broadcasters.iter().position(|b| b.serial == serial) {
             let b = self.broadcasters.remove(i);
@@ -2154,7 +2408,7 @@ impl Session {
             self.announce_members();
             return None;
         }
-        let p = self.peer.as_ref().filter(|p| p.serial == serial)?;
+        let p = self.peers.iter().find(|p| p.serial == serial)?;
         let (info, key, heard) = (p.info.clone(), p.key, p.heard);
         let client = matches!(self.role, Role::Client { .. });
         let broadcaster = self.is_broadcaster();
@@ -2163,7 +2417,15 @@ impl Session {
                 "{} closed the room. Join again to keep broadcasting.",
                 info.name
             ),
-            LinkEnd::Bye => log::info!("{} left the room. You can keep playing.", info.name),
+            LinkEnd::Bye if client => {
+                log::info!("{} closed the room. You can keep playing.", info.name)
+            }
+            LinkEnd::Bye => {
+                log::info!("{} left the room.", info.name);
+                self.unlink(serial, "partner left", false);
+                self.pump_fetches();
+                return None;
+            }
             LinkEnd::Lost(why) if client => {
                 log::warn!(
                     "Lost the link to {}'s room ({why}). Reconnecting…",
@@ -2181,7 +2443,7 @@ impl Session {
                         since: Instant::now(),
                     });
                 }
-                self.unlink("connection lost", true);
+                self.unlink(serial, "connection lost", true);
                 self.rejoin_gen += 1;
                 self.rejoin = Some(Rejoin {
                     host: info,
@@ -2194,28 +2456,29 @@ impl Session {
             }
             LinkEnd::Lost(why) if key != 0 => {
                 log::warn!(
-                    "Lost the link to {} ({why}). You can keep playing while they reconnect.",
+                    "Lost the link to {} ({why}). The room carries on while they reconnect.",
                     info.name
                 );
-                self.awaiting = Some(Awaiting {
+                self.awaiting.retain(|a| a.info.id != info.id);
+                self.awaiting.push(Awaiting {
                     info,
                     key,
                     since: Instant::now(),
                     heard,
                 });
-                self.unlink("connection lost", true);
+                self.unlink(serial, "connection lost", true);
+                self.pump_fetches();
                 return None;
             }
             LinkEnd::Lost(why) => {
-                log::warn!(
-                    "Lost the link to {} ({why}). You can keep playing.",
-                    info.name
-                );
-                self.unlink("connection lost", false);
+                log::warn!("Lost the link to {} ({why}).", info.name);
+                self.unlink(serial, "connection lost", false);
+                self.pump_fetches();
                 return None;
             }
         }
-        self.unlink("partner left", false);
+        // The host closed the room.
+        self.unlink(serial, "partner left", false);
         // Left on purpose: nobody holds anyone's place.
         self.lost = None;
         self.own_moves.clear();
@@ -2223,41 +2486,35 @@ impl Session {
         None
     }
 
-    /// Forget the link to the other DJ (or, on a client, the host), however
-    /// it ended. Transfers with that booth stop. With `pause` (the link was
-    /// lost, and the booth may be back) downloads from it carry on from
-    /// where they got to when it is; otherwise they fail.
-    fn unlink(&mut self, why: &str, pause: bool) {
-        let peer = self.peer.take();
-        if let Some(p) = &peer {
-            p.conn.close();
-            self.running.stop_with(p.info.id);
+    /// Forget the link with this serial (on a client, its link to the
+    /// host), however it ended. Transfers with that booth stop. With `pause`
+    /// (the link was lost, and the booth may be back) downloads from it
+    /// carry on from where they got to when it is; otherwise they fail.
+    fn unlink(&mut self, serial: u64, why: &str, pause: bool) {
+        let Some(i) = self.peers.iter().position(|p| p.serial == serial) else {
+            return;
+        };
+        let p = self.peers.remove(i);
+        p.conn.close();
+        self.running.stop_with(p.info.id);
+        if self.peers.is_empty() {
+            self.in_sync = None;
+            self.late_from = i64::MAX;
+            self.late.clear();
         }
-        self.in_sync = None;
-        self.late_from = i64::MAX;
-        self.late.clear();
         self.announce_members();
-        match peer {
-            Some(p) if pause => self.pause_fetches(p.info.id),
-            _ => {
-                let pending: Vec<(TrackId, Purpose)> = self
-                    .active_fetch
-                    .drain()
-                    .map(|(id, f)| (id, f.purpose))
-                    .chain(self.fetch_queue.drain(..))
-                    .collect();
-                for (id, purpose) in pending {
-                    self.finish_fetch(id, purpose, Err(why.into()));
-                }
-                self.fail_paused(why);
-            }
+        match pause {
+            true => self.pause_fetches(p.info.id),
+            false => self.fail_fetches(p.info.id, why),
         }
-        for t in self
-            .transfers
-            .iter_mut()
-            .filter(|t| t.state == TransferState::Active)
-        {
-            t.state = TransferState::Failed(why.into());
+        if self.peers.is_empty() && self.broadcasters.is_empty() {
+            for t in self
+                .transfers
+                .iter_mut()
+                .filter(|t| t.state == TransferState::Active)
+            {
+                t.state = TransferState::Failed(why.into());
+            }
         }
     }
 
@@ -2310,10 +2567,10 @@ impl Session {
         }
     }
 
-    /// Drop the room link the way a network failure does: no Bye, the
-    /// connection just closes. For trying out getting back in.
+    /// Drop the room links the way a network failure does: no Bye, the
+    /// connections just close. For trying out getting back in.
     pub fn cut_link(&mut self) {
-        if let Some(p) = &self.peer {
+        for p in &self.peers {
             log::warn!("Cutting the link to {} (test)", p.info.name);
             p.conn.close();
         }
@@ -2323,7 +2580,7 @@ impl Session {
         if let Some(r) = &self.rejoin {
             log::info!("Stopped reconnecting to {}'s room", r.host.name);
         }
-        if self.peer.is_some() {
+        if !self.peers.is_empty() {
             // The host hears this booth leave, and stops holding its place.
             // Giving up while cut off leaves the host holding it, so joining
             // again by hand soon still brings its moves.
@@ -2335,7 +2592,7 @@ impl Session {
         // purpose (the app may be closing).
         let deadline = Instant::now() + Duration::from_millis(300);
         let conns = self
-            .peer
+            .peers
             .iter()
             .map(|p| &p.conn)
             .chain(self.broadcasters.iter().map(|b| &b.conn));
@@ -2348,9 +2605,31 @@ impl Session {
             b.conn.close();
             self.running.stop_with(b.info.id);
         }
-        self.unlink("partner left", false);
-        self.awaiting = None;
+        let serials: Vec<u64> = self.peers.iter().map(|p| p.serial).collect();
+        for serial in serials {
+            self.unlink(serial, "partner left", false);
+        }
+        // Nothing more comes from anyone, linked or not (a booth giving up
+        // getting back in, a DJ the host was waiting for).
+        let pending: Vec<(TrackId, Purpose)> = (self.active_fetch.drain())
+            .map(|(id, f)| (id, f.purpose))
+            .chain(self.fetch_queue.drain(..))
+            .collect();
+        for (id, purpose) in pending {
+            self.finish_fetch(id, purpose, Err("partner left".into()));
+        }
+        self.fail_paused("partner left", |_| true);
+        for t in self
+            .transfers
+            .iter_mut()
+            .filter(|t| t.state == TransferState::Active)
+        {
+            t.state = TransferState::Failed("partner left".into());
+        }
+        self.awaiting.clear();
         self.held = None;
+        self.track_from.clear();
+        self.offered.clear();
         if let Role::Host { stop, .. } = &self.role {
             stop.store(true, Ordering::Relaxed);
         }
@@ -2359,7 +2638,17 @@ impl Session {
         log::info!("Left the room");
     }
 
-    pub fn on_control_msg(&mut self, msg: Msg) {
+    /// A message from the room arrived on link `from` (its serial): from
+    /// the host, or on the host from one of the other DJs, whose moves,
+    /// tracks and shares it passes on to everyone else.
+    pub fn on_control_msg(&mut self, from: u64, msg: Msg) {
+        let host = matches!(self.role, Role::Host { .. });
+        // On the host, the DJ who sent it.
+        let sender = self
+            .peers
+            .iter()
+            .find(|p| p.serial == from)
+            .map(|p| p.info.id);
         match msg {
             Msg::Event { ev } => {
                 if ev.time >= self.late_from {
@@ -2374,54 +2663,26 @@ impl Session {
                         self.check_my_loads();
                     }
                     self.publish();
-                    // One that went in further back reaches the broadcasters
-                    // with the remade room.
+                    // One that went in further back reaches the others with
+                    // the remade room.
                     if landed == Landed::Now {
-                        self.relay(&Msg::Event { ev });
+                        self.relay(from, &Msg::Event { ev });
                     }
                 }
             }
             Msg::Track { info } => {
-                self.relay(&Msg::Track { info: info.clone() });
+                if let (true, Some(dj)) = (host, sender) {
+                    self.track_from.insert(info.id, dj);
+                }
+                self.relay(from, &Msg::Track { info: info.clone() });
                 self.track_meta.insert(info.id, info);
             }
-            Msg::Members { djs, broadcasters } => {
-                if matches!(self.role, Role::Client { .. }) {
-                    self.roster = Roster { djs, broadcasters };
-                }
-            }
-            Msg::Digest { t, digest } => {
-                if self.timeline.state_at(t).digest() == digest {
-                    self.in_sync = Some(true);
-                    self.digest_mismatch = 0;
-                } else {
-                    self.in_sync = Some(false);
-                    self.digest_mismatch += 1;
-                    if self.digest_mismatch >= 2 {
-                        log::warn!("Out of step with the host; resyncing");
-                        self.send(Msg::ResyncRequest);
-                        self.digest_mismatch = 0;
-                    }
-                }
-            }
-            Msg::ResyncRequest => self.send(Msg::Resync {
-                timeline: self.timeline.clone(),
-            }),
-            Msg::Resync { timeline } => {
-                let mine: Vec<Event> = self
-                    .timeline
-                    .events()
-                    .iter()
-                    .filter(|e| e.origin == self.me.id)
-                    .cloned()
-                    .collect();
-                self.timeline = timeline;
-                for e in mine {
-                    self.timeline.insert(e);
-                }
-                self.ensure_room_tracks();
-                self.publish();
-            }
+            Msg::ResyncRequest if host => self.send_to_link(
+                from,
+                Msg::Resync {
+                    timeline: self.timeline.clone(),
+                },
+            ),
             Msg::Share { offer } => {
                 log::info!(
                     "{} wants to share \"{}\" ({} tracks)",
@@ -2429,6 +2690,19 @@ impl Session {
                     offer.title,
                     offer.tracks.len()
                 );
+                if let (true, Some(dj)) = (host, sender) {
+                    // The DJs who accept get the tracks through this booth.
+                    for t in &offer.tracks {
+                        self.track_from.insert(t.id, dj);
+                        self.offered.insert(t.id, t.clone());
+                    }
+                    self.relay_to_djs(
+                        from,
+                        &Msg::Share {
+                            offer: offer.clone(),
+                        },
+                    );
+                }
                 let dir = self
                     .paths
                     .shared_dir
@@ -2448,6 +2722,15 @@ impl Session {
                 accepted,
                 name,
             } => {
+                if host {
+                    // For whichever DJ offered it.
+                    let reply = Msg::ShareReply {
+                        share_id,
+                        accepted,
+                        name: name.clone(),
+                    };
+                    self.relay_to_djs(from, &reply);
+                }
                 if let Some(s) = self
                     .outgoing
                     .iter_mut()
@@ -2461,11 +2744,71 @@ impl Session {
                     s.replies.push((name, accepted));
                 }
             }
-            Msg::PushRequest { id } => self.start_push(id),
-            Msg::NoFile { id } => self.fetch_failed(id, "partner doesn't have that file"),
+            Msg::NoFile { id } if host => {
+                if self
+                    .active_fetch
+                    .get(&id)
+                    .is_some_and(|f| Some(f.from) == sender)
+                {
+                    self.fetch_failed(id, "partner doesn't have that file");
+                }
+            }
             Msg::Bye => {}
+            // The rest only ever comes from the host.
+            m if host => log::debug!("ignoring {m:?} from a DJ"),
+            Msg::Members { djs, broadcasters } => {
+                if matches!(self.role, Role::Client { .. }) {
+                    self.roster = Roster { djs, broadcasters };
+                }
+            }
+            Msg::Digest { t, digest } => {
+                if self.timeline.state_at(t).digest() == digest {
+                    self.in_sync = Some(true);
+                    self.digest_mismatch = 0;
+                } else {
+                    self.in_sync = Some(false);
+                    self.digest_mismatch += 1;
+                    if self.digest_mismatch >= 2 {
+                        log::warn!("Out of step with the host; resyncing");
+                        self.send(Msg::ResyncRequest);
+                        self.digest_mismatch = 0;
+                    }
+                }
+            }
+            Msg::Resync { timeline } => self.take_resync(timeline),
+            Msg::PushRequest { id } => self.start_push(id),
             other => log::debug!("ignoring unexpected control message {other:?}"),
         }
+    }
+
+    /// To the link with this serial only.
+    fn send_to_link(&self, serial: u64, m: Msg) {
+        if let Some(p) = self.peers.iter().find(|p| p.serial == serial) {
+            p.conn.send(m);
+        }
+    }
+
+    /// Client: the host sent the room as it has it (asked for, or after
+    /// moves went into it further back than the timelines reach). This
+    /// booth's own moves from after its start that it hasn't got yet go back
+    /// in; older ones are already in its base, so they aren't applied twice.
+    /// A load of this booth's that the room now refuses is reported.
+    fn take_resync(&mut self, timeline: Timeline) {
+        let base = timeline.base_time();
+        let mine: Vec<Event> = self
+            .timeline
+            .events()
+            .iter()
+            .filter(|e| e.origin == self.me.id && e.time >= base)
+            .cloned()
+            .collect();
+        self.timeline = timeline;
+        for e in mine {
+            self.timeline.insert(e);
+        }
+        self.check_my_loads();
+        self.ensure_room_tracks();
+        self.publish();
     }
 
     /// A move reached this booth `us` after it happened (a scheduled one,
@@ -2500,7 +2843,7 @@ impl Session {
         let (Some(path), Role::Client { addr, room, .. }, Some(host)) = (
             self.servable.get(&id).cloned(),
             &self.role,
-            self.peer.as_ref().map(|p| p.info.id),
+            self.peers.first().map(|p| p.info.id),
         ) else {
             self.send(Msg::NoFile { id });
             return;
@@ -2531,7 +2874,7 @@ impl Session {
         self.library.lock().save_grids();
 
         if matches!(self.role, Role::Host { .. })
-            && (self.peer.is_some() || !self.broadcasters.is_empty())
+            && (!self.peers.is_empty() || !self.broadcasters.is_empty())
             && self.last_digest.elapsed() > Duration::from_secs(2)
         {
             let t = now - 1_500_000;
@@ -2554,25 +2897,24 @@ impl Session {
         for id in stalled {
             self.fetch_failed(id, "transfer stalled");
         }
-        // Downloads a dropped link cut off fail once nobody is coming back:
-        // this booth gave up getting back in, or the host stopped waiting.
-        let coming_back = self.rejoin.is_some()
-            || self
-                .awaiting
-                .as_ref()
-                .is_some_and(|a| a.since.elapsed() < self.rejoin_for + self.link_timeout);
-        if !self.paused.is_empty() && self.peer.is_none() && !coming_back {
-            self.fail_paused("connection lost");
-        }
-        // A download cut off while the link stayed up carries on.
-        let linked = self
-            .peer
-            .as_ref()
-            .map(|p| p.info.id)
-            .filter(|&id| id == self.paused_from);
-        if let Some(id) = linked {
-            if !self.paused.is_empty() && self.paused_since.elapsed() >= RESUME_AFTER {
-                self.resume_fetches(id);
+        // Downloads a dropped link cut off fail once the booth they come
+        // from isn't coming back: this booth gave up getting back in, or the
+        // host stopped waiting for that DJ.
+        let mut froms: Vec<u64> = self.paused.iter().map(|p| p.fetch.from).collect();
+        froms.sort();
+        froms.dedup();
+        for from in froms {
+            if self.linked(from) {
+                // One cut off while the link stayed up carries on.
+                let due = self
+                    .paused
+                    .iter()
+                    .any(|p| p.fetch.from == from && p.since.elapsed() >= RESUME_AFTER);
+                if due {
+                    self.resume_fetches(from);
+                }
+            } else if self.rejoin.is_none() && !self.expected_back(from) {
+                self.fail_paused("connection lost", |p| p.fetch.from == from);
             }
         }
         self.transfers.retain(|t| {
@@ -2623,7 +2965,7 @@ impl Session {
         }
         // Ask the host again for tracks on a deck that didn't download (a
         // broadcaster can ask for a partner's track before the host has it).
-        if matches!(self.role, Role::Client { .. }) && self.peer.is_some() {
+        if matches!(self.role, Role::Client { .. }) && !self.peers.is_empty() {
             let due: Vec<TrackId> = in_use
                 .iter()
                 .filter(|id| {
@@ -2641,21 +2983,22 @@ impl Session {
         self.publish();
     }
 
-    /// Host: keep the held room (see `held`) while the other DJ is linked or
-    /// expected back, reaching back to [`HELD_MARGIN_US`] before they were
-    /// last heard from, and remake the live timeline from it after a late
-    /// move. Client DJ: forget own moves that have surely reached the room,
-    /// and all of them once nobody is holding this booth's place.
+    /// Host: keep the held room (see `held`) while any other DJ is linked or
+    /// expected back, reaching back to [`HELD_MARGIN_US`] before the one
+    /// heard from longest ago was last heard from, and remake the live
+    /// timeline from it after a late move. Client DJ: forget own moves that
+    /// have surely reached the room, and all of them once nobody is holding
+    /// this booth's place.
     fn keep_history(&mut self, now: i64) {
         let window = self.rejoin_for + self.link_timeout;
         let shared = |i: Instant| now - i.elapsed().as_micros() as i64;
         if matches!(self.role, Role::Host { .. }) {
-            let heard = self.peer.as_ref().map(|p| p.heard).or_else(|| {
-                self.awaiting
-                    .as_ref()
-                    .filter(|a| a.since.elapsed() < window)
-                    .map(|a| a.heard)
-            });
+            // Nobody is coming back after this long.
+            self.awaiting.retain(|a| a.since.elapsed() < window);
+            // The DJ heard from longest ago.
+            let heard = (self.peers.iter().map(|p| p.heard))
+                .chain(self.awaiting.iter().map(|a| a.heard))
+                .min();
             if let Some(held) = &mut self.held {
                 let keep_from = heard.map_or(i64::MAX, |h| shared(h) - HELD_MARGIN_US);
                 held.compact(keep_from.min(self.timeline.base_time()));
@@ -2675,7 +3018,7 @@ impl Session {
             {
                 self.lost = None;
             }
-        } else if let Some(p) = &self.peer {
+        } else if let Some(p) = self.peers.first() {
             let keep_from = shared(p.heard) - HELD_MARGIN_US;
             self.own_moves.retain(|e| e.time >= keep_from);
         }
@@ -2689,7 +3032,7 @@ impl Session {
     fn follow_grid_tempos(&mut self, now: i64) {
         let room = self.timeline.state_at(now);
         self.relocks.retain(|&(_, t)| t > now - 1_000_000);
-        let quiet = matches!(self.role, Role::Client { .. }) && self.peer.is_some();
+        let quiet = matches!(self.role, Role::Client { .. }) && !self.peers.is_empty();
         for c in 0..DECKS {
             let d = &room.decks[c];
             let watched = (d.track, d.gen, d.bpm_at(now));
@@ -2742,14 +3085,13 @@ impl Session {
         for d in &mut decks {
             d.loading = None; // this booth's library at work, not the room's
         }
-        // The DJs only: on a DJ's booth "you" first, on a broadcaster the host.
-        let djs = if self.is_broadcaster() {
-            self.roster().djs
-        } else {
-            let mut djs = vec![self.me.clone()];
-            djs.extend(self.peer.as_ref().map(|p| p.info.clone()));
-            djs
-        };
+        // The DJs only: on a DJ's booth "you" first, then the others as the
+        // room lists them (host first); on a broadcaster, the room's list.
+        let mut djs = self.roster().djs;
+        if !self.is_broadcaster() {
+            djs.retain(|p| p.id != self.me.id);
+            djs.insert(0, self.me.clone());
+        }
         BroadcastView {
             t,
             room,
@@ -2795,11 +3137,17 @@ impl Session {
             local: self.local,
             link: LinkView {
                 role,
-                peer: self.peer.as_ref().map(|p| p.info.clone()),
+                links: self
+                    .peers
+                    .iter()
+                    .map(|p| PeerLink {
+                        info: p.info.clone(),
+                        rtt_us: p.rtt_us,
+                        quiet_for: p.heard.elapsed(),
+                    })
+                    .collect(),
                 roster: self.roster(),
                 late_us: self.late_peak_us(),
-                rtt_us: self.peer.as_ref().and_then(|p| p.rtt_us),
-                quiet_for: self.peer.as_ref().map(|p| p.heard.elapsed()),
                 clock_spread_us: self.est.spread(),
                 in_sync: self.in_sync,
                 rejoin: self.rejoin.as_ref().map(|r| RejoinView {
@@ -2812,9 +3160,10 @@ impl Session {
                 // noticed, which can be up to a link timeout after this one.
                 awaiting: self
                     .awaiting
-                    .as_ref()
+                    .iter()
                     .filter(|a| a.since.elapsed() < self.rejoin_for + self.link_timeout)
-                    .map(|a| a.info.name.clone()),
+                    .map(|a| a.info.name.clone())
+                    .collect(),
             },
             transfers: self.transfers.clone(),
             incoming: self
@@ -2844,8 +3193,8 @@ impl Session {
                     paused: self
                         .paused
                         .iter()
-                        .filter(|(_, f)| {
-                            matches!(f.purpose, Purpose::Share { share_id, .. }
+                        .filter(|p| {
+                            matches!(p.fetch.purpose, Purpose::Share { share_id, .. }
                                 if share_id == s.offer.share_id)
                         })
                         .count(),
@@ -2925,15 +3274,15 @@ mod tests {
                 },
             };
             let now = s.now();
-            s.on_control_msg(ev(now - 300_000, 1));
+            s.on_control_msg(0, ev(now - 300_000, 1));
             assert_eq!(s.late_peak_us(), None, "not in a room: not measured");
 
             s.late_from = now - 1_000_000;
-            s.on_control_msg(ev(now - 2_000_000, 2)); // before joining
+            s.on_control_msg(0, ev(now - 2_000_000, 2)); // before joining
             assert_eq!(s.late_peak_us(), None);
-            s.on_control_msg(ev(now - 300_000, 3));
-            s.on_control_msg(ev(now - 120_000, 4));
-            s.on_control_msg(ev(now + 200_000, 5)); // a relock, scheduled ahead
+            s.on_control_msg(0, ev(now - 300_000, 3));
+            s.on_control_msg(0, ev(now - 120_000, 4));
+            s.on_control_msg(0, ev(now + 200_000, 5)); // a relock, scheduled ahead
             let peak = s.late_peak_us().unwrap();
             assert!((300_000..400_000).contains(&peak), "peak {peak}");
             assert_eq!(s.view().link.late_us, Some(peak));
@@ -3011,14 +3360,17 @@ mod tests {
             assert_eq!(s.view().room.decks[1].track, Some(TrackId([2; 32])));
             assert!(s.take_notices().is_empty());
             // The partner's fader move from before the load arrives.
-            s.on_control_msg(Msg::Event {
-                ev: Event {
-                    time: now - 200_000,
-                    origin: 7,
-                    seq: 1,
-                    action: Action::Volume { deck: 1, v: 0.9 },
+            s.on_control_msg(
+                0,
+                Msg::Event {
+                    ev: Event {
+                        time: now - 200_000,
+                        origin: 7,
+                        seq: 1,
+                        action: Action::Volume { deck: 1, v: 0.9 },
+                    },
                 },
-            });
+            );
             let room = s.view().room;
             assert_eq!(room.decks[1].track, Some(TrackId([1; 32])));
             assert!(room.decks[1].playing);
@@ -3027,14 +3379,17 @@ mod tests {
                 vec!["Deck B is playing: pause it or pull its fader down to load onto it."]
             );
             // Told once.
-            s.on_control_msg(Msg::Event {
-                ev: Event {
-                    time: now - 50_000,
-                    origin: 7,
-                    seq: 2,
-                    action: Action::Crossfader { v: 0.4 },
+            s.on_control_msg(
+                0,
+                Msg::Event {
+                    ev: Event {
+                        time: now - 50_000,
+                        origin: 7,
+                        seq: 2,
+                        action: Action::Crossfader { v: 0.4 },
+                    },
                 },
-            });
+            );
             assert!(s.take_notices().is_empty());
         }
         drop(h);
@@ -3133,14 +3488,17 @@ mod tests {
             s.act_at(load_onto(0, 1), now - 10_000_000);
             s.act_at(Action::Play { deck: 0 }, now - 9_000_000);
             s.timeline.compact(now - 3_500_000);
-            s.on_control_msg(Msg::Event {
-                ev: Event {
-                    time: now - 6_000_000,
-                    origin: 7,
-                    seq: 1,
-                    action: Action::Pause { deck: 0 },
+            s.on_control_msg(
+                0,
+                Msg::Event {
+                    ev: Event {
+                        time: now - 6_000_000,
+                        origin: 7,
+                        seq: 1,
+                        action: Action::Pause { deck: 0 },
+                    },
                 },
-            });
+            );
             assert!(s.rebuild_due);
             s.rebuild_from_held();
             let deck = s.timeline.latest().decks[0];
@@ -3280,6 +3638,45 @@ mod tests {
             assert_eq!(b.room.xf_touch, s.me.id);
             assert_eq!(b.dj_name(s.me.id), Some("Alice"));
             assert_eq!(b.dj_name(0), None);
+        }
+        drop(h);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A resync from the host keeps this booth's own moves the host hasn't
+    /// got yet, but doesn't apply one again that the host's room has
+    /// already folded into its base: a nudge would move the deck twice.
+    #[test]
+    fn a_resync_applies_each_own_move_once() {
+        let root = std::env::temp_dir().join(format!("tandem-resync-{}", fastrand::u64(..)));
+        let h = solo(&root);
+        {
+            let mut s = h.lock();
+            let now = s.now();
+            s.timeline = Timeline::new(now - 10_000_000);
+            s.act_at(load_onto(0, 1), now - 9_000_000);
+            s.timeline.compact(now - 7_000_000);
+            s.act_at(
+                Action::Nudge {
+                    deck: 0,
+                    delta: 1.0,
+                },
+                now - 6_000_000,
+            );
+            // The host's room: it has the nudge too, folded into its base.
+            let mut room = s.timeline.clone();
+            room.compact(now - 5_000_000);
+            // One the host hasn't got yet.
+            s.act_at(
+                Action::Nudge {
+                    deck: 0,
+                    delta: 0.25,
+                },
+                now - 1_000_000,
+            );
+            s.on_control_msg(0, Msg::Resync { timeline: room });
+            let at = s.timeline.latest().decks[0].position_at(now);
+            assert!((at - 1.25).abs() < 1e-9, "at {at} s");
         }
         drop(h);
         let _ = std::fs::remove_dir_all(&root);

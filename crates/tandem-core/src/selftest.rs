@@ -1,14 +1,17 @@
-//! End-to-end loopback test: a host, a joining DJ and a broadcaster in one
-//! process, talking over real TCP, with the joiners' clocks deliberately
+//! End-to-end loopback test: a host, three joining DJs and a broadcaster in
+//! one process, talking over real TCP, with the joiners' clocks deliberately
 //! hours off.
 //!
-//! Checks that the clocks sync, that a track a booth doesn't have is
-//! transferred and verified (the joining DJ's tracks reach the broadcaster
-//! through the host), that every booth's room state stays identical, that
-//! the booths render bit-identical audio for the same moment, that a
-//! broadcaster can't change the room, that a share can be offered,
-//! accepted and downloaded, that a booth whose link drops gets back in, and
-//! that a track it was receiving carries on from where it got to.
+//! Checks that the clocks sync, that a fifth DJ is turned away, that a track
+//! a booth doesn't have is transferred and verified (a joining DJ's tracks
+//! reach the other DJs and the broadcaster through the host), that one
+//! joining DJ's moves reach another, that every booth's room state stays
+//! identical, that the booths render bit-identical audio for the same
+//! moment, that a broadcaster can't change the room, that a share can be
+//! offered, accepted and downloaded (from one joining DJ to another, through
+//! the host), that a booth whose link drops gets back in with what it did
+//! meanwhile reaching every DJ, and that a track it was receiving carries on
+//! from where it got to.
 
 use crate::config::Paths;
 use crate::library::Library;
@@ -79,6 +82,8 @@ fn run(root: &std::path::Path, say: &mut dyn FnMut(&str)) -> anyhow::Result<()> 
     let alice = session(root, "Alice", 0)?;
     let bob = session(root, "Bob", 3_600_000_000)?; // an hour off
     let carol = session(root, "Carol", -7_200_000_000)?; // two hours the other way
+    let dave = session(root, "Dave", 1_800_000_000)?;
+    let erin = session(root, "Erin", -900_000_000)?;
 
     let port = crate::net::host(&alice, 0, "TEST42")?;
     let addr = format!("127.0.0.1:{port}");
@@ -95,13 +100,18 @@ fn run(root: &std::path::Path, say: &mut dyn FnMut(&str)) -> anyhow::Result<()> 
     ));
     ensure!(skew < 5_000, "clock offset too large: {skew} us");
 
-    // A third DJ is turned away; a broadcaster gets in.
-    let dave = session(root, "Dave", 0)?;
-    match crate::net::join(&dave, &addr, "test42", false) {
-        Ok(()) => bail!("a third DJ got into the room"),
+    // Two more DJs get in, a fifth is turned away, and a broadcaster gets in.
+    for h in [&dave, &erin] {
+        crate::net::join(h, &addr, "TEST42", false)?;
+        let skew = (h.lock().clock().now() - alice.lock().clock().now()).abs();
+        ensure!(skew < 5_000, "a joining DJ's clock is off by {skew} us");
+    }
+    let frank = session(root, "Frank", 0)?;
+    match crate::net::join(&frank, &addr, "test42", false) {
+        Ok(()) => bail!("a fifth DJ got into the room"),
         Err(e) => ensure!(
-            format!("{e:#}").contains("two DJs"),
-            "third DJ refused for the wrong reason: {e:#}"
+            format!("{e:#}").contains("4 DJs"),
+            "fifth DJ refused for the wrong reason: {e:#}"
         ),
     }
     crate::net::join(&carol, &addr, "test42", true)?;
@@ -128,14 +138,21 @@ fn run(root: &std::path::Path, say: &mut dyn FnMut(&str)) -> anyhow::Result<()> 
                 )
             };
             let room = (
-                vec!["Alice".to_string(), "Bob".into()],
+                vec![
+                    "Alice".to_string(),
+                    "Bob".into(),
+                    "Dave".into(),
+                    "Erin".into(),
+                ],
                 vec!["Carol".to_string()],
             );
-            names(&alice) == room && names(&bob) == room && names(&carol) == room
+            [&alice, &bob, &carol, &dave, &erin]
+                .iter()
+                .all(|h| names(h) == room)
         },
     )?;
     say(&format!(
-        "a third DJ is refused; Carol joins as a broadcaster (clock off by {:.2} ms)",
+        "Dave and Erin join as DJs too, a fifth DJ is refused, and Carol joins as a broadcaster (clock off by {:.2} ms)",
         skew as f64 / 1000.0
     ));
 
@@ -167,12 +184,14 @@ fn run(root: &std::path::Path, say: &mut dyn FnMut(&str)) -> anyhow::Result<()> 
         id.unwrap()
     };
     let took = wait_for(
-        "the broadcaster to receive both tracks",
+        "the broadcaster and the other DJs to receive both tracks",
         Duration::from_secs(40),
         || {
-            let c = carol.lock();
-            c.track_status(id) == Some(TrackStatus::Ready)
-                && c.track_status(bob_id) == Some(TrackStatus::Ready)
+            [&carol, &dave, &erin].iter().all(|h| {
+                let h = h.lock();
+                h.track_status(id) == Some(TrackStatus::Ready)
+                    && h.track_status(bob_id) == Some(TrackStatus::Ready)
+            })
         },
     )?;
     ensure!(
@@ -180,7 +199,7 @@ fn run(root: &std::path::Path, say: &mut dyn FnMut(&str)) -> anyhow::Result<()> 
         "the host didn't get Bob's track"
     );
     say(&format!(
-        "the broadcaster has both DJs' tracks (Bob's through the host) after {:.2} s",
+        "everyone has both tracks (Bob's through the host) after {:.2} s",
         took.as_secs_f64()
     ));
 
@@ -193,6 +212,10 @@ fn run(root: &std::path::Path, say: &mut dyn FnMut(&str)) -> anyhow::Result<()> 
     bob.lock().act(Action::Volume { deck: 0, v: 0.7 });
     bob.lock().act(Action::Play { deck: 1 });
     alice.lock().act(Action::Crossfader { v: 0.3 });
+    dave.lock().act(Action::Volume { deck: 2, v: 0.6 });
+    wait_for("Dave's move to reach Erin", Duration::from_secs(5), || {
+        erin.lock().latest().decks[2].volume == 0.6
+    })?;
 
     // The broadcaster can't change anything: not through its own session,
     // and not by sending the host an event directly.
@@ -229,7 +252,14 @@ fn run(root: &std::path::Path, say: &mut dyn FnMut(&str)) -> anyhow::Result<()> 
     )?;
     std::thread::sleep(Duration::from_millis(400));
     let _ = raw.shutdown(std::net::Shutdown::Both);
-    for (who, h) in [("Alice", &alice), ("Bob", &bob), ("Carol", &carol)] {
+    let everyone = [
+        ("Alice", &alice),
+        ("Bob", &bob),
+        ("Carol", &carol),
+        ("Dave", &dave),
+        ("Erin", &erin),
+    ];
+    for (who, h) in everyone {
         let s = h.lock();
         ensure!(
             s.latest().crossfader == 0.3,
@@ -246,24 +276,25 @@ fn run(root: &std::path::Path, say: &mut dyn FnMut(&str)) -> anyhow::Result<()> 
     say("a broadcaster's moves are ignored, by its own booth and by the host");
 
     let t = alice.lock().clock().now() - 100_000;
-    let (da, db, dc) = (
-        alice.lock().state_at(t).digest(),
-        bob.lock().state_at(t).digest(),
-        carol.lock().state_at(t).digest(),
-    );
-    ensure!(da == db, "room state differs between booths");
-    ensure!(da == dc, "room state differs on the broadcaster");
-    say("room state identical on all three booths");
+    let da = alice.lock().state_at(t).digest();
+    for (who, h) in everyone {
+        ensure!(
+            h.lock().state_at(t).digest() == da,
+            "room state differs on {who}'s booth"
+        );
+    }
+    say("room state identical on all five booths");
 
     // Pings keep each end's "last heard" fresh, so a stalled link stands out.
     let settle = Duration::from_millis(2_500);
     if joined.elapsed() < settle {
         std::thread::sleep(settle - joined.elapsed());
     }
-    for (who, h) in [("Alice", &alice), ("Bob", &bob), ("Carol", &carol)] {
-        let quiet = h.lock().view().link.quiet_for;
+    for (who, h) in everyone {
+        let links = h.lock().view().link.links;
+        let quiet: Vec<Duration> = links.iter().map(|l| l.quiet_for).collect();
         ensure!(
-            matches!(quiet, Some(q) if q < Duration::from_secs(2)),
+            !quiet.is_empty() && quiet.iter().all(|q| *q < Duration::from_secs(2)),
             "{who} hasn't heard from the other end lately: {quiet:?}"
         );
     }
@@ -317,7 +348,7 @@ fn run(root: &std::path::Path, say: &mut dyn FnMut(&str)) -> anyhow::Result<()> 
     let view = carol.lock().broadcast_view();
     let djs: Vec<&str> = view.djs.iter().map(|p| p.name.as_str()).collect();
     ensure!(
-        djs == ["Alice", "Bob"],
+        djs == ["Alice", "Bob", "Dave", "Erin"],
         "broadcaster's window names {djs:?}"
     );
     say("all booths render identical audio for the same moment, the broadcaster's feed too");
@@ -354,6 +385,49 @@ fn run(root: &std::path::Path, say: &mut dyn FnMut(&str)) -> anyhow::Result<()> 
     );
     say("share offered, accepted (consent logged), downloaded and verified");
 
+    // Bob shares a track only he has. Dave accepts and gets it through the
+    // host, which never accepted it; Erin declines.
+    let bob_extra = bob_music.join("Bob - Shared Tone.wav");
+    crate::audio::write_wav(
+        &bob_extra,
+        44_100,
+        &crate::audio::test_signal(44_100, 3.0, 660.0),
+    )?;
+    bob.lock()
+        .offer_share("Bob's test crate".into(), vec![bob_extra]);
+    let offer = |h: &SessionHandle| {
+        let v = h.lock().view();
+        v.incoming
+            .iter()
+            .find(|s| s.title == "Bob's test crate")
+            .map(|s| s.share_id)
+    };
+    wait_for(
+        "Bob's offer to reach the other DJs",
+        Duration::from_secs(10),
+        || [&alice, &dave, &erin].iter().all(|h| offer(h).is_some()),
+    )?;
+    let share_id = offer(&dave).unwrap();
+    dave.lock().respond_share(share_id, true);
+    erin.lock().respond_share(share_id, false);
+    wait_for(
+        "Bob's shared track to reach Dave",
+        Duration::from_secs(30),
+        || {
+            let v = dave.lock().view();
+            v.incoming
+                .iter()
+                .any(|s| s.share_id == share_id && s.received == 1)
+        },
+    )?;
+    wait_for("Bob to hear both answers", Duration::from_secs(5), || {
+        let v = bob.lock().view();
+        v.outgoing
+            .iter()
+            .any(|(title, _, replies)| title == "Bob's test crate" && replies.len() == 2)
+    })?;
+    say("a share from one joining DJ reaches another through the host, which passes it on without taking it");
+
     // A dropped link: Bob gets back in by himself, and the room has both
     // DJs' moves from while he was out.
     bob.lock().cut_link();
@@ -366,11 +440,19 @@ fn run(root: &std::path::Path, say: &mut dyn FnMut(&str)) -> anyhow::Result<()> 
     bob.lock().act(Action::Volume { deck: 3, v: 0.35 });
     let took = wait_for("Bob to get back in", Duration::from_secs(15), || {
         let v = bob.lock().view();
-        v.link.peer.is_some() && v.link.rejoin.is_none()
+        v.link.linked() && v.link.rejoin.is_none()
     })?;
     wait_for("the host to see Bob back", Duration::from_secs(5), || {
-        alice.lock().roster().djs.len() == 2
+        alice.lock().roster().djs.len() == 4
     })?;
+    wait_for(
+        "what Bob did while he was out to reach the other DJs",
+        Duration::from_secs(5),
+        || {
+            dave.lock().latest().decks[3].volume == 0.35
+                && erin.lock().latest().decks[3].volume == 0.35
+        },
+    )?;
     let t = alice.lock().clock().now() - 100_000;
     ensure!(
         alice.lock().state_at(t).digest() == bob.lock().state_at(t).digest(),
@@ -385,7 +467,7 @@ fn run(root: &std::path::Path, say: &mut dyn FnMut(&str)) -> anyhow::Result<()> 
         "what Bob did while he was out didn't reach the room"
     );
     say(&format!(
-        "a dropped link: Bob gets back in by himself after {:.1} s, with both DJs' moves from meanwhile",
+        "a dropped link: Bob gets back in by himself after {:.1} s, and every DJ has everyone's moves from meanwhile",
         took.as_secs_f64()
     ));
 
@@ -472,7 +554,8 @@ fn run(root: &std::path::Path, say: &mut dyn FnMut(&str)) -> anyhow::Result<()> 
         },
     )?;
     say("when the host leaves, the broadcaster's decks empty out");
-    bob.lock().leave();
-    carol.lock().leave();
+    for h in [&bob, &carol, &dave, &erin] {
+        h.lock().leave();
+    }
     Ok(())
 }

@@ -402,11 +402,11 @@ impl TandemApp {
             }
             ui.spacing_mut().item_spacing.x = spacing;
             if !matches!(src, Source::Room) {
-                let can = view.link.peer.is_some()
+                let can = view.link.linked()
                     && !all_paths.is_empty()
                     && view.preparing_share.is_none();
                 let r = ui.add_enabled(can, egui::Button::new("Share this list…"));
-                let r = if view.link.peer.is_none() {
+                let r = if !view.link.linked() {
                     r.on_disabled_hover_text("Host or join a room first")
                 } else {
                     r
@@ -551,7 +551,7 @@ impl TandemApp {
         if n == 0 {
             ui.add_space(12.0);
             let hint = match src {
-                Source::Room => "Tracks you or your partner load will appear here.",
+                Source::Room => "Tracks you or the other DJs load will appear here.",
                 Source::Shared => "Nothing shared with you yet.",
                 _ if scanning => "Scanning…",
                 _ if !self.ui.search.is_empty() => "No matches.",

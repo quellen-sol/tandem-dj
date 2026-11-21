@@ -69,7 +69,7 @@ impl TandemApp {
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
                     ui.label("Your DJ name:");
-                    ui.add(egui::TextEdit::singleline(&mut self.ui.name_draft).hint_text("shown to your partner").desired_width(220.0));
+                    ui.add(egui::TextEdit::singleline(&mut self.ui.name_draft).hint_text("shown to the other DJs").desired_width(220.0));
                 });
                 ui.checkbox(&mut self.ui.terms_checked, "I've read these terms. I'll use Tandem for personal, non-commercial purposes only.");
                 ui.add_space(8.0);
@@ -160,14 +160,14 @@ impl TandemApp {
         let mut done = None;
         egui::Modal::new(egui::Id::new("outgoing-share")).show(ctx, |ui| {
             ui.set_width(480.0);
-            ui.label(RichText::new("Share with your partner").size(18.0).strong());
+            ui.label(RichText::new("Share with the room").size(18.0).strong());
             ui.label(format!("{} tracks · {}", draft.paths.len(), mb(draft.bytes)));
             ui.horizontal(|ui| {
                 ui.label("Name:");
                 ui.text_edit_singleline(&mut draft.title);
             });
             ui.add_space(4.0);
-            ui.label("Your partner will see a request and can accept or decline. Tracks they already have aren't sent again.");
+            ui.label("Every other DJ in the room sees a request and can accept or decline. Tracks they already have aren't sent again.");
             ui.checkbox(&mut draft.pledge, terms::sender_pledge(draft.paths.len()));
             ui.add_space(6.0);
             ui.horizontal(|ui| {
@@ -196,7 +196,7 @@ impl TandemApp {
         let mut open = true;
         let mut start = false;
         egui::Window::new("Host a room").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
-            ui.label("Your partner joins with your address and this room code.");
+            ui.label("Up to three more DJs join with your address and this room code.");
             egui::Grid::new("host-grid").num_columns(2).show(ui, |ui| {
                 ui.label("Port");
                 if ui.add(egui::DragValue::new(&mut self.settings.host_port).range(1024..=65535)).changed() {
@@ -213,7 +213,7 @@ impl TandemApp {
                 ui.end_row();
             });
             ui.add_space(6.0);
-            ui.label(RichText::new("Give your partner one of these addresses:").strong());
+            ui.label(RichText::new("Give the other DJs one of these addresses:").strong());
             for (ip, note) in local_ips() {
                 ui.horizontal(|ui| {
                     let addr = format!("{ip}:{}", self.settings.host_port);
@@ -240,7 +240,7 @@ impl TandemApp {
             match tandem_core::net::host(&self.session, self.settings.host_port, &code) {
                 Ok(_) => {
                     self.ui.host_open = false;
-                    self.toast(format!("Hosting room {code}. Waiting for your partner."));
+                    self.toast(format!("Hosting room {code}. Waiting for the other DJs."));
                 }
                 Err(e) => self.toast(format!("Couldn't host: {e:#}")),
             }
@@ -763,7 +763,7 @@ impl TandemApp {
                 self.mark_dirty();
             }
         });
-        ui.label(RichText::new("Keeps track transfers from swamping your connection while you play: every track you send, to your partner or a broadcaster, shares it. Lower it if your partner's controls feel laggy, or a broadcaster warns that moves arrive late, while tracks are being sent.").small().weak());
+        ui.label(RichText::new("Keeps track transfers from swamping your connection while you play: every track you send, to another DJ or a broadcaster, shares it. Lower it if the other DJs' controls feel laggy, or a broadcaster warns that moves arrive late, while tracks are being sent.").small().weak());
         ui.separator();
         if ui
             .checkbox(
@@ -775,7 +775,7 @@ impl TandemApp {
             self.midi.engine.lock().quantize_loops = self.settings.quantize_loops;
             self.mark_dirty();
         }
-        ui.label(RichText::new("IN goes on the nearest beat, and OUT makes the loop 1 bar, ½ bar, ¼ bar … or 2, 4, 8 bars …, whichever is nearest to when you press it: OUT about a bar after IN makes a 1-bar loop. Off: IN and OUT go exactly where the playhead is. Tracks without a beatgrid always loop exactly. This is your own setting; your partner's loops follow theirs.").small().weak());
+        ui.label(RichText::new("IN goes on the nearest beat, and OUT makes the loop 1 bar, ½ bar, ¼ bar … or 2, 4, 8 bars …, whichever is nearest to when you press it: OUT about a bar after IN makes a 1-bar loop. Off: IN and OUT go exactly where the playhead is. Tracks without a beatgrid always loop exactly. This is your own setting; the other DJs' loops follow theirs.").small().weak());
         ui.separator();
         ui.horizontal(|ui| {
             ui.label("Screen frame rate");

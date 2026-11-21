@@ -1,6 +1,6 @@
 # Tandem
 
-Back-to-back DJing with a friend, from anywhere. Two DJs in different places share up to four decks and a mixer, each hears the full mix at full quality in their own booth, and one of you, or a third PC, can stream the set.
+Back-to-back DJing with friends, from anywhere. Up to four DJs in different places share up to four decks and a mixer, each hears the full mix at full quality in their own booth, and one of you, or another PC, can stream the set.
 
 **Personal, non-commercial use only.** See [TERMS.md](TERMS.md).
 
@@ -8,10 +8,10 @@ Back-to-back DJing with a friend, from anywhere. Two DJs in different places sha
 
 ## How it works
 
-Both laptops run the whole mix locally. Only small, timestamped control messages ("deck A play at 12:04:31.208") cross the internet, and both machines agree on one shared clock. The same moves at the same timestamps give the same mix on both laptops.
+Every DJ's laptop runs the whole mix locally. Only small, timestamped control messages ("deck A play at 12:04:31.208") cross the internet, and all the machines agree on one shared clock. The same moves at the same timestamps give the same mix on every laptop.
 
-- **Your own controls are instant.** Your partner's moves reach you about half a round trip late, typically 20–80 ms.
-- **The broadcast is exact.** The streaming feed runs half a second behind, so both DJs' moves land in it exactly where they happened.
+- **Your own controls are instant.** Your partner's moves reach you about half a round trip late, typically 20–80 ms. With more than two of you, everything goes through the host's PC, so a move between two DJs who both joined takes both of their trips to the host.
+- **The broadcast is exact.** The streaming feed runs half a second behind, so every DJ's moves land in it exactly where they happened.
 - **Tracks are matched by content.** If your partner loads a track you already have, Tandem finds your copy. If you don't have it, it's copied over for the session and deleted when Tandem closes.
 
 The details are in [docs/DESIGN.md](docs/DESIGN.md).
@@ -28,7 +28,7 @@ To check a PC without opening the app, open a terminal in the folder and run:
 tandem.exe --self-test
 ```
 
-The self-test lists your audio and MIDI devices, opens your default output for half a second of silence, and runs a full room test over the network stack, with two DJs and a broadcaster. It ends with `SELF-TEST PASSED`.
+The self-test lists your audio and MIDI devices, opens your default output for half a second of silence, and runs a full room test over the network stack, with four DJs and a broadcaster. It ends with `SELF-TEST PASSED`.
 
 ## Set up your booth
 
@@ -160,11 +160,13 @@ Tandem fits laptop screens, down to a 1080p laptop at 175% display scaling.
 ## Play together
 
 1. **Get connected.** The easiest way is for both of you to install [Tailscale](https://tailscale.com) (free) and sign in. You'll each get a `100.x.y.z` address that works from anywhere. Without it, the host has to forward TCP port 47800 on their router.
-2. **Host.** One of you clicks **Host a room**, then sends the other one of the listed addresses and the room code. Click **Allow** if Windows Firewall asks.
-3. **Join.** The other clicks **Join a room**, enters the address and code, and joins.
-4. **Check the connection.** The top bar shows your partner, the round-trip time and **✔ in sync**. If it says **⚠ no reply for N s** instead, nothing has arrived from the other PC for a while: its connection has stalled. The room carries on if it comes back within 15 seconds.
+2. **Host.** One of you clicks **Host a room**, then sends the others one of the listed addresses and the room code. Click **Allow** if Windows Firewall asks. Only the host needs to be reachable: everyone else connects to the host.
+3. **Join.** The others click **Join a room**, enter the address and code, and join. Up to three can join as DJs, so a room holds four.
+4. **Check the connection.** The top bar shows who you're playing with, the round-trip time and **✔ in sync**. On the host's PC each DJ has their own round trip; on everyone else's, it's the trip to the host. If it says **⚠ no reply for N s** instead, nothing has arrived from that PC for a while: its connection has stalled. The room carries on if it comes back within 15 seconds.
 
-**If the connection drops,** the joining PC gets back into the room by itself. Its top bar says **Reconnecting to … attempt N** while it tries (for up to 5 minutes), and the host's says **Waiting for … to reconnect**. The decks play on meanwhile, and you can both keep going: once it's back, what each of you did meanwhile comes into the room on both PCs, at the moment it was done. On a control you both touched, whichever move came later wins. Your partner's moves land when you're back together, so a fader they moved meanwhile jumps to where they left it, and a deck they started plays on from where it would be by now. A load onto a deck the other DJ had playing out loud by then is refused, with the usual note. A track that was being sent either way pauses and carries on from where it got to once you're back together, and a deck waiting for it comes in where the room is. **Give up** stops trying; joining the same room again within the 5 minutes still brings your moves. Leaving on purpose, or the host closing the room, never starts this.
+Every DJ can work every deck and the whole mixer: there are no deck assignments, so agree among yourselves who takes which.
+
+**If the connection drops,** the joining PC gets back into the room by itself. Its top bar says **Reconnecting to … attempt N** while it tries (for up to 5 minutes), and the host's says **Waiting for … to reconnect**. The decks play on meanwhile, and everyone can keep going: once it's back, what each of you did meanwhile comes into the room on every PC, at the moment it was done. On a control more than one of you touched, whichever move came later wins. The others' moves land when you're back together, so a fader they moved meanwhile jumps to where they left it, and a deck they started plays on from where it would be by now. A load onto a deck another DJ had playing out loud by then is refused, with the usual note. A track that was being sent either way pauses and carries on from where it got to once you're back together, and a deck waiting for it comes in where the room is. The room keeps your place while it waits, so nobody else can take your seat as a DJ. **Give up** stops trying; joining the same room again within the 5 minutes still brings your moves. Leaving on purpose, or the host closing the room, never starts this. When a DJ who joined leaves, the room carries on for everyone else; when the host leaves, the room closes.
 
 **Sync click** in the top bar plays a metronome on the shared room clock. Put both laptops side by side, or on a phone call, and the clicks should line up.
 
@@ -172,8 +174,10 @@ Tandem fits laptop screens, down to a 1080p laptop at 175% display scaling.
 
 1. Pick a folder or Serato crate.
 2. Click **Share this list…** and confirm you have the right to share it.
-3. Your partner gets a popup and must agree to use the tracks for personal, non-commercial purposes before anything downloads.
+3. Every other DJ in the room gets a popup, and each must agree to use the tracks for personal, non-commercial purposes before anything downloads to them.
 4. Tracks they already have are skipped. The rest are saved to `Music\Tandem Shared\<your name>\<crate>` and show up under **Shared with me**.
+
+A share between two DJs who both joined goes through the host's PC. The host passes the tracks on without keeping them: they sit in its session folder, which is emptied when Tandem closes, unless the host accepts the share too.
 
 Every agreement is written to a local consent log (Settings → General → Logs and consent record).
 
@@ -207,9 +211,9 @@ What a broadcaster can and can't do:
 
 - **It can't change anything.** Its main window has no decks, mixer or library, only the DJs' names, whether the decks' tracks have arrived, the feed's level and these instructions. A controller plugged into it does nothing, and the host ignores anything it sends.
 - **It doesn't need your music.** Tracks come from the host as the DJs load them, and are deleted when Tandem closes, like the session copies a DJ gets of their partner's tracks. A track takes a few seconds to arrive (a joining DJ's goes through the host), and its deck is silent on the stream until it has.
-- **It runs 1000 ms behind the room,** twice a DJ's broadcast delay, because the joining DJ's moves reach it through the host. That leaves room for slow connections, and viewers can't tell. It's its own setting: Settings → Audio → Broadcast delay changes it while you're broadcasting, and your delay as a DJ stays as it was.
+- **It runs 1000 ms behind the room,** twice a DJ's broadcast delay, because the joining DJs' moves reach it through the host. That leaves room for slow connections, and viewers can't tell. It's its own setting: Settings → Audio → Broadcast delay changes it while you're broadcasting, and your delay as a DJ stays as it was.
 - **TIMING,** in its main window, shows how long the DJs' moves take to get there (the longest in the last minute). If that gets too close to the delay, some moves land late on the stream: TIMING turns amber, the top bar warns, and one click raises the delay enough. The stream repeats that much once as it changes, so do it between tracks if you can.
-- **Both DJs see it** in the top bar (📡 and its name). Up to 4 broadcasters can join a room, alongside the two DJs. Tandem remembers the **Broadcaster only** tick for next time.
+- **Every DJ sees it** in the top bar (📡 and its name). Up to 4 broadcasters can join a room, alongside up to four DJs. Tandem remembers the **Broadcaster only** tick for next time.
 - **If the connection drops,** it gets back into the room by itself, and the stream plays on meanwhile as the room last was. **If the host leaves,** or it can't get back in within 5 minutes, its decks empty and it goes quiet. Join again to carry on.
 
 ## Trying it on one PC
@@ -224,7 +228,7 @@ Host in one window and join `127.0.0.1` from the other.
 
 ## Known limits in v0.11
 
-- **Decks and DJs:** 4 decks, 2 DJs per room, plus up to 4 broadcasters. There's one sync master: you can't sync two groups of decks to two different tempos.
+- **Decks and DJs:** 4 decks and up to 4 DJs per room, plus up to 4 broadcasters. Every DJ can touch every deck: there are no deck assignments. There's one sync master: you can't sync two groups of decks to two different tempos. The host's PC carries everyone's moves and tracks, so its connection matters most.
 - **Beatgrids:** detection finds big, steady tempo changes but not gradual drifts, and doesn't find bars (the "1"). Some tracks come out at half or double time (87 instead of 174, say): **½** and **×2** under GRID fix that. Set markers by hand for both: see [Fixing a beatgrid](#fixing-a-beatgrid). A grid can have up to 32 markers, and every bar is 4 beats. Hot cues and play aren't snapped to the beat, except on a synced deck (loops are: see [Loops](#loops)). Quantized loops count bars from the beat you press IN on, not from the grid's bar 1.
 - **Loops:** loop rolls are the only slip feature (no slip mode for scratching, hot cues or loops), there's no beat jump (the FLX6's BEAT JUMP pads roll) and no slicer, no fine-adjusting IN/OUT with the jog wheel, and loops aren't saved with the track.
 - **Keys:** detection is good but not perfect: on a test library it matched reference tools on about 3 tracks in 4, and most misses were a compatible neighbour (the relative major/minor, or one step round the Camelot wheel). A track gets one key, even if it changes key part-way through.
@@ -241,7 +245,7 @@ Host in one window and join `127.0.0.1` from the other.
   - Check that the address and room code are right.
   - The host must click **Allow** on the Windows Firewall prompt (or allow `tandem.exe` in firewall settings).
   - Without Tailscale, the host needs TCP 47800 forwarded.
-  - **"This room already has two DJs":** to join just to stream, tick **Broadcaster only**.
+  - **"This room already has 4 DJs":** to join just to stream, tick **Broadcaster only**. A DJ whose connection dropped keeps their seat for 5 minutes while they reconnect.
 - **The broadcaster says moves arrive late.** Click the raise button in its TIMING. If it only happens while tracks are being sent, lower **Upload speed limit** (Settings → General) on the host. That limit covers all of a PC's uploads together, so it keeps track transfers from filling the connection that carries the DJs' moves.
 - **Controller not listed.** Close other DJ software, replug it, then click **Refresh**.
 - **No sound.** Pick the right devices in **Settings → Audio** and check **Status** there.

@@ -1,12 +1,16 @@
 //! Track transfer over a dedicated TCP connection per file.
 //!
-//! Connections always go from the joining DJ to the host (so only the host
+//! Connections always go from a joining DJ to the host (so only the host
 //! needs an open port): the joiner either downloads (`FileGet`) or uploads
 //! (`FilePut`, when the host asked for one of the joiner's tracks). Every
 //! file is checked against its content hash before it's used.
 //!
-//! Broadcasters only download. A track the joining DJ loaded reaches them
-//! through the host: if the host is still receiving it, the download waits.
+//! Broadcasters only download. A track a joining DJ loaded reaches them, and
+//! the other joining DJs, through the host. If the host is still receiving
+//! it, the download waits; if that takes a while, the host says to ask
+//! again later (`FileError::later`). A track a joining DJ offered in a share
+//! goes the same way to the DJs who accept it: the host fetches it from the
+//! DJ who offered it when one asks.
 //!
 //! The upload speed limit is for all of a booth's uploads together (one
 //! [`UploadPacer`] per session), so a host sending tracks to its partner and
@@ -80,7 +84,7 @@ impl UploadPacer {
 const CHUNK: usize = 128 * 1024;
 /// How long a download waits for a track the host is still receiving.
 /// Under the asker's 30 s read timeout; it asks again if this runs out.
-const PENDING_WAIT: Duration = Duration::from_secs(20);
+pub const PENDING_WAIT: Duration = Duration::from_secs(20);
 /// The transfers running in this booth, so they can be stopped: all of
 /// them with a booth whose link dropped, and one writing a `.part` file
 /// that a newer transfer of the same track wants.
@@ -224,6 +228,23 @@ impl std::error::Error for BadPartial {}
 /// True if a transfer ended because it was stopped, not because it failed.
 pub fn was_stopped<T>(res: &anyhow::Result<T>) -> bool {
     matches!(res, Err(e) if e.downcast_ref::<Stopped>().is_some())
+}
+
+/// The host is still getting the track from the DJ who has it: ask again.
+#[derive(Debug)]
+struct NotYet(String);
+
+impl std::fmt::Display for NotYet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NotYet {}
+
+/// True if a download asked the host too soon (see [`NotYet`]).
+pub fn not_yet(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<NotYet>().is_some()
 }
 
 /// True if a transfer was cut off by the network (the connection closed,
@@ -388,27 +409,35 @@ pub fn serve(
     match m {
         Msg::FileGet { id, offset } => {
             let start = Instant::now();
+            let (mut answer, wait) = {
+                let mut ses = h.lock();
+                (ses.servable_for(id, from.id, broadcaster), ses.pending_wait)
+            };
             let path = loop {
-                match h.lock().servable(id) {
-                    Servable::Ready(path) => break Some(path),
-                    Servable::Pending if start.elapsed() < PENDING_WAIT => {}
-                    Servable::Pending | Servable::No => break None,
+                match answer {
+                    Servable::Ready(path) => break Ok(path),
+                    Servable::Pending if start.elapsed() < wait => {}
+                    Servable::Pending => break Err(true),
+                    Servable::No => break Err(false),
                 }
                 std::thread::sleep(Duration::from_millis(200));
+                answer = h.lock().servable(id);
             };
             let (rate, running) = {
                 let ses = h.lock();
                 (ses.max_upload_bytes_s, ses.running())
             };
-            let Some(path) = path else {
-                write_msg(
-                    &mut s,
-                    &Msg::FileError {
-                        reason: "The host doesn't have that track yet.".into(),
-                    },
-                    &[],
-                )?;
-                return Ok(());
+            let path = match path {
+                Ok(path) => path,
+                Err(later) => {
+                    let reason = match later {
+                        true => "The host is still getting that track.",
+                        false => "The host doesn't have that track.",
+                    };
+                    let reason = reason.into();
+                    write_msg(&mut s, &Msg::FileError { reason, later }, &[])?;
+                    return Ok(());
+                }
             };
             let size = std::fs::metadata(&path)?.len();
             // Carry on from where the asker got to, if the file has that.
@@ -453,12 +482,15 @@ pub fn serve(
         Msg::FilePut {
             id, size, resume, ..
         } => {
-            let expected = (!broadcaster).then(|| h.lock().accept_push(id)).flatten();
+            let expected = (!broadcaster)
+                .then(|| h.lock().accept_push(id, from.id))
+                .flatten();
             let Some(expected) = expected else {
                 write_msg(
                     &mut s,
                     &Msg::FileError {
                         reason: "Not expecting that file.".into(),
+                        later: false,
                     },
                     &[],
                 )?;
@@ -484,6 +516,7 @@ pub fn serve(
                         &mut s,
                         &Msg::FileError {
                             reason: "the file didn't check out".into(),
+                            later: false,
                         },
                         &[],
                     );
@@ -505,7 +538,7 @@ pub fn serve(
     }
 }
 
-/// Host: receive the upload the joining DJ (`from`) offered, carrying on
+/// Host: receive the upload a joining DJ (`from`) offered, carrying on
 /// from the `.part` file if it can.
 #[allow(clippy::too_many_arguments)]
 fn recv_push(
@@ -575,7 +608,11 @@ pub fn fetch(
             write_msg(&mut s, &Msg::FileGet { id, offset: p.have }, &[])?;
             let (size, offset) = match read_msg(&mut s)?.0 {
                 Msg::FileHeader { size, offset, .. } => (size, offset),
-                Msg::FileError { reason } => bail!(reason),
+                Msg::FileError {
+                    reason,
+                    later: true,
+                } => return Err(NotYet(reason).into()),
+                Msg::FileError { reason, .. } => bail!(reason),
                 Msg::Reject { reason } => bail!(reason),
                 other => bail!("unexpected reply {other:?}"),
             };
@@ -645,7 +682,7 @@ pub fn push(
         let offset = match read_msg(&mut s)?.0 {
             Msg::FileOk { offset } if offset <= size => offset,
             Msg::FileOk { offset } => bail!("the host asked for byte {offset} of {size}"),
-            Msg::FileError { reason } | Msg::Reject { reason } => bail!(reason),
+            Msg::FileError { reason, .. } | Msg::Reject { reason } => bail!(reason),
             other => bail!("unexpected reply {other:?}"),
         };
         if offset > 0 {
@@ -772,7 +809,7 @@ fn recv_body(
                 }
             }
             Msg::End => break,
-            Msg::FileError { reason } => bail!(reason),
+            Msg::FileError { reason, .. } => bail!(reason),
             other => bail!("unexpected {other:?} during transfer"),
         }
     }

@@ -196,7 +196,6 @@ fn button_scale(deck_w: f32) -> f32 {
     ((deck_w - 12.0) / COMPACT_ROW_W).clamp(0.7, 1.0)
 }
 
-/// Camelot-compatible: same key, relative major/minor, or one step round the wheel.
 /// Who's broadcasting this room, if anyone.
 fn broadcasters(ui: &mut egui::Ui, view: &SessionView) {
     let names: Vec<&str> = view
@@ -213,6 +212,59 @@ fn broadcasters(ui: &mut egui::Ui, view: &SessionView) {
         .on_hover_text("Broadcasting this room: they see and hear the set as the stream does, and can't change anything.");
 }
 
+/// A link's light: green, or amber when it has gone quiet.
+fn link_dot(ui: &mut egui::Ui, quiet: bool) {
+    let (dot, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
+    ui.painter()
+        .circle_filled(dot.center(), 4.0, if quiet { AMBER } else { GREEN });
+}
+
+/// The host's links: each joining DJ with their round trip, then those
+/// expected back. `narrow` with several DJs: the round trips go in hover
+/// text.
+fn host_links(ui: &mut egui::Ui, view: &SessionView, narrow: bool) {
+    let links = &view.link.links;
+    let many = links.len() > 1;
+    for l in links {
+        let name = l.info.name.as_str();
+        // A stalled link keeps its last round trip, which would look healthy.
+        let quiet = Some(l.quiet_for).filter(|q| *q >= LINK_QUIET);
+        link_dot(ui, quiet.is_some());
+        let label = ui.label(RichText::new(name).color(GREEN).strong());
+        if let Some(q) = quiet {
+            ui.label(RichText::new(format!("⚠ no reply for {} s", q.as_secs())).color(AMBER))
+                .on_hover_text(format!(
+                    "Nothing has arrived from {name} for a while: a connection may have dropped. If it comes back within {} s the room carries on as before; after that, their Tandem reconnects by itself.",
+                    LINK_TIMEOUT.as_secs()
+                ));
+            continue;
+        }
+        let Some(rtt) = l.rtt_us else { continue };
+        let ms = rtt as f64 / 1000.0;
+        let tip = format!("Time for a message to reach {name} and come back. Your own controls are always instant; {name}'s arrive about half this late in your headphones, and exactly on time in the broadcast.");
+        match (many, narrow) {
+            (true, true) => {
+                label.on_hover_text(format!("{ms:.0} ms round trip.\n\n{tip}"));
+            }
+            (true, false) => {
+                ui.label(format!("{ms:.0} ms")).on_hover_text(tip);
+            }
+            (false, _) => {
+                ui.label(format!("{ms:.0} ms round trip"))
+                    .on_hover_text(tip);
+            }
+        }
+    }
+    for name in &view.link.awaiting {
+        ui.label(RichText::new(format!("Waiting for {name} to reconnect…")).color(AMBER))
+            .on_hover_text(format!("The link to {name} dropped. Their Tandem keeps trying to get back in for {} minutes, and the room carries on meanwhile. Once they're back, what they did meanwhile comes into the room too; on a control more than one of you touched, whichever move came later wins.", REJOIN_FOR.as_secs() / 60));
+    }
+    if links.is_empty() && view.link.awaiting.is_empty() {
+        ui.label(RichText::new("Waiting for other DJs to join…").color(AMBER));
+    }
+}
+
+/// Camelot-compatible: same key, relative major/minor, or one step round the wheel.
 pub(crate) fn keys_fit(a: i8, b: i8) -> bool {
     let (ca, cb) = (tandem_core::keys::camelot(a), tandem_core::keys::camelot(b));
     let split = |c: &str| {
@@ -360,7 +412,7 @@ impl TandemApp {
         let mut tip = if broadcasting {
             format!("The link to the room dropped, so Tandem is getting this booth back in. It keeps trying for {mins} minutes. The stream plays on as the room last was, and follows the room again once it's back.")
         } else {
-            format!("The link to the room dropped, so Tandem is getting you back in. It keeps trying for {mins} minutes. Your decks play on meanwhile. Once you're back, what you did meanwhile reaches the room and what your partner did reaches you; on a control you both touched, whichever move came later wins.")
+            format!("The link to the room dropped, so Tandem is getting you back in. It keeps trying for {mins} minutes. Your decks play on meanwhile. Once you're back, what you did meanwhile reaches the room and what the others did reaches you; on a control more than one of you touched, whichever move came later wins.")
         };
         if let Some(e) = &r.error {
             tip.push_str(&format!("\n\nLast try: {e}"));
@@ -376,48 +428,41 @@ impl TandemApp {
         }
     }
 
-    /// Your partner, the round trip and whether the room is in sync.
-    /// `narrow`: the clock spread goes in the round trip's hover text.
+    /// Who this booth is in the room with, the round trip and whether the
+    /// room is in sync. The host shows each joining DJ's own link; a joining
+    /// booth's one link is to the host. `narrow`: the clock spread (and on
+    /// the host, with several DJs, each round trip) go in hover text.
     fn peer_status(&mut self, ui: &mut egui::Ui, view: &SessionView, narrow: bool) {
-        let Some(peer) = &view.link.peer else {
-            match &view.link.awaiting {
-                Some(name) => {
-                    ui.label(RichText::new(format!("Waiting for {name} to reconnect…")).color(AMBER))
-                        .on_hover_text(format!("The link to {name} dropped. Their Tandem keeps trying to get back in for {} minutes, and the room carries on meanwhile. Once they're back, what they did meanwhile comes into the room too; on a control you both touched, whichever move came later wins.", REJOIN_FOR.as_secs() / 60));
-                }
-                None => {
-                    ui.label(RichText::new("Waiting for your partner to join…").color(AMBER));
-                }
-            }
+        if matches!(view.link.role, RoleView::Hosting { .. }) {
+            host_links(ui, view, narrow);
+            return;
+        }
+        let Some(link) = view.link.links.first() else {
             return;
         };
         let broadcasting = matches!(view.link.role, RoleView::Broadcasting { .. });
         // A stalled link keeps its last round trip, which would look healthy.
-        let quiet = view.link.quiet_for.filter(|q| *q >= LINK_QUIET);
-        let (dot, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
-        ui.painter().circle_filled(
-            dot.center(),
-            4.0,
-            if quiet.is_some() { AMBER } else { GREEN },
-        );
+        let quiet = Some(link.quiet_for).filter(|q| *q >= LINK_QUIET);
+        link_dot(ui, quiet.is_some());
+        let djs: Vec<&str> = view
+            .link
+            .roster
+            .djs
+            .iter()
+            .filter(|p| broadcasting || p.id != view.me.id)
+            .map(|p| p.name.as_str())
+            .collect();
         let name = if broadcasting {
-            let djs: Vec<&str> = view
-                .link
-                .roster
-                .djs
-                .iter()
-                .map(|p| p.name.as_str())
-                .collect();
             djs.join(" b2b ")
         } else {
-            peer.name.clone()
+            djs.join(", ")
         };
         ui.label(RichText::new(name).color(GREEN).strong());
+        let host = link.info.name.as_str();
         if let Some(q) = quiet {
-            let (other, after) = match &view.link.role {
-                RoleView::Broadcasting { .. } => ("the host", "this booth reconnects by itself"),
-                RoleView::Joined { .. } => ("your partner", "Tandem reconnects you by itself"),
-                _ => ("your partner", "their Tandem reconnects by itself"),
+            let (other, after) = match broadcasting {
+                true => ("the host", "this booth reconnects by itself"),
+                false => (host, "Tandem reconnects you by itself"),
             };
             ui.label(RichText::new(format!("⚠ no reply for {} s", q.as_secs())).color(AMBER))
                 .on_hover_text(format!(
@@ -430,13 +475,14 @@ impl TandemApp {
             .link
             .clock_spread_us
             .map(|spread| format!("{:.1} ms", spread as f64 / 2000.0));
-        if let Some(rtt) = view.link.rtt_us {
+        if let Some(rtt) = link.rtt_us {
             let mut tip = if broadcasting {
-                "Time for a message to reach the host and come back. This booth plays the room a broadcast delay behind, so both DJs' moves are on time in it."
+                "Time for a message to reach the host and come back. This booth plays the room a broadcast delay behind, so every DJ's moves are on time in it.".to_string()
+            } else if djs.len() <= 1 {
+                "Time for a message to reach your partner and come back. Your own controls are always instant; your partner's arrive about half this late in your headphones, and exactly on time in the broadcast.".to_string()
             } else {
-                "Time for a message to reach your partner and come back. Your own controls are always instant; your partner's arrive about half this late in your headphones, and exactly on time in the broadcast."
-            }
-            .to_string();
+                format!("Time for a message to reach {host}, the host, and come back. Your own controls are always instant. {host}'s moves arrive about half this late in your headphones; the other DJs' come through {host}, so they take their own trip there too. In the broadcast, everyone's are on time.")
+            };
             if let (true, Some(c)) = (narrow, &clock) {
                 tip = format!("{tip}\n\nShared clock accurate to about ±{c}.");
             }
@@ -1532,8 +1578,8 @@ impl TandemApp {
             ui.label(RichText::new("CURVE").small().strong());
             curve_icon(ui, cur);
             let mut tip = cur.about().to_string();
-            if view.link.peer.is_some() {
-                tip.push_str("\n\nThe curve is part of the room: changing it changes it for your partner too.");
+            if view.link.linked() {
+                tip.push_str("\n\nThe curve is part of the room: changing it changes it for everyone in the room.");
             }
             egui::ComboBox::from_id_salt("xf-curve")
                 .selected_text(cur.label())
@@ -1688,8 +1734,8 @@ impl TandemApp {
                 Color32::from_gray(38)
             };
             let mut tip = tip;
-            if view.link.peer.is_some() {
-                tip.push_str(". Part of the room: it changes for your partner too.");
+            if view.link.linked() {
+                tip.push_str(". Part of the room: it changes for everyone in the room.");
             }
             let r = ui
                 .add(
@@ -2223,26 +2269,22 @@ fn deck_status(dv: &DeckView, view: &SessionView, short: bool) -> Option<(String
             }
             let text = match t {
                 Some(t) if t.state == TransferState::Paused && t.done == 0 => {
-                    "Receiving this track from your partner: waiting until the link is back".into()
+                    "Receiving this track: waiting until the link is back".into()
                 }
                 Some(t) if t.state == TransferState::Paused => format!(
-                    "Receiving this track from your partner: paused at {:.0}% until the link is back",
+                    "Receiving this track: paused at {:.0}% until the link is back",
                     pct(t.done)
                 ),
-                Some(t) if t.state == TransferState::Queued && t.done > 0 => format!(
-                    "Receiving this track from your partner… resuming at {:.0}%",
-                    pct(t.done)
-                ),
+                Some(t) if t.state == TransferState::Queued && t.done > 0 => {
+                    format!("Receiving this track… resuming at {:.0}%", pct(t.done))
+                }
                 Some(t) if t.from > 0 => format!(
-                    "Receiving this track from your partner… {:.0}% (resumed at {:.0}%)",
+                    "Receiving this track… {:.0}% (resumed at {:.0}%)",
                     pct(t.done),
                     pct(t.from)
                 ),
-                Some(t) => format!(
-                    "Receiving this track from your partner… {:.0}%",
-                    pct(t.done)
-                ),
-                None => "Receiving this track from your partner…".to_string(),
+                Some(t) => format!("Receiving this track… {:.0}%", pct(t.done)),
+                None => "Receiving this track…".to_string(),
             };
             Some((text, AMBER))
         }

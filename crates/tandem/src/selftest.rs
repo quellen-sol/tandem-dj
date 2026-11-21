@@ -77,7 +77,7 @@ pub fn run() -> i32 {
         }
     }
 
-    println!("\nRoom loopback test (two DJs and a broadcaster):");
+    println!("\nRoom loopback test (four DJs and a broadcaster):");
     match tandem_core::selftest::loopback(&mut |m| println!("  ok: {m}")) {
         Ok(()) => {}
         Err(e) => {

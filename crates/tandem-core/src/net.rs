@@ -1,14 +1,20 @@
-//! Rooms over TCP: one DJ hosts, the other joins.
+//! Rooms over TCP: one DJ hosts, and up to three more join, for
+//! [`MAX_DJS`] in all.
 //!
-//! The host's clock *is* the room clock. The joining DJ measures its offset
+//! The host's clock *is* the room clock. A joining DJ measures its offset
 //! with pings (see [`crate::clock`]) before applying the room state, and
 //! keeps pinging so the estimate tracks drift.
 //!
+//! The host is the hub: every joining booth's one link is to it. It passes
+//! each DJ's moves, track details and shares on to the other DJs, and their
+//! tracks too (a joining DJ gets another's track from the host, which gets
+//! it from the DJ who has it).
+//!
 //! Up to [`MAX_BROADCASTERS`] more booths can join as broadcasters: they
-//! sync their clock and receive the room exactly like the joining DJ (the
-//! host relays the DJ's events and tracks to them), so they can play the
-//! broadcast feed and show the broadcast window. They can't change anything:
-//! the host answers their pings and resync requests and ignores the rest.
+//! sync their clock and receive the room exactly like a joining DJ, so they
+//! can play the broadcast feed and show the broadcast window. They can't
+//! change anything: the host answers their pings and resync requests and
+//! ignores the rest.
 //!
 //! A booth whose link to the host drops without anyone leaving (no `Bye`)
 //! gets back in by itself: see [`rejoin`]. The host knows it's the same
@@ -85,7 +91,10 @@ impl PeerConn {
     }
 }
 
-/// How many booths can join a room as broadcasters, besides the two DJs.
+/// How many DJs a room takes, the host included.
+pub const MAX_DJS: usize = 4;
+
+/// How many booths can join a room as broadcasters, besides the DJs.
 pub const MAX_BROADCASTERS: usize = 4;
 
 /// A control link that hears nothing for this long is dropped.
@@ -294,7 +303,7 @@ fn host_control(
             Ok((m, _)) if broadcaster => {
                 log::debug!("ignoring {m:?} from broadcaster {}", info.name)
             }
-            Ok((m, _)) => h.lock().on_control_msg(m),
+            Ok((m, _)) => h.lock().on_control_msg(serial, m),
             Err(e) => break LinkEnd::Lost(why_lost(&e, timeout)),
         }
     };
@@ -548,7 +557,7 @@ fn start_link(
         merged,
     );
     for m in buffered {
-        ses.on_control_msg(m);
+        ses.on_control_msg(serial, m);
     }
 
     // Reader. When the link breaks without a Bye, it stays on to get the
@@ -564,7 +573,7 @@ fn start_link(
                         h2.lock().on_pong(t1, remote, t2);
                     }
                     Ok((Msg::Bye, _)) => break LinkEnd::Bye,
-                    Ok((m, _)) => h2.lock().on_control_msg(m),
+                    Ok((m, _)) => h2.lock().on_control_msg(serial, m),
                     Err(e) => break LinkEnd::Lost(why_lost(&e, timeout)),
                 }
             };
@@ -605,7 +614,7 @@ fn start_link(
     Ok(())
 }
 
-/// Join a host's room, as the second DJ or, with `broadcaster`, only to
+/// Join a host's room, as one of its DJs or, with `broadcaster`, only to
 /// play and show the set for a stream. Blocks for the handshake and initial
 /// clock sync (about a second), then runs in the background.
 pub fn join(
@@ -694,7 +703,7 @@ mod tests {
     use crate::files::Landing;
     use crate::library::Library;
     use crate::model::{Action, TrackId};
-    use crate::session::{RoleView, TrackStatus, Transfer, TransferState};
+    use crate::session::{RoleView, ShareState, TrackStatus, Transfer, TransferState};
     use crate::time::SharedClock;
     use parking_lot::Mutex;
     use std::io::{Read, Write};
@@ -887,7 +896,7 @@ mod tests {
     /// In the room with its link up, and not getting back in.
     fn linked(h: &SessionHandle) -> bool {
         let v = h.lock().view();
-        v.link.peer.is_some() && v.link.rejoin.is_none()
+        v.link.linked() && v.link.rejoin.is_none()
     }
 
     fn names(v: &[PeerInfo]) -> Vec<String> {
@@ -917,7 +926,7 @@ mod tests {
         relay.sever();
         wait_for("Bob to notice", Duration::from_secs(5), || rejoining(&bob));
         wait_for("Alice to notice", Duration::from_secs(5), || {
-            alice.lock().view().link.awaiting.as_deref() == Some("Bob")
+            alice.lock().view().link.awaiting == ["Bob"]
         });
         assert!(matches!(
             bob.lock().view().link.role,
@@ -930,7 +939,7 @@ mod tests {
         });
         wait_for("Alice to see Bob back", Duration::from_secs(5), || {
             let v = alice.lock().view();
-            v.link.peer.as_ref().map(|p| p.id) == Some(bob_id) && v.link.awaiting.is_none()
+            v.link.links.iter().any(|l| l.info.id == bob_id) && v.link.awaiting.is_empty()
         });
         assert_eq!(bob.lock().latest().decks[1].volume, 0.75);
         assert!(
@@ -1019,7 +1028,7 @@ mod tests {
             assert!(c.latest().decks[0].playing, "Carol stopped playing");
         }
         assert!(
-            alice.lock().view().link.peer.is_some(),
+            alice.lock().view().link.linked(),
             "Alice dropped Bob before the test could check the replacement"
         );
 
@@ -1180,7 +1189,7 @@ mod tests {
         thread::sleep(Duration::from_secs(3));
         assert!(!rejoining(&bob));
         assert!(
-            bob.lock().view().link.peer.is_none(),
+            !bob.lock().view().link.linked(),
             "Bob got back in after giving up"
         );
         alice.lock().leave();
@@ -1216,7 +1225,7 @@ mod tests {
     }
 
     fn awaiting(h: &SessionHandle) -> bool {
-        h.lock().view().link.awaiting.is_some()
+        !h.lock().view().link.awaiting.is_empty()
     }
 
     /// Bob is back, and Alice and Bob have the same room.
@@ -1226,7 +1235,7 @@ mod tests {
         });
         wait_for("Alice to see Bob back", Duration::from_secs(5), || {
             let v = alice.lock().view();
-            v.link.peer.is_some() && v.link.awaiting.is_none()
+            v.link.linked() && v.link.awaiting.is_empty()
         });
         wait_for("Alice and Bob to agree", Duration::from_secs(5), || {
             digests_match(alice, bob)
@@ -1430,8 +1439,8 @@ mod tests {
     }
 
     /// Only the booth whose place the room is holding brings moves in: not
-    /// one that knows its id (every event carries it) but not its key, nor
-    /// another booth joining fresh.
+    /// one that knows its id (every event carries it) but not its key, which
+    /// is turned away, nor another booth joining fresh.
     #[test]
     fn only_the_awaited_booth_brings_moves_in() {
         let rig = Rig::new("merge-others");
@@ -1466,18 +1475,21 @@ mod tests {
             let mut s =
                 connect_with(addr, ConnKind::Control, "MERGE7", &who, key, false, cut_off).unwrap();
             match read_msg(&mut s).unwrap().0 {
+                Msg::Reject { reason } if who.name == "Bob" => {
+                    assert!(reason.starts_with(ROOM_FULL), "{reason}")
+                }
                 Msg::Welcome {
                     merged, timeline, ..
-                } => {
+                } if who.name != "Bob" => {
                     assert!(!merged, "{} brought moves in", who.name);
                     assert_eq!(timeline.latest().crossfader, 0.5);
                 }
-                other => panic!("{} wasn't welcomed: {other:?}", who.name),
+                other => panic!("{}: {other:?}", who.name),
             }
             assert_eq!(alice.lock().latest().crossfader, 0.5);
             drop(s);
             wait_for("Alice to see it go", Duration::from_secs(5), || {
-                alice.lock().view().link.peer.is_none()
+                !alice.lock().view().link.linked()
             });
         }
         alice.lock().leave();
@@ -1670,7 +1682,7 @@ mod tests {
         relay.blackhole();
         wait_for("Bob to notice", Duration::from_secs(10), || rejoining(&bob));
         assert!(
-            alice.lock().view().link.peer.is_some(),
+            alice.lock().view().link.linked(),
             "Alice dropped Bob before he was back"
         );
         relay.restore();
@@ -1794,8 +1806,217 @@ mod tests {
             matches!(bob.lock().view().link.role, RoleView::Solo)
         });
         assert!(!rejoining(&bob));
-        assert!(dave.lock().view().link.peer.is_none());
+        assert!(!dave.lock().view().link.linked());
         for h in [&alice, &bob, &dave] {
+            h.lock().leave();
+        }
+    }
+
+    /// Four DJs share a room and a fifth is turned away, though a
+    /// broadcaster still gets in. Each DJ's moves reach every booth, and a
+    /// track only one joining DJ has reaches the others and the broadcaster
+    /// through the host. One DJ leaving doesn't end the room for the rest,
+    /// and frees their seat.
+    #[test]
+    fn four_djs_share_a_room() {
+        let rig = Rig::new("four-djs");
+        let t = LINK_TIMEOUT;
+        let alice = rig.booth("Alice", 0, t);
+        let bob = rig.booth("Bob", 3_600_000_000, t);
+        let carol = rig.booth("Carol", -1_800_000_000, t);
+        let dave = rig.booth("Dave", 900_000_000, t);
+        let eve = rig.booth("Eve", 0, t);
+        let port = host(&alice, 0, "FOUR12").unwrap();
+        let addr = format!("127.0.0.1:{port}");
+        for h in [&bob, &carol, &dave] {
+            join(h, &addr, "FOUR12", false).unwrap();
+        }
+        let err = join(&eve, &addr, "FOUR12", false).unwrap_err();
+        assert!(format!("{err:#}").contains("4 DJs"), "{err:#}");
+        join(&eve, &addr, "FOUR12", true).unwrap();
+        let all = [&alice, &bob, &carol, &dave, &eve];
+        wait_for("everyone to know who's in", Duration::from_secs(5), || {
+            all.iter().all(|h| {
+                let r = h.lock().roster();
+                names(&r.djs) == ["Alice", "Bob", "Carol", "Dave"]
+                    && names(&r.broadcasters) == ["Eve"]
+            })
+        });
+        let links = alice.lock().view().link.links;
+        let to: Vec<&str> = links.iter().map(|l| l.info.name.as_str()).collect();
+        assert_eq!(to, ["Bob", "Carol", "Dave"]);
+
+        alice.lock().act(Action::Crossfader { v: 0.2 });
+        bob.lock().act(Action::Volume { deck: 0, v: 0.3 });
+        carol.lock().act(Action::Volume { deck: 1, v: 0.4 });
+        dave.lock().act(Action::Volume { deck: 2, v: 0.5 });
+        wait_for(
+            "every move to reach every booth",
+            Duration::from_secs(5),
+            || {
+                all.iter().all(|h| {
+                    let r = h.lock().latest();
+                    let v: Vec<f32> = r.decks.iter().map(|d| d.volume).collect();
+                    r.crossfader == 0.2 && v[..3] == [0.3, 0.4, 0.5]
+                })
+            },
+        );
+
+        let wav = tone(&rig.root.join("carol-music"), "Carol Tone.wav", 4.0, 550.0);
+        carol.lock().load_path(3, wav);
+        let id = loaded(&carol, 3);
+        wait_for(
+            "everyone to get Carol's track",
+            Duration::from_secs(30),
+            || all.iter().all(|h| ready(h, id)),
+        );
+        for h in [&alice, &bob, &dave, &eve] {
+            arrived_whole(h, id);
+        }
+        wait_for("everyone to agree", Duration::from_secs(5), || {
+            all[1..].iter().all(|h| digests_match(&alice, h))
+        });
+
+        carol.lock().leave();
+        wait_for("everyone to see Carol go", Duration::from_secs(5), || {
+            [&alice, &bob, &dave, &eve]
+                .iter()
+                .all(|h| names(&h.lock().roster().djs) == ["Alice", "Bob", "Dave"])
+        });
+        assert!(
+            linked(&bob) && linked(&dave),
+            "Carol leaving ended the room"
+        );
+        bob.lock().act(Action::Crossfader { v: 0.6 });
+        wait_for("Bob's move to reach Dave", Duration::from_secs(5), || {
+            dave.lock().latest().crossfader == 0.6
+        });
+        let frank = rig.booth("Frank", 0, t);
+        join(&frank, &addr, "FOUR12", false).unwrap();
+        wait_for("Frank to get the room", Duration::from_secs(5), || {
+            frank.lock().latest().crossfader == 0.6 && digests_match(&alice, &frank)
+        });
+        for h in [&frank, &dave, &bob, &eve, &alice] {
+            h.lock().leave();
+        }
+    }
+
+    /// Three DJs join Alice's room, Bob through a link that goes dark.
+    /// While he's cut off the room keeps his seat (a new DJ is turned away)
+    /// and everyone plays on. Once he's back, every booth has every move
+    /// from meanwhile, each at the time it was made: Bob's reach the other
+    /// joining DJs, and theirs reach him. The cut is longer than the rooms
+    /// keep their recent moves, so his have to go in further back.
+    #[test]
+    fn a_dj_back_from_a_cut_and_the_other_djs_share_every_move() {
+        let rig = Rig::new("four-cut");
+        let t = Duration::from_secs(2);
+        let alice = rig.booth("Alice", 0, t);
+        let bob = rig.booth("Bob", 900_000_000, t);
+        let carol = rig.booth("Carol", -900_000_000, t);
+        let dave = rig.booth("Dave", 0, t);
+        let eve = rig.booth("Eve", 0, t);
+        let port = host(&alice, 0, "CUT412").unwrap();
+        let relay = Relay::new(port);
+        let addr = format!("127.0.0.1:{port}");
+        join(&bob, &relay.addr(), "CUT412", false).unwrap();
+        join(&carol, &addr, "CUT412", false).unwrap();
+        join(&dave, &addr, "CUT412", false).unwrap();
+
+        relay.blackhole();
+        bob.lock().act(Action::Volume { deck: 0, v: 0.25 });
+        wait_for("Alice to wait for Bob", Duration::from_secs(5), || {
+            alice.lock().view().link.awaiting == ["Bob"]
+        });
+        let err = join(&eve, &addr, "CUT412", false).unwrap_err();
+        assert!(format!("{err:#}").contains("4 DJs"), "{err:#}");
+        carol.lock().act(Action::Volume { deck: 1, v: 0.35 });
+        dave.lock().act(Action::Crossfader { v: 0.45 });
+        alice.lock().act(Action::Volume { deck: 2, v: 0.55 });
+        thread::sleep(Duration::from_secs(4));
+        relay.restore();
+
+        wait_for("Bob to get back in", Duration::from_secs(15), || {
+            linked(&bob)
+        });
+        let djs = [&alice, &bob, &carol, &dave];
+        // Straight away: sooner than out-of-step digests could resync them.
+        wait_for(
+            "every DJ to have every move",
+            Duration::from_millis(1500),
+            || {
+                djs.iter().all(|h| {
+                    let r = h.lock().latest();
+                    let v: Vec<f32> = r.decks.iter().map(|d| d.volume).collect();
+                    v[..3] == [0.25, 0.35, 0.55] && r.crossfader == 0.45
+                })
+            },
+        );
+        wait_for("everyone to agree", Duration::from_secs(5), || {
+            djs[1..].iter().all(|h| digests_match(&alice, h))
+        });
+        let mut r = names(&alice.lock().roster().djs);
+        r.sort();
+        assert_eq!(r, ["Alice", "Bob", "Carol", "Dave"]);
+        for h in [&bob, &carol, &dave, &alice] {
+            h.lock().leave();
+        }
+    }
+
+    /// Bob offers a track only he has. Carol and Dave accept and get it
+    /// through Alice, the host, who never accepts it: she fetches it from
+    /// Bob to pass on. While it's on its way to her, their downloads are
+    /// told to ask again, and wait rather than fail.
+    #[test]
+    fn a_share_between_joining_djs_goes_through_the_host() {
+        let rig = Rig::new("four-share");
+        let t = LINK_TIMEOUT;
+        let alice = rig.booth("Alice", 0, t);
+        let bob = rig.booth("Bob", 0, t);
+        let carol = rig.booth("Carol", 0, t);
+        let dave = rig.booth("Dave", 0, t);
+        // About 4 s for Bob to send it, a few asks' worth of waiting.
+        alice.lock().pending_wait = Duration::from_millis(300);
+        bob.lock().max_upload_bytes_s = 400_000.0;
+        let port = host(&alice, 0, "SHARE4").unwrap();
+        let addr = format!("127.0.0.1:{port}");
+        for h in [&bob, &carol, &dave] {
+            join(h, &addr, "SHARE4", false).unwrap();
+        }
+        let wav = tone(&rig.root.join("bob-music"), "Bob Shared.wav", 10.0, 330.0);
+        let id = id_of(&wav);
+        bob.lock().offer_share("Bob's crate".into(), vec![wav]);
+        let offer = |h: &SessionHandle| h.lock().view().incoming.first().map(|s| s.share_id);
+        wait_for(
+            "the offer to reach everyone",
+            Duration::from_secs(10),
+            || [&alice, &carol, &dave].iter().all(|h| offer(h).is_some()),
+        );
+        let share = offer(&carol).unwrap();
+        carol.lock().respond_share(share, true);
+        dave.lock().respond_share(share, true);
+        let got = |h: &SessionHandle| {
+            let v = h.lock().view();
+            let s = &v.incoming[0];
+            assert_eq!(s.failed, 0, "{}'s download failed", h.lock().me.name);
+            s.received == 1
+        };
+        wait_for("Carol and Dave to get it", Duration::from_secs(40), || {
+            got(&carol) && got(&dave)
+        });
+        for h in [&carol, &dave] {
+            arrived_whole(h, id);
+        }
+        wait_for("Bob to hear both answers", Duration::from_secs(5), || {
+            let v = bob.lock().view();
+            v.outgoing.first().is_some_and(|(_, _, r)| r.len() == 2)
+        });
+        // Alice passed it on without taking it.
+        let a = alice.lock();
+        assert_eq!(a.view().incoming[0].state, ShareState::Pending);
+        assert!(!a.paths.shared_dir.join("Bob").exists());
+        drop(a);
+        for h in [&bob, &carol, &dave, &alice] {
             h.lock().leave();
         }
     }
