@@ -305,6 +305,8 @@ pub struct TandemApp {
     pub(crate) local_edit: LocalParams,
     /// What the controller's master and headphone level knobs do.
     pub(crate) level_knobs: LevelKnobs,
+    /// Which decks were cued last frame, to notice a CUE press.
+    pfl_seen: [bool; DECKS],
     /// When the next frame is due, at the chosen frame rate.
     next_frame: Instant,
     /// Levels from the live lane, as the mixer shows them.
@@ -428,6 +430,7 @@ impl TandemApp {
             pending: Vec::new(),
             local_edit,
             level_knobs: LevelKnobs::default(),
+            pfl_seen: local_edit.pfl,
             next_frame: Instant::now(),
             meters,
             meter_view: MeterView::default(),
@@ -527,6 +530,20 @@ impl TandemApp {
         self.ui.toast = Some((msg.into(), Instant::now()));
     }
 
+    /// A deck was just cued but no output plays the headphones: say where
+    /// to set them up instead of staying silent.
+    fn warn_unheard_cue(&mut self, view: &SessionView) {
+        let pfl = view.local.pfl;
+        let cued = pfl
+            .iter()
+            .zip(self.pfl_seen)
+            .any(|(&now, before)| now && !before);
+        self.pfl_seen = pfl;
+        if cued && !self.audio.phones && !self.audio_broadcaster {
+            self.toast("No headphone output: pick one in Settings → Audio → Headphones (cue)");
+        }
+    }
+
     pub(crate) fn restart_audio(&mut self) {
         self.audio = AudioOutputs::none(); // close devices before reopening them
         let (snap, clock) = {
@@ -554,7 +571,10 @@ impl TandemApp {
             self.audio.cue_device.as_deref(),
         );
         let mut e = self.midi.engine.lock();
-        e.card = card;
+        e.card = ControllerCard {
+            phones_mix: card.phones && self.audio.phones_mixer.is_some(),
+            ..card
+        };
         self.level_knobs = LevelKnobs::of(&e, self.midi.port.is_some());
     }
 
@@ -911,6 +931,7 @@ impl eframe::App for TandemApp {
         }
         let view = view;
         self.local_edit = view.local;
+        self.warn_unheard_cue(&view);
         self.follow_controller_card();
         self.follow_role(&view);
         self.follow_four_decks(&view.room);

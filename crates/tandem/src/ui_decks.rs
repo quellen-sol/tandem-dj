@@ -1443,13 +1443,16 @@ impl TandemApp {
     /// Headphone mix and level, master and broadcast level.
     fn local_levels(&mut self, ui: &mut egui::Ui) {
         let knobs = self.level_knobs;
+        let mixer = self.audio.phones_mixer;
         ui.label(RichText::new("Your booth only").small().weak());
         ui.spacing_mut().slider_width = 130.0;
-        ui.add(
+        ui.add_enabled(
+            mixer.is_none(),
             egui::Slider::new(&mut self.local_edit.cue_mix, 0.0..=1.0)
                 .show_value(false)
                 .text("phones: cue ↔ master"),
-        );
+        )
+        .on_disabled_hover_text(phones_mixer_tip(mixer));
         ui.add(
             egui::Slider::new(&mut self.local_edit.hp_level, 0.0..=1.0)
                 .show_value(false)
@@ -1476,6 +1479,7 @@ impl TandemApp {
     fn local_levels_compact(&mut self, ui: &mut egui::Ui) {
         let tip = "Your booth only";
         let knobs = self.level_knobs;
+        let mixer = self.audio.phones_mixer;
         ui.spacing_mut().slider_width = 64.0;
         let bcast = self.settings.audio.broadcast.is_some();
         let l = &mut self.local_edit;
@@ -1485,8 +1489,12 @@ impl TandemApp {
             .show(ui, |ui| {
                 ui.label(RichText::new("phones mix").small())
                     .on_hover_text(tip);
-                ui.add(egui::Slider::new(&mut l.cue_mix, 0.0..=1.0).show_value(false))
-                    .on_hover_text("Headphones: cue (left) ↔ master (right). Your booth only.");
+                ui.add_enabled(
+                    mixer.is_none(),
+                    egui::Slider::new(&mut l.cue_mix, 0.0..=1.0).show_value(false),
+                )
+                .on_hover_text("Headphones: cue (left) ↔ master (right). Your booth only.")
+                .on_disabled_hover_text(phones_mixer_tip(mixer));
                 ui.label(RichText::new("level").small()).on_hover_text(tip);
                 ui.add(egui::Slider::new(&mut l.hp_level, 0.0..=1.0).show_value(false))
                     .on_hover_text(knobs.phones.tip(Target::HeadphoneLevel));
@@ -1778,6 +1786,16 @@ impl TandemApp {
                 "Master level: the mix after the faders and crossfader, before your master level. Red: over full scale.",
             );
     }
+}
+
+/// Why the headphone mix slider is greyed out: `mixer`, the controller the
+/// headphones play through, blends cue and master itself.
+fn phones_mixer_tip(mixer: Option<&str>) -> String {
+    format!(
+        "Your headphones play through the {}, which blends cue and master itself: \
+         use its HEADPHONES MIX knob and MASTER CUE button.",
+        mixer.unwrap_or("controller")
+    )
 }
 
 /// What the controller's knob does to one of this booth's levels.

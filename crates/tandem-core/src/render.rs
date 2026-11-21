@@ -856,6 +856,9 @@ pub struct Lane {
     /// Where this lane publishes its levels, if it's the one metered.
     meters: Option<Arc<LevelMeters>>,
     ballistics: Ballistics,
+    /// The headphone output carries only the cued channels: the sound card
+    /// blends in the master itself.
+    cue_only: bool,
 }
 
 impl Lane {
@@ -876,7 +879,15 @@ impl Lane {
             primed: false,
             meters: None,
             ballistics: Ballistics::new(sample_rate),
+            cue_only: false,
         }
+    }
+
+    /// Send only the cued channels to the headphones, ignoring the cue/master
+    /// mix: for a controller that blends the master in with its own knob.
+    pub fn cue_only(mut self, on: bool) -> Self {
+        self.cue_only = on;
+        self
     }
 
     /// Measure this lane's channel and master levels into `meters`.
@@ -952,7 +963,7 @@ impl Lane {
                 let o = (f + i) * 2;
                 master[o] = soft_clip(m[0] * out_gain + click);
                 master[o + 1] = soft_clip(m[1] * out_gain + click);
-                let mix = local.cue_mix;
+                let mix = if self.cue_only { 0.0 } else { local.cue_mix };
                 cue[o] = soft_clip((c[0] * (1.0 - mix) + m[0] * mix) * hp + click);
                 cue[o + 1] = soft_clip((c[1] * (1.0 - mix) + m[1] * mix) * hp + click);
             }
@@ -1176,6 +1187,56 @@ mod tests {
         let l = meters.read();
         assert!((l.channels[0] - peak).abs() < 0.05 * peak, "{l:?}");
         assert!(l.master[0] < 0.05 * bus, "{l:?}");
+    }
+
+    /// Deck A cued with its fader down and the phones mix turned all the way
+    /// to master: the headphone peak with and without `cue_only`.
+    fn phones_peak(cue_only: bool) -> f32 {
+        let a = track();
+        let mut tl = Timeline::new(0);
+        for (seq, action) in [
+            Action::Load {
+                deck: 0,
+                track: a.id,
+                duration: a.duration(),
+                cue: 0.0,
+                grid: None,
+                key: -1,
+            },
+            Action::Play { deck: 0 },
+            Action::Volume { deck: 0, v: 0.0 },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            tl.insert(Event {
+                time: 0,
+                origin: 1,
+                seq: seq as u64 + 1,
+                action,
+            });
+        }
+        let mut snap = snap_with(tl, a);
+        snap.local.pfl[0] = true;
+        snap.local.cue_mix = 1.0;
+        let mut lane = Lane::new(48_000.0, 0, LaneKind::Live).cue_only(cue_only);
+        let n = 48_000;
+        let (mut m, mut c) = (vec![0.0; n * 2], vec![0.0; n * 2]);
+        lane.render(&snap, 0, &mut m, &mut c);
+        assert!(
+            m.iter().all(|x| x.abs() < 1e-3),
+            "fader down: master is silent"
+        );
+        c.iter().fold(0.0, |p, x| p.max(x.abs()))
+    }
+
+    #[test]
+    fn cue_only_phones_ignore_the_mix() {
+        // Mixed in software, "all master" leaves nothing of the cued deck...
+        assert!(phones_peak(false) < 1e-3);
+        // ...but a controller blends the master in itself, so its headphone
+        // channels always carry the cued deck.
+        assert!(phones_peak(true) > 0.1, "{}", phones_peak(true));
     }
 
     #[test]

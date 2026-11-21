@@ -12,6 +12,7 @@ use cpal::{FromSample, SizedSample};
 use parking_lot::Mutex;
 use std::sync::Arc;
 use tandem_core::config::{AudioSettings, Route};
+use tandem_core::mapping::{mixes_own_phones, CONTROLLER_PHONES_PAIR};
 use tandem_core::meter::LevelMeters;
 use tandem_core::render::{AudioSnapshot, Lane, LaneKind, StreamClock};
 use tandem_core::time::SharedClock;
@@ -29,11 +30,7 @@ pub fn list_devices() -> Vec<DeviceInfo> {
     if let Ok(devs) = host.output_devices() {
         for dev in devs {
             let Ok(name) = dev.name() else { continue };
-            let max_channels = dev
-                .supported_output_configs()
-                .ok()
-                .and_then(|it| it.map(|c| c.channels()).max())
-                .unwrap_or(2);
+            let max_channels = max_channels(&dev);
             let sample_rate = dev
                 .default_output_config()
                 .map(|c| c.sample_rate().0)
@@ -46,6 +43,14 @@ pub fn list_devices() -> Vec<DeviceInfo> {
         }
     }
     out
+}
+
+/// The most output channels `dev` offers.
+fn max_channels(dev: &cpal::Device) -> u16 {
+    dev.supported_output_configs()
+        .ok()
+        .and_then(|it| it.map(|c| c.channels()).max())
+        .unwrap_or(2)
 }
 
 pub fn default_device_name() -> Option<String> {
@@ -74,6 +79,9 @@ struct RouteOut {
     ch: usize,
     /// The master output: its lane fills the level meters.
     metered: bool,
+    /// Headphones on a controller that mixes its own: send only the cued
+    /// channels and let its HEADPHONES MIX knob blend in the master.
+    cue_only: bool,
 }
 
 pub struct AudioOutputs {
@@ -84,6 +92,13 @@ pub struct AudioOutputs {
     /// picked), and the one playing the headphones.
     pub master_device: Option<String>,
     pub cue_device: Option<String>,
+    /// Some output is playing the headphones.
+    pub phones: bool,
+    /// The headphones play through this controller's jack, and it blends
+    /// cue and master itself (its knob, not Tandem's slider).
+    pub phones_mixer: Option<&'static str>,
+    /// No headphone output was picked, so they went to that jack.
+    pub phones_auto: bool,
 }
 
 impl AudioOutputs {
@@ -94,8 +109,28 @@ impl AudioOutputs {
             errors: Arc::new(Mutex::new(Vec::new())),
             master_device: None,
             cue_device: None,
+            phones: false,
+            phones_mixer: None,
+            phones_auto: false,
         }
     }
+}
+
+/// Headphones when none are picked: the jack of the controller the master
+/// plays through, if it's one that mixes its own.
+fn auto_phones(master: &Route) -> Option<Route> {
+    mixes_own_phones(&master.device)?;
+    if master.pair == CONTROLLER_PHONES_PAIR {
+        return None;
+    }
+    let dev = cpal::default_host()
+        .output_devices()
+        .ok()?
+        .find(|d| d.name().map(|n| n == master.device).unwrap_or(false))?;
+    (max_channels(&dev) >= (CONTROLLER_PHONES_PAIR + 1) * 2).then(|| Route {
+        device: master.device.clone(),
+        pair: CONTROLLER_PHONES_PAIR,
+    })
 }
 
 /// Open every device the settings route to. The lane that plays the master
@@ -131,10 +166,25 @@ pub fn start(
                 bus: Bus::Master,
                 ch: r.pair as usize * 2,
                 metered: true,
+                cue_only: false,
             },
         );
     }
-    if let (Some(r), false) = (&cfg.cue, broadcaster) {
+    // A broadcaster's booth has no headphones.
+    let auto_cue = match (&cfg.cue, &master, broadcaster) {
+        (None, Some(m), false) => auto_phones(m),
+        _ => None,
+    };
+    let cue = cfg
+        .cue
+        .clone()
+        .filter(|_| !broadcaster)
+        .or_else(|| auto_cue.clone());
+    let phones_mixer = cue
+        .as_ref()
+        .filter(|r| r.pair == CONTROLLER_PHONES_PAIR)
+        .and_then(|r| mixes_own_phones(&r.device));
+    if let Some(r) = &cue {
         add(
             r,
             RouteOut {
@@ -142,6 +192,7 @@ pub fn start(
                 bus: Bus::Cue,
                 ch: r.pair as usize * 2,
                 metered: false,
+                cue_only: phones_mixer.is_some(),
             },
         );
     }
@@ -158,6 +209,7 @@ pub fn start(
                 bus: Bus::Master,
                 ch: r.pair as usize * 2,
                 metered: false,
+                cue_only: false,
             },
         );
     }
@@ -169,8 +221,10 @@ pub fn start(
     };
     let mut streams = Vec::new();
     let mut status = Vec::new();
+    let mut phones = false;
     for (dev, routes) in by_dev {
         let metered = routes.iter().any(|r| r.metered);
+        let has_cue = routes.iter().any(|r| r.bus == Bus::Cue);
         match open_device(
             &dev,
             routes,
@@ -184,6 +238,7 @@ pub fn start(
                 log::info!("Audio: {desc}");
                 streams.push(stream);
                 status.push(desc);
+                phones |= has_cue;
             }
             Err(e) => {
                 log::error!("Audio device \"{dev}\": {e:#}");
@@ -199,11 +254,10 @@ pub fn start(
         status,
         errors,
         master_device: master.map(|r| r.device),
-        cue_device: cfg
-            .cue
-            .as_ref()
-            .filter(|_| !broadcaster)
-            .map(|r| r.device.clone()),
+        cue_device: cue.map(|r| r.device),
+        phones,
+        phones_mixer: phones_mixer.filter(|_| phones),
+        phones_auto: auto_cue.is_some() && phones,
     }
 }
 
@@ -260,6 +314,7 @@ fn open_device(
                 "{} on ch {}/{}",
                 match (r.lane, r.bus) {
                     (LaneSel::Live, Bus::Master) => "master",
+                    (LaneSel::Live, Bus::Cue) if r.cue_only => "headphones (cue only)",
                     (LaneSel::Live, Bus::Cue) => "headphones",
                     (LaneSel::Broadcast, _) => "broadcast",
                 },
@@ -304,10 +359,13 @@ fn build<T: SizedSample + FromSample<f32>>(
         (Some(m), Some(l)) if l == sel => lane.with_meters(m.clone()),
         _ => lane,
     };
-    let mut live = routes
-        .iter()
-        .any(|r| r.lane == LaneSel::Live)
-        .then(|| lane(LaneSel::Live, Lane::new(sr, 0, LaneKind::Live)));
+    let cue_only = routes.iter().any(|r| r.cue_only);
+    let mut live = routes.iter().any(|r| r.lane == LaneSel::Live).then(|| {
+        lane(
+            LaneSel::Live,
+            Lane::new(sr, 0, LaneKind::Live).cue_only(cue_only),
+        )
+    });
     let mut bcast = routes
         .iter()
         .any(|r| r.lane == LaneSel::Broadcast)

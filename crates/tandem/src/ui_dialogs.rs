@@ -424,14 +424,18 @@ impl TandemApp {
             &mut self.settings.audio.master,
             &devices,
         );
+        let cue_off = match (self.audio.phones_auto, self.audio.phones_mixer) {
+            (true, Some(c)) => format!("Auto ({c} headphones)"),
+            _ => "Off".to_string(),
+        };
         route_editor(
             ui,
             "Headphones (cue)",
-            "Off",
+            &cue_off,
             &mut self.settings.audio.cue,
             &devices,
         );
-        ui.label(RichText::new("Most DJ controllers with a built-in sound card show up with 4 channels: master on 1/2, headphones on 3/4.").small().weak());
+        ui.label(RichText::new("Most DJ controllers with a built-in sound card show up with 4 channels: master on 1/2, headphones on 3/4. With the master on a Pioneer DDJ-FLX6, FLX4 or DDJ-400, the headphones go to its jack automatically, and its own HEADPHONES MIX knob blends cue and master.").small().weak());
         ui.add_space(6.0);
         route_editor(
             ui,
@@ -670,6 +674,16 @@ impl TandemApp {
                 None => format!("{name} knob: sets Tandem's {what} level."),
             };
             ui.label(RichText::new(text).small().weak());
+        }
+        if engine.card.phones_mix && engine.mapping.binding_for(Target::CueMix).is_some() {
+            ui.label(
+                RichText::new(
+                    "Headphone mix knob: the headphones play through this controller's own jack, \
+                     and it blends cue and master there by itself, so the knob leaves Tandem's mix alone.",
+                )
+                .small()
+                .weak(),
+            );
         }
         ui.separator();
         let learning = engine.learn;

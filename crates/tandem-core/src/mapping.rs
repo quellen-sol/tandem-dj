@@ -774,6 +774,10 @@ pub struct ControllerCard {
     pub master: bool,
     /// The headphone output plays through it.
     pub phones: bool,
+    /// The headphones play through its jack, and it blends cue and master
+    /// for them itself: its HEADPHONES MIX knob works on the sound card
+    /// (see [`mixes_own_phones`]). The app sets it from the audio routing.
+    pub phones_mix: bool,
 }
 
 impl ControllerCard {
@@ -787,17 +791,34 @@ impl ControllerCard {
         Self {
             master: on(master),
             phones: on(phones),
+            phones_mix: false,
         }
     }
 
-    /// The controller sets this level itself, on its own sound card.
+    /// The controller sets this level (or mix) itself, on its own sound card.
     pub fn sets(&self, target: Target) -> bool {
         match target {
             Target::MasterLevel => self.master,
             Target::HeadphoneLevel => self.phones,
+            Target::CueMix => self.phones_mix,
             _ => false,
         }
     }
+}
+
+/// The stereo pair a DJ controller's headphone jack plays (channels 3/4).
+pub const CONTROLLER_PHONES_PAIR: u16 = 1;
+
+/// If `device` is the sound card of a controller that mixes its own
+/// headphones, the controller's name. These play the jack from channels 3/4
+/// and blend in the master themselves: the HEADPHONES MIX knob turns
+/// channels 3/4 down in hardware and MASTER CUE adds the master, so Tandem
+/// sends them only the cued decks. Measured on a DDJ-FLX6; Mixxx's manuals
+/// say the same of the DDJ-400 and FLX4.
+pub fn mixes_own_phones(device: &str) -> Option<&'static str> {
+    ["DDJ-FLX6", "DDJ-FLX4", "DDJ-400"]
+        .into_iter()
+        .find(|model| is_controller_card(model, device))
 }
 
 /// Whether the sound card `device` is the one built into the controller on
@@ -3487,7 +3508,8 @@ mod tests {
             e.card,
             ControllerCard {
                 master: true,
-                phones: false
+                phones: false,
+                phones_mix: false,
             }
         );
         // The FLX6 turns its own output down: Tandem's level stays put.
@@ -3506,6 +3528,46 @@ mod tests {
         assert_eq!(e.card, ControllerCard::default());
         play_levels(&mut e, &mut local, &master);
         assert_eq!(local.master_level, (0x08 << 7) as f32 / 16383.0);
+    }
+
+    #[test]
+    fn phones_mix_knob_leaves_a_controller_that_mixes_its_own_alone() {
+        let mut e = MidiEngine::new(builtin_preset("DDJ-FLX6").unwrap(), 0.08);
+        let mut local = LocalParams::default();
+        // HEADPHONE MIX, per Pioneer's list: CC 0x0C and 0x2C on channel 7.
+        let mix = knob(0x0C, &[(0x7F, 0x7F)]);
+        // Headphones on the FLX6's jack: its knob blends them in hardware.
+        e.card = ControllerCard::find(
+            Some("DDJ-FLX6"),
+            Some("Line (DDJ-FLX6)"),
+            Some("Line (DDJ-FLX6)"),
+        );
+        e.card.phones_mix = true;
+        assert!(play_levels(&mut e, &mut local, &mix)
+            .iter()
+            .all(|o| !matches!(o, MidiOut::CueMix(_))));
+        // Headphones on a headset: the knob sets Tandem's mix.
+        e.card = ControllerCard::find(
+            Some("DDJ-FLX6"),
+            Some("Line (DDJ-FLX6)"),
+            Some("Speakers (G733 Gaming Headset)"),
+        );
+        let out = play_levels(&mut e, &mut local, &mix);
+        assert!(
+            out.iter().any(|o| matches!(o, MidiOut::CueMix(_))),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn controllers_that_mix_their_own_headphones() {
+        // Windows names the FLX6's sound card like this.
+        assert_eq!(mixes_own_phones("Line (2- DDJ-FLX6)"), Some("DDJ-FLX6"));
+        assert_eq!(mixes_own_phones("Speakers (DDJ-FLX4)"), Some("DDJ-FLX4"));
+        assert_eq!(mixes_own_phones("DDJ-400"), Some("DDJ-400"));
+        assert_eq!(mixes_own_phones("Speakers (G733 Gaming Headset)"), None);
+        // Not known to: its knob still sets Tandem's mix.
+        assert_eq!(mixes_own_phones("Speakers (SC LIVE 4)"), None);
     }
 
     #[test]
