@@ -298,7 +298,7 @@ Work through these in order and note anything that fails. `tandem.log` (Settings
 
 ### v0.11.6
 
-- **A dropped connection rejoins by itself.** When a joining DJ's or a broadcaster's connection drops, Tandem gets it back into the same room: its top bar says **Reconnecting to … attempt N** (with **Give up**) and it keeps trying for 5 minutes, while the host's says **Waiting for … to reconnect**. The decks play on meanwhile, and a broadcaster's stream doesn't go silent. Once it's back, the decks follow the room again, as after a fresh join, so anything the joining DJ changed while cut off is dropped (a later patch brings those moves into the room instead: see below). Leaving, or the host closing the room, never starts it.
+- **A dropped connection rejoins by itself.** When a joining DJ's or a broadcaster's connection drops, Tandem gets it back into the same room: its top bar says **Reconnecting to … attempt N** (with **Give up**) and it keeps trying for 5 minutes, while the host's says **Waiting for … to reconnect**. The decks play on meanwhile, and a broadcaster's stream doesn't go silent. Once it's back, the decks follow the room again, as after a fresh join, so anything the joining DJ changed while cut off is dropped (since v0.11.16 they come into the room instead: see below). Leaving, or the host closing the room, never starts it.
   - Test: in a room, unplug the joining PC's network for about 30 seconds, then plug it back in. Does it say **Reconnecting to …**, then get back in within a few seconds with its decks following the host's?
 - No protocol change: v0.11.5 and v0.11.6 can share a room, but only a v0.11.6 booth rejoins by itself, and a v0.11.5 host takes a booth back only after its old connection times out (15 s).
 
@@ -362,6 +362,12 @@ Work through these in order and note anything that fails. `tandem.log` (Settings
 - **Switching decks on the FLX6 no longer makes the tempo jump.** One tempo fader drives decks 1 and 3 (or 2 and 4). Move it on deck 3, switch back to deck 1, and deck 1's first move used to jump by however far the fader had gone on deck 3. Now, after a DECK switch, the fader moves the deck you switched to by exactly as much as you move it, starting from that deck's own tempo, as it does after SYNC. The fader then usually doesn't sit where that deck's tempo is; the screen shows the real tempo, and **SHIFT + SYNC** puts the deck back on the fader. Saved FLX6 mappings pick it up by themselves.
   - Test (four-deck FLX6): set deck 1 to −4% with the tempo fader, press DECK to switch to deck 3 and push the fader up to +4%, then switch back to deck 1 and nudge the fader up a little. Does deck 1 go up a little from −4%, with no jump? Does deck 3 stay where you left it?
 - No protocol change: v0.11.14 and v0.11.15 can share a room.
+
+### v0.11.16
+
+- **Moves made while cut off come through.** When the joining PC's connection drops and it gets back in, what you both did meanwhile is now in the room on both PCs, at the moment it was done. On a control you both touched, whichever move came later wins, whoever made it. A deck your partner started while you were apart comes in playing from where it would be by now, and a fader they moved jumps to where they left it. A load onto a deck the other DJ had playing out loud by then is refused, with the usual note. **Give up**, then joining the same room again within 5 minutes, brings your moves too.
+  - Test: in a room, unplug the joining PC's network. While it says **Reconnecting…**, move the crossfader on the host and deck A's fader on the joining PC, then plug it back in. Once it's back, do both PCs show both moves?
+- Protocol version 14: v0.11.16 can't share a room with earlier versions, so every booth needs v0.11.16.
 
 ## Next candidates
 
