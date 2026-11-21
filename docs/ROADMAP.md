@@ -458,7 +458,7 @@ Work through these in order and note anything that fails. `tandem.log` (Settings
 - **The DDJ-FLX6's Beat FX strip works:** FX SELECT, CH SELECT (CH1–4 are decks A–D; MST does nothing yet), BEAT ◀ ▶ and their lights, LEVEL/DEPTH and ON/OFF with its light. Saved FLX6 mappings pick it up (preset version 13). Other controllers can learn the FX unit functions.
 - Effects cost little: a reverb about 0.3% of one core where it's heard, an echo or phaser about 0.1%, and one that's off nothing.
 - The self-test switches effects on and checks every booth renders them the same.
-- Protocol version 16 (on this branch; renumbered at release after v0.13's): everyone in the room needs this version.
+- Protocol version 17: v0.14 can't share a room with v0.13 or earlier, so everyone in the room, broadcasters included, needs v0.14.
 
 ### Test plan for effects
 
