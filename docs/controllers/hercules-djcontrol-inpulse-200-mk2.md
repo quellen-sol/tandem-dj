@@ -1,6 +1,6 @@
 # Hercules DJControl Inpulse 200 MK2
 
-**Status:** researched, not yet tried on the unit. Researched 2026-11-20. Built-in preset "Hercules DJControl Inpulse 200 MK2" (not released yet).
+**Status:** researched, not yet tried on the unit. Researched 2026-11-20. Built-in preset "Hercules DJControl Inpulse 200 MK2" since v0.11.17.
 
 A two-deck beginner controller from 2023: per deck a touch-sensitive jog wheel, PLAY, CUE, SYNC, SHIFT, a LOOP button with ½ and X2, a tempo fader, four pads with two mode buttons (HOT CUE and STEMS, and with SHIFT: FX and SAMPLER), and a mixer channel with GAIN, a two-band EQ (HIGH, LOW), FILTER, a headphone-cue button and a volume fader. In the middle: the BROWSER knob, ASSIST./PREP., MASTER and HEADPHONES volume knobs, a MASTER monitoring button, BEATMATCH GUIDE and the crossfader. It has a built-in four-channel sound card.
 
@@ -179,6 +179,7 @@ Two sources drive an MK2's lights ([5] on Windows, [7] tested on an MK2 and an I
 - **Jog ticks per turn** (248) is the MK1's figure. Ring and top may differ on the MK2 [7].
 - **MASTER and HEADPHONES knobs:** one MK2 source [4] says which is CC 0x03 and which 0x04 (the MK1 list and the MK3 mapping say the same). If they turn out swapped, swap the two bindings.
 - **Letting go with SHIFT changed.** Because SHIFT moves a button to another channel, a button pressed without SHIFT and let go with SHIFT held may send its release on the SHIFT channel. Tandem would then not see CUE or the jog touch let go until it's pressed again. Nothing found says what the unit does; the Pioneer presets have the same exposure.
+- **Headphones: who blends cue and master?** The MASTER button puts outputs 1-2 into the headphones in hardware ([1] p.43, [2]), and the unit has no headphone mix knob. Tandem keeps a list of controllers that mix their own headphones (`mixes_own_phones` in `mapping.rs`): for those it sends the jack only the cued decks and uses the jack by itself when no headphone output is picked. This unit isn't on it, because nobody has checked one. So the owner picks the unit's channels 3/4 as the headphone output in Settings → Audio and blends with the **phones: cue ↔ master** slider on screen; with the unit's MASTER button on as well, the master reaches the headphones from both.
 - **Firmware:** no source names the firmware it was made with. VirtualDJ's page [2] (2023) says no update existed then.
 - **FX pad mode in "hardware mode".** VirtualDJ [2] describes a mode where the firmware itself runs effects from the FX pads. On the MK1 those pads then send extra messages (notes 0x25-0x2B, CC 0x07, 0x0C, 0x0D on the deck's channel, per [12] and [9]). None of them is bound here.
 
@@ -210,7 +211,8 @@ Close DJUCED, Serato and any other DJ software first. Steps marked **(preset)** 
 13. Hold SHIFT and move a TEMPO fader: the tempo should stay put. Say if it changes instead (then the unit doesn't send a separate message and that binding should go).
 14. Turn MASTER and HEADPHONES with Tandem playing through the controller: the level should change once, not twice as fast, and Settings → Controller should say the controller sets those levels itself. Tell us the sound card's name as Windows shows it in Tandem's audio settings.
 15. Lights: which of these come on by themselves and which stay dark: the HOT CUE / STEMS mode buttons (press each, and SHIFT + each), MASTER, BEATMATCH GUIDE, the green tempo-centre light? Do PLAY, CUE, SYNC and the hot cue pads go dark while SHIFT is held (expected)? Does anything stay lit after Tandem closes?
-16. If anything is dead: run `tandem.exe --midi-monitor 30` with Tandem closed, press the dead control with and without SHIFT, and send the output.
+16. Headphones: with the master on the unit's outputs 1/2 and the headphones on its 3/4 (Settings → Audio), put **phones: cue ↔ master** on screen fully to cue, cue deck A with its fader down and play deck B with its fader up. The headphones should play deck A only. Then press the unit's MASTER button: does deck B come into the headphones too? (That says whether the unit belongs on Tandem's list of controllers that mix their own headphones.)
+17. If anything is dead: run `tandem.exe --midi-monitor 30` with Tandem closed, press the dead control with and without SHIFT, and send the output.
 
 ## Sources
 

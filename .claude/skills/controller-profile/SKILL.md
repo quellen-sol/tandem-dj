@@ -48,8 +48,9 @@ you settled on. Then find out:
 - **What is its MIDI port called on Windows?** The preset is matched by port
   name, so this matters as much as any note number. See "Port names" in
   [references/sources.md](references/sources.md).
-- **Does it have a sound card**, and which knobs act in hardware without
-  sending MIDI (often master, headphones, mic)?
+- **Does it have a sound card**, which knobs act in hardware (often master,
+  headphones, mic, with or without also sending MIDI), and does it blend cue
+  and master for the headphones by itself?
 
 ### 2. Learn what Tandem can express
 

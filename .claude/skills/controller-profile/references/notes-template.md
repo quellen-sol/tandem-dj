@@ -28,8 +28,9 @@ has to be in.
 
 - MIDI port name(s) on Windows, every spelling found, and the source of each.
 - Driver or mode needed. Whether it's MIDI, and how that was established.
-- Sound card: channels for master and headphones; knobs that act in
-  hardware and send no MIDI.
+- Sound card: channels for master and headphones; knobs and buttons that
+  act in hardware (and whether they also send MIDI); whether the unit blends
+  cue and master for the headphones itself.
 - Init or keep-alive it needs, bytes in full, and whether Tandem sends it.
 
 ## Layout

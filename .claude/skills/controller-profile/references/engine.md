@@ -59,7 +59,8 @@ jumps), `HotCueClear { slot }`, `LoopIn`, `LoopOut`, `Reloop`,
 beats), `Tempo`, `TempoShift`, `Volume`, `Eq { band }` (0 low, 1 mid,
 2 high), `Trim`, `Filter` (0.5 is off), `Pfl` (headphone cue, toggles),
 `Jog`, `JogTouch`, `BendDown`, `BendUp` (hold), `Load`,
-`PadMode { mode }` (`HotCues`, `BeatLoops`, `Rolls`).
+`PadMode { mode }` (`HotCues`, `BeatLoops`, `Rolls`), `DeckSelect` (a
+message saying a side now plays this deck, see "Deck layers").
 
 What the loop buttons do when pressed (`model.rs` is the authority):
 
@@ -86,12 +87,25 @@ Two things that look like gaps but aren't:
 
 - **Deck layers.** If the DECK button changes the MIDI channel, bind the
   second layer's messages to decks C and D (the FLX6 preset does). If the
-  hardware sends the same messages on both layers, only A and B are
-  reachable (the SC Live 4).
+  unit also says which deck a side has switched to (the FLX6 sends note
+  0x3C on that deck's channel), bind that to `DeckSelect { deck }`: one
+  tempo fader serves both layers, and this is how Tandem knows to re-read
+  where it is instead of jumping the tempo. If the hardware sends the same
+  messages on both layers, only A and B are reachable (the SC Live 4).
 - **Master and headphone knobs on a controller with a sound card.** Bind
   them if they send MIDI. When Tandem plays through the controller's own
   card, it notices by the card's name and lets the hardware do the level, so
   the sound isn't turned down twice.
+- **Controllers that blend their own headphones.** Some units mix cue and
+  master for the headphone jack in hardware (a HEADPHONES MIX knob or a
+  MASTER CUE button that works with no software running). `mixes_own_phones`
+  in `mapping.rs` lists them: for those, Tandem sends the jack only the cued
+  decks, greys out its own cue ↔ master slider, and uses the jack by itself
+  when no headphone output is picked. Find out whether this unit does it and
+  record the answer. Adding a unit to that list changes what the DJ hears,
+  so do it only on a manufacturer's statement or a check on the hardware;
+  otherwise leave the list alone and put the question on the owner's
+  checklist.
 
 ## Decisions
 
