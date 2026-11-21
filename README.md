@@ -248,6 +248,7 @@ Host in one window and join `127.0.0.1` from the other.
   - **"This room already has 4 DJs":** to join just to stream, tick **Broadcaster only**. A DJ whose connection dropped keeps their seat for 5 minutes while they reconnect.
 - **The broadcaster says moves arrive late.** Click the raise button in its TIMING. If it only happens while tracks are being sent, lower **Upload speed limit** (Settings → General) on the host. That limit covers all of a PC's uploads together, so it keeps track transfers from filling the connection that carries the DJs' moves.
 - **Controller not listed.** Close other DJ software, replug it, then click **Refresh**.
+- **A control does nothing, or the wrong thing.** Record what the controller sends: close Tandem, double-click **record-midi.bat** (next to `tandem.exe`), type a name for the recording, then press the controls you were asked to, about a second apart. Each message shows up as it arrives. Press Enter when you're done. The file is saved next to `tandem.exe`, and a window opens showing it, ready to send to whoever is fixing the mapping.
 - **No sound.** Pick the right devices in **Settings → Audio** and check **Status** there.
 - **Logs.** `%LOCALAPPDATA%\Tandem\data\tandem.log`. Settings → General has buttons to open every folder.
 

@@ -290,13 +290,17 @@ fn controller_loop(
     }
 }
 
-/// `tandem.exe --midi-monitor [seconds]`: print everything a controller sends.
+/// `tandem.exe --midi-monitor [seconds]`: print everything a controller sends
+/// (`record-midi.bat` runs it and saves the output). It listens to a
+/// controller Tandem has a mapping for, else a Pioneer, else the first input.
 pub fn monitor(seconds: u64) -> i32 {
     let names = ports();
     println!("MIDI inputs: {names:?}");
+    let pioneer = |n: &String| n.to_uppercase().contains("DDJ");
     let Some(name) = names
         .iter()
-        .find(|n| n.to_uppercase().contains("DDJ"))
+        .find(|n| tandem_core::mapping::builtin_preset(n).is_some())
+        .or(names.iter().find(|n| pioneer(n)))
         .or(names.first())
         .cloned()
     else {
@@ -344,8 +348,13 @@ pub fn monitor(seconds: u64) -> i32 {
         }
     };
     println!("Listening to {name} for {seconds} s…");
-    // Keep a Pioneer awake (and ask it to report its knob positions) while listening.
-    let mut out = open_output(&name);
+    // Keep a Pioneer awake (and ask it to report its knob positions) while
+    // listening. Nothing goes to anyone else's controller.
+    let mut out = if pioneer(&name) {
+        open_output(&name)
+    } else {
+        None
+    };
     let end = Instant::now() + Duration::from_secs(seconds);
     while Instant::now() < end {
         if let Some(o) = out.as_mut() {

@@ -212,9 +212,15 @@ AskUserQuestion to press a short, ordered list of controls about a second
 apart, then read the file. Ask for SHIFT variants and for each pad mode
 button followed by pad 1. For lights, ask what they see. A capture turns
 "single source" into "confirmed" and it has overturned a guess before.
-The monitor listens to the first port whose name contains "DDJ", otherwise
-to the first MIDI input it finds, so have other MIDI devices unplugged and
-check the port name it prints.
+The monitor listens to the first port Tandem has a built-in preset for, then
+one whose name contains "DDJ", otherwise the first MIDI input it finds, so
+have other MIDI devices unplugged and check the port name it prints.
+
+When the owner is a friend on another PC, they can record it themselves:
+`record-midi.bat`, next to `tandem.exe` in the release zip (v0.12.1 on; it
+works with older `tandem.exe` too), asks for a file name, shows each message
+as it arrives and saves them all to that file next to `tandem.exe`. Give
+them the ordered list of controls to press and ask for the file back.
 
 If nobody has the unit, write the hardware checklist in the notes file: the
 few things the owner should try first, in the order that finds the most

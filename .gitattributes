@@ -1,0 +1,2 @@
+# cmd.exe reads batch files by CRLF lines; LF-only ones can lose labels.
+*.bat text eol=crlf

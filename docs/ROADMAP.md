@@ -410,6 +410,13 @@ Work through these in order and note anything that fails. `tandem.log` (Settings
    - Once it's back, does every PC have what that DJ did meanwhile, and that DJ what the others did?
 6. Have one joining DJ leave. Do the others carry on, and can someone else join in their place?
 
+### v0.12.1
+
+- **record-midi.bat records what a controller sends,** for fixing a mapping from afar. It's next to `tandem.exe` in the zip. Double-click it with Tandem closed, type a name, press the controls you were asked to, then press Enter. Each message shows up as it arrives, and they're all saved to a text file next to `tandem.exe`. The window then opens showing the file, ready to send. It works with an older `tandem.exe` too, so it can be sent on its own.
+- **The recorder listens to the right controller:** one Tandem has a mapping for before any other MIDI device. It sends nothing to a controller unless it's a Pioneer, which needs its keep-alive.
+  - Test: with Tandem closed and a controller plugged in, run record-midi.bat, type `test` and press a few buttons. Does each press show up? Press Enter: does `test.txt` next to `tandem.exe` hold the same lines, and does a window open showing it? Run it again with the same name: is the new one saved as `test-2.txt`? With Tandem open, does it ask you to close Tandem first?
+- No protocol change: v0.12.0 and v0.12.1 can share a room.
+
 ## Next candidates
 
 Rough priority order:
