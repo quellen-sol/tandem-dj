@@ -369,6 +369,14 @@ Work through these in order and note anything that fails. `tandem.log` (Settings
   - Test: in a room, unplug the joining PC's network. While it says **Reconnecting…**, move the crossfader on the host and deck A's fader on the joining PC, then plug it back in. Once it's back, do both PCs show both moves?
 - Protocol version 14: v0.11.16 can't share a room with earlier versions, so every booth needs v0.11.16.
 
+### v0.11.17
+
+- **The Hercules DJControl Inpulse 200 MK2 maps itself.** Pick it in Settings → Controller: the left side is deck A and the right side deck B. PLAY, CUE, SYNC, LOAD, the jog wheels, the tempo faders, GAIN, HIGH, LOW, FILTER, the volume faders and crossfader, the headphone cue buttons, the BROWSER knob and the MASTER and HEADPHONES knobs all work, and the lights on PLAY, CUE, SYNC, LOOP, the headphone cue buttons and the hot cue pads follow Tandem. In HOT CUE mode the four pads are hot cues 1 to 4 (SHIFT + pad clears one). LOOP starts a 4-beat loop and leaves it again, ½ and X2 halve and double it, and with SHIFT they are loop IN and OUT. SHIFT + CUE, SHIFT + SYNC and SHIFT + tempo fader work as on the FLX6, and SHIFT + pressing BROWSER takes the knob to the lists. The STEMS, FX and SAMPLER pads do nothing in Tandem.
+- **It hasn't been tried on the hardware yet.** Hercules publishes no MIDI list for the MK2, so the mapping comes from mappings and programs other people made with one, read against Hercules' list for the first Inpulse 200. Which way the tempo fader runs and how many steps the jog wheel counts per turn are taken from its sibling models, so calibrate the jog wheel first (Settings → Controller → **Calibrate…**, with your hand on top of the platter). [controllers/hercules-djcontrol-inpulse-200-mk2.md](controllers/hercules-djcontrol-inpulse-200-mk2.md) says where each control's message came from, how sure it is, and what to check.
+  - Test (on an Inpulse 200 MK2, with DJUCED and Serato closed): does Settings → Controller list "DJControl Inpulse 200 Mk2", and do PLAY and CUE work and light up on both sides? Move a tempo fader down, towards +: does the BPM rise? Set a hot cue with pad 1, then press SHIFT + pad 1: does it clear, and does the pad's light go out? Press LOOP on a playing deck, then ½, X2 and LOOP again: does it loop 4 beats, halve, double and leave? The notes file has the full list of 17 checks.
+- **For adding the next controller:** a `controller-profile` skill for Claude Code (in `.claude/skills`) researches a controller's MIDI messages and lights from several sources, then writes the mapping, its tests and a notes file like the one above. `cargo run -p tandem-core --example preset_table -- "<port name>"` prints a built-in mapping to check, and with `--json` a mapping file to try on a Tandem that doesn't have it built in yet.
+- No protocol change: v0.11.16 and v0.11.17 can share a room.
+
 ## Next candidates
 
 Rough priority order:
