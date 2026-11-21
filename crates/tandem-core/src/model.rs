@@ -165,6 +165,9 @@ pub struct DeckState {
     /// track runs on underneath (see [`Roll`]).
     #[serde(default)]
     pub roll: Option<Roll>,
+    /// The channel's effects, after its fader and the crossfader.
+    #[serde(default)]
+    pub fx: FxBank,
     /// Bumped on every discontinuity (load, play, pause, jump). The renderer
     /// hard-syncs when it changes and smoothly chases otherwise.
     pub gen: u64,
@@ -202,6 +205,7 @@ impl Default for DeckState {
             looping: false,
             loop_beats: None,
             roll: None,
+            fx: FxBank::default(),
             gen: 0,
             last_touch: 0,
         }
@@ -621,6 +625,104 @@ fn default_xf_assign() -> [XfSide; DECKS] {
     std::array::from_fn(XfSide::default_for)
 }
 
+/// Effect slots in a deck's bank. They run in series, 1 → 2 → 3.
+pub const FX_SLOTS: usize = 3;
+/// What a bank's BEATS steps through, in beats: 1/16 to 32, with ¾ (the
+/// classic echo time, which Pioneer mixers and the DDJ-FLX6 step through).
+pub const FX_BEATS: [f64; 11] = [
+    0.0625, 0.125, 0.25, 0.5, 0.75, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0,
+];
+/// A new bank's BEATS: 1 beat.
+pub const FX_BEATS_DEFAULT: u8 = 5;
+
+/// An effect a slot can hold (see `fx.rs` for what each does).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum FxKind {
+    Echo,
+    Reverb,
+    Phaser,
+}
+
+impl FxKind {
+    /// In the order a slot's effect menu lists them.
+    pub const ALL: [FxKind; 3] = [FxKind::Echo, FxKind::Reverb, FxKind::Phaser];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            FxKind::Echo => "ECHO",
+            FxKind::Reverb => "REVERB",
+            FxKind::Phaser => "PHASER",
+        }
+    }
+
+    /// Four letters, for narrow places.
+    pub fn short(self) -> &'static str {
+        match self {
+            FxKind::Echo => "ECHO",
+            FxKind::Reverb => "VERB",
+            FxKind::Phaser => "PHSR",
+        }
+    }
+
+    /// The next effect in [`FxKind::ALL`], round to the first.
+    pub fn next(self) -> FxKind {
+        let i = FxKind::ALL.iter().position(|&k| k == self).unwrap_or(0);
+        FxKind::ALL[(i + 1) % FxKind::ALL.len()]
+    }
+}
+
+/// One effect slot of a deck's bank.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FxSlot {
+    pub kind: FxKind,
+    pub on: bool,
+    /// 0..1: what it means is the effect's own (see `fx.rs`).
+    pub depth: f32,
+    /// Shared time (us) the slot was last switched on or changed effect: a
+    /// starting point every booth agrees on, for effects that need one (a
+    /// phaser on a track with no beatgrid).
+    pub since: i64,
+}
+
+/// A deck's effects: three slots in series and one BEATS value, which sets
+/// each effect's time from the deck's own BPM. Part of the room, like the
+/// EQ, so every booth and the broadcast hear the same effects. It belongs
+/// to the channel: loading or ejecting a track leaves it alone.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FxBank {
+    pub slots: [FxSlot; FX_SLOTS],
+    /// An index into [`FX_BEATS`]. An index rather than a float, so it
+    /// survives JSON exactly (floats without `float_roundtrip` don't).
+    pub beats: u8,
+}
+
+impl Default for FxBank {
+    /// Echo, reverb and phaser, all off at half depth, BEATS 1.
+    fn default() -> Self {
+        Self {
+            slots: std::array::from_fn(|i| FxSlot {
+                kind: FxKind::ALL[i % FxKind::ALL.len()],
+                on: false,
+                depth: 0.5,
+                since: 0,
+            }),
+            beats: FX_BEATS_DEFAULT,
+        }
+    }
+}
+
+impl FxBank {
+    /// The bank's BEATS, in beats.
+    pub fn beats(&self) -> f64 {
+        FX_BEATS[(self.beats as usize).min(FX_BEATS.len() - 1)]
+    }
+
+    /// Any slot switched on.
+    pub fn any_on(&self) -> bool {
+        self.slots.iter().any(|s| s.on)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RoomState {
     pub decks: [DeckState; DECKS],
@@ -842,6 +944,32 @@ pub enum Action {
     CrossfaderCurve {
         curve: XfCurve,
     },
+    /// Switch an effect slot on or off. A value, not a toggle, so late and
+    /// reordered moves come out the same everywhere. Switched off, the
+    /// effect's tail rings out.
+    FxOn {
+        deck: u8,
+        slot: u8,
+        on: bool,
+    },
+    /// An effect slot's depth (0..1).
+    FxDepth {
+        deck: u8,
+        slot: u8,
+        v: f32,
+    },
+    /// The effect in a slot. A slot that's on switches effect at once, and
+    /// the old one rings out.
+    FxSelect {
+        deck: u8,
+        slot: u8,
+        kind: FxKind,
+    },
+    /// The bank's BEATS: an index into [`FX_BEATS`].
+    FxBeats {
+        deck: u8,
+        beats: u8,
+    },
 }
 
 impl Action {
@@ -878,7 +1006,11 @@ impl Action {
             | JogTouch { deck, .. }
             | Sync { deck, .. }
             | KeyLock { deck, .. }
-            | KeyShift { deck, .. } => Some(deck as usize),
+            | KeyShift { deck, .. }
+            | FxOn { deck, .. }
+            | FxDepth { deck, .. }
+            | FxSelect { deck, .. }
+            | FxBeats { deck, .. } => Some(deck as usize),
             Crossfader { .. } | CrossfaderCurve { .. } => None,
         }
     }
@@ -1597,6 +1729,33 @@ impl RoomState {
                 d.key_lock = on;
             }
             Action::KeyShift { semitones, .. } => d.key_shift = semitones.clamp(-12, 12),
+            // The effects aren't the track's: none of them moves the
+            // playhead or lets go of a roll.
+            Action::FxOn { slot, on, .. } => {
+                if let Some(s) = d.fx.slots.get_mut(slot as usize) {
+                    if on && !s.on {
+                        s.since = t;
+                    }
+                    s.on = on;
+                }
+            }
+            Action::FxDepth { slot, v, .. } => {
+                if let Some(s) = d.fx.slots.get_mut(slot as usize) {
+                    // NaN would stick (clamp passes it through).
+                    s.depth = if v.is_nan() { 0.0 } else { v.clamp(0.0, 1.0) };
+                }
+            }
+            Action::FxSelect { slot, kind, .. } => {
+                if let Some(s) = d.fx.slots.get_mut(slot as usize) {
+                    if s.kind != kind {
+                        s.kind = kind;
+                        s.since = t;
+                    }
+                }
+            }
+            Action::FxBeats { beats, .. } => {
+                d.fx.beats = beats.min(FX_BEATS.len() as u8 - 1);
+            }
             Action::Crossfader { .. }
             | Action::CrossfaderCurve { .. }
             | Action::XfAssign { .. }
@@ -1669,6 +1828,13 @@ impl RoomState {
                 }
                 None => h.u64(0),
             }
+            for s in &d.fx.slots {
+                h.u64(s.kind as u64);
+                h.u64(s.on as u64);
+                h.u64(s.depth.to_bits() as u64);
+                h.u64(s.since as u64);
+            }
+            h.u64(d.fx.beats as u64);
             h.u64(d.gen);
         }
         h.u64(self.crossfader.to_bits() as u64);
@@ -4200,5 +4366,418 @@ mod tests {
         let json = serde_json::to_string(&e).unwrap();
         assert!(json.contains(r#""a":"Roll""#), "{json}");
         assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), e);
+    }
+
+    fn load(deck: u8, track: u8) -> Action {
+        Action::Load {
+            deck,
+            track: tid(track),
+            duration: 200.0,
+            cue: 0.0,
+            grid: None,
+            key: -1,
+        }
+    }
+
+    #[test]
+    fn a_new_deck_has_echo_reverb_and_phaser_off() {
+        let fx = DeckState::default().fx;
+        let kinds = fx.slots.map(|s| s.kind);
+        assert_eq!(kinds, [FxKind::Echo, FxKind::Reverb, FxKind::Phaser]);
+        assert!(fx
+            .slots
+            .iter()
+            .all(|s| !s.on && s.depth == 0.5 && s.since == 0));
+        assert_eq!(fx.beats(), 1.0);
+        assert!(!fx.any_on());
+        assert_eq!(FX_BEATS[FX_BEATS_DEFAULT as usize], 1.0);
+        assert_eq!(FxKind::Echo.next(), FxKind::Reverb);
+        assert_eq!(FxKind::Phaser.next(), FxKind::Echo);
+    }
+
+    #[test]
+    fn effects_apply_and_clamp() {
+        let mut tl = Timeline::new(0);
+        let fx = |a: Action| a;
+        tl.insert(ev(
+            1_000,
+            7,
+            1,
+            fx(Action::FxOn {
+                deck: 1,
+                slot: 2,
+                on: true,
+            }),
+        ));
+        tl.insert(ev(
+            2_000,
+            7,
+            2,
+            Action::FxDepth {
+                deck: 1,
+                slot: 2,
+                v: 1.7,
+            },
+        ));
+        tl.insert(ev(
+            3_000,
+            7,
+            3,
+            Action::FxDepth {
+                deck: 1,
+                slot: 0,
+                v: -0.3,
+            },
+        ));
+        tl.insert(ev(
+            4_000,
+            7,
+            4,
+            Action::FxBeats {
+                deck: 1,
+                beats: 200,
+            },
+        ));
+        tl.insert(ev(
+            5_000,
+            7,
+            5,
+            Action::FxSelect {
+                deck: 1,
+                slot: 1,
+                kind: FxKind::Echo,
+            },
+        ));
+        // Out of range: nothing happens (and nothing panics).
+        tl.insert(ev(
+            6_000,
+            7,
+            6,
+            Action::FxOn {
+                deck: 1,
+                slot: 3,
+                on: true,
+            },
+        ));
+        tl.insert(ev(
+            6_500,
+            7,
+            7,
+            Action::FxOn {
+                deck: 9,
+                slot: 0,
+                on: true,
+            },
+        ));
+        tl.insert(ev(
+            6_600,
+            7,
+            8,
+            Action::FxDepth {
+                deck: 1,
+                slot: 1,
+                v: f32::NAN,
+            },
+        ));
+        let s = tl.latest();
+        let b = s.decks[1].fx;
+        assert!(b.slots[2].on);
+        assert_eq!(b.slots[2].since, 1_000);
+        assert_eq!(b.slots[2].depth, 1.0);
+        assert_eq!(b.slots[0].depth, 0.0);
+        assert_eq!(b.slots[1].depth, 0.0);
+        assert_eq!(b.beats as usize, FX_BEATS.len() - 1);
+        assert_eq!(b.beats(), 32.0);
+        assert_eq!(b.slots[1].kind, FxKind::Echo);
+        assert_eq!(b.slots[1].since, 5_000);
+        assert!(!b.slots[0].on && !b.slots[1].on);
+        assert_eq!(s.decks[1].last_touch, 7);
+        // The other decks' banks are untouched.
+        assert_eq!(s.decks[0].fx, FxBank::default());
+        // Switching on again, or picking the same effect, keeps `since`.
+        tl.insert(ev(
+            7_000,
+            7,
+            9,
+            Action::FxOn {
+                deck: 1,
+                slot: 2,
+                on: true,
+            },
+        ));
+        tl.insert(ev(
+            7_500,
+            7,
+            10,
+            Action::FxSelect {
+                deck: 1,
+                slot: 1,
+                kind: FxKind::Echo,
+            },
+        ));
+        let b = tl.latest().decks[1].fx;
+        assert_eq!((b.slots[2].since, b.slots[1].since), (1_000, 5_000));
+        // Off, then on: a new starting point.
+        tl.insert(ev(
+            8_000,
+            7,
+            11,
+            Action::FxOn {
+                deck: 1,
+                slot: 2,
+                on: false,
+            },
+        ));
+        tl.insert(ev(
+            9_000,
+            7,
+            12,
+            Action::FxOn {
+                deck: 1,
+                slot: 2,
+                on: true,
+            },
+        ));
+        assert_eq!(tl.latest().decks[1].fx.slots[2].since, 9_000);
+    }
+
+    #[test]
+    fn effects_dont_touch_the_track() {
+        let mut tl = Timeline::new(0);
+        tl.insert(ev(1_000, 1, 1, load(0, 1)));
+        tl.insert(ev(2_000, 1, 2, Action::Play { deck: 0 }));
+        tl.insert(ev(
+            3_000_000,
+            1,
+            3,
+            Action::Roll {
+                deck: 0,
+                beats: 1.0,
+                on: true,
+            },
+        ));
+        let before = tl.latest().decks[0];
+        let moves = [
+            Action::FxOn {
+                deck: 0,
+                slot: 0,
+                on: true,
+            },
+            Action::FxDepth {
+                deck: 0,
+                slot: 0,
+                v: 0.8,
+            },
+            Action::FxBeats { deck: 0, beats: 2 },
+            Action::FxSelect {
+                deck: 0,
+                slot: 0,
+                kind: FxKind::Phaser,
+            },
+        ];
+        for (i, a) in moves.into_iter().enumerate() {
+            tl.insert(ev(3_100_000 + i as i64 * 1_000, 2, 1 + i as u64, a));
+        }
+        let after = tl.latest().decks[0];
+        assert_eq!(
+            (after.anchor_time, after.anchor_pos, after.gen),
+            (before.anchor_time, before.anchor_pos, before.gen)
+        );
+        assert_eq!(after.roll, before.roll);
+        assert!(after.playing);
+        assert_eq!(after.last_touch, 2);
+    }
+
+    #[test]
+    fn loading_and_ejecting_keep_the_bank() {
+        let mut tl = Timeline::new(0);
+        tl.insert(ev(
+            1_000,
+            1,
+            1,
+            Action::FxOn {
+                deck: 2,
+                slot: 0,
+                on: true,
+            },
+        ));
+        tl.insert(ev(2_000, 1, 2, Action::FxBeats { deck: 2, beats: 7 }));
+        tl.insert(ev(
+            3_000,
+            1,
+            3,
+            Action::FxDepth {
+                deck: 2,
+                slot: 1,
+                v: 0.2,
+            },
+        ));
+        let bank = tl.latest().decks[2].fx;
+        tl.insert(ev(4_000, 1, 4, load(2, 5)));
+        assert_eq!(tl.latest().decks[2].track, Some(tid(5)));
+        assert_eq!(tl.latest().decks[2].fx, bank);
+        tl.insert(ev(5_000, 1, 5, Action::Eject { deck: 2 }));
+        assert_eq!(tl.latest().decks[2].track, None);
+        assert_eq!(tl.latest().decks[2].fx, bank);
+    }
+
+    #[test]
+    fn effect_moves_converge_whatever_order_they_arrive_in() {
+        let mut events = vec![
+            ev(1_000, 1, 1, load(0, 1)),
+            ev(
+                2_000,
+                1,
+                2,
+                Action::FxOn {
+                    deck: 0,
+                    slot: 0,
+                    on: true,
+                },
+            ),
+            ev(
+                2_500,
+                2,
+                1,
+                Action::FxOn {
+                    deck: 0,
+                    slot: 0,
+                    on: false,
+                },
+            ),
+            ev(
+                3_000,
+                2,
+                2,
+                Action::FxDepth {
+                    deck: 0,
+                    slot: 0,
+                    v: 0.25,
+                },
+            ),
+            ev(
+                3_000,
+                1,
+                3,
+                Action::FxDepth {
+                    deck: 0,
+                    slot: 0,
+                    v: 0.75,
+                },
+            ),
+            ev(
+                3_500,
+                2,
+                3,
+                Action::FxSelect {
+                    deck: 0,
+                    slot: 1,
+                    kind: FxKind::Phaser,
+                },
+            ),
+            ev(
+                4_000,
+                1,
+                4,
+                Action::FxOn {
+                    deck: 0,
+                    slot: 1,
+                    on: true,
+                },
+            ),
+            ev(4_100, 2, 4, Action::FxBeats { deck: 0, beats: 3 }),
+            ev(4_200, 1, 5, Action::FxBeats { deck: 0, beats: 8 }),
+            ev(
+                5_000,
+                2,
+                5,
+                Action::FxOn {
+                    deck: 1,
+                    slot: 2,
+                    on: true,
+                },
+            ),
+        ];
+        let mut a = Timeline::new(0);
+        for e in &events {
+            a.insert(e.clone());
+        }
+        let s = a.latest().decks[0].fx;
+        assert!(!s.slots[0].on);
+        // Same time: the higher origin is applied last.
+        assert_eq!(s.slots[0].depth, 0.25);
+        assert_eq!((s.slots[1].kind, s.slots[1].on), (FxKind::Phaser, true));
+        assert_eq!((s.slots[1].since, s.beats), (4_000, 8));
+        for seed in 0..8 {
+            fastrand::Rng::with_seed(seed).shuffle(&mut events);
+            let mut b = Timeline::new(0);
+            for e in &events {
+                b.insert(e.clone());
+            }
+            for t in [0, 2_200, 3_200, 4_150, 9_000] {
+                assert_eq!(a.state_at(t), b.state_at(t), "at {t}");
+                assert_eq!(a.state_at(t).digest(), b.state_at(t).digest(), "at {t}");
+            }
+        }
+    }
+
+    #[test]
+    fn effects_survive_the_wire() {
+        let moves = [
+            Action::FxOn {
+                deck: 3,
+                slot: 1,
+                on: true,
+            },
+            Action::FxDepth {
+                deck: 3,
+                slot: 1,
+                v: 0.123_456_79,
+            },
+            Action::FxSelect {
+                deck: 3,
+                slot: 2,
+                kind: FxKind::Reverb,
+            },
+            Action::FxBeats { deck: 3, beats: 4 },
+        ];
+        let mut tl = Timeline::new(0);
+        for (i, a) in moves.iter().enumerate() {
+            let e = ev(1_000 + i as i64, 4, i as u64 + 1, a.clone());
+            let json = serde_json::to_string(&e).unwrap();
+            assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), e, "{json}");
+            tl.insert(e);
+        }
+        let json = serde_json::to_string(&tl).unwrap();
+        assert!(json.contains(r#""a":"FxSelect""#) && json.contains(r#""kind":"Reverb""#));
+        let back: Timeline = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.latest(), tl.latest());
+        assert_eq!(back.latest().digest(), tl.latest().digest());
+        // A room state saved before effects existed loads with the default bank.
+        let mut old: serde_json::Value = serde_json::to_value(RoomState::default()).unwrap();
+        for d in old["decks"].as_array_mut().unwrap() {
+            d.as_object_mut().unwrap().remove("fx");
+        }
+        let s: RoomState = serde_json::from_value(old).unwrap();
+        assert_eq!(s.decks[0].fx, FxBank::default());
+    }
+
+    #[test]
+    fn the_digest_sees_every_effect_field() {
+        let base = RoomState::default();
+        let changes: [&dyn Fn(&mut FxBank); 5] = [
+            &|b| b.slots[1].kind = FxKind::Phaser,
+            &|b| b.slots[2].on = true,
+            &|b| b.slots[0].depth = 0.51,
+            &|b| b.slots[1].since = 12,
+            &|b| b.beats = 6,
+        ];
+        for (i, change) in changes.iter().enumerate() {
+            for d in 0..DECKS {
+                let mut s = base;
+                change(&mut s.decks[d].fx);
+                assert_ne!(s.digest(), base.digest(), "change {i} on deck {d}");
+            }
+        }
     }
 }
