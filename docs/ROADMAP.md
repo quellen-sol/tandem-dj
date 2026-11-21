@@ -349,6 +349,14 @@ Work through these in order and note anything that fails. `tandem.log` (Settings
   - Test: as for v0.11.12, but turn off the joining PC's Wi-Fi for 20 seconds instead of unplugging the cable. Does the track carry on within a few seconds of it reconnecting, on both PCs?
 - No protocol change: v0.11.12 and v0.11.13 can share a room.
 
+### v0.11.14
+
+- **Channel CUE on the FLX6 plays in your headphones.** With **Headphones (cue)** left on Off, the cue had nowhere to go: only MASTER CUE worked, because the FLX6 does that by itself. Now, when the master plays through a DDJ-FLX6, FLX4 or DDJ-400 and no headphone output is picked, the headphones go to its jack (channels 3/4; Settings shows **Auto**).
+- **The HEADPHONES MIX knob blends cue and master on the controller.** Those controllers mix their headphones in hardware, so Tandem now sends their jack only the cued decks: the knob goes from your cue to the master, and MASTER CUE adds the master. Before, Tandem mixed the master in a second time from the same knob. The **phones: cue ↔ master** slider on screen is greyed out there, and Settings → Controller says what the knob does. Through any other sound card the knob and slider set Tandem's mix as before.
+- Pressing CUE with no headphone output shows a reminder in the status bar.
+  - Test (FLX6, master through the FLX6, Headphones on Auto): play deck 1 with its fader down and CH1 CUE on, and deck 2 with its fader up. Sweep HEADPHONES MIX from CUE to MASTER: does it go from deck 1 to deck 2? (Checked on the laptop's FLX6 with a test build.) On a four-deck FLX6, does CH3 and CH4 CUE work the same?
+- No protocol change: v0.11.13 and v0.11.14 can share a room.
+
 ## Next candidates
 
 Rough priority order:
