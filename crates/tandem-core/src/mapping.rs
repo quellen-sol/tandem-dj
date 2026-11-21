@@ -1878,6 +1878,9 @@ pub fn builtin_preset(port_name: &str) -> Option<Mapping> {
     let letters: String = n.chars().filter(|c| c.is_alphanumeric()).collect();
     if letters.contains("SCLIVE4") {
         Some(denon_sc_live_4(port_name))
+    } else if letters.contains("INPULSE200MK2") {
+        // Not the first Inpulse 200 or the MK3: other labels, other maps.
+        Some(hercules_inpulse_200_mk2(port_name))
     } else if n.contains("DDJ-FLX6") {
         Some(ddj_flx6(port_name))
     } else if n.contains("DDJ-FLX4") || n.contains("DDJ-400") {
@@ -2100,6 +2103,88 @@ fn denon_sc_live_4(device: &str) -> Mapping {
     m.bind(Trigger::cc(15, 0x13), Target::HeadphoneLevel);
     m.bind(Trigger::cc(15, 0x05), Target::Browse).rel = RelMode::TwosComplement;
     m.bind(Trigger::note(15, 0x06), Target::BrowsePress);
+    m
+}
+
+/// Hercules DJControl Inpulse 200 MK2. Hercules publishes no MIDI list for
+/// it: this comes from a djay mapping learned on one, two programs written
+/// against one, MIDI recorded from one, and Hercules' list for the first
+/// Inpulse 200, whose messages the MK2 kept under new labels. It hasn't
+/// been tried on the unit yet, and four things are inferred from its
+/// siblings, not shown for the MK2: SHIFT + tempo fader, SHIFT + BROWSER,
+/// the tempo fader's direction and the jog's ticks per turn. Where each
+/// message came from and how sure it is:
+/// docs/controllers/hercules-djcontrol-inpulse-200-mk2.md.
+///
+/// Global controls send on MIDI channel 1, the left deck on channel 2 and
+/// the right deck on channel 3, driving decks A and B. A deck's controls
+/// move three channels up while its SHIFT is held, so each SHIFT function
+/// is a message of its own. The pads send on channel 7 (left) and 8
+/// (right), a different note range in each pad mode, which the unit keeps
+/// track of itself: HOT CUE 0x00, STEMS 0x10, FX 0x20, SAMPLER 0x30, each
+/// + 8 with SHIFT. Only the hot cue pads have something to do here.
+///
+/// Every fader and knob is 14-bit, fine half on CC + 32. The unit has no
+/// level meters, and its lights are plain: 127 lit, 0 off.
+fn hercules_inpulse_200_mk2(device: &str) -> Mapping {
+    let mut m = Mapping::empty(device);
+    m.preset = Some("Hercules DJControl Inpulse 200 MK2".to_string());
+    m.preset_version = PRESET_VERSION;
+    // The first Inpulse 200's figure (Mixxx's mapping); calibrate to be
+    // sure, with a hand on top: the ring may count more slowly.
+    m.jog_ticks_per_rev = Some(248.0);
+    for side in 0..2u8 {
+        let ch = 1 + side;
+        let shift = 4 + side;
+        let deck = side;
+        m.bind(Trigger::note(ch, 0x07), Target::Play { deck });
+        m.bind(Trigger::note(ch, 0x06), Target::Cue { deck });
+        m.bind(Trigger::note(shift, 0x06), Target::BackToStart { deck });
+        m.bind(Trigger::note(ch, 0x05), Target::Sync { deck });
+        m.bind(Trigger::note(shift, 0x05), Target::SyncOff { deck });
+        // The platter: turned with a hand on top (CC 0x0A, with the touch
+        // sensor's note) or by its ring (CC 0x09).
+        m.bind(Trigger::note(ch, 0x08), Target::JogTouch { deck });
+        for cc in [0x0A, 0x09] {
+            m.bind(Trigger::cc(ch, cc), Target::Jog { deck }).rel = RelMode::TwosComplement;
+        }
+        // The tempo fader's value falls towards +, the bottom end.
+        m.bind(Trigger::cc(ch, 0x08), Target::Tempo { deck }).invert = true;
+        m.bind(Trigger::cc(shift, 0x08), Target::TempoShift { deck })
+            .invert = true;
+        m.bind(Trigger::note(ch, 0x0D), Target::Load { deck });
+        // Loop section: LOOP is a 4-beat loop, on and off; ½ and X2 halve
+        // and double it; with SHIFT they are IN and OUT.
+        m.bind(Trigger::note(ch, 0x03), Target::BeatLoop { deck, size: 4 });
+        m.bind(Trigger::note(ch, 0x09), Target::LoopHalve { deck });
+        m.bind(Trigger::note(ch, 0x0A), Target::LoopDouble { deck });
+        m.bind(Trigger::note(shift, 0x09), Target::LoopIn { deck });
+        m.bind(Trigger::note(shift, 0x0A), Target::LoopOut { deck });
+        // Mixer channel: GAIN, a two-band EQ, FILTER, headphone cue.
+        m.bind(Trigger::cc(ch, 0x00), Target::Volume { deck });
+        m.bind(Trigger::cc(ch, 0x05), Target::Trim { deck });
+        m.bind(Trigger::cc(ch, 0x04), Target::Eq { deck, band: 2 });
+        m.bind(Trigger::cc(ch, 0x02), Target::Eq { deck, band: 0 });
+        m.bind(Trigger::cc(ch, 0x01), Target::Filter { deck });
+        m.bind(Trigger::note(ch, 0x0C), Target::Pfl { deck });
+        // Four pads, in HOT CUE mode; SHIFT + pad clears.
+        let pads = 6 + side;
+        for slot in 0..4u8 {
+            m.bind(Trigger::note(pads, slot), Target::HotCue { deck, slot });
+            m.bind(
+                Trigger::note(pads, 0x08 + slot),
+                Target::HotCueClear { deck, slot },
+            );
+        }
+    }
+    m.bind(Trigger::cc(0, 0x00), Target::Crossfader);
+    // MASTER and HEADPHONES also turn the unit's own outputs up and down.
+    m.bind(Trigger::cc(0, 0x03), Target::MasterLevel);
+    m.bind(Trigger::cc(0, 0x04), Target::HeadphoneLevel);
+    m.bind(Trigger::cc(0, 0x01), Target::Browse).rel = RelMode::TwosComplement;
+    m.bind(Trigger::note(0, 0x00), Target::BrowsePress);
+    // SHIFT + pressing BROWSER.
+    m.bind(Trigger::note(3, 0x00), Target::BrowseBack);
     m
 }
 
@@ -4060,6 +4145,456 @@ mod tests {
         send(&mut e, [0x95, 0x1C, 0x7F]);
         assert_eq!(light(&e, &room, (0x94, 0x1C)), Some(127));
         assert_eq!(light(&e, &room, (0x95, 0x1C)), Some(127));
+    }
+
+    /// The Inpulse 200 MK2's messages below are the ones in
+    /// docs/controllers/hercules-djcontrol-inpulse-200-mk2.md: global
+    /// controls on MIDI channel 1 (0x90 / 0xB0), the left deck on channel 2
+    /// and the right on channel 3, each three channels up while its SHIFT
+    /// is held, and the pads on channels 7 and 8.
+    fn inpulse_200_mk2() -> MidiEngine {
+        MidiEngine::new(builtin_preset("DJControl Inpulse 200 Mk2").unwrap(), 0.08)
+    }
+
+    /// Plays messages in and lets the room follow, as a session does.
+    /// Returns everything they sent.
+    fn follow(e: &mut MidiEngine, room: &mut RoomState, msgs: &[[u8; 3]]) -> Vec<MidiOut> {
+        let local = LocalParams::default();
+        let mut all = Vec::new();
+        for m in msgs {
+            for o in e.handle(m, room, &local) {
+                if let MidiOut::Action(a) = &o {
+                    let seq = all.len() as u64 + 1;
+                    room.apply(&crate::model::Event {
+                        time: 1_000_000 + seq as i64 * 1000,
+                        origin: 1,
+                        seq,
+                        action: a.clone(),
+                    });
+                }
+                all.push(o);
+            }
+        }
+        all
+    }
+
+    #[test]
+    fn inpulse_200_mk2_port_names() {
+        // The name its sources give (on Windows, macOS and Linux), and with
+        // the number Windows may put in front.
+        for port in ["DJControl Inpulse 200 Mk2", "2- DJControl Inpulse 200 Mk2"] {
+            let p = builtin_preset(port).expect(port);
+            assert_eq!(
+                p.preset.as_deref(),
+                Some("Hercules DJControl Inpulse 200 MK2")
+            );
+        }
+        assert_eq!(
+            mapping_key("2- DJControl Inpulse 200 Mk2"),
+            "DJControl_Inpulse_200_Mk2"
+        );
+        // The first Inpulse 200, the MK3 and the bigger models have other
+        // labels and other maps.
+        for port in [
+            "DJControl Inpulse 200",
+            "DJControl Inpulse 200 MK3",
+            "DJControl Inpulse 300 Mk2",
+            "DJControl Inpulse 500",
+        ] {
+            assert!(builtin_preset(port).is_none(), "{port}");
+        }
+    }
+
+    #[test]
+    fn inpulse_200_mk2_transport_and_shift() {
+        let mut e = inpulse_200_mk2();
+        for (deck, st) in [(0u8, 0x91u8), (1, 0x92)] {
+            // PLAY 0x07, CUE 0x06, SYNC 0x05, LOAD 0x0D, headphone cue 0x0C.
+            // Buttons let go with a note-on of velocity 0.
+            assert_eq!(tap(&mut e, st, 0x07), act(Action::Play { deck }));
+            assert_eq!(
+                tap(&mut e, st, 0x06),
+                [
+                    MidiOut::Action(Action::CueDown { deck }),
+                    MidiOut::Action(Action::CueUp { deck }),
+                ]
+            );
+            assert_eq!(tap(&mut e, st, 0x05), act(Action::Sync { deck, on: true }));
+            assert_eq!(tap(&mut e, st, 0x0D), [MidiOut::LoadSelected(deck)]);
+            assert_eq!(tap(&mut e, st, 0x0C), [MidiOut::TogglePfl(deck)]);
+            // With SHIFT held the same buttons arrive three channels up:
+            // SHIFT + CUE goes back to the start, SHIFT + SYNC turns sync
+            // off.
+            let shift = st + 3;
+            assert_eq!(
+                tap(&mut e, shift, 0x06),
+                act(Action::Seek { deck, pos: 0.0 })
+            );
+            assert_eq!(
+                tap(&mut e, shift, 0x05)[0],
+                MidiOut::Action(Action::Sync { deck, on: false })
+            );
+            // SHIFT's own note does nothing, nor do SHIFT + PLAY (stutter),
+            // SHIFT + LOOP (vinyl mode), SHIFT + LOAD or SHIFT + the
+            // headphone cue.
+            assert!(tap(&mut e, st, 0x04).is_empty());
+            for note in [0x07, 0x03, 0x0D, 0x0C] {
+                assert!(tap(&mut e, shift, note).is_empty(), "{note:02X}");
+            }
+        }
+    }
+
+    #[test]
+    fn inpulse_200_mk2_loop_section() {
+        let mut e = inpulse_200_mk2();
+        let quantize = e.quantize_loops;
+        for (deck, st) in [(0u8, 0x91u8), (1, 0x92)] {
+            // LOOP (0x03) is a 4-beat loop; ½ (0x09) and X2 (0x0A) halve
+            // and double it.
+            assert_eq!(
+                tap(&mut e, st, 0x03),
+                act(Action::BeatLoop { deck, beats: 4.0 })
+            );
+            assert_eq!(tap(&mut e, st, 0x09), act(Action::LoopHalve { deck }));
+            assert_eq!(tap(&mut e, st, 0x0A), act(Action::LoopDouble { deck }));
+            // With SHIFT they are IN and OUT, as printed under them.
+            assert_eq!(
+                tap(&mut e, st + 3, 0x09),
+                act(Action::LoopIn { deck, quantize })
+            );
+            assert_eq!(
+                tap(&mut e, st + 3, 0x0A),
+                act(Action::LoopOut { deck, quantize })
+            );
+            // Holding ½ also sends note 0x0B, and holding LOAD 0x0E.
+            assert!(tap(&mut e, st, 0x0B).is_empty());
+            assert!(tap(&mut e, st, 0x0E).is_empty());
+        }
+    }
+
+    #[test]
+    fn inpulse_200_mk2_pads() {
+        let mut e = inpulse_200_mk2();
+        for (deck, st) in [(0u8, 0x96u8), (1, 0x97)] {
+            for slot in 0..4u8 {
+                // HOT CUE mode: notes 0-3, and 8-11 with SHIFT (clear).
+                assert_eq!(
+                    tap(&mut e, st, slot),
+                    [
+                        MidiOut::Action(Action::HotCue { deck, slot }),
+                        MidiOut::Action(Action::HotCueUp { deck, slot }),
+                    ]
+                );
+                assert_eq!(
+                    tap(&mut e, st, 0x08 + slot),
+                    act(Action::ClearHotCue { deck, slot })
+                );
+                // STEMS (0x10), FX (0x20) and SAMPLER (0x30) pads, plain
+                // and with SHIFT (+ 8): Tandem has nothing for them.
+                for base in [0x10, 0x18, 0x20, 0x28, 0x30, 0x38] {
+                    assert!(tap(&mut e, st, base + slot).is_empty(), "{base:02X}");
+                }
+            }
+        }
+        // The pad mode buttons (HOT CUE 0x0F, STEMS 0x10, and with SHIFT FX
+        // 0x11 and SAMPLER 0x12) switch the pads inside the unit.
+        for st in [0x91, 0x92] {
+            for note in [0x0F, 0x10, 0x11, 0x12] {
+                assert!(tap(&mut e, st, note).is_empty(), "{note:02X}");
+            }
+        }
+    }
+
+    #[test]
+    fn inpulse_200_mk2_jog() {
+        let mut e = inpulse_200_mk2();
+        let local = LocalParams::default();
+        let mut room = RoomState::default();
+        room.decks[1].track = Some(crate::model::TrackId([1; 32]));
+        let nudge = |e: &mut MidiEngine| match e.flush(None)[..] {
+            [Action::Nudge { deck: 1, delta }] => delta,
+            ref other => panic!("{other:?}"),
+        };
+        // Turned by the ring (CC 0x09) while paused: it searches, forwards
+        // when clockwise (1 a tick).
+        assert!(e.handle(&[0xB2, 0x09, 0x01], &room, &local).is_empty());
+        assert!((nudge(&mut e) - SECONDS_PER_TURN / 248.0).abs() < 1e-12);
+        // A hand on top of the right platter (note 0x08) holds the record.
+        assert_eq!(
+            e.handle(&[0x92, 0x08, 0x7F], &room, &local),
+            act(Action::JogTouch {
+                deck: 1,
+                down: true,
+                spin: 0.0,
+            })
+        );
+        room.decks[1].scratching = true;
+        // Turned with the hand on it: CC 0x0A, bigger steps when faster.
+        e.handle(&[0xB2, 0x0A, 0x01], &room, &local);
+        e.handle(&[0xB2, 0x0A, 0x03], &room, &local);
+        assert!((nudge(&mut e) - 4.0 / 248.0 * SECONDS_PER_TURN).abs() < 1e-12);
+        // Anticlockwise counts down from 127: backwards.
+        e.handle(&[0xB2, 0x0A, 0x7F], &room, &local);
+        e.handle(&[0xB2, 0x0A, 0x7E], &room, &local);
+        assert!((nudge(&mut e) + 3.0 / 248.0 * SECONDS_PER_TURN).abs() < 1e-12);
+        assert_eq!(
+            e.handle_at(&[0x92, 0x08, 0x00], 100_000, &room, &local),
+            act(Action::JogTouch {
+                deck: 1,
+                down: false,
+                spin: 0.0,
+            })
+        );
+        room.decks[1].scratching = false;
+        // Playing, a second later: the ring bends the speed, up when
+        // turned clockwise and down when anticlockwise.
+        room.decks[1].playing = true;
+        for _ in 0..4 {
+            e.handle_at(&[0xB2, 0x09, 0x01], 1_100_000, &room, &local);
+        }
+        match e.flush(Some(0.025))[..] {
+            [Action::Bend { deck: 1, bend }] => assert!(bend > 0.0, "{bend}"),
+            ref other => panic!("{other:?}"),
+        }
+        for _ in 0..12 {
+            e.handle_at(&[0xB2, 0x09, 0x7F], 1_125_000, &room, &local);
+        }
+        match e.flush(Some(0.025))[..] {
+            [Action::Bend { deck: 1, bend }] => assert!(bend < 0.0, "{bend}"),
+            ref other => panic!("{other:?}"),
+        }
+        // SHIFT + jog (fast search in other software) arrives on channel
+        // 6, touch and turn: left alone.
+        assert!(e.handle(&[0x95, 0x08, 0x7F], &room, &local).is_empty());
+        assert!(e.handle(&[0xB5, 0x0A, 0x01], &room, &local).is_empty());
+        assert!(e.handle(&[0xB5, 0x09, 0x01], &room, &local).is_empty());
+        assert!(e.flush(None).is_empty());
+    }
+
+    #[test]
+    fn inpulse_200_mk2_tempo_fader_falls_towards_plus() {
+        let mut e = inpulse_200_mk2();
+        let mut room = RoomState::default();
+        // 14-bit: CC 0x08, then its fine half on CC 0x28.
+        drive(&mut e, &mut room, &fader(1, 0x08, CENTRE, CENTRE, 1));
+        let centre = room.decks[0].tempo;
+        assert!((centre - 1.0).abs() < 1e-5);
+        // Down, towards "+": the value falls and the tempo rises, to +8%.
+        let up = tempo_after_pairs(&mut e, &mut room, 0, &fader(1, 0x08, CENTRE, BOTTOM, 37));
+        assert!(up.windows(2).all(|w| w[1] > w[0]));
+        assert!((room.decks[0].tempo - 1.08).abs() < 1e-9);
+        // SHIFT + fader (channel 5) back to the centre: the tempo stays.
+        let shifted = fader(4, 0x08, BOTTOM, CENTRE, 37);
+        assert!(drive(&mut e, &mut room, &shifted).is_empty());
+        assert_eq!(room.decks[0].tempo, 1.08);
+        let hw = e.hardware_tempo(0).unwrap();
+        assert!((hw - 1.0).abs() < 1e-5, "the fader is at the centre: {hw}");
+        // Down again: on from +8%, past the fader's own range.
+        tempo_after_pairs(&mut e, &mut room, 0, &fader(1, 0x08, CENTRE, BOTTOM, 37));
+        let want = 1.08 + (1.08 - centre);
+        assert!((room.decks[0].tempo - want).abs() < 1e-9);
+        // The right deck, up to the top ("−"): 8% slower.
+        drive(&mut e, &mut room, &fader(2, 0x08, CENTRE, CENTRE, 1));
+        let down = tempo_after_pairs(&mut e, &mut room, 1, &fader(2, 0x08, CENTRE, TOP, 37));
+        assert!(down.windows(2).all(|w| w[1] < w[0]));
+        assert!((room.decks[1].tempo - 0.92).abs() < 1e-9);
+    }
+
+    #[test]
+    fn inpulse_200_mk2_mixer_and_browse() {
+        let mut e = inpulse_200_mk2();
+        let mut room = RoomState::default();
+        let last = |out: Vec<MidiOut>| out.last().cloned();
+        for (deck, st) in [(0u8, 0xB1u8), (1, 0xB2)] {
+            let d = deck as usize;
+            // Each fader and knob sends its coarse half, then its fine half
+            // 32 higher: volume 0x00, FILTER 0x01, LOW 0x02, HIGH 0x04,
+            // GAIN 0x05.
+            let out = follow(&mut e, &mut room, &[[st, 0x00, 0x40], [st, 0x20, 0x00]]);
+            let v = 8192.0 / 16383.0;
+            assert_eq!(last(out), Some(MidiOut::Action(Action::Volume { deck, v })));
+            follow(&mut e, &mut room, &[[st, 0x01, 0x7F], [st, 0x21, 0x7F]]);
+            follow(&mut e, &mut room, &[[st, 0x02, 0x00], [st, 0x22, 0x00]]);
+            follow(&mut e, &mut room, &[[st, 0x04, 0x7F], [st, 0x24, 0x7F]]);
+            follow(&mut e, &mut room, &[[st, 0x05, 0x20], [st, 0x25, 0x00]]);
+            assert_eq!(room.decks[d].volume, v);
+            assert_eq!(room.decks[d].filter, 1.0);
+            assert_eq!(
+                room.decks[d].eq,
+                [0.0, 0.5, 1.0],
+                "low, (no mid knob), high"
+            );
+            assert_eq!(room.decks[d].trim, 4096.0 / 16383.0);
+            // With SHIFT held the mixer arrives three channels up: left
+            // alone.
+            for cc in [0x00, 0x01, 0x02, 0x04, 0x05] {
+                let msgs = [[st + 3, cc, 0x10], [st + 3, cc + 32, 0x00]];
+                assert!(follow(&mut e, &mut room, &msgs).is_empty(), "{cc:02X}");
+            }
+        }
+        // The crossfader: 0 is full left, deck A's side.
+        follow(&mut e, &mut room, &[[0xB0, 0x00, 0x00], [0xB0, 0x20, 0x00]]);
+        assert_eq!(room.crossfader, 0.0);
+        follow(&mut e, &mut room, &[[0xB0, 0x00, 0x7F], [0xB0, 0x20, 0x7F]]);
+        assert_eq!(room.crossfader, 1.0);
+
+        let local = LocalParams::default();
+        let mut h = |msg: [u8; 3]| e.handle(&msg, &room, &local);
+        // BROWSER: clockwise (1) moves down the list, anticlockwise (127)
+        // up; pressing it, and SHIFT + pressing it (channel 4).
+        assert_eq!(h([0xB0, 0x01, 0x01]), vec![MidiOut::Browse(1)]);
+        assert_eq!(h([0xB0, 0x01, 0x03]), vec![MidiOut::Browse(3)]);
+        assert_eq!(h([0xB0, 0x01, 0x7F]), vec![MidiOut::Browse(-1)]);
+        assert_eq!(h([0x90, 0x00, 0x7F]), vec![MidiOut::BrowsePress]);
+        assert!(h([0x90, 0x00, 0x00]).is_empty());
+        assert_eq!(h([0x93, 0x00, 0x7F]), vec![MidiOut::BrowseBack]);
+        assert!(h([0x93, 0x00, 0x00]).is_empty());
+        // Left alone: SHIFT + turn, turning with ASSIST./PREP. held,
+        // BEATMATCH GUIDE, MASTER and ASSIST./PREP.
+        for msg in [
+            [0xB3, 0x01, 0x01],
+            [0xB0, 0x02, 0x01],
+            [0x90, 0x01, 0x7F],
+            [0x90, 0x02, 0x7F],
+            [0x90, 0x03, 0x7F],
+        ] {
+            assert!(h(msg).is_empty(), "{msg:02X?}");
+        }
+    }
+
+    #[test]
+    fn inpulse_200_mk2_level_knobs() {
+        let mut e = inpulse_200_mk2();
+        let mut local = LocalParams::default();
+        // MASTER is CC 0x03 and HEADPHONES CC 0x04 on channel 1, 14-bit.
+        let master = [[0xB0, 0x03, 0x7F], [0xB0, 0x23, 0x7F]];
+        let out = play_levels(&mut e, &mut local, &master);
+        assert!(!out.is_empty());
+        assert!(out.iter().all(|o| matches!(o, MidiOut::MasterLevel(_))));
+        assert_eq!(local.master_level, 1.0);
+        let phones = [[0xB0, 0x04, 0x00], [0xB0, 0x24, 0x00]];
+        let out = play_levels(&mut e, &mut local, &phones);
+        assert!(!out.is_empty());
+        assert!(out.iter().all(|o| matches!(o, MidiOut::HeadphoneLevel(_))));
+        assert_eq!(local.hp_level, 0.0);
+        assert_eq!(local.master_level, 1.0);
+    }
+
+    #[test]
+    fn inpulse_200_mk2_lights() {
+        let e = inpulse_200_mk2();
+        let mut local = LocalParams::default();
+        let mut room = RoomState::default();
+        let light = |room: &RoomState, local: &LocalParams, k: (u8, u8)| {
+            let lights = e.lights(room, local);
+            lights.iter().find(|(kk, _)| *kk == k).map(|x| x.1)
+        };
+        // At rest: eleven lights a side, all off. A light is a note-on to
+        // its button's own note, 127 lit and 0 off.
+        let rest = e.lights(&room, &local);
+        assert_eq!(rest.len(), 22);
+        assert!(rest.iter().all(|&(_, v)| v == 0), "{rest:02X?}");
+        // Deck A playing in sync with hot cue 3 set and its headphone cue
+        // on; deck B loaded and paused.
+        room.decks[0] = crate::model::DeckState {
+            track: Some(crate::model::TrackId([1; 32])),
+            duration: 100.0,
+            playing: true,
+            synced: true,
+            ..Default::default()
+        };
+        room.decks[0].hot_cues[2] = Some(1.0);
+        room.decks[1].track = Some(crate::model::TrackId([2; 32]));
+        local.pfl[0] = true;
+        for (k, want) in [
+            ((0x91, 0x07), 127), // PLAY
+            ((0x91, 0x06), 0),   // CUE
+            ((0x91, 0x05), 127), // SYNC
+            ((0x91, 0x0C), 127), // headphone cue
+            ((0x96, 0x02), 127), // pad 3
+            ((0x96, 0x00), 0),   // pad 1
+            ((0x92, 0x07), 0),
+            ((0x92, 0x06), 127),
+            ((0x92, 0x05), 0),
+            ((0x92, 0x0C), 0),
+            ((0x97, 0x02), 0),
+        ] {
+            assert_eq!(light(&room, &local, k), Some(want), "{k:02X?}");
+        }
+        // A 4-beat loop: LOOP lights, and on the SHIFT layer, which the
+        // unit shows while SHIFT is held, IN and OUT.
+        room.decks[0].loop_in = Some(10.0);
+        room.decks[0].loop_out = Some(12.0);
+        room.decks[0].looping = true;
+        room.decks[0].loop_beats = Some(4.0);
+        for k in [(0x91, 0x03), (0x94, 0x09), (0x94, 0x0A)] {
+            assert_eq!(light(&room, &local, k), Some(127), "{k:02X?}");
+        }
+        assert_eq!(light(&room, &local, (0x92, 0x03)), Some(0));
+        // Halved to 2 beats: still looping, but LOOP is the 4-beat loop.
+        room.decks[0].loop_beats = Some(2.0);
+        assert_eq!(light(&room, &local, (0x91, 0x03)), Some(0));
+        assert_eq!(light(&room, &local, (0x94, 0x09)), Some(127));
+        // Nothing is sent to ½ and X2, the jog, LOAD, SHIFT + SYNC, CUE or
+        // a pad, the pad mode buttons, the STEMS, FX and SAMPLER pads, or
+        // the buttons and the ring in the middle.
+        for k in [
+            (0x91, 0x09),
+            (0x91, 0x0A),
+            (0x91, 0x08),
+            (0x91, 0x0D),
+            (0x94, 0x05),
+            (0x94, 0x06),
+            (0x96, 0x0A),
+            (0x91, 0x0F),
+            (0x91, 0x10),
+            (0x96, 0x12),
+            (0x96, 0x22),
+            (0x96, 0x32),
+            (0x90, 0x00),
+            (0x93, 0x00),
+            (0x90, 0x03),
+            (0x90, 0x05),
+        ] {
+            assert_eq!(light(&room, &local, k), None, "{k:02X?}");
+        }
+    }
+
+    #[test]
+    fn inpulse_200_mk2_preset_is_whole() {
+        let preset = builtin_preset("DJControl Inpulse 200 Mk2").unwrap();
+        let json = serde_json::to_string(&preset).unwrap();
+        assert_eq!(serde_json::from_str::<Mapping>(&json).unwrap(), preset);
+        // No level meters on the unit, and plain lights.
+        assert!(preset.meters.is_empty());
+        assert!(preset.bindings.iter().all(|b| b.light.is_none()));
+        // Each message does one thing, and SHIFT and the pad modes are the
+        // unit's own business.
+        for (i, a) in preset.bindings.iter().enumerate() {
+            assert!(!a.shift && a.mode.is_none());
+            assert!(
+                preset.bindings[i + 1..]
+                    .iter()
+                    .all(|b| b.trigger != a.trigger),
+                "{}",
+                a.label()
+            );
+        }
+        // Both decks have the same controls, and C and D have none.
+        let on = |d: u8| {
+            preset
+                .bindings
+                .iter()
+                .filter(|b| b.target.deck() == Some(d))
+                .count()
+        };
+        assert_eq!((on(0), on(1), on(2), on(3)), (30, 30, 0, 0));
+        // No fine half (CC n + 32) of a fader is anything else's message.
+        for b in &preset.bindings {
+            if b.trigger.kind == MidiKind::Cc {
+                assert!(b.trigger.number < 32, "{}", b.label());
+            }
+        }
     }
 
     #[test]
