@@ -377,6 +377,39 @@ Work through these in order and note anything that fails. `tandem.log` (Settings
 - **For adding the next controller:** a `controller-profile` skill for Claude Code (in `.claude/skills`) researches a controller's MIDI messages and lights from several sources, then writes the mapping, its tests and a notes file like the one above. `cargo run -p tandem-core --example preset_table -- "<port name>"` prints a built-in mapping to check, and with `--json` a mapping file to try on a Tandem that doesn't have it built in yet.
 - No protocol change: v0.11.16 and v0.11.17 can share a room.
 
+## Round 12 (v0.12): rooms of up to four DJs
+
+- **Up to four DJs in a room:** the host and up to three who join. Everyone works every deck and the whole mixer, and everyone hears every move.
+  - Everything goes through the host: each DJ's moves, tracks and shares reach the others from the host's PC, so only the host needs to be reachable, as before.
+  - A track only one DJ has reaches all the others through the host, the way a joining DJ's always reached a broadcaster.
+  - Moves between two DJs who both joined take both of their trips to the host, so they arrive about a round trip late instead of half of one. The broadcast still has them exactly where they were made.
+  - The host's top bar shows each DJ with their own light and round trip; everyone else's shows the other DJs by name and the round trip to the host. The broadcast window names everyone: "*A* b2b *B* b2b *C*".
+  - A fifth DJ is told **This room already has 4 DJs** and can tick **Broadcaster only** to stream it instead. Up to 4 broadcasters still fit alongside.
+- **A share goes to every other DJ,** and each accepts or declines for themselves. Between two DJs who both joined, the host passes the tracks on without keeping them, whether or not it accepted.
+- **A dropped connection, per DJ.** Each joining DJ whose connection drops gets back in by itself, as before, and the room keeps their seat while it waits. What they did meanwhile reaches every DJ, not just the host. A DJ who joined leaving doesn't end the room for anyone else; the host leaving still closes it.
+- **A track that's still on its way to the host no longer shows as failed** on a broadcaster or a joining DJ: their download waits and asks again until the host has it.
+- **Fixed:** a resync could apply some of your own recent moves a second time (a jog nudge from just before it could move the deck twice).
+- The self-test now runs a room with four DJs and a broadcaster, and checks that a fifth DJ is turned away.
+- Protocol version 15: v0.12 can't share a room with v0.11 or earlier, so everyone in the room, broadcasters included, needs v0.12.
+
+### Test plan for four DJs
+
+1. Host on one PC and join from three others.
+   - Does the host's top bar show each DJ with a green light and a round trip?
+   - Does each joining DJ's top bar show the other three by name?
+   - Does a fifth PC trying to join as a DJ get "This room already has 4 DJs"? Does it get in with **Broadcaster only** ticked?
+2. Each DJ loads a track only they have onto a different deck. Does every PC get every track, "receiving" then ready?
+3. Mix with all four.
+   - Do two DJs who both joined hear each other's moves promptly, about a round trip to the host late?
+   - Is every cut on time in the broadcast?
+4. Share a crate from a joining DJ.
+   - Do the other three each get the popup?
+   - Have another joining DJ accept and the host ignore it. Do the tracks arrive, and does the host's `Music\Tandem Shared` stay empty?
+5. Unplug one joining DJ's network for 20 seconds while the others keep playing.
+   - Does the host say **Waiting for *name* to reconnect…** while the rest carry on?
+   - Once it's back, does every PC have what that DJ did meanwhile, and that DJ what the others did?
+6. Have one joining DJ leave. Do the others carry on, and can someone else join in their place?
+
 ## Next candidates
 
 Rough priority order:
