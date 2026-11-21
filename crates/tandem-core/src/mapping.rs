@@ -157,6 +157,13 @@ pub enum Target {
     TempoShift {
         deck: u8,
     },
+    /// A four-deck controller's DECK button gave its side to this deck (the
+    /// DDJ-FLX6 says so with a message of its own). The tempo fader may have
+    /// moved while it drove the other deck, so it starts again from wherever
+    /// it is (see [`MidiEngine::tempo_fader`]).
+    DeckSelect {
+        deck: u8,
+    },
     Volume {
         deck: u8,
     },
@@ -249,6 +256,9 @@ impl Target {
             Target::TempoShift { deck: d } => {
                 format!("Deck {} · SHIFT + tempo fader (tempo stays)", deck(d))
             }
+            Target::DeckSelect { deck: d } => {
+                format!("Deck {} · DECK button (this side switches to it)", deck(d))
+            }
             Target::Volume { deck: d } => format!("Deck {} · Channel fader", deck(d)),
             Target::Eq { deck: d, band } => {
                 format!(
@@ -312,6 +322,7 @@ impl Target {
             | Roll { deck, .. }
             | Tempo { deck }
             | TempoShift { deck }
+            | DeckSelect { deck }
             | Volume { deck }
             | Eq { deck, .. }
             | Trim { deck }
@@ -406,6 +417,7 @@ impl Target {
             v.push(Target::BendUp { deck: d });
             v.push(Target::Tempo { deck: d });
             v.push(Target::TempoShift { deck: d });
+            v.push(Target::DeckSelect { deck: d });
             v.push(Target::Trim { deck: d });
             for band in (0..3).rev() {
                 v.push(Target::Eq { deck: d, band });
@@ -551,7 +563,7 @@ pub struct Mapping {
 }
 
 /// Bump when built-in presets gain controls; saved mappings pick them up.
-pub const PRESET_VERSION: u32 = 11;
+pub const PRESET_VERSION: u32 = 12;
 /// Up to this preset version, four-deck controllers drove Tandem's two
 /// decks: decks 1 and 3 drove A, decks 2 and 4 drove B.
 const LAST_TWO_DECK_PRESET: u32 = 6;
@@ -859,6 +871,9 @@ struct Takeover {
     /// Tempo fader only: how far (in tempo) it has moved past the room's
     /// limit, up to one coarse step (see [`MidiEngine::tempo_fader`]).
     past_limit: f64,
+    /// Tempo fader only: readings still to come that only say where the
+    /// fader is, after a DECK button gave it this deck back.
+    relearn: u8,
 }
 
 pub struct MidiEngine {
@@ -1251,6 +1266,7 @@ impl MidiEngine {
                         t.last_sent = t.last_hw;
                     }
                 }
+                Target::DeckSelect { deck } if down => self.deck_selected(deck),
                 Target::HotCue { deck, slot } => out.push(MidiOut::Action(if down {
                     Action::HotCue { deck, slot }
                 } else {
@@ -1547,6 +1563,12 @@ impl MidiEngine {
     ///
     /// A deck nobody has touched (tempo 0%) takes the fader's position
     /// straight away, like the other controls.
+    ///
+    /// On a four-deck controller, one fader drives decks 1 and 3 (or 2 and
+    /// 4). After its DECK button switches back, the fader may be anywhere:
+    /// the first reading (both halves, on a 14-bit fader) only says where it
+    /// is, and from there it works as above. So switching decks never makes
+    /// a tempo jump, and the deck is usually off the fader afterwards.
     fn tempo_fader(&mut self, deck: u8, v: f32, room: &RoomState) -> Option<f64> {
         /// Closer than this (0.05%) counts as "on the fader".
         const MATCH: f64 = 0.0005;
@@ -1555,6 +1577,10 @@ impl MidiEngine {
         let current = room.decks.get(deck as usize)?.tempo;
         let t = self.tempo_takeover(deck);
         let prev = t.last_hw.replace(v);
+        if t.relearn > 0 {
+            t.relearn -= 1;
+            return None;
+        }
         let past_limit = std::mem::take(&mut t.past_limit);
         let hw = at(v);
         let next = match prev {
@@ -1595,6 +1621,35 @@ impl MidiEngine {
     /// physically is, whichever message (with or without SHIFT) said so last.
     fn tempo_takeover(&mut self, deck: u8) -> &mut Takeover {
         self.takeover.entry(Target::Tempo { deck }).or_default()
+    }
+
+    /// A DECK button gave its side to `deck`. The side's tempo fader drove
+    /// the other deck meanwhile, so where it was for this one is forgotten:
+    /// its next reading (both halves of it, if it's a 14-bit fader) only
+    /// says where it is now. The coarse half seen last on this deck's
+    /// channel is stale too, so a fine half on its own waits for a new one.
+    /// A deck whose fader hasn't sent anything yet is taken to be 14-bit
+    /// when another deck's is.
+    fn deck_selected(&mut self, deck: u8) {
+        let tempo_cc = |b: &Binding| {
+            matches!(b.target, Target::Tempo { .. } | Target::TempoShift { .. })
+                && b.trigger.kind == MidiKind::Cc
+        };
+        let hires = self
+            .mapping
+            .bindings
+            .iter()
+            .filter(|b| tempo_cc(b))
+            .any(|b| self.hires.contains(&(b.trigger.channel, b.trigger.number)));
+        for b in &self.mapping.bindings {
+            if tempo_cc(b) && b.target.deck() == Some(deck) {
+                self.msb.remove(&(b.trigger.channel, b.trigger.number));
+            }
+        }
+        let t = self.tempo_takeover(deck);
+        t.last_hw = None;
+        t.past_limit = 0.0;
+        t.relearn = if hires { 2 } else { 1 };
     }
 
     /// Where the control currently is in the room, in 0..1 fader units.
@@ -1840,11 +1895,19 @@ pub fn builtin_preset(port_name: &str) -> Option<Mapping> {
 /// The DDJ-FLX6: the Pioneer DDJ layout on four decks, and its MASTER LEVEL
 /// and HEADPHONE LEVEL knobs, 14-bit CCs on channel 7 (from Pioneer's FLX6
 /// MIDI list; HEADPHONE LEVEL also recorded from one).
+///
+/// Its DECK buttons switch a side between decks 1 and 3 (or 2 and 4), and
+/// it says which deck has the side now: note 0x3C on the deck's channel,
+/// on (127) for the deck it switched to and off for the other one (from
+/// the MIDI list). It doesn't say where the tempo fader is.
 fn ddj_flx6(device: &str) -> Mapping {
     // Large jogs: same resolution as the DDJ-SX family until calibrated.
     let mut m = pioneer_ddj(device, "Pioneer DDJ-FLX6", 4, 2048.0);
     m.bind(Trigger::cc(6, 0x08), Target::MasterLevel);
     m.bind(Trigger::cc(6, 0x0D), Target::HeadphoneLevel);
+    for deck in 0..4 {
+        m.bind(Trigger::note(deck, 0x3C), Target::DeckSelect { deck });
+    }
     m
 }
 
@@ -2789,6 +2852,53 @@ mod tests {
     }
 
     #[test]
+    fn flx6_deck_switch_doesnt_make_the_tempo_jump() {
+        // The DJ's report: move the fader on deck 1, switch to deck 3 and
+        // move it there, switch back: deck 1's first move jumped, by as far
+        // as the fader went on deck 3.
+        let mut e = MidiEngine::new(builtin_preset("DDJ-FLX6").unwrap(), 0.08);
+        let mut room = two_decks(&mut e);
+        let at = |p: u16| 1.0 + (p as f64 / 16383.0 - 0.5) * 0.16;
+        let left = |deck: u8| [[0x90 | deck, 0x3C, 0x7F], [0x90 | (deck ^ 2), 0x3C, 0x00]];
+        // Deck A to -4%, on the fader.
+        drive(&mut e, &mut room, &fader(0, 0x00, CENTRE, 4096, 10));
+        let a = room.decks[0].tempo;
+        assert!((a - at(4096)).abs() < 1e-9);
+
+        // DECK: the left side plays deck C (nobody has touched it). Up to
+        // +4%: C starts from 0% and moves by as much as the fader does
+        // after its first reading, which only says where the fader is.
+        assert!(drive(&mut e, &mut room, &left(2)).is_empty());
+        let up = fader(2, 0x00, 4096, 12288, 10);
+        let c = tempo_after_pairs(&mut e, &mut room, 2, &up);
+        assert_eq!(c[0], 1.0, "switching alone changes nothing");
+        assert!(
+            c.windows(2).all(|w| w[1] > w[0] && w[1] - w[0] < 0.01),
+            "{c:?}"
+        );
+        let first = 4096 + (12288 - 4096) / 10;
+        assert!((room.decks[2].tempo - (1.0 + at(12288) - at(first))).abs() < 1e-6);
+        assert_eq!(room.decks[0].tempo, a, "deck A stays put");
+
+        // DECK again: back to deck A. The fader is at +4% now, A at -4%.
+        // A lone fine half first (its coarse half is the one from before
+        // the switch) changes nothing either.
+        assert!(drive(&mut e, &mut room, &left(0)).is_empty());
+        assert!(drive(&mut e, &mut room, &[[0xB0, 0x20, 0x11]]).is_empty());
+        let a_moves = tempo_after_pairs(&mut e, &mut room, 0, &fader(0, 0x00, 12288, 14000, 5));
+        assert_eq!(a_moves[0], a, "no jump");
+        assert!(a_moves
+            .windows(2)
+            .all(|w| w[1] > w[0] && w[1] - w[0] < 0.005));
+        let first = 12288 + (14000 - 12288) / 5;
+        assert!((room.decks[0].tempo - (a + at(14000) - at(first))).abs() < 1e-6);
+        assert_eq!(room.decks[2].tempo, c[9], "deck C stays put");
+        // The fader position is known again: SHIFT + SYNC puts A on it.
+        drive(&mut e, &mut room, &[[0x90, 0x60, 127]]);
+        assert!((room.decks[0].tempo - at(14000)).abs() < 1e-6);
+    }
+
+    #[test]
     fn shift_tempo_on_synced_decks() {
         let mut e = MidiEngine::new(pioneer_ddj("DDJ-FLX6", "test", 4, 2048.0), 0.08);
         let mut room = two_decks(&mut e);
@@ -3602,22 +3712,36 @@ mod tests {
     }
 
     #[test]
-    fn saved_v7_to_v10_flx6_mappings_gain_the_level_knobs() {
+    fn saved_v7_to_v11_flx6_mappings_gain_the_level_knobs() {
         let preset = builtin_preset("DDJ-FLX6").unwrap();
-        assert_eq!(preset.preset_version, 11);
+        assert_eq!(preset.preset_version, 12);
         let level = |t: &Target| matches!(t, Target::MasterLevel | Target::HeadphoneLevel);
         let rolls = |t: &Target| matches!(t, Target::Roll { .. });
         let shift_tempo = |t: &Target| matches!(t, Target::TempoShift { .. });
         let browse = |t: &Target| matches!(t, Target::BrowsePress | Target::BrowseBack);
-        // Saved by preset 10 (v0.11.7 and v0.11.8): just the two knobs are
-        // new. Preset 9: the roll pads too. Preset 8: and SHIFT + TEMPO on
-        // all four decks. Preset 7: and the browse knob's press and BACK.
-        for (version, added) in [(10, 2), (9, 2 + 32), (8, 2 + 32 + 4), (7, 2 + 32 + 4 + 2)] {
+        let deck_select = |t: &Target| matches!(t, Target::DeckSelect { .. });
+        // Saved by preset 11 (v0.11.9 to v0.11.13): the four DECK messages
+        // are new (see `flx6_deck_switch_doesnt_make_the_tempo_jump`).
+        let mut saved = preset.clone();
+        saved.preset_version = 11;
+        saved.bindings.retain(|b| !deck_select(&b.target));
+        assert_eq!(saved.upgrade_from(&preset), 4);
+        assert_eq!(saved.bindings.len(), preset.bindings.len());
+        // Preset 10 (v0.11.7 and v0.11.8): and the two knobs. Preset 9: the
+        // roll pads too. Preset 8: and SHIFT + TEMPO on all four decks.
+        // Preset 7: and the browse knob's press and BACK.
+        for (version, added) in [
+            (10, 4 + 2),
+            (9, 4 + 2 + 32),
+            (8, 4 + 2 + 32 + 4),
+            (7, 4 + 2 + 32 + 4 + 2),
+        ] {
             let mut saved = preset.clone();
             saved.preset_version = version;
             saved.jog_ticks_per_rev = Some(6387.0);
             saved.bindings.retain(|b| {
                 !level(&b.target)
+                    && !deck_select(&b.target)
                     && (version > 9 || !rolls(&b.target))
                     && (version > 8 || !shift_tempo(&b.target))
                     && (version > 7 || !browse(&b.target))
@@ -3650,14 +3774,16 @@ mod tests {
         // but keep everything else the family has.
         let small = builtin_preset("DDJ-FLX4").unwrap();
         assert!(!small.bindings.iter().any(|b| level(&b.target)));
+        assert!(!small.bindings.iter().any(|b| deck_select(&b.target)));
         assert_eq!(
             small.bindings.iter().filter(|b| rolls(&b.target)).count(),
             16
         );
         assert!(small.binding_for(Target::BrowsePress).is_some());
-        // The FLX6 is the family's four-deck layout plus the two knobs.
+        // The FLX6 is the family's four-deck layout plus the two knobs and
+        // the four DECK messages.
         let family = pioneer_ddj("DDJ-FLX6", "Pioneer DDJ-FLX6", 4, 2048.0);
-        assert_eq!(preset.bindings.len(), family.bindings.len() + 2);
+        assert_eq!(preset.bindings.len(), family.bindings.len() + 2 + 4);
         assert!(family.bindings.iter().all(|b| preset.bindings.contains(b)));
     }
 
