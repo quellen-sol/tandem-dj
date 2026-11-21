@@ -2020,4 +2020,291 @@ mod tests {
             h.lock().leave();
         }
     }
+
+    /// A folder of a booth's, scanned, as its library lists it.
+    fn listed(h: &SessionHandle, dir: &std::path::Path) -> (String, Vec<crate::library::LibTrack>) {
+        use crate::library::{folder_key, scan, SourceKind};
+        let lib = h.lock().library();
+        let key = folder_key(dir);
+        scan(&lib, key.clone(), SourceKind::Folder(dir.to_path_buf()));
+        wait_for("the folder to be listed", Duration::from_secs(10), || {
+            lib.lock().lists.get(&key).is_some_and(|l| !l.scanning)
+        });
+        let tracks = lib.lock().lists[&key].tracks.clone();
+        (key, tracks)
+    }
+
+    /// The lists other DJs share live, as a booth's library shows them:
+    /// (owner's name, list name, track titles).
+    fn live_lists(h: &SessionHandle) -> Vec<(String, String, Vec<String>)> {
+        let v = h.lock().view();
+        v.room_crates
+            .iter()
+            .map(|c| {
+                let titles = c.tracks.iter().map(|t| t.title.clone()).collect();
+                (c.owner_name.clone(), c.name.clone(), titles)
+            })
+            .collect()
+    }
+
+    /// A DJ shares a folder live: the other DJs (and only the DJs) see its
+    /// tracks without anything being copied, and a DJ who joins later gets
+    /// it too. A track loaded from it, by a joining DJ or the host, comes
+    /// over from its owner to every booth. Changes to the list reach the
+    /// room; stopping sharing it, or its owner leaving, takes it away.
+    #[test]
+    fn lists_shared_live_come_over_only_when_loaded() {
+        let rig = Rig::new("live-lists");
+        let t = LINK_TIMEOUT;
+        let alice = rig.booth("Alice", 0, t);
+        let bob = rig.booth("Bob", 3_600_000_000, t);
+        let carol = rig.booth("Carol", -1_800_000_000, t);
+        let dave = rig.booth("Dave", 900_000_000, t);
+        let eve = rig.booth("Eve", 0, t);
+        let port = host(&alice, 0, "LIVE12").unwrap();
+        let addr = format!("127.0.0.1:{port}");
+        for h in [&bob, &carol] {
+            join(h, &addr, "LIVE12", false).unwrap();
+        }
+        join(&eve, &addr, "LIVE12", true).unwrap();
+
+        let picks = rig.root.join("bob-picks");
+        let one = tone(&picks, "Bob - One.wav", 2.0, 330.0);
+        let two = tone(&picks, "Bob - Two.wav", 2.5, 440.0);
+        let (key, tracks) = listed(&bob, &picks);
+        bob.lock().share_live(key.clone(), "Picks".into(), tracks);
+        let want = |titles: &[&str]| {
+            let titles = titles.iter().map(|t| t.to_string()).collect();
+            vec![("Bob".to_string(), "Picks".to_string(), titles)]
+        };
+        wait_for("the DJs to see Bob's list", Duration::from_secs(5), || {
+            [&alice, &carol]
+                .iter()
+                .all(|h| live_lists(h) == want(&["One", "Two"]))
+        });
+        assert!(
+            live_lists(&bob).is_empty(),
+            "Bob sees his own list as another's"
+        );
+        assert!(live_lists(&eve).is_empty(), "a broadcaster got the list");
+        assert!(
+            carol.lock().view().transfers.is_empty() && alice.lock().view().transfers.is_empty(),
+            "sharing a list live copied tracks"
+        );
+
+        // Carol loads one Bob has analysed: it loads at once and comes
+        // over from Bob to everyone.
+        let info = |h: &SessionHandle, title: &str| {
+            let v = h.lock().view();
+            let c = v.room_crates.iter().find(|c| c.name == "Picks").unwrap();
+            c.tracks.iter().find(|t| t.title == title).unwrap().clone()
+        };
+        let mut two_info = info(&carol, "Two");
+        assert_eq!(two_info.id, id_of(&two));
+        assert!(two_info.grid.is_none(), "Bob never analysed it");
+        let grid = crate::analysis::BeatGrid::new(0.1, 120.0).unwrap();
+        two_info.grid = Some(grid);
+        carol.lock().load_room_track(1, two_info.clone());
+        assert_eq!(carol.lock().latest().decks[1].track, Some(two_info.id));
+        let all = [&alice, &bob, &carol, &eve];
+        wait_for(
+            "everyone to get the track Carol loaded",
+            Duration::from_secs(30),
+            || all.iter().all(|h| ready(h, two_info.id)),
+        );
+        for h in [&alice, &carol, &eve] {
+            arrived_whole(h, two_info.id);
+        }
+        assert_eq!(carol.lock().latest().decks[1].grid, Some(grid));
+        // The host loads one nobody has analysed: it comes over and is
+        // analysed first, then loads (with what was found) everywhere.
+        let one_info = info(&alice, "One");
+        assert_eq!(one_info.id, id_of(&one));
+        alice.lock().load_room_track(2, one_info.clone());
+        assert_eq!(
+            alice.lock().latest().decks[2].track,
+            None,
+            "loaded before it was analysed"
+        );
+        assert!(alice.lock().view().decks[2].loading.is_some());
+        assert_eq!(loaded(&alice, 2), one_info.id);
+        assert!(
+            ready(&alice, one_info.id),
+            "loaded before the track arrived"
+        );
+        assert!(alice.lock().view().decks[2].loading.is_none());
+        wait_for(
+            "everyone to get the track Alice loaded",
+            Duration::from_secs(30),
+            || all.iter().all(|h| ready(h, one_info.id)),
+        );
+        assert!(
+            std::fs::read_dir(&carol.lock().paths.shared_dir)
+                .unwrap()
+                .next()
+                .is_none(),
+            "Carol's Shared with me got a copy"
+        );
+        wait_for("everyone to agree", Duration::from_secs(5), || {
+            all[1..].iter().all(|h| digests_match(&alice, h))
+        });
+
+        // Bob adds a track: the room gets the new list, and so does a DJ
+        // who joins after.
+        tone(&picks, "Bob - Three.wav", 1.0, 550.0);
+        let (_, tracks) = listed(&bob, &picks);
+        bob.lock().update_live(&key, "Picks".into(), tracks);
+        join(&dave, &addr, "LIVE12", false).unwrap();
+        wait_for(
+            "the new list to reach the DJs",
+            Duration::from_secs(5),
+            || {
+                [&alice, &carol, &dave]
+                    .iter()
+                    .all(|h| live_lists(h) == want(&["One", "Three", "Two"]))
+            },
+        );
+
+        // The host shares one of its own: the joining DJs get it.
+        let alice_dir = rig.root.join("alice-set");
+        tone(&alice_dir, "Alice - Opener.wav", 1.5, 220.0);
+        let (alice_key, alice_tracks) = listed(&alice, &alice_dir);
+        alice
+            .lock()
+            .share_live(alice_key, "Set".into(), alice_tracks);
+        wait_for(
+            "the joining DJs to see Alice's list",
+            Duration::from_secs(5),
+            || {
+                [&bob, &carol, &dave].iter().all(|h| {
+                    live_lists(h).iter().any(|(who, name, titles)| {
+                        who == "Alice" && name == "Set" && titles == &["Opener"]
+                    })
+                })
+            },
+        );
+        let opener = {
+            let v = dave.lock().view();
+            let c = v.room_crates.iter().find(|c| c.name == "Set").unwrap();
+            c.tracks[0].clone()
+        };
+        dave.lock().load_room_track(3, opener.clone());
+        wait_for(
+            "Alice's track to reach every booth",
+            Duration::from_secs(30),
+            || {
+                [&alice, &bob, &carol, &dave, &eve]
+                    .iter()
+                    .all(|h| ready(h, opener.id))
+            },
+        );
+
+        // Bob stops sharing his: it's gone, and the track on the deck stays.
+        bob.lock().unshare_live(&key);
+        wait_for("Bob's list to go", Duration::from_secs(5), || {
+            [&alice, &carol, &dave]
+                .iter()
+                .all(|h| live_lists(h).iter().all(|(who, _, _)| who != "Bob"))
+        });
+        assert_eq!(carol.lock().latest().decks[1].track, Some(two_info.id));
+
+        // Shared again, then Bob leaves: it goes with him.
+        let (_, tracks) = listed(&bob, &picks);
+        bob.lock().share_live(key, "Picks".into(), tracks);
+        wait_for("Bob's list to come back", Duration::from_secs(5), || {
+            live_lists(&dave).iter().any(|(who, _, _)| who == "Bob")
+        });
+        bob.lock().leave();
+        wait_for("Bob's list to go with him", Duration::from_secs(5), || {
+            [&alice, &carol, &dave]
+                .iter()
+                .all(|h| live_lists(h).iter().all(|(who, _, _)| who != "Bob"))
+        });
+        assert!(alice
+            .lock()
+            .room_crates_of_test()
+            .iter()
+            .all(|o| *o != bob.lock().me.id));
+        for h in [&carol, &dave, &eve, &alice] {
+            h.lock().leave();
+        }
+        assert!(live_lists(&carol).is_empty() && carol.lock().view().live.is_empty());
+    }
+
+    /// A DJ whose link drops keeps sharing their lists: the others still
+    /// have them once the DJ is back. One they stop sharing, or start
+    /// sharing, while cut off is gone, or there, for the others once
+    /// they're back.
+    #[test]
+    fn lists_shared_live_follow_a_dj_through_a_dropped_link() {
+        let rig = Rig::new("live-cut");
+        let t = Duration::from_secs(2);
+        let alice = rig.booth("Alice", 0, t);
+        let bob = rig.booth("Bob", 900_000_000, t);
+        let carol = rig.booth("Carol", 0, t);
+        let port = host(&alice, 0, "LIVECUT").unwrap();
+        let addr = format!("127.0.0.1:{port}");
+        join(&bob, &addr, "LIVECUT", false).unwrap();
+        join(&carol, &addr, "LIVECUT", false).unwrap();
+        let (dir_a, dir_b) = (rig.root.join("bob-a"), rig.root.join("bob-b"));
+        tone(&dir_a, "A.wav", 1.0, 300.0);
+        tone(&dir_b, "B.wav", 1.0, 400.0);
+        let (one, a) = listed(&bob, &dir_a);
+        let (two, b) = listed(&bob, &dir_b);
+        bob.lock().share_live(one.clone(), "First".into(), a);
+        let names_at = |h: &SessionHandle| -> Vec<String> {
+            let mut v: Vec<String> = live_lists(h).into_iter().map(|(_, n, _)| n).collect();
+            v.sort();
+            v
+        };
+        wait_for(
+            "Carol to see the first list",
+            Duration::from_secs(5),
+            || names_at(&carol) == ["First"],
+        );
+
+        bob.lock().cut_link();
+        wait_for("Bob to notice", Duration::from_secs(5), || rejoining(&bob));
+        bob.lock().unshare_live(&one);
+        bob.lock().share_live(two, "Second".into(), b);
+        wait_for("Bob to get back in", Duration::from_secs(15), || {
+            linked(&bob)
+        });
+        wait_for(
+            "the others to have Bob's lists as they are now",
+            Duration::from_secs(5),
+            || names_at(&carol) == ["Second"] && names_at(&alice) == ["Second"],
+        );
+
+        // Back again with nothing changed: the host doesn't pass the same
+        // list on a second time, since the moves wait behind it.
+        let second_at = |h: &SessionHandle| h.lock().view().room_crates[0].clone();
+        let before = second_at(&carol);
+        bob.lock().cut_link();
+        wait_for("Bob to notice", Duration::from_secs(5), || rejoining(&bob));
+        wait_for("Bob to get back in", Duration::from_secs(15), || {
+            linked(&bob)
+        });
+        // Bob's next list comes after anything he sent on getting back in.
+        let dir_c = rig.root.join("bob-c");
+        tone(&dir_c, "C.wav", 1.0, 500.0);
+        let (three, c) = listed(&bob, &dir_c);
+        bob.lock().share_live(three, "Third".into(), c);
+        wait_for(
+            "Carol to see the third list",
+            Duration::from_secs(5),
+            || names_at(&carol) == ["Second", "Third"],
+        );
+        let after = (carol.lock().view().room_crates.iter())
+            .find(|c| c.name == "Second")
+            .unwrap()
+            .clone();
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "the unchanged list came to Carol again"
+        );
+        for h in [&bob, &carol, &alice] {
+            h.lock().leave();
+        }
+    }
 }

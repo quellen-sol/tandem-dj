@@ -1,6 +1,7 @@
-//! First-run terms, share consent popups, host/join and settings windows.
+//! First-run terms, share consent popups, crate windows, host/join and
+//! settings windows.
 
-use crate::app::{SettingsTab, TandemApp};
+use crate::app::{CrateMode, SettingsTab, TandemApp};
 use crate::output;
 use eframe::egui::{self, Color32, RichText};
 use std::net::IpAddr;
@@ -100,7 +101,8 @@ impl TandemApp {
 
     pub(crate) fn windows(&mut self, ctx: &egui::Context, view: &SessionView) {
         self.incoming_share_modal(ctx, view);
-        self.outgoing_share_modal(ctx);
+        self.outgoing_share_modal(ctx, view);
+        self.crate_modal(ctx);
         self.host_window(ctx);
         self.join_window(ctx);
         self.settings_window(ctx);
@@ -153,39 +155,141 @@ impl TandemApp {
         }
     }
 
-    fn outgoing_share_modal(&mut self, ctx: &egui::Context) {
+    fn outgoing_share_modal(&mut self, ctx: &egui::Context, view: &SessionView) {
         let Some(draft) = &mut self.ui.share_draft else {
             return;
         };
         let mut done = None;
         egui::Modal::new(egui::Id::new("outgoing-share")).show(ctx, |ui| {
-            ui.set_width(480.0);
+            ui.set_width(500.0);
             ui.label(RichText::new("Share with the room").size(18.0).strong());
-            ui.label(format!("{} tracks · {}", draft.paths.len(), mb(draft.bytes)));
-            ui.horizontal(|ui| {
-                ui.label("Name:");
-                ui.text_edit_singleline(&mut draft.title);
-            });
+            let size = if draft.bytes > 0 {
+                format!(" · {}", mb(draft.bytes))
+            } else {
+                String::new()
+            };
+            ui.label(format!("{} tracks{size}", draft.paths.len()));
             ui.add_space(4.0);
-            ui.label("Every other DJ in the room sees a request and can accept or decline. Tracks they already have aren't sent again.");
+            let live = ui.add_enabled_ui(draft.live_no.is_none(), |ui| {
+                ui.radio_value(&mut draft.live, true, RichText::new("📡 Share it live").strong());
+                ui.indent("live", |ui| {
+                    ui.label(RichText::new("The other DJs see this list in their library and can load any track from it. A track only comes over when someone loads it, as a copy for the session that goes when Tandem closes. Changes you make to the list reach them, until you stop sharing it or leave the room."));
+                });
+            });
+            if let Some(why) = &draft.live_no {
+                live.response.on_disabled_hover_text(why);
+                ui.label(RichText::new(why).small().weak());
+            }
+            ui.add_space(2.0);
+            let copies = ui.add_enabled_ui(draft.copies_no.is_none(), |ui| {
+                ui.radio_value(&mut draft.live, false, RichText::new("⬇ Send copies to keep").strong());
+                ui.indent("copies", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Name:");
+                        ui.text_edit_singleline(&mut draft.title);
+                    });
+                    ui.label(RichText::new("Every other DJ in the room sees a request and can accept or decline. Tracks they already have aren't sent again; the rest go to their Shared with me."));
+                });
+            });
+            if let Some(why) = &draft.copies_no {
+                copies.response.on_disabled_hover_text(why);
+            }
+            if draft.live && draft.live_no.is_some() {
+                draft.live = false;
+            }
+            ui.add_space(6.0);
             ui.checkbox(&mut draft.pledge, terms::sender_pledge(draft.paths.len()));
             ui.add_space(6.0);
+            let ok = draft.pledge
+                && match draft.live {
+                    true => draft.live_no.is_none(),
+                    false => draft.copies_no.is_none() && !draft.title.trim().is_empty() && !draft.paths.is_empty(),
+                };
             ui.horizontal(|ui| {
                 if ui.button("Cancel").clicked() {
                     done = Some(false);
                 }
-                if ui.add_enabled(draft.pledge && !draft.title.trim().is_empty(), egui::Button::new(RichText::new("Share").strong())).clicked() {
+                let label = if draft.live { "Share live" } else { "Send copies" };
+                if ui.add_enabled(ok, egui::Button::new(RichText::new(label).strong())).clicked() {
                     done = Some(true);
                 }
             });
         });
         if let Some(go) = done {
             let draft = self.ui.share_draft.take().unwrap();
-            if go {
-                self.session
+            match (go, draft.live) {
+                (false, _) => {}
+                (true, true) => {
+                    let src = self.ui.source.clone();
+                    if src.key() == draft.key {
+                        self.share_live(&src, view);
+                        self.toast("Shared live: the other DJs can load from it now.");
+                    }
+                }
+                (true, false) => self
+                    .session
                     .lock()
-                    .offer_share(draft.title.trim().to_string(), draft.paths);
+                    .offer_share(draft.title.trim().to_string(), draft.paths),
             }
+        }
+    }
+
+    /// Making, renaming or deleting one of your crates.
+    fn crate_modal(&mut self, ctx: &egui::Context) {
+        let Some(d) = &mut self.ui.crate_dialog else {
+            return;
+        };
+        let mut done = None;
+        egui::Modal::new(egui::Id::new("crate-dialog")).show(ctx, |ui| {
+            ui.set_width(380.0);
+            match d.mode {
+                CrateMode::Delete(_) => {
+                    ui.label(RichText::new(format!("Delete \"{}\"?", d.name)).size(18.0).strong());
+                    ui.label("Its tracks stay on your computer and in your other lists. If it's shared live, it's gone from the other DJs' libraries too.");
+                }
+                CrateMode::New | CrateMode::Rename(_) => {
+                    let title = match d.mode {
+                        CrateMode::New => "New crate",
+                        _ => "Rename crate",
+                    };
+                    ui.label(RichText::new(title).size(18.0).strong());
+                    if !d.add.is_empty() {
+                        let n = d.add.len();
+                        ui.label(if n == 1 { "With the track you picked in it.".to_string() } else { format!("With the {n} tracks you picked in it.") });
+                    }
+                    let r = ui.add(egui::TextEdit::singleline(&mut d.name).hint_text("Name, e.g. Friday warm-up").desired_width(340.0));
+                    if std::mem::take(&mut d.focus) {
+                        r.request_focus();
+                    }
+                    if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !d.name.trim().is_empty() {
+                        done = Some(true);
+                    }
+                }
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Cancel").clicked() {
+                    done = Some(false);
+                }
+                let (label, ok) = match d.mode {
+                    CrateMode::Delete(_) => ("Delete", true),
+                    CrateMode::New => ("Make crate", !d.name.trim().is_empty()),
+                    CrateMode::Rename(_) => ("Rename", !d.name.trim().is_empty()),
+                };
+                if ui.add_enabled(ok, egui::Button::new(RichText::new(label).strong())).clicked() {
+                    done = Some(true);
+                }
+            });
+        });
+        let Some(go) = done else { return };
+        let d = self.ui.crate_dialog.take().expect("open");
+        if !go {
+            return;
+        }
+        match d.mode {
+            CrateMode::New => self.make_crate(&d.name, d.add),
+            CrateMode::Rename(id) => tandem_core::library::rename_crate(&self.library, id, &d.name),
+            CrateMode::Delete(id) => self.delete_crate(id),
         }
     }
 

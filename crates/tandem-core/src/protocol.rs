@@ -13,7 +13,7 @@ use crate::model::{Event, Timeline, TrackId};
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
-pub const PROTOCOL_VERSION: u32 = 15;
+pub const PROTOCOL_VERSION: u32 = 16;
 pub const DEFAULT_PORT: u16 = 47800;
 const MAX_JSON: u32 = 64 << 20;
 const MAX_PAYLOAD: u32 = 8 << 20;
@@ -55,6 +55,26 @@ impl ShareOffer {
         self.tracks.iter().map(|t| t.size).sum()
     }
 }
+
+/// A list of tracks a DJ shares live with the room: a crate of theirs, a
+/// folder or a Serato crate. The other DJs see what's in it and can load any
+/// of its tracks, which only then comes over, as any track a DJ loads does.
+/// It's sent again whenever it changes.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RoomCrate {
+    /// The DJ sharing it.
+    pub owner: u64,
+    pub owner_name: String,
+    /// The owner's id for it, the same through every change.
+    pub crate_id: u64,
+    pub name: String,
+    pub tracks: Vec<TrackInfo>,
+}
+
+/// The most tracks a list shared live carries. Every change sends the whole
+/// list on the control connection, which the moves share, so it's kept to
+/// a size that goes out in a moment (about 200 KB).
+pub const ROOM_CRATE_MAX: usize = 500;
 
 /// The moves a DJ's booth made since shortly before it last heard from the
 /// room, and every one while its link was down, with the tracks they load.
@@ -153,6 +173,17 @@ pub enum Msg {
     /// Client -> host: I can't upload that one.
     NoFile {
         id: TrackId,
+    },
+    /// A DJ shares a list live, or it changed (see [`RoomCrate`]). The host
+    /// passes each DJ's on to the other DJs, and sends a DJ who joins every
+    /// one shared so far.
+    Crate {
+        room_crate: RoomCrate,
+    },
+    /// A DJ stopped sharing a list live, or left the room.
+    CrateGone {
+        owner: u64,
+        crate_id: u64,
     },
     /// Host -> everyone: who's in the room, whenever that changes.
     Members {

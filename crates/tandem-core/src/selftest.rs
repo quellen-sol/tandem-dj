@@ -9,9 +9,10 @@
 //! identical, that the booths render bit-identical audio for the same
 //! moment, that a broadcaster can't change the room, that a share can be
 //! offered, accepted and downloaded (from one joining DJ to another, through
-//! the host), that a booth whose link drops gets back in with what it did
-//! meanwhile reaching every DJ, and that a track it was receiving carries on
-//! from where it got to.
+//! the host), that a list shared live reaches the other DJs with nothing
+//! copied until a track from it is loaded, that a booth whose link drops
+//! gets back in with what it did meanwhile reaching every DJ, and that a
+//! track it was receiving carries on from where it got to.
 
 use crate::config::Paths;
 use crate::library::Library;
@@ -427,6 +428,82 @@ fn run(root: &std::path::Path, say: &mut dyn FnMut(&str)) -> anyhow::Result<()> 
             .any(|(title, _, replies)| title == "Bob's test crate" && replies.len() == 2)
     })?;
     say("a share from one joining DJ reaches another through the host, which passes it on without taking it");
+
+    // Dave shares a folder live: the others see it, and a track Erin loads
+    // from it comes over from Dave to every booth, through the host.
+    let dave_dir = root.join("dave-live");
+    std::fs::create_dir_all(&dave_dir)?;
+    crate::audio::write_wav(
+        &dave_dir.join("Dave - Live One.wav"),
+        44_100,
+        &crate::audio::test_signal(44_100, 2.0, 495.0),
+    )?;
+    let dave_lib = dave.lock().library();
+    let live_key = crate::library::folder_key(&dave_dir);
+    crate::library::scan(
+        &dave_lib,
+        live_key.clone(),
+        crate::library::SourceKind::Folder(dave_dir.clone()),
+    );
+    wait_for(
+        "Dave's folder to be listed",
+        Duration::from_secs(10),
+        || {
+            dave_lib
+                .lock()
+                .lists
+                .get(&live_key)
+                .is_some_and(|l| !l.scanning)
+        },
+    )?;
+    let listed = dave_lib.lock().lists[&live_key].tracks.clone();
+    dave.lock()
+        .share_live(live_key.clone(), "Dave's live picks".into(), listed);
+    let live_track = |h: &SessionHandle| {
+        let v = h.lock().view();
+        v.room_crates
+            .iter()
+            .find(|c| c.name == "Dave's live picks")
+            .and_then(|c| c.tracks.first().cloned())
+    };
+    wait_for(
+        "Dave's live list to reach the other DJs",
+        Duration::from_secs(10),
+        || {
+            [&alice, &bob, &erin]
+                .iter()
+                .all(|h| live_track(h).is_some())
+        },
+    )?;
+    ensure!(
+        carol.lock().view().room_crates.is_empty(),
+        "a broadcaster got a list shared live"
+    );
+    let info = live_track(&erin).expect("checked above");
+    ensure!(
+        erin.lock().track_status(info.id).is_none(),
+        "a list shared live sent its tracks before anyone loaded one"
+    );
+    erin.lock().load_room_track(3, info.clone());
+    let took = wait_for(
+        "the track Erin loaded to reach every booth",
+        Duration::from_secs(30),
+        || {
+            [&alice, &bob, &carol, &dave, &erin]
+                .iter()
+                .all(|h| h.lock().track_status(info.id) == Some(TrackStatus::Ready))
+        },
+    )?;
+    dave.lock().unshare_live(&live_key);
+    wait_for("Dave's live list to go", Duration::from_secs(5), || {
+        [&alice, &bob, &erin]
+            .iter()
+            .all(|h| h.lock().view().room_crates.is_empty())
+    })?;
+    say(&format!(
+        "a list shared live reaches the other DJs, and a track loaded from it comes over from its owner to every booth in {:.2} s",
+        took.as_secs_f64()
+    ));
 
     // A dropped link: Bob gets back in by himself, and the room has both
     // DJs' moves from while he was out.

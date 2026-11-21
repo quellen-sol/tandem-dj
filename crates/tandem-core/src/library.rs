@@ -1,17 +1,19 @@
-//! Music library: folders, Serato crates, the "Shared with me" folder, and
-//! "All Music" (all of them together).
+//! Music library: folders, the DJ's own crates, Serato crates, the "Shared
+//! with me" folder, and "All Music" (all of them together).
 //!
 //! Tags and content hashes are cached on disk (keyed by path, size and
 //! modified time), so rescans are fast and a track is only hashed once.
 //!
 //! Beatgrids a DJ has edited are kept separately (`beatgrids.json`), keyed by
 //! content hash, so they're never overwritten by analysis and follow the
-//! track wherever it's loaded from.
+//! track wherever it's loaded from. Crates the DJ makes in Tandem are kept
+//! in `crates.json` beside them.
 
 use crate::analysis::{self, BeatGrid};
 use crate::audio::TrackAudio;
 use crate::config::{LibrarySort, SortColumn};
 use crate::model::TrackId;
+use crate::protocol::TrackInfo;
 use crate::serato::{self, SeratoCrate};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -200,10 +202,42 @@ fn stat(path: &Path) -> Option<(u64, u64)> {
 pub enum SourceKind {
     Folder(PathBuf),
     Crate(SeratoCrate),
+    /// One of the DJ's own crates, by id.
+    Mine(u64),
     Shared,
-    /// Every library folder, "Shared with me" and every Serato crate, with
-    /// each file listed once.
+    /// Every library folder, "Shared with me", every crate of the DJ's and
+    /// every Serato crate, with each file listed once.
     All,
+}
+
+/// A crate the DJ made in Tandem: a named list of tracks on this computer,
+/// in the order they were added.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MyCrate {
+    /// Never changes, so a rename keeps everything else about it.
+    pub id: u64,
+    pub name: String,
+    pub tracks: Vec<PathBuf>,
+}
+
+/// What a [`resync`] found, once every list it rescanned is done.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Resynced {
+    /// Tracks in none of those lists before that are in one now.
+    pub added: usize,
+    /// Tracks that were in one of them and are in none now (deleted, moved
+    /// away, or taken out of a Serato crate).
+    pub removed: usize,
+}
+
+/// A [`resync`] under way.
+struct Resyncing {
+    /// The lists it's waiting for.
+    waiting: HashSet<String>,
+    /// Every list it rescans.
+    keys: Vec<String>,
+    /// The files those lists had before.
+    before: HashSet<String>,
 }
 
 #[derive(Default)]
@@ -287,6 +321,12 @@ pub struct Library {
     user_grids: HashMap<TrackId, BeatGrid>,
     grids_path: PathBuf,
     grids_dirty: bool,
+    /// The DJ's own crates, in the order they were made.
+    pub my_crates: Vec<MyCrate>,
+    crates_path: PathBuf,
+    resyncing: Option<Resyncing>,
+    /// The last resync, once it finished, for the UI to report.
+    pub resynced: Option<Resynced>,
 }
 
 /// A background BPM analysis ([`analyze_list`]) in progress.
@@ -313,6 +353,11 @@ pub fn crate_key(c: &SeratoCrate) -> String {
     format!("crate:{}", c.file.display())
 }
 
+/// The list key of one of the DJ's own crates.
+pub fn my_crate_key(id: u64) -> String {
+    format!("mine:{id}")
+}
+
 impl Library {
     pub fn new(shared_dir: PathBuf, cache_path: PathBuf) -> Self {
         let mut cache: HashMap<String, CacheEntry> = std::fs::read(&cache_path)
@@ -335,6 +380,14 @@ impl Library {
             }),
             Err(_) => HashMap::new(),
         };
+        let crates_path = cache_path.with_file_name("crates.json");
+        let my_crates = match std::fs::read(&crates_path) {
+            Ok(b) => serde_json::from_slice(&b).unwrap_or_else(|e| {
+                log::error!("Couldn't read {}: {e}", crates_path.display());
+                Vec::new()
+            }),
+            Err(_) => Vec::new(),
+        };
         Self {
             folders: Vec::new(),
             crates: Vec::new(),
@@ -349,7 +402,61 @@ impl Library {
             user_grids,
             grids_path,
             grids_dirty: false,
+            my_crates,
+            crates_path,
+            resyncing: None,
+            resynced: None,
         }
+    }
+
+    /// Write the DJ's crates to disk (after every change: it's small).
+    fn save_crates(&self) {
+        let res = serde_json::to_vec_pretty(&self.my_crates)
+            .map_err(std::io::Error::other)
+            .and_then(|bytes| {
+                let tmp = self.crates_path.with_extension("tmp");
+                std::fs::write(&tmp, bytes)?;
+                std::fs::rename(&tmp, &self.crates_path)
+            });
+        if let Err(e) = res {
+            log::error!("Couldn't save your crates: {e}");
+        }
+    }
+
+    pub fn my_crate(&self, id: u64) -> Option<&MyCrate> {
+        self.my_crates.iter().find(|c| c.id == id)
+    }
+
+    /// Every file the lists with these keys hold.
+    fn files_in(&self, keys: &[String]) -> HashSet<String> {
+        keys.iter()
+            .filter_map(|k| self.lists.get(k))
+            .flat_map(|l| l.tracks.iter().map(|t| same_file(&t.path)))
+            .collect()
+    }
+
+    /// A list finished scanning: if a resync was waiting for it and it was
+    /// the last, work out what changed.
+    fn resync_scanned(&mut self, key: &str) {
+        let Some(r) = self.resyncing.as_mut() else {
+            return;
+        };
+        r.waiting.remove(key);
+        if !r.waiting.is_empty() {
+            return;
+        }
+        let r = self.resyncing.take().expect("checked above");
+        let after = self.files_in(&r.keys);
+        let done = Resynced {
+            added: after.difference(&r.before).count(),
+            removed: r.before.difference(&after).count(),
+        };
+        log::info!(
+            "Resynced the library: {} new tracks, {} gone",
+            done.added,
+            done.removed
+        );
+        self.resynced = Some(done);
     }
 
     /// Write edited beatgrids to disk, if any changed.
@@ -472,7 +579,9 @@ pub fn scan(lib: &Arc<Mutex<Library>>, key: String, kind: SourceKind) {
         entry.error = None;
     }
     let lib = lib.clone();
-    std::thread::spawn(move || {
+    // Asked again meanwhile: it goes round again, still scanning, so the
+    // list never looks finished with what it held before.
+    std::thread::spawn(move || loop {
         let (groups, error) = source_files(&lib, &kind);
         let mut out: Vec<LibTrack> = Vec::new();
         let mut seen = HashSet::new();
@@ -506,13 +615,15 @@ pub fn scan(lib: &Arc<Mutex<Library>>, key: String, kind: SourceKind) {
         let entry = l.lists.entry(key.clone()).or_default();
         entry.tracks = out;
         entry.rev += 1;
-        entry.scanning = false;
         entry.error = error;
         let again = std::mem::take(&mut entry.rescan);
+        entry.scanning = again;
+        if !again {
+            l.resync_scanned(&key);
+        }
         l.save_cache();
-        drop(l);
-        if again {
-            scan(&lib, key, kind);
+        if !again {
+            break;
         }
     });
 }
@@ -524,6 +635,176 @@ pub fn refresh_all(lib: &Arc<Mutex<Library>>) {
     if lib.lock().lists.contains_key(KEY_ALL) {
         scan(lib, KEY_ALL.into(), SourceKind::All);
     }
+}
+
+/// Look again at everything on disk: every folder, Shared with me, which
+/// Serato crates there are and what's in them, and the DJ's crates, then
+/// All Music. Lists stay on screen while they're rescanned. When it's done,
+/// `resynced` says how many tracks came and went.
+pub fn resync(lib: &Arc<Mutex<Library>>, music_dir: Option<&Path>) {
+    let mut jobs: Vec<(String, SourceKind)> = Vec::new();
+    {
+        let mut l = lib.lock();
+        l.refresh_crates(music_dir);
+        for f in &l.folders {
+            jobs.push((folder_key(f), SourceKind::Folder(f.clone())));
+        }
+        jobs.push((KEY_SHARED.into(), SourceKind::Shared));
+        // Crates only if they've been listed: they're read when picked.
+        for c in &l.crates {
+            if l.lists.contains_key(&crate_key(c)) {
+                jobs.push((crate_key(c), SourceKind::Crate(c.clone())));
+            }
+        }
+        for c in &l.my_crates {
+            if l.lists.contains_key(&my_crate_key(c.id)) {
+                jobs.push((my_crate_key(c.id), SourceKind::Mine(c.id)));
+            }
+        }
+        let keys: Vec<String> = jobs.iter().map(|(k, _)| k.clone()).collect();
+        let before = l.files_in(&keys);
+        l.resynced = None;
+        l.resyncing = Some(Resyncing {
+            waiting: keys.iter().cloned().collect(),
+            keys,
+            before,
+        });
+    }
+    log::info!("Resyncing the library ({} lists)", jobs.len());
+    for (key, kind) in jobs {
+        scan(lib, key, kind);
+    }
+    refresh_all(lib);
+}
+
+/// Is a [`resync`] still going?
+pub fn resyncing(lib: &Arc<Mutex<Library>>) -> bool {
+    lib.lock().resyncing.is_some()
+}
+
+/// Make a new, empty crate. Returns its id.
+pub fn new_crate(lib: &Arc<Mutex<Library>>, name: &str) -> u64 {
+    let mut l = lib.lock();
+    let mut id = fastrand::u64(1..);
+    while l.my_crate(id).is_some() {
+        id = fastrand::u64(1..);
+    }
+    l.my_crates.push(MyCrate {
+        id,
+        name: crate_name(name),
+        tracks: Vec::new(),
+    });
+    l.save_crates();
+    l.lists.insert(my_crate_key(id), TrackList::default());
+    id
+}
+
+/// A crate's name as typed, tidied: one line, not empty, not too long.
+fn crate_name(name: &str) -> String {
+    let name: String = name.split_whitespace().collect::<Vec<_>>().join(" ");
+    let name: String = name.chars().take(60).collect();
+    if name.is_empty() {
+        "New crate".into()
+    } else {
+        name
+    }
+}
+
+pub fn rename_crate(lib: &Arc<Mutex<Library>>, id: u64, name: &str) {
+    let mut l = lib.lock();
+    if let Some(c) = l.my_crates.iter_mut().find(|c| c.id == id) {
+        c.name = crate_name(name);
+        l.save_crates();
+    }
+}
+
+/// Delete a crate (its files stay where they are).
+pub fn delete_crate(lib: &Arc<Mutex<Library>>, id: u64) {
+    {
+        let mut l = lib.lock();
+        l.my_crates.retain(|c| c.id != id);
+        l.lists.remove(&my_crate_key(id));
+        l.save_crates();
+    }
+    refresh_all(lib);
+}
+
+/// Add tracks to the end of a crate, leaving out any it already has.
+/// Returns how many went in. The new ones are hashed in the background,
+/// so sharing the crate later doesn't wait for it.
+pub fn add_to_crate(lib: &Arc<Mutex<Library>>, id: u64, paths: &[PathBuf]) -> usize {
+    let added: Vec<PathBuf> = {
+        let mut l = lib.lock();
+        let Some(c) = l.my_crates.iter_mut().find(|c| c.id == id) else {
+            return 0;
+        };
+        let mut have: HashSet<String> = c.tracks.iter().map(|p| same_file(p)).collect();
+        let added: Vec<PathBuf> = paths
+            .iter()
+            .filter(|p| have.insert(same_file(p)))
+            .cloned()
+            .collect();
+        c.tracks.extend(added.iter().cloned());
+        if !added.is_empty() {
+            l.save_crates();
+        }
+        added
+    };
+    if added.is_empty() {
+        return 0;
+    }
+    scan(lib, my_crate_key(id), SourceKind::Mine(id));
+    refresh_all(lib);
+    let n = added.len();
+    let lib = lib.clone();
+    std::thread::spawn(move || {
+        for p in added {
+            let _ = hash_path(&lib, &p);
+        }
+    });
+    n
+}
+
+/// Take tracks out of a crate (the files stay where they are).
+pub fn remove_from_crate(lib: &Arc<Mutex<Library>>, id: u64, paths: &[PathBuf]) {
+    {
+        let mut l = lib.lock();
+        let Some(c) = l.my_crates.iter_mut().find(|c| c.id == id) else {
+            return;
+        };
+        let gone: HashSet<String> = paths.iter().map(|p| same_file(p)).collect();
+        let before = c.tracks.len();
+        c.tracks.retain(|p| !gone.contains(&same_file(p)));
+        if c.tracks.len() == before {
+            return;
+        }
+        l.save_crates();
+    }
+    scan(lib, my_crate_key(id), SourceKind::Mine(id));
+    refresh_all(lib);
+}
+
+/// What the room is told about a library track (shared live in a crate):
+/// its content hash, worked out now if it isn't known yet, with the names
+/// the library shows and the grid and key it has. `None` if the file can't
+/// be read.
+pub fn room_info(lib: &Arc<Mutex<Library>>, t: &LibTrack) -> Option<TrackInfo> {
+    let id = hash_path(lib, &t.path).ok()?;
+    Some(TrackInfo {
+        id,
+        title: t.title.clone(),
+        artist: t.artist.clone(),
+        bpm: t.bpm,
+        duration: t.duration,
+        size: t.size,
+        file_name: t
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default(),
+        grid: cached_grid(lib, &t.path),
+        key: t.key.or_else(|| cached_key(lib, &t.path)),
+    })
 }
 
 /// One group of files from a source, which decides on its own whether its
@@ -546,13 +827,40 @@ fn source_files(lib: &Arc<Mutex<Library>>, kind: &SourceKind) -> (Vec<FileGroup>
             ),
             Err(e) => (Vec::new(), Some(format!("couldn't read crate: {e}"))),
         },
+        SourceKind::Mine(id) => {
+            let paths = lib
+                .lock()
+                .my_crate(*id)
+                .map(|c| c.tracks.clone())
+                .unwrap_or_default();
+            let (here, gone): (Vec<PathBuf>, Vec<PathBuf>) =
+                paths.into_iter().partition(|p| p.exists());
+            let error = match gone.len() {
+                0 => None,
+                1 => Some("1 track in this crate is missing: moved or deleted?".to_string()),
+                n => Some(format!(
+                    "{n} tracks in this crate are missing: moved or deleted?"
+                )),
+            };
+            (vec![(None, here)], error)
+        }
         // Each part is grouped as its own list is, so names come out the
         // same here as there. Folders come first, so a track that's also in
         // a crate is listed from its folder.
         SourceKind::All => {
-            let (folders, shared, crates) = {
+            let (folders, shared, crates, mine) = {
                 let l = lib.lock();
-                (l.folders.clone(), l.shared_dir.clone(), l.crates.clone())
+                let mine: Vec<PathBuf> = l
+                    .my_crates
+                    .iter()
+                    .flat_map(|c| c.tracks.iter().cloned())
+                    .collect();
+                (
+                    l.folders.clone(),
+                    l.shared_dir.clone(),
+                    l.crates.clone(),
+                    mine,
+                )
             };
             let mut groups: Vec<FileGroup> = folders
                 .into_iter()
@@ -562,6 +870,7 @@ fn source_files(lib: &Arc<Mutex<Library>>, kind: &SourceKind) -> (Vec<FileGroup>
                 })
                 .collect();
             groups.push((None, walk(&shared)));
+            groups.push((None, mine.into_iter().filter(|p| p.exists()).collect()));
             for c in &crates {
                 match serato::crate_tracks(c) {
                     Ok(paths) => groups.push((None, paths)),
@@ -573,11 +882,12 @@ fn source_files(lib: &Arc<Mutex<Library>>, kind: &SourceKind) -> (Vec<FileGroup>
     }
 }
 
-/// A path as compared to list each file once: Windows paths ignore case.
+/// A path as compared to list each file once: Windows paths ignore case,
+/// and take either slash.
 fn same_file(path: &Path) -> String {
     let s = path.to_string_lossy();
     if cfg!(windows) {
-        s.to_lowercase()
+        s.to_lowercase().replace('/', "\\")
     } else {
         s.into_owned()
     }
@@ -1148,6 +1458,132 @@ mod tests {
         );
         wait_for(&|l| l.analyzing.is_none());
         assert_eq!(analysed(), n);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+        for _ in 0..1000 {
+            if done() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    fn titles(lib: &Arc<Mutex<Library>>, key: &str) -> Vec<String> {
+        wait_for("the scan", || {
+            lib.lock().lists.get(key).is_some_and(|l| !l.scanning)
+        });
+        lib.lock().lists[key]
+            .tracks
+            .iter()
+            .map(|t| t.title.clone())
+            .collect()
+    }
+
+    #[test]
+    fn crates_keep_their_tracks_in_order_across_restarts() {
+        let dir = std::env::temp_dir().join(format!("tandem-crates-test-{}", fastrand::u64(..)));
+        let signal = crate::audio::test_signal(44_100, 0.2, 330.0);
+        let file = |f: &str| {
+            let p = dir.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            crate::audio::write_wav(&p, 44_100, &signal).unwrap();
+            p
+        };
+        let (a, b, c) = (
+            file("music/A - One.wav"),
+            file("music/B - Two.wav"),
+            file("elsewhere/C - Three.wav"),
+        );
+        let open = || {
+            Arc::new(Mutex::new(Library::new(
+                dir.join("shared"),
+                dir.join("cache.json"),
+            )))
+        };
+        let lib = open();
+        let id = new_crate(&lib, "  Friday \n warm-up ");
+        assert_eq!(lib.lock().my_crate(id).unwrap().name, "Friday warm-up");
+        assert_eq!(add_to_crate(&lib, id, &[b.clone(), a.clone()]), 2);
+        // Already in it: left out, the rest go on the end.
+        assert_eq!(add_to_crate(&lib, id, &[a.clone(), c.clone()]), 1);
+        let key = my_crate_key(id);
+        assert_eq!(titles(&lib, &key), ["Two", "One", "Three"]);
+        rename_crate(&lib, id, "Gig");
+
+        // Kept across restarts.
+        let lib = open();
+        let kept = lib.lock().my_crate(id).cloned().unwrap();
+        assert_eq!(kept.name, "Gig");
+        assert_eq!(kept.tracks, [b.clone(), a.clone(), c.clone()]);
+
+        // A file that's gone is left out of the list, and the list says so.
+        std::fs::remove_file(&a).unwrap();
+        scan(&lib, key.clone(), SourceKind::Mine(id));
+        assert_eq!(titles(&lib, &key), ["Two", "Three"]);
+        let error = lib.lock().lists[&key].error.clone().unwrap();
+        assert!(error.contains("1 track"), "{error}");
+
+        // All Music has crate tracks that aren't in a folder.
+        lib.lock().folders = vec![dir.join("music")];
+        scan(&lib, KEY_ALL.into(), SourceKind::All);
+        assert_eq!(titles(&lib, KEY_ALL), ["Two", "Three"]);
+
+        remove_from_crate(&lib, id, std::slice::from_ref(&b));
+        assert_eq!(titles(&lib, &key), ["Three"]);
+        delete_crate(&lib, id);
+        assert!(open().lock().my_crates.is_empty());
+        assert!(!lib.lock().lists.contains_key(&key));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn resync_finds_new_and_removed_files() {
+        let dir = std::env::temp_dir().join(format!("tandem-resync-test-{}", fastrand::u64(..)));
+        let signal = crate::audio::test_signal(44_100, 0.2, 330.0);
+        let file = |f: &str| {
+            let p = dir.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            crate::audio::write_wav(&p, 44_100, &signal).unwrap();
+            p
+        };
+        let (_, old) = (file("a/A - One.wav"), file("b/B - Two.wav"));
+        let lib = Arc::new(Mutex::new(Library::new(
+            dir.join("shared"),
+            dir.join("cache.json"),
+        )));
+        let folders = vec![dir.join("a"), dir.join("b")];
+        lib.lock().folders = folders.clone();
+        for f in &folders {
+            scan(&lib, folder_key(f), SourceKind::Folder(f.clone()));
+            titles(&lib, &folder_key(f));
+        }
+        // A song appears in one folder, one goes from the other, and one
+        // arrives in a folder within a folder.
+        file("a/new/C - Three.wav");
+        file("a/D - Four.wav");
+        std::fs::remove_file(&old).unwrap();
+        resync(&lib, None);
+        assert!(resyncing(&lib));
+        wait_for("the resync", || !resyncing(&lib));
+        assert_eq!(
+            lib.lock().resynced,
+            Some(Resynced {
+                added: 2,
+                removed: 1
+            })
+        );
+        assert_eq!(
+            titles(&lib, &folder_key(&folders[0])),
+            ["One", "Four", "Three"]
+        );
+        assert!(titles(&lib, &folder_key(&folders[1])).is_empty());
+        // Nothing changed since: nothing to report.
+        resync(&lib, None);
+        wait_for("the second resync", || !resyncing(&lib));
+        assert_eq!(lib.lock().resynced, Some(Resynced::default()));
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -1,14 +1,34 @@
 //! Library browser: sources on the left, tracks on the right.
 
-use crate::app::{lib_bpm, room_bpm, BrowseFocus, ShareDraft, Source, TandemApp};
+use crate::app::{
+    lib_bpm, room_bpm, BrowseFocus, CrateDialog, CrateMode, DragTracks, Source, TandemApp,
+};
 use crate::ui_decks::{fmt_time, DeckLayout, DECK_COLORS};
 use eframe::egui::{self, pos2, vec2, Align2, Color32, FontId, RichText, Sense};
+use std::path::PathBuf;
 use tandem_core::config::SortColumn;
-use tandem_core::library::{KEY_ALL, KEY_SHARED};
+use tandem_core::library::{self, KEY_ALL, KEY_SHARED};
 use tandem_core::session::{deck_letter, SessionView, ShareState, TransferState};
 
 /// The outline round the side of the library the browse knob moves through.
 const KNOB_FOCUS: Color32 = Color32::from_rgb(70, 130, 210);
+
+/// Lists shared live: the 📡 mark on yours, and the other DJs' lists.
+const LIVE: Color32 = Color32::from_rgb(110, 200, 150);
+
+/// What a crate on the left does when a dragged track hovers over it: lights
+/// up, and takes it when it's let go.
+fn crate_drop(ui: &egui::Ui, r: &egui::Response) -> Option<DragTracks> {
+    if r.dnd_hover_payload::<DragTracks>().is_some() {
+        ui.painter().rect_stroke(
+            r.rect.expand(1.0),
+            3.0,
+            egui::Stroke::new(1.5_f32, LIVE),
+            egui::StrokeKind::Outside,
+        );
+    }
+    r.dnd_release_payload::<DragTracks>().map(|p| (*p).clone())
+}
 
 /// Scroll the source list to `r` if the knob just moved there.
 fn follow(r: &egui::Response, on: bool) {
@@ -112,6 +132,30 @@ impl TandemApp {
                     egui::StrokeKind::Inside,
                 );
             });
+        // A track being dragged: its title follows the pointer.
+        if let (Some(d), Some(at)) = (
+            egui::DragAndDrop::payload::<DragTracks>(ctx),
+            ctx.pointer_latest_pos(),
+        ) {
+            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+            let p = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Tooltip,
+                egui::Id::new("dragged track"),
+            ));
+            let text = format!("📦 {}", d.1);
+            let galley =
+                p.layout_no_wrap(text, FontId::proportional(13.0), Color32::from_gray(235));
+            let rect = egui::Rect::from_min_size(at + vec2(14.0, 10.0), galley.size())
+                .expand2(vec2(8.0, 4.0));
+            p.rect_filled(rect, 4.0, Color32::from_rgb(40, 60, 52));
+            p.rect_stroke(
+                rect,
+                4.0,
+                egui::Stroke::new(1.0_f32, LIVE),
+                egui::StrokeKind::Inside,
+            );
+            p.galley(rect.min + vec2(8.0, 4.0), galley, Color32::from_gray(235));
+        }
     }
 
     fn sources(&mut self, ui: &mut egui::Ui, view: &SessionView) {
@@ -172,6 +216,33 @@ impl TandemApp {
                     pick = Some(Source::Shared);
                 }
 
+                if !view.room_crates.is_empty() {
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("SHARED LIVE IN THIS ROOM").small().weak());
+                    for c in &view.room_crates {
+                        let src = Source::Live {
+                            owner: c.owner,
+                            id: c.crate_id,
+                        };
+                        let on = self.ui.source == src;
+                        let text = RichText::new(format!(
+                            "📡 {} · {} ({})",
+                            c.name,
+                            c.owner_name,
+                            c.tracks.len()
+                        ))
+                        .color(LIVE);
+                        let r = ui.selectable_label(on, text).on_hover_text(format!(
+                            "{} shares this list live. Load any track from it and it comes over from {}'s PC, like any track a DJ loads, and goes when Tandem closes.",
+                            c.owner_name, c.owner_name
+                        ));
+                        follow(&r, on && knob);
+                        if r.clicked() {
+                            pick = Some(src);
+                        }
+                    }
+                }
+
                 ui.add_space(6.0);
                 ui.label(RichText::new("FOLDERS").small().weak());
                 let mut remove = None;
@@ -198,14 +269,30 @@ impl TandemApp {
                         }
                     });
                 }
-                if ui.button("➕ Add music folder…").clicked() {
-                    if let Some(dir) = rfd::FileDialog::new()
-                        .set_title("Add a music folder")
-                        .pick_folder()
-                    {
-                        self.add_folder(dir);
+                let mut resync = false;
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("➕ Add music folder…").clicked() {
+                        if let Some(dir) = rfd::FileDialog::new()
+                            .set_title("Add a music folder")
+                            .pick_folder()
+                        {
+                            self.add_folder(dir);
+                        }
                     }
-                }
+                    let busy = library::resyncing(&self.library);
+                    let r = ui
+                        .add_enabled(!busy, egui::Button::new("⟳ Resync folders"))
+                        .on_hover_text(
+                            "Look for songs added, changed or removed since Tandem started: in your folders, Shared with me, your crates and Serato's.",
+                        );
+                    if busy {
+                        ui.spinner();
+                    }
+                    resync |= r.clicked();
+                });
+
+                ui.add_space(6.0);
+                self.my_crates_section(ui, view, knob, &mut pick);
 
                 ui.add_space(6.0);
                 let crates = self.library.lock().crates.clone();
@@ -235,11 +322,12 @@ impl TandemApp {
                             pick = Some(Source::Crate(c.clone()));
                         }
                     }
-                    if ui.small_button("Rescan crates").clicked() {
-                        self.library
-                            .lock()
-                            .refresh_crates(self.paths.music_dir.as_deref());
-                        tandem_core::library::refresh_all(&self.library);
+                    if ui
+                        .small_button("Rescan crates")
+                        .on_hover_text("Look again for Serato crates and what's in them (and your folders).")
+                        .clicked()
+                    {
+                        resync = true;
                     }
                 });
                 // The knob only moves through crates you can see.
@@ -293,6 +381,9 @@ impl TandemApp {
                 if let Some(dir) = remove {
                     self.remove_folder(&dir);
                 }
+                if resync {
+                    self.resync();
+                }
                 if let Some(src) = pick {
                     // Picking a list goes into it, like pressing the knob
                     // on it: the knob moves through its tracks.
@@ -300,6 +391,129 @@ impl TandemApp {
                     self.ui.browse_focus = BrowseFocus::Tracks;
                 }
             });
+    }
+
+    /// MY CRATES: the crates you made, with ➕ New crate. Tracks dragged
+    /// onto one go in it; right-click one to rename, share or delete it.
+    fn my_crates_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        view: &SessionView,
+        knob: bool,
+        pick: &mut Option<Source>,
+    ) {
+        let mine = self.library.lock().my_crates.clone();
+        let in_room = matches!(
+            view.link.role,
+            tandem_core::session::RoleView::Hosting { .. }
+                | tandem_core::session::RoleView::Joined { .. }
+        );
+        let mut dropped: Option<(u64, DragTracks)> = None;
+        let mut share: Option<Source> = None;
+        let mut unshare: Option<String> = None;
+        let section = egui::CollapsingHeader::new(
+            RichText::new(format!("MY CRATES ({})", mine.len()))
+                .small()
+                .weak(),
+        )
+        .id_salt("my crates")
+        .default_open(true)
+        .show(ui, |ui| {
+            if mine.is_empty() {
+                ui.label(
+                    RichText::new(
+                        "Make a crate, then drag tracks onto it (or right-click a track).",
+                    )
+                    .small()
+                    .weak(),
+                );
+            }
+            for c in &mine {
+                let src = Source::Mine(c.id);
+                let key = src.key();
+                let live = view.live.iter().find(|l| l.key == key);
+                let on = self.ui.source == src;
+                let mut text = RichText::new(format!("📦 {} ({})", c.name, c.tracks.len()));
+                if live.is_some() {
+                    text = RichText::new(format!("📦 {} ({}) 📡", c.name, c.tracks.len()));
+                }
+                let mut r = ui.selectable_label(on, text);
+                if live.is_some() {
+                    r = r.on_hover_text(
+                        "Shared live with the room: the other DJs see it and can load from it.",
+                    );
+                }
+                follow(&r, on && knob);
+                if r.clicked() {
+                    *pick = Some(src.clone());
+                }
+                if let Some(d) = crate_drop(ui, &r) {
+                    dropped = Some((c.id, d));
+                }
+                r.context_menu(|ui| {
+                    if ui.button("Rename…").clicked() {
+                        self.ui.crate_dialog = Some(CrateDialog {
+                            mode: CrateMode::Rename(c.id),
+                            name: c.name.clone(),
+                            add: Vec::new(),
+                            focus: true,
+                        });
+                        ui.close_menu();
+                    }
+                    if live.is_some() {
+                        if ui.button("Stop sharing live").clicked() {
+                            unshare = Some(key.clone());
+                            ui.close_menu();
+                        }
+                    } else {
+                        let r =
+                            ui.add_enabled(in_room, egui::Button::new("Share live with the room…"));
+                        if r.on_disabled_hover_text("Host or join a room first")
+                            .clicked()
+                        {
+                            share = Some(src.clone());
+                            ui.close_menu();
+                        }
+                    }
+                    if ui.button("Delete…").clicked() {
+                        self.ui.crate_dialog = Some(CrateDialog {
+                            mode: CrateMode::Delete(c.id),
+                            name: c.name.clone(),
+                            add: Vec::new(),
+                            focus: false,
+                        });
+                        ui.close_menu();
+                    }
+                });
+            }
+            let r = ui.small_button("➕ New crate").on_hover_text(
+                "Make a crate of your own tracks. Drop a track here to start one with it.",
+            );
+            let new_with = crate_drop(ui, &r);
+            if r.clicked() || new_with.is_some() {
+                self.ui.crate_dialog = Some(CrateDialog {
+                    mode: CrateMode::New,
+                    name: String::new(),
+                    add: new_with.map(|d| d.0).unwrap_or_default(),
+                    focus: true,
+                });
+            }
+        });
+        // The knob only moves through crates you can see.
+        self.ui.mine_open = section.body_returned.is_some();
+        if let Some((id, d)) = dropped {
+            self.add_to_crate(id, d.0);
+        }
+        if let Some(key) = unshare {
+            self.session.lock().unshare_live(&key);
+        }
+        if let Some(src) = share {
+            // Show it, so the share window has its tracks.
+            if self.ui.source != src {
+                self.set_source(src.clone());
+            }
+            self.open_share(&src, view);
+        }
     }
 
     /// The search box. While it has text, a ✖ inside its right end clears
@@ -367,21 +581,18 @@ impl TandemApp {
         let shown = self.shown_decks();
         let src = self.ui.source.clone();
         let key = src.key();
-        let (scanning, error, all_paths, bytes) = {
+        let (scanning, error, count) = {
             let lib = self.library.lock();
             match lib.lists.get(&key) {
-                Some(l) => (
-                    l.scanning,
-                    l.error.clone(),
-                    l.tracks.iter().map(|t| t.path.clone()).collect::<Vec<_>>(),
-                    l.tracks.iter().map(|t| t.size).sum::<u64>(),
-                ),
-                None => (false, None, Vec::new(), 0),
+                Some(l) => (l.scanning, l.error.clone(), l.tracks.len()),
+                None => (false, None, 0),
             }
         };
+        let live = view.live.iter().find(|l| l.key == key).cloned();
+        let room_crate = src.room_crate(view).cloned();
 
         ui.horizontal(|ui| {
-            ui.label(RichText::new(src.label()).strong());
+            ui.label(RichText::new(self.list_label(&src, view)).strong());
             self.search_box(ui);
             ui.label("Load to");
             let spacing = ui.spacing().item_spacing.x;
@@ -401,23 +612,47 @@ impl TandemApp {
                 }
             }
             ui.spacing_mut().item_spacing.x = spacing;
-            if !matches!(src, Source::Room) {
-                let can = view.link.linked()
-                    && !all_paths.is_empty()
+            let in_room = matches!(
+                view.link.role,
+                tandem_core::session::RoleView::Hosting { .. }
+                    | tandem_core::session::RoleView::Joined { .. }
+            );
+            if let Some(l) = &live {
+                let text = if l.preparing {
+                    "📡 Sharing live (preparing…)".to_string()
+                } else {
+                    format!("📡 Shared live ({})", l.tracks)
+                };
+                ui.label(RichText::new(text).color(LIVE)).on_hover_text(
+                    "The other DJs see this list and can load from it. Changes you make to it reach them.",
+                );
+                if ui.button("Stop sharing").clicked() {
+                    self.session.lock().unshare_live(&key);
+                }
+            } else if let Some(c) = &room_crate {
+                ui.label(
+                    RichText::new(format!("📡 from {}'s PC when loaded", c.owner_name))
+                        .color(LIVE),
+                )
+                .on_hover_text(format!(
+                    "{} shares this list live. A track comes over from their PC only when someone loads it, and goes when Tandem closes.",
+                    c.owner_name
+                ));
+            } else if src.local() {
+                let live_ok = in_room && src.live_shareable();
+                let can = (view.link.linked() || live_ok)
+                    && (count > 0 || matches!(src, Source::Mine(_)))
                     && view.preparing_share.is_none();
-                let r = ui.add_enabled(can, egui::Button::new("Share this list…"));
-                let r = if !view.link.linked() {
+                let r = ui.add_enabled(can, egui::Button::new("Share…"));
+                let r = if !in_room {
                     r.on_disabled_hover_text("Host or join a room first")
                 } else {
-                    r
+                    r.on_hover_text(
+                        "Share it live (the others load from it, nothing is copied until they do) or send copies to keep.",
+                    )
                 };
                 if r.clicked() {
-                    self.ui.share_draft = Some(ShareDraft {
-                        title: src.label(),
-                        paths: all_paths.clone(),
-                        bytes,
-                        pledge: false,
-                    });
+                    self.open_share(&src, view);
                 }
             }
             if let Some(t) = &view.preparing_share {
@@ -447,7 +682,7 @@ impl TandemApp {
                         tandem_core::library::cancel_analysis(&self.library);
                     }
                 }
-                None if !matches!(src, Source::Room) && !scanning && !all_paths.is_empty() => {
+                None if src.local() && !scanning && count > 0 => {
                     if ui
                         .button("Analyze BPM")
                         .on_hover_text("Detect the tempo and beatgrid of every track in this list (runs in the background; each track is only analysed once).")
@@ -553,9 +788,13 @@ impl TandemApp {
             let hint = match src {
                 Source::Room => "Tracks you or the other DJs load will appear here.",
                 Source::Shared => "Nothing shared with you yet.",
+                Source::Live { .. } if room_crate.is_none() => "No longer shared.",
                 _ if scanning => "Scanning…",
                 _ if !self.ui.search.is_empty() => "No matches.",
                 Source::All => "No music yet. Add a music folder on the left.",
+                Source::Mine(_) => {
+                    "Nothing in this crate yet: drag tracks onto it on the left, or right-click a track → Add to crate."
+                }
                 _ => "No audio files here.",
             };
             ui.label(RichText::new(hint).weak());
@@ -582,20 +821,33 @@ impl TandemApp {
         let mut clicked = None;
         let mut double = None;
         let mut menu_load = None;
+        let mut to_crate: Option<(Option<u64>, PathBuf)> = None;
+        let mut out_of_crate: Option<PathBuf> = None;
+        let mine = lib.my_crates.clone();
+        let room = src.room_tracks(view);
+        // Tracks on this computer can be dragged onto a crate.
+        let sense = if src.local() {
+            Sense::click_and_drag()
+        } else {
+            Sense::click()
+        };
         scroll.show_rows(ui, row_h, n, |ui, range| {
             for i in range {
                 let Some(&idx) = self.ui.filtered.get(i) else {
                     continue;
                 };
-                let row = match &src {
-                    Source::Room => view.room_tracks.get(idx).map(|t| Row {
+                let file = list
+                    .and_then(|l| l.tracks.get(idx))
+                    .filter(|_| room.is_none());
+                let row = match room {
+                    Some(tracks) => tracks.get(idx).map(|t| Row {
                         title: t.title.clone(),
                         artist: t.artist.clone(),
                         bpm: room_bpm(t),
                         key: t.key,
                         duration: t.duration,
                     }),
-                    _ => list.and_then(|l| l.tracks.get(idx)).map(|t| Row {
+                    None => file.map(|t| Row {
                         title: t.title.clone(),
                         artist: t.artist.clone(),
                         bpm: lib_bpm(t),
@@ -604,7 +856,10 @@ impl TandemApp {
                     }),
                 };
                 let Some(row) = row else { continue };
-                let (rect, resp) = ui.allocate_exact_size(vec2(width, row_h), Sense::click());
+                let (rect, resp) = ui.allocate_exact_size(vec2(width, row_h), sense);
+                if let (Some(t), true) = (file, resp.drag_started()) {
+                    resp.dnd_set_drag_payload(DragTracks(vec![t.path.clone()], row.title.clone()));
+                }
                 let p = ui.painter_at(rect);
                 let selected = i == self.ui.sel_index;
                 if selected {
@@ -669,10 +924,45 @@ impl TandemApp {
                             ui.close_menu();
                         }
                     }
+                    let Some(t) = file else { return };
+                    ui.separator();
+                    ui.menu_button("Add to crate", |ui| {
+                        for c in mine.iter().filter(|c| src != Source::Mine(c.id)) {
+                            if ui.button(format!("📦 {}", c.name)).clicked() {
+                                to_crate = Some((Some(c.id), t.path.clone()));
+                                ui.close_menu();
+                            }
+                        }
+                        if ui.button("➕ New crate…").clicked() {
+                            to_crate = Some((None, t.path.clone()));
+                            ui.close_menu();
+                        }
+                    });
+                    if let Source::Mine(_) = src {
+                        if ui.button("Remove from this crate").clicked() {
+                            out_of_crate = Some(t.path.clone());
+                            ui.close_menu();
+                        }
+                    }
                 });
             }
         });
         drop(lib);
+        match to_crate {
+            Some((Some(id), path)) => self.add_to_crate(id, vec![path]),
+            Some((None, path)) => {
+                self.ui.crate_dialog = Some(CrateDialog {
+                    mode: CrateMode::New,
+                    name: String::new(),
+                    add: vec![path],
+                    focus: true,
+                })
+            }
+            None => {}
+        }
+        if let (Some(path), Source::Mine(id)) = (out_of_crate, &src) {
+            library::remove_from_crate(&self.library, *id, &[path]);
+        }
         if clicked.is_some() || double.is_some() || menu_load.is_some() {
             self.ui.browse_focus = BrowseFocus::Tracks;
         }
@@ -692,5 +982,78 @@ impl TandemApp {
                 self.load(d, item, view);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A track row dragged onto a crate on the left lands there when it's
+    /// let go: the row hands over its file as it starts moving, and the
+    /// crate takes it on release (egui clears it only after that frame).
+    #[test]
+    fn a_track_dragged_onto_a_crate_lands_in_it() {
+        let ctx = egui::Context::default();
+        let row_at = pos2(300.0, 18.0);
+        let crate_at = pos2(40.0, 20.0);
+        let mut got = None;
+        let frame = |events: Vec<egui::Event>, got: &mut Option<DragTracks>| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    pos2(0.0, 0.0),
+                    vec2(600.0, 200.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let target = ui.put(
+                        egui::Rect::from_center_size(crate_at, vec2(60.0, 20.0)),
+                        egui::Button::new("📦 Gig"),
+                    );
+                    if let Some(d) = crate_drop(ui, &target) {
+                        *got = Some(d);
+                    }
+                    // In a scrolling list, as the track rows are.
+                    let list = egui::Rect::from_min_size(pos2(200.0, 10.0), vec2(200.0, 100.0));
+                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(list), |ui| {
+                        egui::ScrollArea::vertical().show_rows(ui, 20.0, 50, |ui, range| {
+                            for i in range {
+                                let resp = ui
+                                    .allocate_exact_size(vec2(200.0, 20.0), Sense::click_and_drag())
+                                    .1;
+                                if i == 0 && resp.drag_started() {
+                                    resp.dnd_set_drag_payload(DragTracks(
+                                        vec![PathBuf::from("a.mp3")],
+                                        "A".into(),
+                                    ));
+                                }
+                            }
+                        });
+                    });
+                });
+            });
+        };
+        let moved = |p: egui::Pos2| egui::Event::PointerMoved(p);
+        let button = |p: egui::Pos2, pressed: bool| egui::Event::PointerButton {
+            pos: p,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        frame(vec![moved(row_at)], &mut got);
+        frame(vec![button(row_at, true)], &mut got);
+        for x in [290.0, 250.0, 150.0, 60.0, 40.0] {
+            frame(vec![moved(pos2(x, 20.0))], &mut got);
+        }
+        assert!(got.is_none(), "dropped before it was let go");
+        frame(vec![button(crate_at, false)], &mut got);
+        let d = got.take().expect("the crate didn't get the track");
+        assert_eq!(d.0, [PathBuf::from("a.mp3")]);
+        // Nothing left to drop afterwards.
+        frame(vec![moved(crate_at)], &mut got);
+        assert!(egui::DragAndDrop::payload::<DragTracks>(&ctx).is_none());
     }
 }

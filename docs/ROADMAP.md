@@ -423,6 +423,30 @@ Work through these in order and note anything that fails. `tandem.log` (Settings
   - Test: join a room with a controller and make fast crossfader cuts, edge to edge, for a few minutes. Does the on-screen crossfader always end where the hardware is, on your PC and the host's?
 - No protocol change: v0.12.0, v0.12.1 and v0.12.2 can share a room. The fix is on the joining DJ's side, so joining DJs need v0.12.2 for it.
 
+## Round 13 (v0.13): your own crates, shared live, and resync
+
+- **⟳ Resync folders** looks again for songs added, changed or removed since Tandem started, in your folders, Shared with me, your crates and Serato's (Serato's **Rescan crates** does the same). The lists stay on screen while it looks, then the status bar says how many tracks came and went.
+  - Test: with Tandem open, copy two new songs into one of your music folders and delete one. Click **⟳ Resync folders**. Does the status bar say *2 new, 1 gone*, and does the folder's list show the new songs?
+- **Your own crates.** **➕ New crate** under MY CRATES, then drag tracks onto it from any list, or right-click a track → **Add to crate**. Right-click a crate to rename, share or delete it, and a track in it to take it out. Crates keep the order you added tracks in, live in `crates.json`, and never touch your files. The browse knob moves through them too.
+  - Test: make a crate, drag three tracks onto it from different folders, then restart Tandem. Is it still there, in that order? Remove one: is the file still in its folder?
+- **Share a crate live with the room.** **Share…** above a crate's tracks (or a folder's, or a Serato crate's) now offers **📡 Share it live** as well as sending copies. The other DJs see the list under **SHARED LIVE IN THIS ROOM** and can load any track from it onto any deck, from the screen or the controller. Nothing is copied until someone loads a track: that one track then comes over from its owner, as any track a DJ loads does, and goes when Tandem closes. Tracks you add or take out, a rename and a resync reach the others within a second or so, and BPMs you analyse every 10 seconds. It lasts until you stop sharing it or leave, carries on through a dropped connection, and reaches DJs who join later; broadcasters don't get it. Up to 500 tracks a list.
+- A track its owner hasn't analysed comes over to the DJ who loaded it first and is analysed there, so it lands with a beatgrid and key, like a track from their own library.
+- The self-test now shares a list live and loads a track from it through the host.
+- Protocol version 16: v0.13 can't share a room with v0.12 or earlier, so everyone in the room, broadcasters included, needs v0.13.
+
+### Test plan for crates shared live
+
+1. Host on one PC and join from two others.
+2. On a joining PC, make a crate of five tracks, at least one never analysed (no BPM), and **Share… → Share it live**.
+   - Do the other two see it under SHARED LIVE IN THIS ROOM, named after the crate and its DJ, with its five tracks, and nothing in their transfers?
+3. On the other joining PC, load an analysed track from it onto deck A, and the unanalysed one onto deck B.
+   - Does deck A load at once and say **Receiving this track…** until it arrives, on every PC?
+   - Does deck B say it's loading, then load with a BPM and key once the track has arrived?
+   - Do the two tracks play in step on every PC, and on a broadcaster?
+4. Drag two more tracks onto the shared crate, and rename it. Do the others see both within a couple of seconds?
+5. Unplug the sharing PC's network for 20 seconds. While it's out, click **Stop sharing**. Once it's back, has the crate gone from the others' libraries, with the tracks on the decks still playing?
+6. Share it again and have that DJ leave the room. Does it go from the others' libraries?
+
 ## Next candidates
 
 Rough priority order:

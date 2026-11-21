@@ -68,6 +68,8 @@ fn main() {
         window_size: arg_after("--window-size").and_then(|p| parse_size(&p.to_string_lossy())),
         zoom: arg_after("--zoom").and_then(|p| p.to_string_lossy().parse().ok()),
         settings: arg_after("--dev-settings").map(|p| p.to_string_lossy().to_string()),
+        crate_demo: args.iter().any(|a| a == "--dev-crate"),
+        crate_step: 0,
         fitted: false,
         shared: false,
         demo_started: false,

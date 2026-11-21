@@ -15,7 +15,7 @@ use tandem_core::library::{self, LibTrack, Library, SortRow, SourceKind};
 use tandem_core::mapping::{ControllerCard, MidiOut};
 use tandem_core::meter::LevelMeters;
 use tandem_core::model::{deck_letter, Action, RoomState, TrackId, XfCurve, DECKS};
-use tandem_core::protocol::TrackInfo;
+use tandem_core::protocol::{RoomCrate, TrackInfo, ROOM_CRATE_MAX};
 use tandem_core::render::LocalParams;
 use tandem_core::serato::SeratoCrate;
 use tandem_core::session::{RoleView, Session, SessionHandle, SessionView};
@@ -23,12 +23,20 @@ use tandem_core::time::{local_us, SharedClock};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Source {
-    /// Every folder, "Shared with me" and every Serato crate.
+    /// Every folder, "Shared with me", every crate of yours and every
+    /// Serato crate.
     All,
     Room,
     Shared,
     Folder(PathBuf),
     Crate(SeratoCrate),
+    /// One of your own crates, by id.
+    Mine(u64),
+    /// A list another DJ in the room shares live: their id and its.
+    Live {
+        owner: u64,
+        id: u64,
+    },
 }
 
 impl Source {
@@ -39,9 +47,13 @@ impl Source {
             Source::Shared => library::KEY_SHARED.into(),
             Source::Folder(p) => library::folder_key(p),
             Source::Crate(c) => library::crate_key(c),
+            Source::Mine(id) => library::my_crate_key(*id),
+            Source::Live { owner, id } => format!("live:{owner}:{id}"),
         }
     }
 
+    /// Its name, for lists that know it themselves (see
+    /// [`TandemApp::list_label`] for the rest).
     pub fn label(&self) -> String {
         match self {
             Source::All => "All Music".into(),
@@ -52,16 +64,51 @@ impl Source {
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| p.display().to_string()),
             Source::Crate(c) => format!("Serato crate: {}", c.name),
+            Source::Mine(_) => "Crate".into(),
+            Source::Live { .. } => "Shared live".into(),
         }
     }
 
     pub fn kind(&self) -> Option<SourceKind> {
         match self {
             Source::All => Some(SourceKind::All),
-            Source::Room => None,
+            Source::Room | Source::Live { .. } => None,
             Source::Shared => Some(SourceKind::Shared),
             Source::Folder(p) => Some(SourceKind::Folder(p.clone())),
             Source::Crate(c) => Some(SourceKind::Crate(c.clone())),
+            Source::Mine(id) => Some(SourceKind::Mine(*id)),
+        }
+    }
+
+    /// Its tracks are files on this computer (not the room's).
+    pub fn local(&self) -> bool {
+        self.kind().is_some()
+    }
+
+    /// Can be shared live with the room: your own lists, not All Music
+    /// (too big) or what others shared with you (that's theirs).
+    pub fn live_shareable(&self) -> bool {
+        matches!(self, Source::Folder(_) | Source::Crate(_) | Source::Mine(_))
+    }
+
+    /// The list a room crate is, in the view.
+    pub fn room_crate<'a>(&self, view: &'a SessionView) -> Option<&'a RoomCrate> {
+        let Source::Live { owner, id } = self else {
+            return None;
+        };
+        view.room_crates
+            .iter()
+            .find(|c| c.owner == *owner && c.crate_id == *id)
+            .map(|c| &**c)
+    }
+
+    /// The tracks of a list the room has (this room's, or one shared
+    /// live), rather than this computer's library.
+    pub fn room_tracks<'a>(&self, view: &'a SessionView) -> Option<&'a [TrackInfo]> {
+        match self {
+            Source::Room => Some(&view.room_tracks),
+            Source::Live { .. } => Some(self.room_crate(view).map_or(&[], |c| &c.tracks)),
+            _ => None,
         }
     }
 }
@@ -92,6 +139,7 @@ pub fn step_source<'a>(lists: &'a [Source], current: &Source, delta: i32) -> Opt
 }
 
 /// Lists rescanned every time they're picked: Serato may have changed them.
+/// (Your own crates change only in Tandem, and rescan when they do.)
 fn rescanned(source: &Source) -> bool {
     matches!(source, Source::Crate(_) | Source::All)
 }
@@ -100,6 +148,29 @@ fn rescanned(source: &Source) -> bool {
 pub enum Item {
     File(PathBuf),
     Known(TrackId),
+    /// From a list another DJ shares live.
+    Live(Box<TrackInfo>),
+}
+
+/// What a dragged track row carries: its file, to drop on a crate.
+#[derive(Clone, Debug)]
+pub struct DragTracks(pub Vec<PathBuf>, pub String);
+
+/// The crate window open: making, renaming or deleting one.
+pub struct CrateDialog {
+    pub mode: CrateMode,
+    pub name: String,
+    /// Tracks to put in a new crate.
+    pub add: Vec<PathBuf>,
+    /// Focus the name box when it opens.
+    pub focus: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CrateMode {
+    New,
+    Rename(u64),
+    Delete(u64),
 }
 
 /// The smallest the main window goes, in points: a 1080p laptop at 175%
@@ -195,11 +266,40 @@ fn room_rev(tracks: &[TrackInfo]) -> u64 {
     })
 }
 
+/// What the room last got of a list shared live.
+pub struct LiveSent {
+    /// The list's version (see `TrackList::rev`).
+    rev: u64,
+    /// Which files it had: tracks coming or going go to the room within a
+    /// second; new details alone (BPMs being analysed) every 10 seconds.
+    files: u64,
+    name: String,
+    at: Instant,
+}
+
+/// Tells one set of files from another.
+fn files_of(tracks: &[LibTrack]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for t in tracks {
+        t.path.hash(&mut h);
+    }
+    h.finish()
+}
+
 pub struct ShareDraft {
     pub title: String,
+    /// The list's key, to keep a live share up to date.
+    pub key: String,
     pub paths: Vec<PathBuf>,
     pub bytes: u64,
     pub pledge: bool,
+    /// Share it live (the other DJs load from it) rather than send copies.
+    pub live: bool,
+    /// Why it can't be shared live, if it can't.
+    pub live_no: Option<String>,
+    /// Why copies can't be sent, if they can't.
+    pub copies_no: Option<String>,
 }
 
 pub struct UiState {
@@ -217,6 +317,11 @@ pub struct UiState {
     pub source_browsed: bool,
     /// The Serato crates section was open last frame.
     pub crates_open: bool,
+    /// The My crates section was open last frame.
+    pub mine_open: bool,
+    pub crate_dialog: Option<CrateDialog>,
+    /// Lists shared live: what the room last got of each, by list key.
+    pub live_sent: HashMap<String, LiveSent>,
     pub show_settings: bool,
     pub settings_tab: SettingsTab,
     pub show_terms: bool,
@@ -260,7 +365,9 @@ pub struct UiState {
 /// never maximised to fit the screen); `--zoom <f>` scales the whole UI, as
 /// Windows display scaling does (`--window-size 1920x1080 --zoom 1.5` looks
 /// like a 1080p laptop at 150%); `--dev-settings <audio|controller|general>`
-/// opens Settings on that tab.
+/// opens Settings on that tab; `--dev-crate` makes a crate "Friday warm-up"
+/// of the first tracks on show and, hosting, shares it live once someone
+/// joins, or, joining, shows the first list shared live in the room.
 pub struct DevOpts {
     pub screenshot: Option<PathBuf>,
     pub shot_frame: u64,
@@ -277,6 +384,8 @@ pub struct DevOpts {
     pub window_size: Option<[f32; 2]>,
     pub zoom: Option<f32>,
     pub settings: Option<String>,
+    pub crate_demo: bool,
+    pub crate_step: u8,
     /// The window has been checked against the screen (`fit_window`).
     pub fitted: bool,
     pub shared: bool,
@@ -393,6 +502,9 @@ impl TandemApp {
             scroll_to_source: false,
             source_browsed: false,
             crates_open: true,
+            mine_open: true,
+            crate_dialog: None,
+            live_sent: HashMap::new(),
             show_settings: false,
             settings_tab: SettingsTab::Audio,
             show_terms: false,
@@ -627,10 +739,18 @@ impl TandemApp {
 
     /// The lists the browse knob moves through, top to bottom as on screen.
     /// Crates only while their section is open.
-    fn knob_sources(&self) -> Vec<Source> {
+    fn knob_sources(&self, view: &SessionView) -> Vec<Source> {
         let mut lists = vec![Source::All, Source::Room, Source::Shared];
+        lists.extend(view.room_crates.iter().map(|c| Source::Live {
+            owner: c.owner,
+            id: c.crate_id,
+        }));
         let folders = self.settings.library_folders.iter().cloned();
         lists.extend(folders.map(Source::Folder));
+        if self.ui.mine_open {
+            let mine = self.library.lock().my_crates.clone();
+            lists.extend(mine.into_iter().map(|c| Source::Mine(c.id)));
+        }
         if self.ui.crates_open {
             let crates = self.library.lock().crates.clone();
             lists.extend(crates.into_iter().map(Source::Crate));
@@ -641,7 +761,7 @@ impl TandemApp {
     /// The browse knob turned: move through the tracks, or through the
     /// lists, showing each one's tracks on the way. Lists shown this way
     /// aren't rescanned yet; pressing the knob to go into one does that.
-    fn browse(&mut self, delta: i32) {
+    fn browse(&mut self, delta: i32, view: &SessionView) {
         match self.ui.browse_focus {
             BrowseFocus::Tracks => {
                 let n = self.ui.filtered.len();
@@ -652,7 +772,7 @@ impl TandemApp {
                 }
             }
             BrowseFocus::Sources => {
-                let lists = self.knob_sources();
+                let lists = self.knob_sources(view);
                 if let Some(next) = step_source(&lists, &self.ui.source, delta) {
                     self.show_source(next.clone(), false);
                     self.ui.source_browsed = true;
@@ -713,6 +833,222 @@ impl TandemApp {
         self.mark_dirty();
     }
 
+    /// A list's name as the library shows it.
+    pub(crate) fn list_label(&self, src: &Source, view: &SessionView) -> String {
+        match src {
+            Source::Mine(id) => (self.library.lock().my_crate(*id))
+                .map(|c| c.name.clone())
+                .unwrap_or_else(|| "Crate".into()),
+            Source::Live { .. } => match src.room_crate(view) {
+                Some(c) => format!("{}'s {}", c.owner_name, c.name),
+                None => "Shared live".into(),
+            },
+            src => src.label(),
+        }
+    }
+
+    /// Look again for new, changed and removed songs in every folder,
+    /// Shared with me and the crates. Says what it found when it's done.
+    pub(crate) fn resync(&mut self) {
+        library::resync(&self.library, self.paths.music_dir.as_deref());
+        // A Serato crate that's gone can't stay on show.
+        if let Source::Crate(c) = &self.ui.source {
+            if !self.library.lock().crates.contains(c) {
+                self.set_source(Source::All);
+            }
+        }
+    }
+
+    /// Report a finished resync.
+    fn report_resync(&mut self) {
+        let Some(r) = self.library.lock().resynced.take() else {
+            return;
+        };
+        let n = |k: usize| {
+            if k == 1 {
+                "1 track".to_string()
+            } else {
+                format!("{k} tracks")
+            }
+        };
+        self.toast(match (r.added, r.removed) {
+            (0, 0) => "Folders resynced: nothing new.".to_string(),
+            (a, 0) => format!("Folders resynced: {} new.", n(a)),
+            (0, g) => format!("Folders resynced: {} gone.", n(g)),
+            (a, g) => format!("Folders resynced: {} new, {} gone.", n(a), n(g)),
+        });
+    }
+
+    /// Put tracks in one of your crates.
+    pub(crate) fn add_to_crate(&mut self, id: u64, paths: Vec<PathBuf>) {
+        let added = library::add_to_crate(&self.library, id, &paths);
+        let name = (self.library.lock().my_crate(id))
+            .map(|c| c.name.clone())
+            .unwrap_or_default();
+        self.toast(match (added, paths.len()) {
+            (0, 1) => format!("Already in \"{name}\"."),
+            (0, _) => format!("They're all in \"{name}\" already."),
+            (1, _) => format!("Added to \"{name}\"."),
+            (k, _) => format!("Added {k} tracks to \"{name}\"."),
+        });
+    }
+
+    /// Make a crate, with these tracks in it, and show it.
+    pub(crate) fn make_crate(&mut self, name: &str, paths: Vec<PathBuf>) {
+        let id = library::new_crate(&self.library, name);
+        if !paths.is_empty() {
+            library::add_to_crate(&self.library, id, &paths);
+        }
+        self.set_source(Source::Mine(id));
+    }
+
+    pub(crate) fn delete_crate(&mut self, id: u64) {
+        let key = library::my_crate_key(id);
+        self.session.lock().unshare_live(&key);
+        library::delete_crate(&self.library, id);
+        if self.ui.source == Source::Mine(id) {
+            self.set_source(Source::All);
+        }
+    }
+
+    /// The tracks of a list on this computer, as listed now.
+    fn list_tracks(&self, key: &str) -> Vec<LibTrack> {
+        (self.library.lock().lists.get(key))
+            .map(|l| l.tracks.clone())
+            .unwrap_or_default()
+    }
+
+    /// Share a list live with the room (see `Session::share_live`).
+    pub(crate) fn share_live(&mut self, src: &Source, view: &SessionView) {
+        let key = src.key();
+        let name = self.list_label(src, view);
+        let (tracks, rev) = {
+            let lib = self.library.lock();
+            match lib.lists.get(&key) {
+                Some(l) => (l.tracks.clone(), l.rev),
+                None => (Vec::new(), 0),
+            }
+        };
+        let sent = LiveSent {
+            rev,
+            files: files_of(&tracks),
+            name: name.clone(),
+            at: Instant::now(),
+        };
+        self.ui.live_sent.insert(key.clone(), sent);
+        self.session.lock().share_live(key, name, tracks);
+    }
+
+    /// Lists shared live follow every change to them (a track added to a
+    /// crate, a resync, BPMs analysed): the room gets the new list, at most
+    /// about once a second. A crate deleted stops being shared.
+    fn follow_live_lists(&mut self, view: &SessionView) {
+        self.ui
+            .live_sent
+            .retain(|k, _| view.live.iter().any(|l| &l.key == k));
+        for live in &view.live {
+            let src = self.source_of_key(&live.key);
+            let Some(src) = src else {
+                // The crate or folder is gone.
+                self.session.lock().unshare_live(&live.key);
+                continue;
+            };
+            let (rev, scanning) = {
+                let lib = self.library.lock();
+                match lib.lists.get(&live.key) {
+                    Some(l) => (l.rev, l.scanning),
+                    None => continue,
+                }
+            };
+            let name = self.list_label(&src, view);
+            let sent = self.ui.live_sent.get(&live.key);
+            let renamed = sent.is_none_or(|s| s.name != name);
+            let waited = sent.map_or(Duration::MAX, |s| s.at.elapsed());
+            if scanning
+                || (!renamed && sent.is_some_and(|s| s.rev == rev))
+                || (!renamed && waited < Duration::from_secs(1))
+            {
+                continue;
+            }
+            let files =
+                (self.library.lock().lists.get(&live.key)).map_or(0, |l| files_of(&l.tracks));
+            let same_files = sent.is_some_and(|s| s.files == files);
+            if !renamed && same_files && waited < Duration::from_secs(10) {
+                continue;
+            }
+            let tracks = self.list_tracks(&live.key);
+            let sent = LiveSent {
+                rev,
+                files,
+                name: name.clone(),
+                at: Instant::now(),
+            };
+            self.ui.live_sent.insert(live.key.clone(), sent);
+            self.session.lock().update_live(&live.key, name, tracks);
+        }
+    }
+
+    /// The list on the left with this key, if it's still there.
+    fn source_of_key(&self, key: &str) -> Option<Source> {
+        let lib = self.library.lock();
+        let folders = self.settings.library_folders.iter().cloned();
+        folders
+            .map(Source::Folder)
+            .chain(lib.my_crates.iter().map(|c| Source::Mine(c.id)))
+            .chain(lib.crates.iter().cloned().map(Source::Crate))
+            .find(|s| s.key() == key)
+    }
+
+    /// The share window for the list on show: live where it can be, copies
+    /// otherwise.
+    pub(crate) fn open_share(&mut self, src: &Source, view: &SessionView) {
+        let key = src.key();
+        let (paths, bytes) = {
+            let lib = self.library.lock();
+            match (lib.lists.get(&key), src) {
+                (Some(l), _) if !l.scanning || !l.tracks.is_empty() => (
+                    l.tracks.iter().map(|t| t.path.clone()).collect::<Vec<_>>(),
+                    l.tracks.iter().map(|t| t.size).sum::<u64>(),
+                ),
+                // A crate not listed yet: what's in it (its size unknown).
+                (_, Source::Mine(id)) => (
+                    lib.my_crate(*id)
+                        .map(|c| c.tracks.clone())
+                        .unwrap_or_default(),
+                    0,
+                ),
+                _ => (Vec::new(), 0),
+            }
+        };
+        let in_room = matches!(
+            view.link.role,
+            RoleView::Hosting { .. } | RoleView::Joined { .. }
+        );
+        let live_no = if !src.live_shareable() {
+            Some("Only your own folders and crates can be shared live.".to_string())
+        } else if !in_room {
+            Some("Host or join a room first.".to_string())
+        } else if paths.len() > ROOM_CRATE_MAX {
+            Some(format!(
+                "Lists of up to {ROOM_CRATE_MAX} tracks can be shared live: put the ones you want in a crate."
+            ))
+        } else {
+            None
+        };
+        let copies_no =
+            (!view.link.linked()).then(|| "Nobody else is in the room yet.".to_string());
+        self.ui.share_draft = Some(ShareDraft {
+            title: self.list_label(src, view),
+            key,
+            paths,
+            bytes,
+            pledge: false,
+            live: live_no.is_none(),
+            live_no,
+            copies_no,
+        });
+    }
+
     /// Click on a column heading: sort by it, then the other way round,
     /// then back to the list's own order.
     pub(crate) fn sort_by(&mut self, column: tandem_core::config::SortColumn) {
@@ -738,9 +1074,10 @@ impl TandemApp {
         let sort = self.settings.library_sort;
         let lib = self.library.clone();
         let lib = lib.lock();
-        let (len, rev) = match &self.ui.source {
-            Source::Room => (view.room_tracks.len(), room_rev(&view.room_tracks)),
-            _ => lib
+        let room = self.ui.source.room_tracks(view);
+        let (len, rev) = match room {
+            Some(tracks) => (tracks.len(), room_rev(tracks)),
+            None => lib
                 .lists
                 .get(&src)
                 .map(|l| (l.tracks.len(), l.rev))
@@ -766,15 +1103,14 @@ impl TandemApp {
                     .all(|w| t.contains(w) || a.contains(w))
             })
         };
-        self.ui.filtered = match &self.ui.source {
-            Source::Room => view
-                .room_tracks
+        self.ui.filtered = match room {
+            Some(tracks) => tracks
                 .iter()
                 .enumerate()
                 .filter(|(_, t)| matches(&t.title, &t.artist))
                 .map(|(i, _)| i)
                 .collect(),
-            _ => lib
+            None => lib
                 .lists
                 .get(&src)
                 .map(|l| {
@@ -788,11 +1124,11 @@ impl TandemApp {
                 .unwrap_or_default(),
         };
         if let Some(sort) = sort {
-            match &self.ui.source {
-                Source::Room => library::sort_rows(&mut self.ui.filtered, sort, |i| {
-                    room_row(&view.room_tracks[i])
-                }),
-                _ => {
+            match room {
+                Some(tracks) => {
+                    library::sort_rows(&mut self.ui.filtered, sort, |i| room_row(&tracks[i]))
+                }
+                None => {
                     if let Some(l) = lib.lists.get(&src) {
                         library::sort_rows(&mut self.ui.filtered, sort, |i| lib_row(&l.tracks[i]));
                     }
@@ -815,6 +1151,10 @@ impl TandemApp {
         let idx = *self.ui.filtered.get(row)?;
         match &self.ui.source {
             Source::Room => view.room_tracks.get(idx).map(|t| Item::Known(t.id)),
+            src @ Source::Live { .. } => src
+                .room_crate(view)
+                .and_then(|c| c.tracks.get(idx))
+                .map(|t| Item::Live(Box::new(t.clone()))),
             src => {
                 let lib = self.library.lock();
                 lib.lists
@@ -833,6 +1173,7 @@ impl TandemApp {
         match item {
             Item::File(p) => s.load_path(deck, p),
             Item::Known(id) => s.load_known(deck, id),
+            Item::Live(info) => s.load_room_track(deck, *info),
         }
     }
 
@@ -864,7 +1205,7 @@ impl TandemApp {
         let outs: Vec<MidiOut> = std::mem::take(&mut *self.midi.ui_queue.lock());
         for o in outs {
             match o {
-                MidiOut::Browse(delta) => self.browse(delta),
+                MidiOut::Browse(delta) => self.browse(delta, view),
                 MidiOut::BrowsePress => self.browse_press(),
                 MidiOut::BrowseBack => self.browse_back(),
                 MidiOut::LoadSelected(deck) => {
@@ -937,6 +1278,8 @@ impl eframe::App for TandemApp {
         self.follow_four_decks(&view.room);
         self.take_levels();
         self.handle_midi_queue(&view);
+        self.follow_live_lists(&view);
+        self.report_resync();
         self.refresh_filter(&view);
 
         self.top_bar(ctx, &view);
@@ -1079,8 +1422,12 @@ impl TandemApp {
         if self.dev.cut_frame == Some(f) {
             self.session.lock().cut_link();
         }
+        if self.dev.crate_demo {
+            self.dev_crate(f, view);
+        }
         if self.dev.demo
             && self.dev.host_port.is_some()
+            && !self.dev.crate_demo
             && !self.dev.shared
             && f > 200
             && view.link.linked()
@@ -1132,6 +1479,56 @@ impl TandemApp {
                 }
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
+        }
+    }
+}
+
+impl TandemApp {
+    /// `--dev-crate`: a crate to look at, shared live by the host.
+    fn dev_crate(&mut self, f: u64, view: &SessionView) {
+        const NAME: &str = "Friday warm-up";
+        let mine = (self.library.lock().my_crates.iter())
+            .find(|c| c.name == NAME)
+            .map(|c| c.id);
+        match self.dev.crate_step {
+            0 if f >= 150 && self.dev.join.is_none() => {
+                let id = match mine {
+                    Some(id) => {
+                        self.set_source(Source::Mine(id));
+                        id
+                    }
+                    None => {
+                        let paths: Vec<PathBuf> = (self.library.lock().lists)
+                            .get(&self.ui.source.key())
+                            .map(|l| l.tracks.iter().take(9).map(|t| t.path.clone()).collect())
+                            .unwrap_or_default();
+                        self.make_crate(NAME, paths);
+                        match &self.ui.source {
+                            Source::Mine(id) => *id,
+                            _ => return,
+                        }
+                    }
+                };
+                self.ui.sel_index = 2;
+                self.dev.crate_step = 1;
+                log::info!("dev: crate {id} on show");
+            }
+            1 if self.dev.host_port.is_some() && view.link.linked() && f >= 200 => {
+                let src = self.ui.source.clone();
+                self.share_live(&src, view);
+                self.dev.crate_step = 2;
+            }
+            0 if self.dev.join.is_some() => {
+                if let Some(c) = view.room_crates.first() {
+                    self.set_source(Source::Live {
+                        owner: c.owner,
+                        id: c.crate_id,
+                    });
+                    self.ui.sel_index = 2;
+                    self.dev.crate_step = 2;
+                }
+            }
+            _ => {}
         }
     }
 }

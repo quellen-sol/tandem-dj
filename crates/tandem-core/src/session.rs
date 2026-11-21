@@ -13,12 +13,12 @@ use crate::clock::ClockEstimator;
 use crate::config::{sanitize_file_name, Paths};
 use crate::files::{Landing, Running};
 use crate::grid::BeatGrid;
-use crate::library::{self, Library};
+use crate::library::{self, LibTrack, Library};
 use crate::meter::LevelMeters;
 pub use crate::model::deck_letter;
 use crate::model::{Action, DeckState, Event, RoomState, Timeline, TrackId, DECKS};
 use crate::net::{PeerConn, RoomAddr};
-use crate::protocol::{CutOff, Msg, PeerInfo, ShareOffer, TrackInfo};
+use crate::protocol::{CutOff, Msg, PeerInfo, RoomCrate, ShareOffer, TrackInfo, ROOM_CRATE_MAX};
 use crate::render::{AudioSnapshot, LocalParams};
 use crate::terms::{self, ConsentRecord, TERMS_VERSION};
 use crate::time::SharedClock;
@@ -267,6 +267,41 @@ pub struct OutgoingShare {
     pub replies: Vec<(String, bool)>,
 }
 
+/// A list this booth shares live with the room (see [`RoomCrate`]).
+struct LiveCrate {
+    /// The app's key for the list it's made from.
+    key: String,
+    /// As the room last heard it (no tracks before the first build).
+    shared: RoomCrate,
+    /// Its tracks' details are being worked out in the background.
+    building: bool,
+    /// The list changed again meanwhile: build it again from this after.
+    next: Option<(String, Vec<LibTrack>)>,
+    /// Built at least once: there's something to send the room.
+    built: bool,
+}
+
+/// A load from a list shared live, waiting for its track to arrive and be
+/// analysed (see `Session::pending_loads`).
+struct PendingLoad {
+    deck: usize,
+    track: TrackId,
+    /// What the deck had when it was asked for: if another track goes on
+    /// it meanwhile, this one doesn't load over it.
+    was: Option<TrackId>,
+}
+
+/// A list this booth shares live, as the UI shows it.
+#[derive(Clone, Debug)]
+pub struct LiveView {
+    /// The app's key for the list it's made from.
+    pub key: String,
+    pub name: String,
+    pub tracks: usize,
+    /// Still working out its tracks' details (hashing new ones).
+    pub preparing: bool,
+}
+
 // ---------------------------------------------------------------- views
 
 #[derive(Clone)]
@@ -377,6 +412,10 @@ pub struct SessionView {
     pub outgoing: Vec<(String, usize, Vec<(String, bool)>)>,
     pub room_tracks: Vec<TrackInfo>,
     pub preparing_share: Option<String>,
+    /// The lists this booth shares live.
+    pub live: Vec<LiveView>,
+    /// The lists the other DJs in the room share live.
+    pub room_crates: Vec<Arc<RoomCrate>>,
 }
 
 /// The room as the broadcast lane is playing it right now: `bcast_delay_us`
@@ -512,6 +551,18 @@ pub struct Session {
     incoming: Vec<IncomingShare>,
     outgoing: Vec<OutgoingShare>,
     preparing_share: Option<String>,
+    /// Lists this booth shares live with the room.
+    live: Vec<LiveCrate>,
+    /// The lists the other DJs share live, as the room last said. On the
+    /// host, every DJ's; it sends them to each DJ who joins.
+    room_crates: Vec<Arc<RoomCrate>>,
+    /// Loads from a list shared live whose owner hadn't analysed the track.
+    /// The track comes here first and is analysed, so the load carries its
+    /// beatgrid and key, as a load from the library does.
+    pending_loads: Vec<PendingLoad>,
+    /// Lists this booth stopped sharing while its link was down: the room
+    /// hears when it's back.
+    unshared_away: Vec<u64>,
     pub max_upload_bytes_s: f64,
     pub bcast_delay_us: i64,
     /// Per deck, as of the last maintenance tick: track, gen and the BPM of
@@ -615,6 +666,10 @@ impl Session {
                 incoming: Vec::new(),
                 outgoing: Vec::new(),
                 preparing_share: None,
+                live: Vec::new(),
+                room_crates: Vec::new(),
+                pending_loads: Vec::new(),
+                unshared_away: Vec::new(),
                 max_upload_bytes_s: 2.0 * 1024.0 * 1024.0,
                 bcast_delay_us: 500_000,
                 grid_watch: [(None, 0, None); DECKS],
@@ -1022,7 +1077,8 @@ impl Session {
         let events = cut_off.events.into_iter().filter(|e| e.origin == id);
         let added = held.merge(events.collect());
         for info in cut_off.tracks {
-            self.track_from.insert(info.id, id);
+            let from = self.crate_owner(info.id).unwrap_or(id);
+            self.track_from.insert(info.id, from);
             if !self.track_meta.contains_key(&info.id) {
                 self.relay(0, &Msg::Track { info: info.clone() });
                 self.track_meta.insert(info.id, info);
@@ -1152,6 +1208,9 @@ impl Session {
         if deck >= DECKS || self.refuse_load(deck, self.now()) {
             return;
         }
+        // A track still on its way for this deck from a list shared live
+        // won't load over this one.
+        self.pending_loads.retain(|p| p.deck != deck);
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -1218,6 +1277,22 @@ impl Session {
         let Some(info) = self.track_meta.get(&id).cloned() else {
             return;
         };
+        // A track still on its way for this deck from a list shared live
+        // won't load over this one.
+        let now = self.now();
+        if deck < DECKS
+            && self
+                .timeline
+                .state_at(now)
+                .load_refusal(deck, now)
+                .is_none()
+        {
+            let waiting = self.pending_loads.iter().any(|p| p.deck == deck);
+            self.pending_loads.retain(|p| p.deck != deck);
+            if waiting {
+                self.loading[deck] = None;
+            }
+        }
         self.act(load_action(deck, &info));
     }
 
@@ -1277,8 +1352,12 @@ impl Session {
             .unwrap_or_else(|| id.short());
         match res {
             Ok(a) => {
+                let audio = Arc::new(a);
                 self.tracks
-                    .insert(id, TrackSlot::new(TrackStatus::Ready, Some(Arc::new(a))));
+                    .insert(id, TrackSlot::new(TrackStatus::Ready, Some(audio.clone())));
+                if self.pending_loads.iter().any(|p| p.track == id) {
+                    self.analyse_then_load(id, audio);
+                }
                 // A deck that played on while it waited comes in where the room is.
                 let now = self.now();
                 let room = self.timeline.state_at(now);
@@ -1351,24 +1430,37 @@ impl Session {
     /// Host: booth `asker` (a broadcaster's, with `broadcaster`) asks for a
     /// track. [`Session::servable`], except that a track another DJ offered
     /// in a share, which this booth didn't take, is fetched from them now to
-    /// pass on to a DJ who accepted it.
+    /// pass on to a DJ who accepted it. So is one from a list another DJ
+    /// shares live: a DJ who loads one from it can ask before their load
+    /// reaches this booth.
     pub fn servable_for(&mut self, id: TrackId, asker: u64, broadcaster: bool) -> Servable {
+        let shared = self.offered.contains_key(&id) || self.crate_owner(id).is_some();
         match self.servable(id) {
-            Servable::No if !broadcaster && self.offered.contains_key(&id) => {}
+            Servable::No if !broadcaster && shared => {}
             s => return s,
         }
-        let from = self.track_from.get(&id).copied();
-        if from.is_none_or(|f| f == asker || !self.linked(f)) {
+        let from = (self.track_from.get(&id).copied())
+            .filter(|&f| f != asker && self.linked(f))
+            .or_else(|| self.crate_owner(id).filter(|&o| o != asker));
+        let Some(from) = from else {
             return Servable::No;
-        }
+        };
+        self.track_from.insert(id, from);
         self.request_fetch(id, Purpose::Relay);
         self.servable(id)
     }
 
-    /// What this booth knows about a track: from the room, or on the host
-    /// from a share another DJ offered.
+    /// What this booth knows about a track: from the room, on the host from
+    /// a share another DJ offered, or from a list a DJ shares live.
     fn meta(&self, id: TrackId) -> Option<&TrackInfo> {
-        self.track_meta.get(&id).or_else(|| self.offered.get(&id))
+        self.track_meta
+            .get(&id)
+            .or_else(|| self.offered.get(&id))
+            .or_else(|| {
+                (self.room_crates.iter())
+                    .flat_map(|c| c.tracks.iter())
+                    .find(|t| t.id == id)
+            })
     }
 
     fn request_fetch(&mut self, id: TrackId, purpose: Purpose) {
@@ -1407,6 +1499,10 @@ impl Session {
                 if self.expected_back(from) {
                     return Source::Awaited(from);
                 }
+            }
+            // Another DJ who shares it live has it too.
+            if let Some(owner) = self.crate_owner(id) {
+                return Source::Linked(owner);
             }
         }
         match self.peers.first() {
@@ -2040,6 +2136,337 @@ impl Session {
         });
     }
 
+    // ------------------------------------------------------------ lists shared live
+
+    /// In a room as one of its DJs (hosting, or joined and not only to
+    /// broadcast), even while its link is getting back in.
+    fn in_room_as_dj(&self) -> bool {
+        matches!(
+            self.role,
+            Role::Host { .. }
+                | Role::Client {
+                    broadcaster: false,
+                    ..
+                }
+        )
+    }
+
+    /// Share a list live with the room: the other DJs see its tracks and
+    /// can load them, and each only comes over when someone does. `key` is
+    /// the app's for the list, to keep it up to date with
+    /// [`Session::update_live`]. The first [`ROOM_CRATE_MAX`] tracks go.
+    pub fn share_live(&mut self, key: String, name: String, tracks: Vec<LibTrack>) {
+        if !self.in_room_as_dj() {
+            log::warn!("Host or join a room before sharing");
+            return;
+        }
+        if self.live.iter().any(|l| l.key == key) {
+            self.update_live(&key, name, tracks);
+            return;
+        }
+        let shown: Vec<&LibTrack> = tracks.iter().take(ROOM_CRATE_MAX).collect();
+        let statement = terms::sender_pledge(shown.len());
+        let others: Vec<String> = (self.roster().djs.into_iter())
+            .filter(|p| p.id != self.me.id)
+            .map(|p| p.name)
+            .collect();
+        let others = others.join(", ");
+        terms::append_consent(
+            &self.paths.consent_log,
+            &ConsentRecord {
+                unix_time: terms::now_unix(),
+                kind: "share-live",
+                terms_version: TERMS_VERSION,
+                me: &self.me.name,
+                other: Some(others.as_str()).filter(|o| !o.is_empty()),
+                share_title: Some(&name),
+                statement: Some(&statement),
+                tracks: shown
+                    .iter()
+                    .filter_map(|t| t.path.file_name())
+                    .map(|n| n.to_string_lossy().to_string())
+                    .collect(),
+            },
+        );
+        log::info!("Sharing \"{name}\" live ({} tracks)", shown.len());
+        let mut crate_id = fastrand::u64(1..);
+        while self.live.iter().any(|l| l.shared.crate_id == crate_id) {
+            crate_id = fastrand::u64(1..);
+        }
+        self.live.push(LiveCrate {
+            key: key.clone(),
+            shared: RoomCrate {
+                owner: self.me.id,
+                owner_name: self.me.name.clone(),
+                crate_id,
+                name: name.clone(),
+                tracks: Vec::new(),
+            },
+            building: false,
+            next: None,
+            built: false,
+        });
+        self.update_live(&key, name, tracks);
+    }
+
+    /// A list shared live changed (tracks in or out, a new name, new BPMs):
+    /// the room gets the new one, if anything it sees changed. New tracks
+    /// are hashed first, in the background.
+    pub fn update_live(&mut self, key: &str, name: String, tracks: Vec<LibTrack>) {
+        let Some(live) = self.live.iter_mut().find(|l| l.key == key) else {
+            return;
+        };
+        if live.building {
+            live.next = Some((name, tracks));
+            return;
+        }
+        live.building = true;
+        let (key, lib, weak) = (key.to_string(), self.library.clone(), self.weak.clone());
+        std::thread::spawn(move || {
+            let built: Vec<(TrackInfo, PathBuf)> = tracks
+                .iter()
+                .take(ROOM_CRATE_MAX)
+                .filter_map(|t| library::room_info(&lib, t).map(|i| (i, t.path.clone())))
+                .collect();
+            if let Some(h) = weak.upgrade() {
+                h.lock().live_built(&key, name, built);
+            }
+        });
+    }
+
+    /// A list shared live has its tracks' details: tell the room, if they
+    /// changed.
+    fn live_built(&mut self, key: &str, name: String, built: Vec<(TrackInfo, PathBuf)>) {
+        let Some(i) = self.live.iter().position(|l| l.key == key) else {
+            return; // no longer shared
+        };
+        let mut tracks = Vec::with_capacity(built.len());
+        let mut seen = HashSet::new();
+        for (info, path) in built {
+            // This booth hands them out when someone loads one.
+            self.servable.insert(info.id, path);
+            if seen.insert(info.id) {
+                tracks.push(info);
+            }
+        }
+        let live = &mut self.live[i];
+        live.building = false;
+        let new = RoomCrate {
+            name,
+            tracks,
+            ..live.shared.clone()
+        };
+        let first = !live.built;
+        let changed = first || new != live.shared;
+        live.shared = new;
+        live.built = true;
+        let next = live.next.take();
+        if changed {
+            let c = self.live[i].shared.clone();
+            if first {
+                log::info!("\"{}\" is shared live ({} tracks)", c.name, c.tracks.len());
+            } else {
+                log::info!(
+                    "\"{}\" changed: the room gets it again ({} tracks)",
+                    c.name,
+                    c.tracks.len()
+                );
+            }
+            self.send(Msg::Crate { room_crate: c });
+        }
+        if let Some((name, tracks)) = next {
+            self.update_live(key, name, tracks);
+        }
+    }
+
+    /// Stop sharing a list live: it goes from the other DJs' libraries.
+    /// Tracks of it already on a deck stay in the room.
+    pub fn unshare_live(&mut self, key: &str) {
+        let Some(i) = self.live.iter().position(|l| l.key == key) else {
+            return;
+        };
+        let live = self.live.remove(i);
+        log::info!("Stopped sharing \"{}\" live", live.shared.name);
+        if self.peers.is_empty() && matches!(self.role, Role::Client { .. }) {
+            self.unshared_away.push(live.shared.crate_id);
+        }
+        self.send(Msg::CrateGone {
+            owner: self.me.id,
+            crate_id: live.shared.crate_id,
+        });
+    }
+
+    /// A list another DJ shares live arrived, or changed.
+    fn take_room_crate(&mut self, c: RoomCrate) {
+        let same = |x: &Arc<RoomCrate>| x.owner == c.owner && x.crate_id == c.crate_id;
+        match self.room_crates.iter_mut().find(|x| same(x)) {
+            Some(x) => *x = Arc::new(c),
+            None => {
+                log::info!(
+                    "{} shares \"{}\" live ({} tracks)",
+                    c.owner_name,
+                    c.name,
+                    c.tracks.len()
+                );
+                self.room_crates.push(Arc::new(c));
+            }
+        }
+    }
+
+    /// Host: a DJ left for good. Their lists go from the room.
+    fn drop_crates_of(&mut self, owner: u64) {
+        let gone: Vec<u64> = self
+            .room_crates
+            .iter()
+            .filter(|c| c.owner == owner)
+            .map(|c| c.crate_id)
+            .collect();
+        self.room_crates.retain(|c| c.owner != owner);
+        for crate_id in gone {
+            self.send(Msg::CrateGone { owner, crate_id });
+        }
+    }
+
+    /// The owners of every list shared live this booth knows of (tests).
+    #[cfg(test)]
+    pub(crate) fn room_crates_of_test(&self) -> Vec<u64> {
+        self.room_crates.iter().map(|c| c.owner).collect()
+    }
+
+    /// A linked DJ who shares this track live, and so has it.
+    fn crate_owner(&self, id: TrackId) -> Option<u64> {
+        self.room_crates
+            .iter()
+            .filter(|c| self.linked(c.owner))
+            .find(|c| c.tracks.iter().any(|t| t.id == id))
+            .map(|c| c.owner)
+    }
+
+    /// Load a track from a list another DJ shares live. It comes over from
+    /// their booth, as their own loads do, unless this booth has the same
+    /// file.
+    pub fn load_room_track(&mut self, deck: usize, info: TrackInfo) {
+        if self.is_broadcaster() {
+            log::info!("Broadcasting only: the DJs load the decks");
+            return;
+        }
+        if deck >= DECKS || self.refuse_load(deck, self.now()) {
+            return;
+        }
+        let id = info.id;
+        // The room may know it already, with a grid edited since.
+        let info = match self.track_meta.get(&id) {
+            Some(m) => m.clone(),
+            None => {
+                self.track_meta.insert(id, info.clone());
+                self.send_all(Msg::Track { info: info.clone() });
+                info
+            }
+        };
+        if matches!(self.role, Role::Host { .. }) && !self.servable.contains_key(&id) {
+            if let Some(owner) = self.crate_owner(id) {
+                self.track_from.insert(id, owner);
+            }
+        }
+        self.pending_loads.retain(|p| p.deck != deck);
+        if info.grid.is_some() {
+            log::info!(
+                "Loading {} onto deck {} from a list shared live",
+                info.file_name,
+                deck_letter(deck)
+            );
+            self.act(load_action(deck, &info));
+            return;
+        }
+        // Nobody has found its beats yet: get it and analyse it first.
+        log::info!(
+            "Getting {} for deck {} to find its beats before it loads",
+            info.file_name,
+            deck_letter(deck)
+        );
+        self.loading[deck] = Some(info.file_name.clone());
+        let was = self.timeline.latest().decks[deck].track;
+        self.pending_loads.push(PendingLoad {
+            deck,
+            track: id,
+            was,
+        });
+        match self.tracks.get(&id).and_then(|s| s.audio.clone()) {
+            Some(audio) => self.analyse_then_load(id, audio),
+            None => self.ensure_track(id),
+        }
+    }
+
+    /// A track a load is waiting for is here: find its beatgrid and key in
+    /// the background, then load it.
+    fn analyse_then_load(&mut self, id: TrackId, audio: Arc<TrackAudio>) {
+        let path = self.servable.get(&id).cloned();
+        let (lib, weak) = (self.library.clone(), self.weak.clone());
+        std::thread::spawn(move || {
+            let (grid, key) = match path {
+                // Cached for a library file (and an edited grid wins).
+                Some(p) => library::analysis_for(&lib, &p, &audio),
+                None => (analysis::analyze(&audio), crate::keys::detect(&audio)),
+            };
+            if let Some(h) = weak.upgrade() {
+                h.lock().finish_pending_load(id, grid, key);
+            }
+        });
+    }
+
+    /// The loads waiting for this track go ahead, with what analysis found.
+    fn finish_pending_load(&mut self, id: TrackId, grid: Option<BeatGrid>, key: Option<i8>) {
+        let (due, rest): (Vec<PendingLoad>, Vec<PendingLoad>) =
+            std::mem::take(&mut self.pending_loads)
+                .into_iter()
+                .partition(|p| p.track == id);
+        self.pending_loads = rest;
+        let Some(m) = self.track_meta.get_mut(&id) else {
+            return;
+        };
+        if m.grid.is_none() {
+            m.grid = grid;
+        }
+        if m.key.is_none() {
+            m.key = key;
+        }
+        let info = m.clone();
+        let room = self.timeline.latest();
+        for p in due {
+            self.loading[p.deck] = None;
+            if room.decks[p.deck].track != p.was {
+                let why = format!(
+                    "Didn't load {} onto deck {}: another track went on it meanwhile.",
+                    info.file_name,
+                    deck_letter(p.deck)
+                );
+                log::info!("{why}");
+                self.notices.push(why);
+            } else if !self.refuse_load(p.deck, self.now()) {
+                self.act(load_action(p.deck, &info));
+            }
+        }
+    }
+
+    /// Loads waiting for a track that couldn't be got are given up, saying so.
+    fn drop_failed_pending_loads(&mut self) {
+        let failed: Vec<(usize, TrackId, String)> = (self.pending_loads.iter())
+            .filter_map(|p| match self.track_status(p.track) {
+                Some(TrackStatus::Failed(why)) => Some((p.deck, p.track, why)),
+                _ => None,
+            })
+            .collect();
+        for (deck, id, why) in failed {
+            self.pending_loads.retain(|p| p.deck != deck);
+            self.loading[deck] = None;
+            let name = self.track_file_name(id);
+            self.notices.push(format!(
+                "Couldn't load {name} onto deck {}: {why}",
+                deck_letter(deck)
+            ));
+        }
+    }
+
     // ------------------------------------------------------------ network callbacks
 
     /// The room for a booth joining it. One whose moves from while it was
@@ -2061,6 +2488,7 @@ impl Session {
 
     pub fn set_hosting(&mut self, port: u16, room: String, stop: Arc<AtomicBool>) {
         self.role = Role::Host { port, room, stop };
+        self.room_crates.clear();
         // Hosting now: no room is holding this booth's place.
         self.lost = None;
         self.own_moves.clear();
@@ -2193,6 +2621,20 @@ impl Session {
         // Keep the room's history in case their link drops.
         self.held.get_or_insert_with(|| self.timeline.clone());
         self.announce_members();
+        // The lists shared live so far: the other DJs' and this booth's.
+        let lists: Vec<RoomCrate> = (self.room_crates.iter())
+            .filter(|c| c.owner != info_id)
+            .map(|c| (**c).clone())
+            .chain(
+                self.live
+                    .iter()
+                    .filter(|l| l.built)
+                    .map(|l| l.shared.clone()),
+            )
+            .collect();
+        for room_crate in lists {
+            self.send_to(info_id, Msg::Crate { room_crate });
+        }
         // Uploads from them the dropped link cut off carry on from where
         // they got to, and tracks on a deck that didn't arrive before are
         // asked for again.
@@ -2335,6 +2777,21 @@ impl Session {
         for t in tracks {
             self.track_meta.insert(t.id, t);
         }
+        // The host sends the lists shared live now. This booth's own go to
+        // the room again (the host may have dropped them, or be another).
+        self.room_crates.clear();
+        if to.broadcaster {
+            self.live.clear();
+        }
+        for l in self.live.iter().filter(|l| l.built) {
+            self.send(Msg::Crate {
+                room_crate: l.shared.clone(),
+            });
+        }
+        for crate_id in std::mem::take(&mut self.unshared_away) {
+            let owner = self.me.id;
+            self.send(Msg::CrateGone { owner, crate_id });
+        }
         // Downloads the dropped link cut off carry on from where they got
         // to; tracks on the decks this booth hasn't got are fetched.
         self.resume_fetches(host_id);
@@ -2423,6 +2880,7 @@ impl Session {
             LinkEnd::Bye => {
                 log::info!("{} left the room.", info.name);
                 self.unlink(serial, "partner left", false);
+                self.drop_crates_of(info.id);
                 self.pump_fetches();
                 return None;
             }
@@ -2473,6 +2931,7 @@ impl Session {
             LinkEnd::Lost(why) => {
                 log::warn!("Lost the link to {} ({why}).", info.name);
                 self.unlink(serial, "connection lost", false);
+                self.drop_crates_of(info.id);
                 self.pump_fetches();
                 return None;
             }
@@ -2527,6 +2986,9 @@ impl Session {
         self.rejoin = None;
         self.roster = Roster::default();
         self.role = Role::Solo;
+        self.room_crates.clear();
+        self.live.clear();
+        self.unshared_away.clear();
         if broadcaster {
             // It only ever played the DJs' room: don't carry on with it.
             self.timeline = Timeline::new(self.now() - 10_000_000);
@@ -2630,6 +3092,12 @@ impl Session {
         self.held = None;
         self.track_from.clear();
         self.offered.clear();
+        self.room_crates.clear();
+        self.live.clear();
+        for p in self.pending_loads.drain(..) {
+            self.loading[p.deck] = None;
+        }
+        self.unshared_away.clear();
         if let Role::Host { stop, .. } = &self.role {
             stop.store(true, Ordering::Relaxed);
         }
@@ -2672,7 +3140,10 @@ impl Session {
             }
             Msg::Track { info } => {
                 if let (true, Some(dj)) = (host, sender) {
-                    self.track_from.insert(info.id, dj);
+                    // A track loaded from a list shared live comes from
+                    // the DJ sharing it.
+                    let from = self.crate_owner(info.id).unwrap_or(dj);
+                    self.track_from.insert(info.id, from);
                 }
                 self.relay(from, &Msg::Track { info: info.clone() });
                 self.track_meta.insert(info.id, info);
@@ -2743,6 +3214,44 @@ impl Session {
                     );
                     s.replies.push((name, accepted));
                 }
+            }
+            Msg::Crate { room_crate } => {
+                if host {
+                    // A DJ speaks only for their own lists.
+                    if sender != Some(room_crate.owner) {
+                        log::debug!("ignoring a list shared for someone else");
+                        return;
+                    }
+                    // A DJ back from a dropped link sends its lists again.
+                    // One the room already has, just as it is, goes no
+                    // further: the other DJs' links carry the moves too.
+                    if (self.room_crates.iter()).any(|c| **c == room_crate) {
+                        log::debug!("\"{}\" came again unchanged", room_crate.name);
+                        return;
+                    }
+                    let m = Msg::Crate {
+                        room_crate: room_crate.clone(),
+                    };
+                    self.relay_to_djs(from, &m);
+                }
+                if room_crate.owner != self.me.id {
+                    self.take_room_crate(room_crate);
+                }
+            }
+            Msg::CrateGone { owner, crate_id } => {
+                if host {
+                    if sender != Some(owner) {
+                        return;
+                    }
+                    self.relay_to_djs(from, &Msg::CrateGone { owner, crate_id });
+                }
+                if let Some(c) =
+                    (self.room_crates.iter()).find(|c| c.owner == owner && c.crate_id == crate_id)
+                {
+                    log::info!("{} stopped sharing \"{}\"", c.owner_name, c.name);
+                }
+                self.room_crates
+                    .retain(|c| !(c.owner == owner && c.crate_id == crate_id));
             }
             Msg::NoFile { id } if host => {
                 if self
@@ -2872,6 +3381,7 @@ impl Session {
         self.my_loads.retain(|l| l.0 >= base);
         self.follow_grid_tempos(now);
         self.library.lock().save_grids();
+        self.drop_failed_pending_loads();
 
         if matches!(self.role, Role::Host { .. })
             && (!self.peers.is_empty() || !self.broadcasters.is_empty())
@@ -2994,7 +3504,14 @@ impl Session {
         let shared = |i: Instant| now - i.elapsed().as_micros() as i64;
         if matches!(self.role, Role::Host { .. }) {
             // Nobody is coming back after this long.
+            let gone: Vec<u64> = (self.awaiting.iter())
+                .filter(|a| a.since.elapsed() >= window)
+                .map(|a| a.info.id)
+                .collect();
             self.awaiting.retain(|a| a.since.elapsed() < window);
+            for id in gone {
+                self.drop_crates_of(id);
+            }
             // The DJ heard from longest ago.
             let heard = (self.peers.iter().map(|p| p.heard))
                 .chain(self.awaiting.iter().map(|a| a.heard))
@@ -3214,6 +3731,25 @@ impl Session {
                 .collect(),
             room_tracks,
             preparing_share: self.preparing_share.clone(),
+            live: self
+                .live
+                .iter()
+                .map(|l| LiveView {
+                    key: l.key.clone(),
+                    name: l.shared.name.clone(),
+                    tracks: l.shared.tracks.len(),
+                    preparing: !l.built,
+                })
+                .collect(),
+            room_crates: {
+                // Only from DJs in the room now (not one reconnecting).
+                let djs = self.roster().djs;
+                self.room_crates
+                    .iter()
+                    .filter(|c| c.owner != self.me.id && djs.iter().any(|d| d.id == c.owner))
+                    .cloned()
+                    .collect()
+            },
         }
     }
 }
@@ -3330,6 +3866,86 @@ mod tests {
             assert!(s.take_notices().is_empty());
             assert_eq!(s.view().room.decks[0].track, Some(TrackId([2; 32])));
         }
+        drop(h);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn info_of(n: u8, grid: Option<BeatGrid>) -> TrackInfo {
+        TrackInfo {
+            id: TrackId([n; 32]),
+            title: format!("Track {n}"),
+            artist: String::new(),
+            bpm: None,
+            duration: 200.0,
+            size: 1000,
+            file_name: format!("track{n}.mp3"),
+            grid,
+            key: None,
+        }
+    }
+
+    /// A track from a list shared live that nobody analysed waits for its
+    /// file before it loads. If another track goes on the deck meanwhile,
+    /// it doesn't load over it, and the DJ is told; one with a beatgrid
+    /// loads at once.
+    #[test]
+    fn a_waiting_load_from_a_live_list_doesnt_land_over_a_newer_one() {
+        let root = std::env::temp_dir().join(format!("tandem-pending-{}", fastrand::u64(..)));
+        let h = solo(&root);
+        {
+            let mut s = h.lock();
+            let x = info_of(1, None);
+            s.load_room_track(0, x.clone());
+            assert_eq!(s.latest().decks[0].track, None, "waits for the file");
+            assert_eq!(s.loading[0].as_deref(), Some("track1.mp3"));
+            // Another DJ's load lands on the deck meanwhile.
+            let y = info_of(2, None);
+            s.act(load_action(0, &y));
+            s.finish_pending_load(x.id, BeatGrid::new(0.1, 120.0), Some(3));
+            assert_eq!(s.latest().decks[0].track, Some(y.id));
+            assert!(s.loading[0].is_none());
+            let notices = s.take_notices();
+            assert_eq!(
+                notices,
+                ["Didn't load track1.mp3 onto deck A: another track went on it meanwhile."]
+            );
+            // What analysis found is kept for the next load of it.
+            assert_eq!(s.track_meta[&x.id].key, Some(3));
+
+            // With a beatgrid: at once, carrying it.
+            let grid = BeatGrid::new(0.2, 124.0);
+            s.load_room_track(1, info_of(3, grid));
+            assert_eq!(s.latest().decks[1].track, Some(TrackId([3; 32])));
+            assert_eq!(s.latest().decks[1].grid, grid);
+            assert!(s.loading[1].is_none());
+        }
+        drop(h);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A waiting load whose track can't be got is given up, saying why, and
+    /// the deck stops showing it as loading.
+    #[test]
+    fn a_waiting_load_whose_track_cant_be_got_says_so() {
+        let root = std::env::temp_dir().join(format!("tandem-pending-fail-{}", fastrand::u64(..)));
+        let h = solo(&root);
+        h.lock().load_room_track(2, info_of(4, None));
+        let start = Instant::now();
+        let notices = loop {
+            let n = h.lock().take_notices();
+            if !n.is_empty() {
+                break n;
+            }
+            assert!(start.elapsed() < Duration::from_secs(5), "no notice");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(
+            notices,
+            ["Couldn't load track4.mp3 onto deck C: not in your library"]
+        );
+        let s = h.lock();
+        assert!(s.loading[2].is_none() && s.latest().decks[2].track.is_none());
+        drop(s);
         drop(h);
         let _ = std::fs::remove_dir_all(&root);
     }

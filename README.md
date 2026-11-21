@@ -33,7 +33,9 @@ The self-test lists your audio and MIDI devices, opens your default output for h
 ## Set up your booth
 
 1. **Music.** In the library, click **Add music folder…**. Serato crates from `Music\_Serato_` (and `X:\_Serato_` on external drives) show up automatically. Tandem only reads them and never writes Serato files.
-   - **All Music**, at the top of the library's list, shows every track in your folders, **Shared with me** and your Serato crates in one list, each track once. Search, sorting and **Analyze BPM** work on it like any other list. It's rescanned each time you pick it, so new files and crate changes show up.
+   - **All Music**, at the top of the library's list, shows every track in your folders, **Shared with me**, your crates and your Serato crates in one list, each track once. Search, sorting and **Analyze BPM** work on it like any other list. It's rescanned each time you pick it, so new files and crate changes show up.
+   - **⟳ Resync folders** (under your folders) looks again for songs you've added, changed or removed since Tandem started: in your folders, **Shared with me**, your crates and Serato's. The lists stay on screen while it looks, and the status bar then says how many tracks came and went. **Rescan crates** under the Serato crates does the same.
+   - **Your own crates.** Under **MY CRATES**, click **➕ New crate** and name it. Then drag tracks from any list onto the crate, or right-click a track → **Add to crate** (dropping a track on **➕ New crate** starts a crate with it). Tracks stay in the order you added them; sort by a column as in any list. Right-click a track in a crate → **Remove from this crate**, and right-click the crate to rename, share or delete it. A crate only lists your files: removing a track or deleting the crate never touches the file. Crates are kept in `%LOCALAPPDATA%\Tandem\data\crates.json`. A file you move or delete afterwards drops out of the crate's list, which then says how many are missing.
    - **Click a column heading** (TITLE, ARTIST, BPM, KEY, TIME) to sort the list by it. Click again to reverse it, and a third time to go back to the list's own order. Keys sort in Camelot order (1A, 1B, 2A…). Tracks with no BPM or key yet go last. Tandem remembers the sort.
    - **Search** looks in titles and artists. Every word has to match, and `|` separates alternatives (`house | garage`). The **✖** at the end of the box, or Escape while you're typing, clears it, and the track you had selected stays selected in the whole list.
 2. **Audio.** Open **Settings → Audio**.
@@ -55,7 +57,7 @@ The self-test lists your audio and MIDI devices, opens your default output for h
    - **Hot cues held while paused are gated.** The deck plays from the hot cue only while you hold the pad. Let go and it snaps back to the hot cue, paused. Press PLAY while holding to keep it playing.
    - **Loops:** **IN**, **OUT** and **RELOOP/EXIT** work as in [Loops](#loops). **SHIFT + IN** is a 4-beat loop, and **CUE/LOOP CALL ◀ / ▶** halve and double the loop. Switch the pads to **BEAT LOOP** (SHIFT + BEAT JUMP) for ¼, ½, 1, 2, 4, 8, 16 and 32-beat loops. The pad of the loop that's playing lights up.
    - **Loop rolls:** switch the pads to **BEAT JUMP** (**ROLL** on the SC Live 4). Hold a pad and the deck loops 1/16, 1/8, ¼ or ½ beat (top row) or 1, 2, 4 or 8 beats (bottom row) while the track runs on underneath. Let go and it carries on where the track has got to, as if it had never rolled. See [Loops](#loops).
-   - **Browsing:** the browse knob moves through the tracks. Press it to move through the lists on the left instead (All Music, This room, your folders and Serato crates): each list's tracks show as you turn. Press it again to go back into the tracks, pick one and press LOAD. **BACK** also takes the knob to the lists. A blue outline shows which side the knob is on. Clicking a list with the mouse puts the knob back on its tracks, and closing the SERATO CRATES section makes the knob skip the crates. On other controllers, learn **Library browse press** and **Library back**.
+   - **Browsing:** the browse knob moves through the tracks. Press it to move through the lists on the left instead (All Music, This room, Shared with me, the lists shared live in the room, your folders, your crates and Serato crates): each list's tracks show as you turn. Press it again to go back into the tracks, pick one and press LOAD. **BACK** also takes the knob to the lists. A blue outline shows which side the knob is on. Clicking a list with the mouse puts the knob back on its tracks, and closing the MY CRATES or SERATO CRATES section makes the knob skip those crates. On other controllers, learn **Library browse press** and **Library back**.
    - **Jog wheel moves the wrong way or jumps?** Tick **1/127 style** or **invert** next to it.
    - **The channel level meters** on the FLX6, FLX4 and DDJ-400 show each channel's deck, like the meters on screen: see [Level meters](#level-meters).
    - **MASTER LEVEL and HEADPHONE LEVEL** set your own master and headphone levels, never your partner's, and the sliders on screen follow them. So the master knob works whatever Tandem plays through, your PC's speakers included. They're mapped on the FLX6 and the Inpulse 200 MK2; on other controllers, **Learn** them. When the master (or the headphones) plays through the controller's own sound card, the controller turns it up and down there by itself, so the knob leaves Tandem's level alone rather than turning the sound down twice. Tandem knows the controller's sound card by its name: Windows names it after the controller, e.g. "Line (DDJ-FLX6)". Settings → Controller says what each knob does with your audio settings.
@@ -172,14 +174,25 @@ Every DJ can work every deck and the whole mixer: there are no deck assignments,
 
 ### Sharing crates
 
-1. Pick a folder or Serato crate.
-2. Click **Share this list…** and confirm you have the right to share it.
-3. Every other DJ in the room gets a popup, and each must agree to use the tracks for personal, non-commercial purposes before anything downloads to them.
-4. Tracks they already have are skipped. The rest are saved to `Music\Tandem Shared\<your name>\<crate>` and show up under **Shared with me**.
+Pick one of your crates, a folder or a Serato crate, click **Share…** above its tracks (or right-click the crate → **Share live with the room…**), confirm you have the right to share it, and pick how:
 
-A share between two DJs who both joined goes through the host's PC. The host passes the tracks on without keeping them: they sit in its session folder, which is emptied when Tandem closes, unless the host accepts the share too.
+**📡 Share it live** (for building a set together):
 
-Every agreement is written to a local consent log (Settings → General → Logs and consent record).
+- Every other DJ in the room sees the list in their library under **SHARED LIVE IN THIS ROOM**, as *list · your name*, with titles, artists, BPMs, keys and lengths. Nothing is copied to them.
+- Any of them can load a track from it, from the screen or the controller, onto any deck. Only then does that one track come over, from your PC (through the host's when you both joined), exactly as when a DJ loads a track the others don't have: a session copy that goes when Tandem closes. The deck says **Receiving this track… N%** meanwhile.
+- A track you haven't analysed (no BPM in your list) comes over to the DJ who loaded it first and is analysed there, so it lands on the deck with its beatgrid and key, as a track from their own library would. That takes as long as the download.
+- Changes you make reach the others within a second or so: tracks you add to the crate or take out, a rename, a resync that finds new songs. BPMs you analyse follow every 10 seconds.
+- It stays shared until you click **Stop sharing** (or right-click the crate), delete it, or leave the room, and it goes with you if you leave. Through a dropped connection it carries on, and a DJ who joins later gets it too. Broadcasters don't see it.
+- Up to 500 tracks can be shared live (the whole list goes out again on each change, on the connection your moves use): put the tracks you want in a crate. Your list shows **📡 Shared live (N)** while it's shared, and the crate a 📡 on the left.
+
+**⬇ Send copies to keep:**
+
+1. Every other DJ in the room gets a popup, and each must agree to use the tracks for personal, non-commercial purposes before anything downloads to them.
+2. Tracks they already have are skipped. The rest are saved to `Music\Tandem Shared\<your name>\<crate>` and show up under **Shared with me**.
+
+A share between two DJs who both joined goes through the host's PC. The host passes the tracks on without keeping them: they sit in its session folder, which is emptied when Tandem closes, unless the host accepts the share too. **All Music** and **Shared with me** can only be sent as copies.
+
+Every agreement is written to a local consent log (Settings → General → Logs and consent record), live shares included.
 
 ### Streaming the set
 
@@ -237,6 +250,8 @@ Host in one window and join `127.0.0.1` from the other.
 - **CPU:** the screen redraws use more CPU than the audio does, and the broadcast window adds about half again. They run at 60 fps by default. **Settings → General → Screen frame rate** goes from 30 fps up to your monitor's full rate, which costs two to three times as much CPU on a 120–144 Hz monitor. Key lock costs under 2% of one core per deck.
 - **Audio driver:** WASAPI shared mode, roughly 10–20 ms of output latency. No ASIO yet.
 - **Serato data:** crates are read, but Serato cue points and beatgrids aren't imported yet.
+- **Crates:** a crate remembers each track by where the file is, so a file you move drops out of it. There's no picking several tracks at once: drag them in one at a time (a whole folder can be shared live as it is). You can't reorder a crate by hand.
+- **Sharing live:** up to 500 tracks a list, and only the DJ who shares a list can change it. Lists aren't shared again by themselves in your next room.
 - **Security:** traffic isn't encrypted by Tandem itself. Use Tailscale, which is encrypted. The room code is a simple gate, not a password.
 
 ## Troubleshooting
