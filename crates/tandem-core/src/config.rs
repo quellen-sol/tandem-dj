@@ -133,6 +133,9 @@ pub struct Settings {
     pub crossfader_curve: XfCurve,
     /// Show decks C and D (they also show whenever one has a track).
     pub four_decks: bool,
+    /// The FX strip under the waveforms is open (false: folded to one line
+    /// naming the effects that are on).
+    pub fx_strip: bool,
     /// LOOP IN goes on the nearest beat and LOOP OUT makes the loop 1 bar,
     /// ½ bar, 2 bars … (on tracks with a beatgrid). Off: exactly at the
     /// playhead. Each DJ's own: the booth that presses decides.
@@ -157,6 +160,7 @@ impl Default for Settings {
             frame_rate: FrameRate::default(),
             crossfader_curve: XfCurve::default(),
             four_decks: false,
+            fx_strip: true,
             quantize_loops: true,
         }
     }

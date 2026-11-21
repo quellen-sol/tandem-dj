@@ -347,12 +347,17 @@ pub struct UiState {
     /// The DJ has dragged the library's edge: keep their height instead of
     /// following the window's.
     pub library_dragged: bool,
+    /// How the FX strip shows this frame (the library decides, from the
+    /// window), and whether it could be open.
+    pub fx_strip: crate::ui_decks::FxStrip,
+    pub fx_strip_fits: bool,
 }
 
 /// Developer options: `--screenshot <file.bmp>` saves the window and exits;
 /// `--demo` loads the first two library tracks and starts playing (deck B
-/// synced, key-matched and on a 4-beat loop); `--demo4` does that on four
-/// decks (C synced and playing too, D cued and through the crossfader);
+/// synced, key-matched and on a 4-beat loop, an echo on A and a reverb on
+/// B); `--demo4` does that on four decks (C synced and playing too, with a
+/// phaser, D cued and through the crossfader);
 /// `--broadcast-view` opens the broadcast window at start;
 /// `--dev-host <port>` / `--dev-join <addr>` host or join room DEVTEST,
 /// with `--dev-broadcaster` joining it as a broadcaster;
@@ -524,6 +529,8 @@ impl TandemApp {
             broadcast_view: dev.broadcast_view,
             cd_seen: [(None, false); 2],
             library_dragged: false,
+            fx_strip: crate::ui_decks::FxStrip::Open,
+            fx_strip_fits: true,
         };
         let local_edit = settings.local;
         Self {
@@ -1384,7 +1391,28 @@ impl TandemApp {
                     deck: 1,
                     beats: 4.0,
                 });
+                s.act(Action::FxBeats { deck: 0, beats: 4 });
+                s.act(Action::FxDepth {
+                    deck: 0,
+                    slot: 0,
+                    v: 0.4,
+                });
+                s.act(Action::FxOn {
+                    deck: 0,
+                    slot: 0,
+                    on: true,
+                });
+                s.act(Action::FxOn {
+                    deck: 1,
+                    slot: 1,
+                    on: true,
+                });
                 if self.dev.demo4 {
+                    s.act(Action::FxOn {
+                        deck: 2,
+                        slot: 2,
+                        on: true,
+                    });
                     s.act(Action::Seek { deck: 2, pos: 30.0 });
                     s.act(Action::Sync { deck: 2, on: true });
                     s.act(Action::Play { deck: 2 });

@@ -325,7 +325,7 @@ fn mixer(ui: &mut egui::Ui, b: &BroadcastView, meters: &MeterView, four: bool) {
     }
     let p = ui.painter();
     if four {
-        for (k, label) in KNOB_LABELS.iter().enumerate() {
+        for (k, label) in KNOB_LABELS.iter().chain(["FX"].iter()).enumerate() {
             let y = area.top() + 7.0 + k as f32 * 18.0;
             p.text(
                 pos2(area.left(), y),
@@ -365,6 +365,7 @@ fn channel(ui: &mut egui::Ui, d: usize, st: &DeckState, labels: bool, side: XfSi
     for (label, v) in KNOB_LABELS.iter().zip(values) {
         knob_bar(ui, labels.then_some(*label), v, col);
     }
+    fx_names(ui, labels, st, col);
     ui.add_space(4.0);
     let moved = side != XfSide::default_for(d);
     let h = (ui.available_height() - if moved { 18.0 } else { 4.0 }).max(30.0);
@@ -394,6 +395,53 @@ fn channel(ui: &mut egui::Ui, d: usize, st: &DeckState, labels: bool, side: XfSi
         ui.vertical_centered(|ui| ui.label(RichText::new(text).small().weak()));
     }
     track
+}
+
+/// The channel's effects that are on, by name (a row under its EQ and
+/// filter, empty while none is).
+fn fx_names(ui: &mut egui::Ui, label: bool, st: &DeckState, col: Color32) {
+    let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 14.0), Sense::hover());
+    let p = ui.painter_at(r);
+    let label_w = if label { 28.0 } else { 0.0 };
+    if label {
+        p.text(
+            pos2(r.left(), r.center().y),
+            egui::Align2::LEFT_CENTER,
+            "FX",
+            egui::FontId::proportional(10.0),
+            Color32::from_gray(140),
+        );
+    }
+    let on: Vec<&str> = st
+        .fx
+        .slots
+        .iter()
+        .filter(|s| s.on)
+        .map(|s| {
+            if label {
+                s.kind.label()
+            } else {
+                s.kind.short()
+            }
+        })
+        .collect();
+    if on.is_empty() {
+        return;
+    }
+    // Centred under the knobs; it shrinks to fit a narrow channel.
+    let text = on.join(" ");
+    let room = r.width() - label_w;
+    let mut size = 10.5;
+    let mut galley = p.layout_no_wrap(text.clone(), egui::FontId::proportional(size), col);
+    while galley.size().x > room && size > 7.0 {
+        size -= 0.5;
+        galley = p.layout_no_wrap(text.clone(), egui::FontId::proportional(size), col);
+    }
+    let at = pos2(
+        r.left() + label_w + (room - galley.size().x).max(0.0) / 2.0,
+        r.center().y - galley.size().y / 2.0,
+    );
+    p.galley(at, galley, col);
 }
 
 /// A knob (0.5 = centre) as a bar growing left or right from the middle,

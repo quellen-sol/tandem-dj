@@ -664,6 +664,21 @@ impl FxKind {
         }
     }
 
+    /// What it does, and what DEPTH and BEATS do for it.
+    pub fn about(self) -> &'static str {
+        match self {
+            FxKind::Echo => {
+                "Echo: the sound repeats every BEATS, each repeat quieter and duller. DEPTH sets how loud the echoes are and how long they go on. Switched off, the echoes ring out; depth down silences them at once."
+            }
+            FxKind::Reverb => {
+                "Reverb: a room round the sound. Up to half DEPTH it adds reverb under the sound; past half the sound itself fades, to reverb alone. BEATS sets how long it rings (60 dB in twice BEATS). Switched off, the tail rings out."
+            }
+            FxKind::Phaser => {
+                "Phaser: notches that sweep up and back once every BEATS, locked to the beatgrid. DEPTH sets how deep they cut."
+            }
+        }
+    }
+
     /// The next effect in [`FxKind::ALL`], round to the first.
     pub fn next(self) -> FxKind {
         let i = FxKind::ALL.iter().position(|&k| k == self).unwrap_or(0);

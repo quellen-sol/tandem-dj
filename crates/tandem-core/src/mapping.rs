@@ -561,6 +561,7 @@ pub fn beats_label(beats: f64) -> String {
     match beats {
         b if (b - 0.25).abs() < 1e-9 => "¼".into(),
         b if (b - 0.5).abs() < 1e-9 => "½".into(),
+        b if (b - 0.75).abs() < 1e-9 => "¾".into(),
         b if b >= 1.0 && b.fract() == 0.0 => format!("{b}"),
         b if b < 1.0 && (1.0 / b).fract().abs() < 1e-9 => format!("1/{}", 1.0 / b),
         b => format!("{b:.2}"),
