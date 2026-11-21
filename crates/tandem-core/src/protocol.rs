@@ -13,7 +13,7 @@ use crate::model::{Event, Timeline, TrackId};
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
-pub const PROTOCOL_VERSION: u32 = 13;
+pub const PROTOCOL_VERSION: u32 = 14;
 pub const DEFAULT_PORT: u16 = 47800;
 const MAX_JSON: u32 = 64 << 20;
 const MAX_PAYLOAD: u32 = 8 << 20;
@@ -56,6 +56,16 @@ impl ShareOffer {
     }
 }
 
+/// The moves a DJ's booth made since shortly before it last heard from the
+/// room, and every one while its link was down, with the tracks they load.
+/// It sends them when it gets back in (`Msg::Hello::cut_off`); the host puts
+/// any it hasn't got into the room at the times they were made.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CutOff {
+    pub events: Vec<Event>,
+    pub tracks: Vec<TrackInfo>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConnKind {
     Control,
@@ -83,11 +93,20 @@ pub enum Msg {
         /// booths older than this field.
         #[serde(default)]
         booth_key: u64,
+        /// A DJ's booth whose link to this room dropped: the moves it made
+        /// that may not have reached the room. Empty otherwise.
+        #[serde(default)]
+        cut_off: CutOff,
     },
     Welcome {
         host: PeerInfo,
         timeline: Timeline,
         tracks: Vec<TrackInfo>,
+        /// The host was holding this booth's place and has put its
+        /// `cut_off` moves into the room, at the times they were made. The
+        /// timeline then reaches back far enough to hold them all.
+        #[serde(default)]
+        merged: bool,
     },
     Reject {
         reason: String,

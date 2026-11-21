@@ -354,7 +354,8 @@ fn run(root: &std::path::Path, say: &mut dyn FnMut(&str)) -> anyhow::Result<()> 
     );
     say("share offered, accepted (consent logged), downloaded and verified");
 
-    // A dropped link: Bob gets back in by himself, with the host's room.
+    // A dropped link: Bob gets back in by himself, and the room has both
+    // DJs' moves from while he was out.
     bob.lock().cut_link();
     wait_for(
         "Bob to notice his link dropped",
@@ -362,6 +363,7 @@ fn run(root: &std::path::Path, say: &mut dyn FnMut(&str)) -> anyhow::Result<()> 
         || bob.lock().view().link.rejoin.is_some(),
     )?;
     alice.lock().act(Action::Crossfader { v: 0.6 });
+    bob.lock().act(Action::Volume { deck: 3, v: 0.35 });
     let took = wait_for("Bob to get back in", Duration::from_secs(15), || {
         let v = bob.lock().view();
         v.link.peer.is_some() && v.link.rejoin.is_none()
@@ -378,8 +380,12 @@ fn run(root: &std::path::Path, say: &mut dyn FnMut(&str)) -> anyhow::Result<()> 
         bob.lock().latest().crossfader == 0.6,
         "Bob missed what happened while he was out"
     );
+    ensure!(
+        alice.lock().latest().decks[3].volume == 0.35,
+        "what Bob did while he was out didn't reach the room"
+    );
     say(&format!(
-        "a dropped link: Bob gets back in by himself after {:.1} s, with the room as it is",
+        "a dropped link: Bob gets back in by himself after {:.1} s, with both DJs' moves from meanwhile",
         took.as_secs_f64()
     ));
 

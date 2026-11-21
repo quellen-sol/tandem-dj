@@ -12,12 +12,14 @@
 //!
 //! A booth whose link to the host drops without anyone leaving (no `Bye`)
 //! gets back in by itself: see [`rejoin`]. The host knows it's the same
-//! booth by its id and booth key, and gives it its seat back.
+//! booth by its id and booth key, and gives it its seat back. A DJ's booth
+//! brings the moves it made while cut off, and the host puts them into the
+//! room at the times they were made (see `Session::take_cut_off`).
 
 use crate::clock::ClockEstimator;
 use crate::model::Timeline;
 use crate::protocol::{
-    read_msg, write_msg, ConnKind, Msg, PeerInfo, TrackInfo, DEFAULT_PORT, PROTOCOL_VERSION,
+    read_msg, write_msg, ConnKind, CutOff, Msg, PeerInfo, TrackInfo, DEFAULT_PORT, PROTOCOL_VERSION,
 };
 use crate::session::{LinkEnd, Session, SessionHandle};
 use anyhow::{anyhow, bail, Context};
@@ -190,6 +192,7 @@ fn handle_incoming(h: SessionHandle, mut s: TcpStream, room: &str) -> anyhow::Re
         peer_id,
         broadcaster,
         booth_key,
+        cut_off,
     } = hello
     else {
         bail!("expected hello")
@@ -224,7 +227,7 @@ fn handle_incoming(h: SessionHandle, mut s: TcpStream, room: &str) -> anyhow::Re
             );
             Ok(())
         }
-        ConnKind::Control => host_control(h, s, info, booth_key, broadcaster),
+        ConnKind::Control => host_control(h, s, info, booth_key, broadcaster, cut_off),
     }
 }
 
@@ -252,6 +255,7 @@ fn host_control(
     info: PeerInfo,
     key: u64,
     broadcaster: bool,
+    cut_off: CutOff,
 ) -> anyhow::Result<()> {
     let (clock, reply, serial, timeout) = {
         let mut ses = h.lock();
@@ -262,7 +266,10 @@ fn host_control(
         }
         let conn = PeerConn::new(s.try_clone()?)?;
         let reply = conn.sender();
-        conn.send(ses.welcome());
+        // A DJ getting back in: what it did while cut off goes into the
+        // room before the room goes to it.
+        let merged = !broadcaster && ses.take_cut_off(info.id, key, cut_off);
+        conn.send(ses.welcome(merged));
         let serial = if broadcaster {
             ses.add_broadcaster(conn, info.clone(), key)
         } else {
@@ -351,6 +358,21 @@ pub(crate) fn connect(
     booth_key: u64,
     broadcaster: bool,
 ) -> anyhow::Result<TcpStream> {
+    let cut_off = CutOff::default();
+    connect_with(addr, kind, room, me, booth_key, broadcaster, cut_off)
+}
+
+/// [`connect`], with a DJ's booth's moves from while its link to the room
+/// was down in the Hello (see [`CutOff`]).
+fn connect_with(
+    addr: SocketAddr,
+    kind: ConnKind,
+    room: &str,
+    me: &PeerInfo,
+    booth_key: u64,
+    broadcaster: bool,
+    cut_off: CutOff,
+) -> anyhow::Result<TcpStream> {
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(6))
         .with_context(|| format!("couldn't reach {addr}"))?;
     s.set_nodelay(true)?;
@@ -366,6 +388,7 @@ pub(crate) fn connect(
             peer_id: me.id,
             broadcaster,
             booth_key,
+            cut_off,
         },
         &[],
     )?;
@@ -389,6 +412,8 @@ struct Welcomed {
     host: PeerInfo,
     timeline: Timeline,
     tracks: Vec<TrackInfo>,
+    /// The host put this booth's `CutOff` moves into the room.
+    merged: bool,
     est: ClockEstimator,
     offset_us: i64,
     /// What arrived while the clock was being measured.
@@ -406,26 +431,38 @@ impl Welcomed {
 /// Say hello, get the room, and measure the clock offset (about a second).
 /// Changes nothing in the session: [`start_link`] does that.
 fn handshake(h: &SessionHandle, to: &RoomAddr) -> anyhow::Result<Welcomed> {
-    let (me, key, clock) = {
+    let (me, key, clock, cut_off) = {
         let s = h.lock();
-        (s.me.clone(), s.booth_key(), s.clock())
+        let cut_off = match to.broadcaster {
+            true => CutOff::default(),
+            false => s.cut_off(),
+        };
+        (s.me.clone(), s.booth_key(), s.clock(), cut_off)
     };
-    let mut s = connect(
+    if !cut_off.events.is_empty() {
+        log::info!(
+            "Sending the {} moves made since the link was last heard",
+            cut_off.events.len()
+        );
+    }
+    let mut s = connect_with(
         to.addr,
         ConnKind::Control,
         &to.room,
         &me,
         key,
         to.broadcaster,
+        cut_off,
     )?;
     s.set_read_timeout(Some(Duration::from_secs(10)))?;
     let (first, _) = read_msg(&mut s).context("no answer from host")?;
-    let (host, timeline, tracks) = match first {
+    let (host, timeline, tracks, merged) = match first {
         Msg::Welcome {
             host,
             timeline,
             tracks,
-        } => (host, timeline, tracks),
+            merged,
+        } => (host, timeline, tracks, merged),
         Msg::Reject { reason } => return Err(Rejected(reason).into()),
         other => bail!("unexpected reply {other:?}"),
     };
@@ -467,6 +504,7 @@ fn handshake(h: &SessionHandle, to: &RoomAddr) -> anyhow::Result<Welcomed> {
         host,
         timeline,
         tracks,
+        merged,
         est,
         offset_us: best.offset_us,
         buffered,
@@ -488,6 +526,7 @@ fn start_link(
         host,
         timeline,
         tracks,
+        merged,
         est,
         offset_us,
         buffered,
@@ -498,7 +537,16 @@ fn start_link(
     reader.set_read_timeout(Some(timeout))?;
     let clock = ses.clock();
     clock.set_offset(offset_us);
-    let serial = ses.on_joined(conn, host, timeline, tracks, est, to.clone(), rejoin);
+    let serial = ses.on_joined(
+        conn,
+        host,
+        timeline,
+        tracks,
+        est,
+        to.clone(),
+        rejoin,
+        merged,
+    );
     for m in buffered {
         ses.on_control_msg(m);
     }
@@ -903,9 +951,9 @@ mod tests {
     /// The connection goes silent, and the host still holds the joiner's
     /// old link when it comes back. The returning booths (a DJ and a
     /// broadcaster) take their own seats back: no second Bob or Carol, and
-    /// the old link closing later doesn't throw them out. Moves the DJ
-    /// made while cut off never reached the room, so they're gone; the
-    /// track it already had is still there, without downloading it again.
+    /// the old link closing later doesn't throw them out. The move the DJ
+    /// made while cut off comes into the room and reaches the broadcaster;
+    /// the track it already had is still there, without downloading it again.
     #[test]
     fn rejoins_after_a_silent_stall_replacing_the_old_link() {
         let rig = Rig::new("rejoin-stall");
@@ -961,8 +1009,8 @@ mod tests {
         wait_for("Bob and Carol to notice", Duration::from_secs(5), || {
             rejoining(&bob) && rejoining(&carol)
         });
-        // Cut off: Bob's move stays on his booth, Alice's can't reach him,
-        // and Carol keeps playing the room as it was.
+        // Cut off: Bob's move stays on his booth for now, Alice's can't
+        // reach him, and Carol keeps playing the room as it was.
         bob.lock().act(Action::Volume { deck: 1, v: 0.3 });
         alice.lock().act(Action::Crossfader { v: 0.8 });
         {
@@ -981,20 +1029,25 @@ mod tests {
             Duration::from_secs(10),
             || linked(&bob) && linked(&carol),
         );
+        wait_for(
+            "Bob's cut-off move to reach everyone",
+            Duration::from_secs(5),
+            || {
+                [&alice, &bob, &carol]
+                    .iter()
+                    .all(|h| h.lock().latest().decks[1].volume == 0.3)
+            },
+        );
         {
             let b = bob.lock();
-            assert_eq!(
-                b.latest().decks[1].volume,
-                1.0,
-                "Bob's cut-off move survived"
-            );
             assert_eq!(b.latest().crossfader, 0.8);
             assert_eq!(b.track_status(id), Some(TrackStatus::Ready));
             assert!(b.latest().decks[0].roll.is_some(), "Bob lost the roll");
         }
         assert!(carol.lock().latest().decks[0].roll.is_some());
-        assert!(digests_match(&alice, &bob), "Bob's room differs");
-        assert!(digests_match(&alice, &carol), "Carol's room differs");
+        wait_for("everyone to agree", Duration::from_secs(5), || {
+            digests_match(&alice, &bob) && digests_match(&alice, &carol)
+        });
         let r = alice.lock().roster();
         assert_eq!(names(&r.djs), ["Alice", "Bob"]);
         assert_eq!(names(&r.broadcasters), ["Carol"]);
@@ -1036,6 +1089,7 @@ mod tests {
             peer_id: me.id,
             broadcaster: false,
             booth_key: 9,
+            cut_off: CutOff::default(),
         };
         write_msg(&mut live, &hello, &[]).unwrap();
         write_msg(&mut gone, &hello, &[]).unwrap();
@@ -1130,6 +1184,304 @@ mod tests {
             "Bob got back in after giving up"
         );
         alice.lock().leave();
+    }
+
+    /// Load stand-in track `n` onto `deck`: the room only needs its id and
+    /// length (no booth has it, so each one's downloads of it just fail).
+    fn load(deck: u8, n: u8) -> Action {
+        Action::Load {
+            deck,
+            track: TrackId([n; 32]),
+            duration: 300.0,
+            cue: 0.0,
+            grid: None,
+            key: -1,
+        }
+    }
+
+    /// Alice hosts, Bob joins through a relay. Both links time out after
+    /// `alice_t` and `bob_t`.
+    fn b2b(
+        rig: &Rig,
+        room: &str,
+        alice_t: Duration,
+        bob_t: Duration,
+    ) -> (SessionHandle, SessionHandle, Relay) {
+        let alice = rig.booth("Alice", 0, alice_t);
+        let bob = rig.booth("Bob", 900_000_000, bob_t);
+        let port = host(&alice, 0, room).unwrap();
+        let relay = Relay::new(port);
+        join(&bob, &relay.addr(), room, false).unwrap();
+        (alice, bob, relay)
+    }
+
+    fn awaiting(h: &SessionHandle) -> bool {
+        h.lock().view().link.awaiting.is_some()
+    }
+
+    /// Bob is back, and Alice and Bob have the same room.
+    fn back_together(alice: &SessionHandle, bob: &SessionHandle) {
+        wait_for("Bob to get back in", Duration::from_secs(15), || {
+            linked(bob)
+        });
+        wait_for("Alice to see Bob back", Duration::from_secs(5), || {
+            let v = alice.lock().view();
+            v.link.peer.is_some() && v.link.awaiting.is_none()
+        });
+        wait_for("Alice and Bob to agree", Duration::from_secs(5), || {
+            digests_match(alice, bob)
+        });
+    }
+
+    /// While Bob is cut off, Alice moves the crossfader and Bob deck A's
+    /// fader. Once he's back, both moves are in the room, on both booths.
+    #[test]
+    fn moves_made_while_cut_off_come_through() {
+        let rig = Rig::new("merge-both");
+        let t = Duration::from_secs(2);
+        let (alice, bob, relay) = b2b(&rig, "MERGE1", t, t);
+        relay.sever();
+        wait_for("Bob to notice", Duration::from_secs(5), || rejoining(&bob));
+        bob.lock().act(Action::Volume { deck: 0, v: 0.4 });
+        alice.lock().act(Action::Crossfader { v: 0.7 });
+        back_together(&alice, &bob);
+        for h in [&alice, &bob] {
+            let room = h.lock().latest();
+            assert_eq!(room.decks[0].volume, 0.4);
+            assert_eq!(room.crossfader, 0.7);
+        }
+        bob.lock().leave();
+        alice.lock().leave();
+    }
+
+    /// Both DJs move the same controls while Bob is cut off, seconds
+    /// apart: the later move wins, whoever made it, on both booths. The cut
+    /// lasts longer than the room keeps its recent moves (3.5 s), so Bob's
+    /// moves have to go in at the times he made them, not when he's back:
+    /// his early crossfader move landing late would beat Alice's later one.
+    /// His first move was made before he knew the link had gone.
+    #[test]
+    fn the_later_move_wins_after_a_long_cut() {
+        let rig = Rig::new("merge-later");
+        let t = Duration::from_secs(2);
+        let (alice, bob, relay) = b2b(&rig, "MERGE2", t, t);
+        relay.blackhole();
+        bob.lock().act(Action::Crossfader { v: 0.1 });
+        alice.lock().act(Action::Volume { deck: 1, v: 0.2 });
+        wait_for("Bob to notice", Duration::from_secs(5), || rejoining(&bob));
+        thread::sleep(Duration::from_millis(2500));
+        alice.lock().act(Action::Crossfader { v: 0.9 });
+        bob.lock().act(Action::Volume { deck: 1, v: 0.6 });
+        thread::sleep(Duration::from_secs(4));
+        relay.restore();
+        back_together(&alice, &bob);
+        for h in [&alice, &bob] {
+            let room = h.lock().latest();
+            assert_eq!(room.crossfader, 0.9, "Alice moved it last");
+            assert_eq!(room.decks[1].volume, 0.6, "Bob moved it last");
+        }
+        bob.lock().leave();
+        alice.lock().leave();
+    }
+
+    /// Bob presses PLAY on deck A while cut off: once he's back, deck A
+    /// plays in the room from when he pressed it, so Alice hears it exactly
+    /// where Bob does.
+    #[test]
+    fn a_deck_started_while_cut_off_plays_from_when_it_was_started() {
+        let rig = Rig::new("merge-play");
+        let t = Duration::from_secs(2);
+        let (alice, bob, relay) = b2b(&rig, "MERGE3", t, t);
+        alice.lock().act(load(0, 1));
+        wait_for("Bob to see the track", Duration::from_secs(5), || {
+            bob.lock().latest().decks[0].track.is_some()
+        });
+        relay.blackhole();
+        wait_for("Bob to notice", Duration::from_secs(5), || rejoining(&bob));
+        let pressed = {
+            let mut b = bob.lock();
+            let t = b.now();
+            b.act_at(Action::Play { deck: 0 }, t);
+            t
+        };
+        thread::sleep(Duration::from_secs(4));
+        relay.restore();
+        back_together(&alice, &bob);
+        let a = alice.lock();
+        let now = a.now();
+        let deck = &a.latest().decks[0];
+        assert!(deck.playing, "deck A isn't playing");
+        let pos = deck.position_at(now);
+        let want = (now - pressed) as f64 / 1e6;
+        assert!((pos - want).abs() < 0.05, "at {pos:.3} s, not {want:.3} s");
+        drop(a);
+        bob.lock().leave();
+        alice.lock().leave();
+    }
+
+    /// While Bob is cut off, Alice starts deck B (out loud) and Bob then
+    /// loads onto it, and Bob starts deck A and Alice then loads onto that.
+    /// Neither could see the other's deck playing, but the room can: both
+    /// loads are refused, and each DJ is told about their own.
+    #[test]
+    fn a_load_made_while_cut_off_onto_a_playing_deck_is_refused_and_reported() {
+        let rig = Rig::new("merge-load");
+        let t = Duration::from_secs(2);
+        let (alice, bob, relay) = b2b(&rig, "MERGE4", t, t);
+        alice.lock().act(load(0, 1));
+        alice.lock().act(load(1, 2));
+        wait_for("Bob to see the tracks", Duration::from_secs(5), || {
+            bob.lock().latest().decks[1].track.is_some()
+        });
+        relay.blackhole();
+        wait_for("Bob to notice", Duration::from_secs(5), || rejoining(&bob));
+        alice.lock().act(Action::Play { deck: 1 });
+        bob.lock().act(Action::Play { deck: 0 });
+        thread::sleep(Duration::from_millis(500));
+        bob.lock().act(load(1, 3));
+        alice.lock().act(load(0, 4));
+        for h in [&alice, &bob] {
+            assert!(h.lock().take_notices().is_empty(), "refused too early");
+        }
+        relay.restore();
+        back_together(&alice, &bob);
+        for h in [&alice, &bob] {
+            let decks = h.lock().latest().decks;
+            assert_eq!(decks[0].track, Some(TrackId([1; 32])));
+            assert_eq!(decks[1].track, Some(TrackId([2; 32])));
+            assert!(decks[0].playing && decks[1].playing);
+        }
+        assert_eq!(
+            bob.lock().take_notices(),
+            ["Deck B is playing: pause it or pull its fader down to load onto it."]
+        );
+        wait_for("Alice to be told", Duration::from_secs(2), || {
+            let n = alice.lock().take_notices();
+            assert!(n.len() <= 1, "{n:?}");
+            n == ["Deck A is playing: pause it or pull its fader down to load onto it."]
+        });
+        bob.lock().leave();
+        alice.lock().leave();
+    }
+
+    /// The link goes silent. Bob keeps going for the 3 s it takes him to
+    /// notice, and every move he makes is sent into the void; Alice still
+    /// holds his old link when he's back. They all come through.
+    #[test]
+    fn moves_sent_before_the_drop_was_noticed_come_through() {
+        let rig = Rig::new("merge-inflight");
+        let (alice, bob, relay) = b2b(
+            &rig,
+            "MERGE5",
+            Duration::from_secs(30),
+            Duration::from_secs(3),
+        );
+        alice.lock().act(Action::Volume { deck: 3, v: 0.5 });
+        wait_for("Bob to see it", Duration::from_secs(5), || {
+            bob.lock().latest().decks[3].volume == 0.5
+        });
+        relay.blackhole();
+        for (i, v) in [0.11, 0.22, 0.33].into_iter().enumerate() {
+            bob.lock().act(Action::Volume { deck: i as u8, v });
+            thread::sleep(Duration::from_millis(800));
+        }
+        wait_for("Bob to notice", Duration::from_secs(5), || rejoining(&bob));
+        assert!(!awaiting(&alice), "Alice dropped Bob's link too soon");
+        relay.restore();
+        back_together(&alice, &bob);
+        for h in [&alice, &bob] {
+            let decks = h.lock().latest().decks;
+            let v: Vec<f32> = decks.iter().map(|d| d.volume).collect();
+            assert_eq!(v, [0.11, 0.22, 0.33, 0.5]);
+        }
+        bob.lock().leave();
+        alice.lock().leave();
+    }
+
+    /// Bob gives up getting back in, plays on alone for a bit, then joins
+    /// the room again by hand while Alice is still waiting for him: what he
+    /// did before and after giving up comes into the room.
+    #[test]
+    fn joining_again_by_hand_soon_brings_the_moves_too() {
+        let rig = Rig::new("merge-hand");
+        let t = Duration::from_secs(2);
+        let (alice, bob, relay) = b2b(&rig, "MERGE6", t, t);
+        relay.blackhole();
+        wait_for("Bob to notice", Duration::from_secs(5), || rejoining(&bob));
+        bob.lock().act(Action::Volume { deck: 0, v: 0.45 });
+        bob.lock().leave();
+        assert!(matches!(bob.lock().view().link.role, RoleView::Solo));
+        bob.lock().act(Action::Volume { deck: 1, v: 0.55 });
+        alice.lock().act(Action::Crossfader { v: 0.35 });
+        wait_for("Alice to wait for Bob", Duration::from_secs(5), || {
+            awaiting(&alice)
+        });
+        relay.restore();
+        join(&bob, &relay.addr(), "MERGE6", false).unwrap();
+        back_together(&alice, &bob);
+        for h in [&alice, &bob] {
+            let room = h.lock().latest();
+            assert_eq!(room.decks[0].volume, 0.45);
+            assert_eq!(room.decks[1].volume, 0.55);
+            assert_eq!(room.crossfader, 0.35);
+        }
+        bob.lock().leave();
+        alice.lock().leave();
+    }
+
+    /// Only the booth whose place the room is holding brings moves in: not
+    /// one that knows its id (every event carries it) but not its key, nor
+    /// another booth joining fresh.
+    #[test]
+    fn only_the_awaited_booth_brings_moves_in() {
+        let rig = Rig::new("merge-others");
+        let t = Duration::from_secs(2);
+        let (alice, bob, relay) = b2b(&rig, "MERGE7", t, t);
+        let port = match alice.lock().view().link.role {
+            RoleView::Hosting { port, .. } => port,
+            _ => unreachable!(),
+        };
+        let addr = resolve(&format!("127.0.0.1:{port}")).unwrap();
+        relay.blackhole();
+        wait_for("Alice to wait for Bob", Duration::from_secs(5), || {
+            awaiting(&alice)
+        });
+        let bob_me = bob.lock().me.clone();
+        let stranger = PeerInfo {
+            id: 0xD15C0,
+            name: "Dave".into(),
+        };
+        let key = bob.lock().booth_key() ^ 1;
+        for who in [bob_me, stranger] {
+            let now = alice.lock().now();
+            let cut_off = CutOff {
+                events: vec![crate::model::Event {
+                    time: now - 500_000,
+                    origin: who.id,
+                    seq: 9_999,
+                    action: Action::Crossfader { v: 0.05 },
+                }],
+                tracks: Vec::new(),
+            };
+            let mut s =
+                connect_with(addr, ConnKind::Control, "MERGE7", &who, key, false, cut_off).unwrap();
+            match read_msg(&mut s).unwrap().0 {
+                Msg::Welcome {
+                    merged, timeline, ..
+                } => {
+                    assert!(!merged, "{} brought moves in", who.name);
+                    assert_eq!(timeline.latest().crossfader, 0.5);
+                }
+                other => panic!("{} wasn't welcomed: {other:?}", who.name),
+            }
+            assert_eq!(alice.lock().latest().crossfader, 0.5);
+            drop(s);
+            wait_for("Alice to see it go", Duration::from_secs(5), || {
+                alice.lock().view().link.peer.is_none()
+            });
+        }
+        alice.lock().leave();
+        bob.lock().leave();
     }
 
     /// A tone of `secs` seconds (about 176 KB a second) in `dir`.

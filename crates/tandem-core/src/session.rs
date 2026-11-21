@@ -17,13 +17,13 @@ use crate::meter::LevelMeters;
 pub use crate::model::deck_letter;
 use crate::model::{Action, DeckState, Event, RoomState, Timeline, TrackId, DECKS};
 use crate::net::{PeerConn, RoomAddr};
-use crate::protocol::{Msg, PeerInfo, ShareOffer, TrackInfo};
+use crate::protocol::{CutOff, Msg, PeerInfo, ShareOffer, TrackInfo};
 use crate::render::{AudioSnapshot, LocalParams};
 use crate::terms::{self, ConsentRecord, TERMS_VERSION};
 use crate::time::SharedClock;
 use arc_swap::ArcSwap;
 use parking_lot::Mutex;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -190,6 +190,29 @@ struct Awaiting {
     info: PeerInfo,
     key: u64,
     since: Instant,
+    /// When the dropped link was last heard from.
+    heard: Instant,
+}
+
+/// Client DJ: the room this booth's link to was lost, while it may still
+/// get back in (by itself, or joined again by hand). The host holds its
+/// place meanwhile, and this booth keeps its moves for it.
+struct LostRoom {
+    addr: SocketAddr,
+    room: String,
+    since: Instant,
+}
+
+/// Where an event went (see [`Session::insert_event`]).
+#[derive(PartialEq)]
+enum Landed {
+    /// The room already had it.
+    Already,
+    /// In the room now.
+    Now,
+    /// Too late for the live timeline, so it's in the held one, and the
+    /// live one is made again from that at the next maintenance tick.
+    Later,
 }
 
 /// Who's in the room.
@@ -403,6 +426,22 @@ pub struct Session {
     rejoin_gen: u64,
     /// Host: the other DJ whose link dropped, while they're expected back.
     awaiting: Option<Awaiting>,
+    /// Host: the room with its history kept further back than `timeline`
+    /// keeps it, to [`HELD_MARGIN_US`] before the other DJ was last heard
+    /// from, while they're linked or expected back. It gets every event
+    /// `timeline` gets, so `timeline` is always this compacted to its own
+    /// base. A DJ coming back after their link dropped has the moves they
+    /// made meanwhile put in here at their own times, and the room is taken
+    /// from it. Never published: the audio threads only see `timeline`.
+    held: Option<Timeline>,
+    /// Host: a move arrived too late for `timeline` but not for `held`.
+    rebuild_due: bool,
+    /// Client DJ: this booth's own moves that may not have reached the room
+    /// (see [`CutOff`]): from [`HELD_MARGIN_US`] before it last heard from
+    /// the host, and every one since while its link is down.
+    own_moves: VecDeque<Event>,
+    /// Client DJ: the room whose link was lost, while it may get back in.
+    lost: Option<LostRoom>,
     /// A link that hears nothing for this long is dropped
     /// ([`crate::net::LINK_TIMEOUT`]; tests shorten it).
     pub link_timeout: Duration,
@@ -454,6 +493,12 @@ const RESUME_AFTER: Duration = Duration::from_secs(1);
 const FETCH_RETRY: Duration = Duration::from_secs(5);
 /// How far back [`LinkView::late_us`] looks.
 pub const LATE_WINDOW: Duration = Duration::from_secs(60);
+/// How far back, from when the other DJ's booth was last heard from, the
+/// host keeps the room's history, and a joining DJ's booth keeps its own
+/// moves, for when the link drops. A move that never arrived was sent after
+/// the last message that did, so it was made at most one trip before that
+/// message got here: this only has to outlast a slow trip.
+const HELD_MARGIN_US: i64 = 10_000_000;
 
 impl Session {
     pub fn create(
@@ -502,6 +547,10 @@ impl Session {
                 rejoin: None,
                 rejoin_gen: 0,
                 awaiting: None,
+                held: None,
+                rebuild_due: false,
+                own_moves: VecDeque::new(),
+                lost: None,
                 link_timeout: crate::net::LINK_TIMEOUT,
                 rejoin_for: crate::net::REJOIN_FOR,
                 late_from: i64::MAX,
@@ -664,7 +713,10 @@ impl Session {
             seq: self.seq,
             action: a,
         };
-        self.timeline.insert(ev.clone());
+        self.insert_event(ev.clone(), true);
+        if self.keeps_moves() {
+            self.own_moves.push_back(ev.clone());
+        }
         if let Action::Load { deck, track, .. } = ev.action {
             self.my_loads.push((t, self.seq, deck as usize, track));
         }
@@ -677,9 +729,10 @@ impl Session {
     /// partner's move from just before it (bringing that deck's fader up,
     /// say) arrived after it, so the deck could be heard when it landed.
     fn check_my_loads(&mut self) {
-        let base = self.timeline.base_time();
+        // The host looks back as far as it keeps the room's history.
+        let timeline = self.held.as_ref().unwrap_or(&self.timeline);
+        let base = timeline.base_time();
         let mut dropped = Vec::new();
-        let timeline = &self.timeline;
         self.my_loads.retain(|&(t, _, deck, track)| {
             if t < base {
                 return false;
@@ -697,15 +750,202 @@ impl Session {
         }
     }
 
+    /// Getting back in, this booth's moves from while it was cut off went
+    /// into the room (`timeline`, reaching back as far as they do). Moves it
+    /// made after sending them aren't in it yet: they go in here, at their
+    /// own times, and to the host. Every load it made meanwhile is checked
+    /// against the room at its own time, so one the room refused (the
+    /// partner's deck was playing out loud by then) is reported. Then the
+    /// room is compacted back to the usual length before anyone plays it.
+    fn took_merged_room(&mut self, mut timeline: Timeline) {
+        let (me, base) = (self.me.id, timeline.base_time());
+        let have: HashSet<u64> = timeline
+            .events()
+            .iter()
+            .filter(|e| e.origin == me)
+            .map(|e| e.seq)
+            .collect();
+        let since: Vec<Event> = self
+            .own_moves
+            .iter()
+            .filter(|e| e.time >= base && !have.contains(&e.seq))
+            .cloned()
+            .collect();
+        for ev in &since {
+            timeline.insert_new(ev.clone());
+        }
+        for e in &self.own_moves {
+            if let Action::Load { deck, track, .. } = e.action {
+                if !self.my_loads.iter().any(|l| l.1 == e.seq) {
+                    self.my_loads.push((e.time, e.seq, deck as usize, track));
+                }
+            }
+        }
+        self.timeline = timeline;
+        self.check_my_loads();
+        self.timeline
+            .compact(self.now() - self.bcast_delay_us - 3_000_000);
+        let base = self.timeline.base_time();
+        self.my_loads.retain(|l| l.0 >= base);
+        for ev in since {
+            // A load's track goes first, as from `finish_local_load`.
+            if let Action::Load { track, .. } = ev.action {
+                if let Some(info) = self.track_meta.get(&track).cloned() {
+                    self.send(Msg::Track { info });
+                }
+            }
+            self.send(Msg::Event { ev });
+        }
+    }
+
     /// The room's timeline has just replaced this booth's (joining, or
-    /// getting back in after the link dropped). Loads it made while cut off
-    /// never reached the room, so they're forgotten without a word: the
-    /// deck wasn't playing over them. Any that did reach it are checked.
+    /// getting back in to a room that had stopped holding its place). Loads
+    /// it made while cut off never reached the room, so they're forgotten
+    /// (the room's notice says so); any that did reach it are checked.
     fn took_room_timeline(&mut self) {
         let (me, events) = (self.me.id, self.timeline.events());
         self.my_loads
             .retain(|l| events.iter().any(|e| e.origin == me && e.seq == l.1));
         self.check_my_loads();
+    }
+
+    /// Put an event in the room: this booth's own (`mine`) or one that
+    /// arrived. On the host it goes in the held room too (see `held`), and
+    /// one that arrives later than `timeline` reaches back, but within
+    /// `held`, goes in at its own time there rather than being clamped, and
+    /// `timeline` is made again from `held` at the next maintenance tick.
+    fn insert_event(&mut self, mut ev: Event, mine: bool) -> Landed {
+        let Some(held) = self.held.as_mut() else {
+            return match self.timeline.insert(ev) {
+                true => Landed::Now,
+                false => Landed::Already,
+            };
+        };
+        let base = self.timeline.base_time();
+        if ev.time < held.base_time() {
+            log::warn!(
+                "event arrived {} ms too late; applying it now",
+                (base - ev.time) / 1000
+            );
+            ev.time = base;
+        }
+        if mine {
+            held.insert_new(ev.clone());
+        } else if !held.insert(ev.clone()) {
+            return Landed::Already;
+        }
+        if ev.time >= base {
+            // New to `held`, so new here too.
+            self.timeline.insert_new(ev);
+            Landed::Now
+        } else {
+            self.rebuild_due = true;
+            Landed::Later
+        }
+    }
+
+    /// Host: make the live timeline again from the held room, after moves
+    /// went in further back than it reaches, and send it to the
+    /// broadcasters, whose rooms reach back no further.
+    fn rebuild_from_held(&mut self) {
+        self.rebuild_due = false;
+        let Some(held) = &self.held else { return };
+        let mut tl = held.clone();
+        tl.compact(self.timeline.base_time());
+        self.timeline = tl;
+        if !self.broadcasters.is_empty() {
+            self.relay(&Msg::Resync {
+                timeline: self.timeline.clone(),
+            });
+        }
+    }
+
+    /// Client DJ: keep this booth's moves for the room in case they don't
+    /// reach it: while in a room, and after its link to one was lost for
+    /// as long as the host holds its place.
+    fn keeps_moves(&self) -> bool {
+        match self.role {
+            Role::Client { broadcaster, .. } => !broadcaster,
+            Role::Solo => self
+                .lost
+                .as_ref()
+                .is_some_and(|l| l.since.elapsed() < self.rejoin_for + self.link_timeout),
+            Role::Host { .. } => false,
+        }
+    }
+
+    /// Client DJ: the moves to send the host when joining (see [`CutOff`]).
+    /// Empty unless this booth's link to a room was lost: the host only
+    /// takes them from a booth whose place it was holding.
+    pub fn cut_off(&self) -> CutOff {
+        if !self.keeps_moves() {
+            return CutOff::default();
+        }
+        let events: Vec<Event> = self.own_moves.iter().cloned().collect();
+        let mut ids: Vec<TrackId> = events
+            .iter()
+            .filter_map(|e| match e.action {
+                Action::Load { track, .. } => Some(track),
+                _ => None,
+            })
+            .collect();
+        ids.sort();
+        ids.dedup();
+        let tracks = ids
+            .iter()
+            .filter_map(|id| self.track_meta.get(id).cloned())
+            .collect();
+        CutOff { events, tracks }
+    }
+
+    /// Host: a DJ's booth (`id`, `key`) is joining. If it's the one whose
+    /// place this room is holding (its link dropped, or has gone quiet),
+    /// the moves it made that may not have reached the room (`cut_off`) go
+    /// in at the times they were made, among everything that happened here
+    /// meanwhile: on a control both DJs touched, the later move wins, and a
+    /// load goes through the load guard at its own time. Returns whether
+    /// they did, for the Welcome.
+    pub fn take_cut_off(&mut self, id: u64, key: u64, cut_off: CutOff) -> bool {
+        let same = |pid: u64, pkey: u64| key != 0 && pid == id && pkey == key;
+        let window = self.rejoin_for + self.link_timeout;
+        let name = self
+            .awaiting
+            .as_ref()
+            .filter(|a| same(a.info.id, a.key) && a.since.elapsed() < window)
+            .map(|a| a.info.name.clone())
+            .or_else(|| {
+                self.peer
+                    .as_ref()
+                    .filter(|p| same(p.info.id, p.key))
+                    .map(|p| p.info.name.clone())
+            });
+        let (Some(name), Some(held)) = (name, self.held.as_mut()) else {
+            return false;
+        };
+        // Its own moves only: it can't speak for anyone else.
+        let events = cut_off.events.into_iter().filter(|e| e.origin == id);
+        let added = held.merge(events.collect());
+        for info in cut_off.tracks {
+            if !self.track_meta.contains_key(&info.id) {
+                self.relay(&Msg::Track { info: info.clone() });
+                self.track_meta.insert(info.id, info);
+            }
+        }
+        if !added.is_empty() {
+            log::info!(
+                "{} moves {name} made while cut off came into the room",
+                added.len()
+            );
+            self.rebuild_from_held();
+            for ev in &added {
+                if let Action::SetGrid { track, grid, .. } = &ev.action {
+                    self.remember_grid(*track, grid.as_deref().copied());
+                }
+            }
+            self.check_my_loads();
+            self.publish();
+        }
+        true
     }
 
     fn after_event(&mut self, ev: &Event) {
@@ -1579,16 +1819,28 @@ impl Session {
 
     // ------------------------------------------------------------ network callbacks
 
-    pub fn welcome(&self) -> Msg {
+    /// The room for a booth joining it. One whose moves from while it was
+    /// cut off just went in (`merged`, see [`Session::take_cut_off`]) gets
+    /// it reaching back as far as they do, to see which of its loads the
+    /// room took.
+    pub fn welcome(&self, merged: bool) -> Msg {
+        let timeline = match &self.held {
+            Some(held) if merged => held.clone(),
+            _ => self.timeline.clone(),
+        };
         Msg::Welcome {
             host: self.me.clone(),
-            timeline: self.timeline.clone(),
+            timeline,
             tracks: self.track_meta.values().cloned().collect(),
+            merged,
         }
     }
 
     pub fn set_hosting(&mut self, port: u16, room: String, stop: Arc<AtomicBool>) {
         self.role = Role::Host { port, room, stop };
+        // Hosting now: no room is holding this booth's place.
+        self.lost = None;
+        self.own_moves.clear();
         self.clock.set_offset(0);
     }
 
@@ -1684,6 +1936,8 @@ impl Session {
         });
         self.in_sync = None;
         self.last_digest = Instant::now();
+        // Keep the room's history in case their link drops.
+        self.held.get_or_insert_with(|| self.timeline.clone());
         self.announce_members();
         // Uploads from them the dropped link cut off carry on from where
         // they got to, and tracks on a deck that didn't arrive from them
@@ -1752,11 +2006,13 @@ impl Session {
     }
 
     /// Client: we joined a host's room, or got back in after the link
-    /// dropped (`rejoin`). Either way the room is taken exactly as the host
-    /// has it now: moves this booth made while cut off never reached the
-    /// room, so they go. Its own settings, library and the tracks it has
-    /// stay, and tracks on the decks it doesn't have yet are fetched again.
-    /// Returns the link's serial.
+    /// dropped (`rejoin`, or joining the same room again by hand). The room
+    /// is taken as the host has it. Getting back in, the host has already
+    /// put this booth's moves from while it was cut off into it (`merged`,
+    /// see [`Session::take_cut_off`]), and any it made since sending them
+    /// go now. Its own settings, library and the tracks it has stay, and
+    /// tracks on the decks it doesn't have yet are fetched again. Returns
+    /// the link's serial.
     #[allow(clippy::too_many_arguments)]
     pub fn on_joined(
         &mut self,
@@ -1767,7 +2023,9 @@ impl Session {
         est: ClockEstimator,
         to: RoomAddr,
         rejoin: bool,
+        merged: bool,
     ) -> u64 {
+        let (to_addr, to_room, host_name) = (to.addr, to.room.clone(), host.name.clone());
         if rejoin {
             let down = self.rejoin.as_ref().map(|r| r.since.elapsed().as_secs());
             log::info!(
@@ -1803,8 +2061,23 @@ impl Session {
         self.est = est;
         self.in_sync = None;
         self.digest_mismatch = 0;
-        self.timeline = timeline;
-        self.took_room_timeline();
+        let lost = self.lost.take();
+        if merged {
+            self.took_merged_room(timeline);
+        } else {
+            let here = lost.is_some_and(|l| l.addr == to_addr && l.room == to_room);
+            if here && !self.own_moves.is_empty() {
+                // The host had stopped holding this booth's place.
+                let why = format!(
+                    "Back in {host_name}'s room, but it had stopped waiting for you: what you did while cut off didn't reach it."
+                );
+                log::warn!("{why}");
+                self.notices.push(why);
+            }
+            self.own_moves.clear();
+            self.timeline = timeline;
+            self.took_room_timeline();
+        }
         for t in tracks {
             self.track_meta.insert(t.id, t);
         }
@@ -1882,7 +2155,7 @@ impl Session {
             return None;
         }
         let p = self.peer.as_ref().filter(|p| p.serial == serial)?;
-        let (info, key) = (p.info.clone(), p.key);
+        let (info, key, heard) = (p.info.clone(), p.key, p.heard);
         let client = matches!(self.role, Role::Client { .. });
         let broadcaster = self.is_broadcaster();
         match end {
@@ -1896,6 +2169,18 @@ impl Session {
                     "Lost the link to {}'s room ({why}). Reconnecting…",
                     info.name
                 );
+                if let Role::Client {
+                    addr,
+                    room,
+                    broadcaster: false,
+                } = &self.role
+                {
+                    self.lost = Some(LostRoom {
+                        addr: *addr,
+                        room: room.clone(),
+                        since: Instant::now(),
+                    });
+                }
                 self.unlink("connection lost", true);
                 self.rejoin_gen += 1;
                 self.rejoin = Some(Rejoin {
@@ -1916,6 +2201,7 @@ impl Session {
                     info,
                     key,
                     since: Instant::now(),
+                    heard,
                 });
                 self.unlink("connection lost", true);
                 return None;
@@ -1930,6 +2216,9 @@ impl Session {
             }
         }
         self.unlink("partner left", false);
+        // Left on purpose: nobody holds anyone's place.
+        self.lost = None;
+        self.own_moves.clear();
         self.end_client();
         None
     }
@@ -2034,6 +2323,13 @@ impl Session {
         if let Some(r) = &self.rejoin {
             log::info!("Stopped reconnecting to {}'s room", r.host.name);
         }
+        if self.peer.is_some() {
+            // The host hears this booth leave, and stops holding its place.
+            // Giving up while cut off leaves the host holding it, so joining
+            // again by hand soon still brings its moves.
+            self.lost = None;
+            self.own_moves.clear();
+        }
         self.send_all(Msg::Bye);
         // Give the Byes a moment to go out, so the others know this was on
         // purpose (the app may be closing).
@@ -2054,6 +2350,7 @@ impl Session {
         }
         self.unlink("partner left", false);
         self.awaiting = None;
+        self.held = None;
         if let Role::Host { stop, .. } = &self.role {
             stop.store(true, Ordering::Relaxed);
         }
@@ -2068,11 +2365,20 @@ impl Session {
                 if ev.time >= self.late_from {
                     self.note_lateness(self.now() - ev.time);
                 }
-                if self.timeline.insert(ev.clone()) {
+                let landed = self.insert_event(ev.clone(), false);
+                if landed != Landed::Already {
                     self.after_event(&ev);
-                    self.check_my_loads();
+                    // Only a move from before one of this booth's loads can
+                    // have the room drop it.
+                    if self.my_loads.iter().any(|l| l.0 >= ev.time) {
+                        self.check_my_loads();
+                    }
                     self.publish();
-                    self.relay(&Msg::Event { ev });
+                    // One that went in further back reaches the broadcasters
+                    // with the remade room.
+                    if landed == Landed::Now {
+                        self.relay(&Msg::Event { ev });
+                    }
                 }
             }
             Msg::Track { info } => {
@@ -2218,7 +2524,8 @@ impl Session {
     fn maintenance(&mut self) {
         let now = self.now();
         self.timeline.compact(now - self.bcast_delay_us - 3_000_000);
-        let base = self.timeline.base_time();
+        self.keep_history(now);
+        let base = self.held.as_ref().unwrap_or(&self.timeline).base_time();
         self.my_loads.retain(|l| l.0 >= base);
         self.follow_grid_tempos(now);
         self.library.lock().save_grids();
@@ -2332,6 +2639,46 @@ impl Session {
             }
         }
         self.publish();
+    }
+
+    /// Host: keep the held room (see `held`) while the other DJ is linked or
+    /// expected back, reaching back to [`HELD_MARGIN_US`] before they were
+    /// last heard from, and remake the live timeline from it after a late
+    /// move. Client DJ: forget own moves that have surely reached the room,
+    /// and all of them once nobody is holding this booth's place.
+    fn keep_history(&mut self, now: i64) {
+        let window = self.rejoin_for + self.link_timeout;
+        let shared = |i: Instant| now - i.elapsed().as_micros() as i64;
+        if matches!(self.role, Role::Host { .. }) {
+            let heard = self.peer.as_ref().map(|p| p.heard).or_else(|| {
+                self.awaiting
+                    .as_ref()
+                    .filter(|a| a.since.elapsed() < window)
+                    .map(|a| a.heard)
+            });
+            if let Some(held) = &mut self.held {
+                let keep_from = heard.map_or(i64::MAX, |h| shared(h) - HELD_MARGIN_US);
+                held.compact(keep_from.min(self.timeline.base_time()));
+            }
+            if self.rebuild_due {
+                self.rebuild_from_held();
+            }
+            if heard.is_none() && self.held.take().is_some() {
+                log::debug!("No DJ to hold a place for: the room keeps its usual history");
+            }
+        } else if !self.keeps_moves() {
+            self.own_moves.clear();
+            if self
+                .lost
+                .as_ref()
+                .is_some_and(|l| l.since.elapsed() >= window)
+            {
+                self.lost = None;
+            }
+        } else if let Some(p) = &self.peer {
+            let keep_from = shared(p.heard) - HELD_MARGIN_US;
+            self.own_moves.retain(|e| e.time >= keep_from);
+        }
     }
 
     /// Keep synced decks locked through tempo changes in their grids. When
@@ -2694,9 +3041,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Getting back into the room replaces this booth's timeline. A load it
-    /// made while cut off never reached the room and goes without a word;
-    /// one that reached it and lost a race there is reported.
+    /// Getting back into a room that wasn't holding this booth's place
+    /// replaces its timeline. A load it made while cut off never reached
+    /// the room and isn't reported as refused (the room says the moves
+    /// didn't come through); one that reached it and lost a race there is.
     #[test]
     fn loads_lost_to_a_dropped_link_arent_reported_as_refused() {
         let root = std::env::temp_dir().join(format!("tandem-rejoin-{}", fastrand::u64(..)));
@@ -2748,6 +3096,161 @@ mod tests {
                 vec!["Deck B is playing: pause it or pull its fader down to load onto it."]
             );
             assert!(s.my_loads.is_empty());
+        }
+        drop(h);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn load_onto(deck: u8, n: u8) -> Action {
+        Action::Load {
+            deck,
+            track: TrackId([n; 32]),
+            duration: 300.0,
+            cue: 0.0,
+            grid: None,
+            key: -1,
+        }
+    }
+
+    /// On the host, while the other DJ may get cut off, a move of theirs
+    /// that arrives later than the live timeline reaches back goes in at its
+    /// own time, from the held room, instead of now: a pause from 6 s ago
+    /// stops the deck where it was 6 s ago.
+    #[test]
+    fn the_host_places_a_late_move_at_its_own_time() {
+        let root = std::env::temp_dir().join(format!("tandem-late-{}", fastrand::u64(..)));
+        let h = solo(&root);
+        {
+            let mut s = h.lock();
+            s.role = Role::Host {
+                port: 0,
+                room: "LATE12".into(),
+                stop: Arc::default(),
+            };
+            let now = s.now();
+            s.timeline = Timeline::new(now - 20_000_000);
+            s.held = Some(s.timeline.clone());
+            s.act_at(load_onto(0, 1), now - 10_000_000);
+            s.act_at(Action::Play { deck: 0 }, now - 9_000_000);
+            s.timeline.compact(now - 3_500_000);
+            s.on_control_msg(Msg::Event {
+                ev: Event {
+                    time: now - 6_000_000,
+                    origin: 7,
+                    seq: 1,
+                    action: Action::Pause { deck: 0 },
+                },
+            });
+            assert!(s.rebuild_due);
+            s.rebuild_from_held();
+            let deck = s.timeline.latest().decks[0];
+            assert!(!deck.playing);
+            assert!((deck.position_at(now) - 3.0).abs() < 1e-9);
+            assert_eq!(s.timeline.base_time(), now - 3_500_000);
+            // Held and live agree on everything after the live base.
+            let held = s.held.as_ref().unwrap();
+            for t in [now - 3_000_000, now] {
+                assert_eq!(held.state_at(t), s.timeline.state_at(t));
+            }
+        }
+        drop(h);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Getting back in, the host has put this booth's moves from while it
+    /// was cut off into the room, reaching back as far as they do. A load
+    /// among them that the room refused (the partner's deck was playing out
+    /// loud by then) is reported, a move made after they were sent goes in
+    /// too, and the room is compacted back to the usual length.
+    #[test]
+    fn a_merged_room_reports_refused_loads_and_takes_later_moves() {
+        let root = std::env::temp_dir().join(format!("tandem-merged-{}", fastrand::u64(..)));
+        let h = solo(&root);
+        {
+            let mut s = h.lock();
+            let (now, me) = (s.now(), s.me.id);
+            let mine = |seq: u64, time: i64, action: Action| Event {
+                time,
+                origin: me,
+                seq,
+                action,
+            };
+            let load = mine(1, now - 8_000_000, load_onto(1, 3));
+            let fader = mine(2, now - 7_000_000, Action::Volume { deck: 0, v: 0.4 });
+            // Made while the clock was being measured, after the Hello.
+            let since = mine(3, now - 500_000, Action::Crossfader { v: 0.3 });
+            s.own_moves = VecDeque::from([load.clone(), fader.clone(), since]);
+            let mut room = Timeline::new(now - 20_000_000);
+            for (seq, time, action) in [
+                (1, now - 12_000_000, load_onto(1, 2)),
+                (2, now - 10_000_000, Action::Play { deck: 1 }),
+            ] {
+                room.insert(Event {
+                    time,
+                    origin: 7,
+                    seq,
+                    action,
+                });
+            }
+            room.insert(load);
+            room.insert(fader);
+            s.took_merged_room(room);
+            assert_eq!(
+                s.take_notices(),
+                vec!["Deck B is playing: pause it or pull its fader down to load onto it."]
+            );
+            let room = s.timeline.latest();
+            assert_eq!(room.decks[1].track, Some(TrackId([2; 32])));
+            assert_eq!(room.decks[0].volume, 0.4);
+            assert_eq!(room.crossfader, 0.3);
+            assert!(s.timeline.base_time() > now - 5_000_000, "not compacted");
+            assert!(s.my_loads.is_empty());
+        }
+        drop(h);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A booth keeps its own moves for a room only while one may be holding
+    /// its place, and sends the tracks they load with them.
+    #[test]
+    fn keeps_its_moves_only_while_a_room_holds_its_place() {
+        let root = std::env::temp_dir().join(format!("tandem-keep-{}", fastrand::u64(..)));
+        let h = solo(&root);
+        {
+            let mut s = h.lock();
+            s.act(Action::Volume { deck: 0, v: 0.5 });
+            assert!(s.own_moves.is_empty());
+            assert!(s.cut_off().events.is_empty());
+
+            s.lost = Some(LostRoom {
+                addr: "127.0.0.1:47800".parse().unwrap(),
+                room: "KEEP12".into(),
+                since: Instant::now(),
+            });
+            let info = TrackInfo {
+                id: TrackId([5; 32]),
+                title: "Five".into(),
+                artist: String::new(),
+                bpm: None,
+                duration: 300.0,
+                size: 1,
+                file_name: "five.wav".into(),
+                grid: None,
+                key: None,
+            };
+            s.track_meta.insert(info.id, info.clone());
+            s.act(Action::Volume { deck: 0, v: 0.6 });
+            s.act(load_onto(1, 5));
+            let cut = s.cut_off();
+            assert_eq!(cut.events.len(), 2);
+            assert_eq!(cut.tracks, [info]);
+
+            // The room stopped holding it.
+            s.rejoin_for = Duration::ZERO;
+            s.link_timeout = Duration::ZERO;
+            let now = s.now();
+            s.keep_history(now);
+            assert!(s.own_moves.is_empty() && s.lost.is_none());
         }
         drop(h);
         let _ = std::fs::remove_dir_all(&root);

@@ -298,7 +298,7 @@ Work through these in order and note anything that fails. `tandem.log` (Settings
 
 ### v0.11.6
 
-- **A dropped connection rejoins by itself.** When a joining DJ's or a broadcaster's connection drops, Tandem gets it back into the same room: its top bar says **Reconnecting to … attempt N** (with **Give up**) and it keeps trying for 5 minutes, while the host's says **Waiting for … to reconnect**. The decks play on meanwhile, and a broadcaster's stream doesn't go silent. Once it's back, the decks follow the room again, as after a fresh join, so anything the joining DJ changed while cut off is dropped. Leaving, or the host closing the room, never starts it.
+- **A dropped connection rejoins by itself.** When a joining DJ's or a broadcaster's connection drops, Tandem gets it back into the same room: its top bar says **Reconnecting to … attempt N** (with **Give up**) and it keeps trying for 5 minutes, while the host's says **Waiting for … to reconnect**. The decks play on meanwhile, and a broadcaster's stream doesn't go silent. Once it's back, the decks follow the room again, as after a fresh join, so anything the joining DJ changed while cut off is dropped (a later patch brings those moves into the room instead: see below). Leaving, or the host closing the room, never starts it.
   - Test: in a room, unplug the joining PC's network for about 30 seconds, then plug it back in. Does it say **Reconnecting to …**, then get back in within a few seconds with its decks following the host's?
 - No protocol change: v0.11.5 and v0.11.6 can share a room, but only a v0.11.6 booth rejoins by itself, and a v0.11.5 host takes a booth back only after its old connection times out (15 s).
 

@@ -360,7 +360,7 @@ impl TandemApp {
         let mut tip = if broadcasting {
             format!("The link to the room dropped, so Tandem is getting this booth back in. It keeps trying for {mins} minutes. The stream plays on as the room last was, and follows the room again once it's back.")
         } else {
-            format!("The link to the room dropped, so Tandem is getting you back in. It keeps trying for {mins} minutes. Your decks play on meanwhile, but nothing you change reaches the room, and once you're back they follow the room again.")
+            format!("The link to the room dropped, so Tandem is getting you back in. It keeps trying for {mins} minutes. Your decks play on meanwhile. Once you're back, what you did meanwhile reaches the room and what your partner did reaches you; on a control you both touched, whichever move came later wins.")
         };
         if let Some(e) = &r.error {
             tip.push_str(&format!("\n\nLast try: {e}"));
@@ -383,7 +383,7 @@ impl TandemApp {
             match &view.link.awaiting {
                 Some(name) => {
                     ui.label(RichText::new(format!("Waiting for {name} to reconnect…")).color(AMBER))
-                        .on_hover_text(format!("The link to {name} dropped. Their Tandem keeps trying to get back in for {} minutes, and the room carries on meanwhile.", REJOIN_FOR.as_secs() / 60));
+                        .on_hover_text(format!("The link to {name} dropped. Their Tandem keeps trying to get back in for {} minutes, and the room carries on meanwhile. Once they're back, what they did meanwhile comes into the room too; on a control you both touched, whichever move came later wins.", REJOIN_FOR.as_secs() / 60));
                 }
                 None => {
                     ui.label(RichText::new("Waiting for your partner to join…").color(AMBER));

@@ -1779,16 +1779,45 @@ impl Timeline {
             );
             ev.time = self.base_time;
         }
-        if self
-            .events
-            .iter()
-            .any(|e| e.origin == ev.origin && e.seq == ev.seq)
-        {
+        if self.has(ev.origin, ev.seq) {
             return false;
         }
+        self.insert_new(ev);
+        true
+    }
+
+    /// Insert an event this booth has just made. Its sequence number is new,
+    /// so there's no looking for it among the others, which matters on a
+    /// timeline that keeps minutes of history (see `Session`'s held room).
+    pub fn insert_new(&mut self, ev: Event) {
         let idx = self.events.partition_point(|e| e.key() <= ev.key());
         self.events.insert(idx, ev);
-        true
+    }
+
+    /// Put many events in at once, each at its own time, as `insert` would
+    /// one by one, but without clamping: one older than the base may already
+    /// be folded into it, so it's left out. So is one already here. Returns
+    /// the events that went in.
+    pub fn merge(&mut self, events: Vec<Event>) -> Vec<Event> {
+        let mut have: std::collections::HashSet<(u64, u64)> =
+            self.events.iter().map(|e| (e.origin, e.seq)).collect();
+        let added: Vec<Event> = events
+            .into_iter()
+            .filter(|e| e.time >= self.base_time && have.insert((e.origin, e.seq)))
+            .collect();
+        if !added.is_empty() {
+            self.events.extend(added.iter().cloned());
+            // Keys are unique, so this is the order `insert` gives.
+            self.events.sort_by_key(Event::key);
+        }
+        added
+    }
+
+    /// Is the event (origin, seq) among the recent ones?
+    pub fn has(&self, origin: u64, seq: u64) -> bool {
+        self.events
+            .iter()
+            .any(|e| e.origin == origin && e.seq == seq)
     }
 
     pub fn state_at(&self, t: i64) -> RoomState {
@@ -1985,6 +2014,82 @@ mod tests {
         let mut c = a.clone();
         c.compact(1_000_000);
         assert_eq!(c.state_at(3_000_000), a.state_at(3_000_000));
+    }
+
+    /// Merging a booth's moves in one go puts each at its own time, exactly
+    /// as inserting them one by one would, skips any already there, and
+    /// leaves out any older than the base (the timeline may already have
+    /// folded them in, and applying one twice would move a deck twice).
+    #[test]
+    fn merging_moves_places_them_like_inserting_them() {
+        let mut room = Timeline::new(1_000_000);
+        room.insert(ev(
+            1_500_000,
+            1,
+            1,
+            Action::Load {
+                deck: 0,
+                track: tid(1),
+                duration: 200.0,
+                cue: 0.0,
+                grid: None,
+                key: -1,
+            },
+        ));
+        room.insert(ev(2_000_000, 1, 2, Action::Crossfader { v: 0.9 }));
+        room.insert(ev(
+            2_600_000,
+            2,
+            1,
+            Action::Nudge {
+                deck: 0,
+                delta: 0.5,
+            },
+        ));
+        room.insert(ev(4_000_000, 1, 3, Action::Volume { deck: 0, v: 0.2 }));
+        let moves = vec![
+            // Already folded into the base: left out.
+            ev(
+                900_000,
+                2,
+                0,
+                Action::Nudge {
+                    deck: 0,
+                    delta: 9.0,
+                },
+            ),
+            ev(1_800_000, 2, 2, Action::Play { deck: 0 }),
+            ev(
+                2_600_000,
+                2,
+                1,
+                Action::Nudge {
+                    deck: 0,
+                    delta: 0.5,
+                },
+            ), // already here
+            ev(3_000_000, 2, 3, Action::Crossfader { v: 0.1 }),
+            ev(3_500_000, 2, 4, Action::Volume { deck: 0, v: 0.7 }),
+        ];
+        let mut one_by_one = room.clone();
+        for m in moves.iter().skip(1) {
+            one_by_one.insert(m.clone());
+        }
+        let added = room.merge(moves);
+        assert_eq!(
+            added.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            [2, 3, 4],
+            "only new moves at or after the base"
+        );
+        assert_eq!(room.events(), one_by_one.events());
+        let s = room.latest();
+        // The later move on each control wins, whoever made it.
+        assert_eq!(s.crossfader, 0.1);
+        assert_eq!(s.decks[0].volume, 0.2);
+        // Played from 1.8 s, nudged once.
+        assert!(s.decks[0].playing);
+        assert!((s.decks[0].position_at(5_000_000) - 3.7).abs() < 1e-9);
+        assert!(room.merge(Vec::new()).is_empty());
     }
 
     #[test]
