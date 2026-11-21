@@ -7,7 +7,8 @@
 //! reach the other DJs and the broadcaster through the host), that one
 //! joining DJ's moves reach another, that every booth's room state stays
 //! identical, that the booths render bit-identical audio for the same
-//! moment, that a broadcaster can't change the room, that a share can be
+//! moment (effects included: two DJs switch effects on, and every booth
+//! hears them the same), that a broadcaster can't change the room, that a share can be
 //! offered, accepted and downloaded (from one joining DJ to another, through
 //! the host), that a list shared live reaches the other DJs with nothing
 //! copied until a track from it is loaded, that a booth whose link drops
@@ -218,6 +219,35 @@ fn run(root: &std::path::Path, say: &mut dyn FnMut(&str)) -> anyhow::Result<()> 
         erin.lock().latest().decks[2].volume == 0.6
     })?;
 
+    // Effects are part of the room: Erin puts a phaser on deck A, Dave an
+    // echo on deck B (Bob's track), and every booth has them.
+    erin.lock().act(Action::FxOn {
+        deck: 0,
+        slot: 2,
+        on: true,
+    });
+    dave.lock().act(Action::FxDepth {
+        deck: 1,
+        slot: 0,
+        v: 0.8,
+    });
+    dave.lock().act(Action::FxOn {
+        deck: 1,
+        slot: 0,
+        on: true,
+    });
+    wait_for(
+        "the effects to reach every booth",
+        Duration::from_secs(5),
+        || {
+            [&alice, &bob, &carol, &dave, &erin].iter().all(|h| {
+                let fx = h.lock().latest().decks.map(|d| d.fx);
+                fx[0].slots[2].on && fx[1].slots[0].on && fx[1].slots[0].depth == 0.8
+            })
+        },
+    )?;
+    say("effects two joining DJs switch on reach every booth and the broadcaster");
+
     // The broadcaster can't change anything: not through its own session,
     // and not by sending the host an event directly.
     let carol_id = carol.lock().me.id;
@@ -346,13 +376,58 @@ fn run(root: &std::path::Path, say: &mut dyn FnMut(&str)) -> anyhow::Result<()> 
         diff < 1e-6,
         "the broadcaster renders different audio (max diff {diff})"
     );
+    // Long enough for the echo to come round, and heard the same way.
+    let n_fx = 48_000;
+    let render_fx = |snap: &crate::render::AudioSnapshot, kind| {
+        let mut lane = Lane::new(48_000.0, 0, kind);
+        let (mut m, mut c) = (vec![0.0f32; n_fx * 2], vec![0.0f32; n_fx * 2]);
+        lane.render(snap, t, &mut m, &mut c);
+        m
+    };
+    let with = render_fx(&snaps.0, LaneKind::Live);
+    let diff = max_diff(&with, &render_fx(&snaps.1, LaneKind::Live));
+    ensure!(
+        diff < 1e-6,
+        "booths render the effects differently (max diff {diff})"
+    );
+    let diff = max_diff(
+        &render_fx(&snaps.0, LaneKind::Broadcast),
+        &render_fx(&snaps.2, LaneKind::Broadcast),
+    );
+    ensure!(
+        diff < 1e-6,
+        "the broadcaster renders the effects differently (max diff {diff})"
+    );
+    // And they're there: the same moment without them sounds different.
+    let mut dry = snaps.0.timeline.clone();
+    for (seq, (deck, slot)) in [(0u8, 2u8), (1, 0)].into_iter().enumerate() {
+        dry.insert(Event {
+            time: t - 1,
+            origin: 0xD7,
+            seq: seq as u64 + 1,
+            action: Action::FxOn {
+                deck,
+                slot,
+                on: false,
+            },
+        });
+    }
+    let dry = crate::render::AudioSnapshot {
+        timeline: dry,
+        tracks: snaps.0.tracks.clone(),
+        local: snaps.0.local,
+    };
+    ensure!(
+        max_diff(&with, &render_fx(&dry, LaneKind::Live)) > 0.01,
+        "the effects made no difference"
+    );
     let view = carol.lock().broadcast_view();
     let djs: Vec<&str> = view.djs.iter().map(|p| p.name.as_str()).collect();
     ensure!(
         djs == ["Alice", "Bob", "Dave", "Erin"],
         "broadcaster's window names {djs:?}"
     );
-    say("all booths render identical audio for the same moment, the broadcaster's feed too");
+    say("all booths render identical audio for the same moment, effects included, the broadcaster's feed too");
 
     // Sharing: Alice offers her folder, Bob accepts.
     alice
