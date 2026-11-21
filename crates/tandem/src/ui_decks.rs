@@ -66,13 +66,10 @@ const WAVE_MIN_H: [f32; 2] = [46.0, 28.0];
 /// Waveforms shorter than this make two decks take compact panels.
 const FULL_WAVE_MIN_H: f32 = 52.0;
 /// A row of the FX strip (two decks' banks), about as tall as the loop
-/// buttons (at 19 the strip still opens on the smallest two-deck laptop
-/// window, 1097 × 538), and the strip folded to one line. Each takes this
-/// plus the spacing before it.
+/// buttons (at 19 the strip still fits the smallest two-deck laptop
+/// window, 1097 × 538). It takes this plus the spacing before it.
 const FX_ROW_H: f32 = 19.0;
-const FX_LINE_H: f32 = 16.0;
-/// The FX strip's fold toggle, at its left, and a slot's effect menu.
-const FX_TOGGLE_W: f32 = 16.0;
+/// A slot's effect menu in the FX strip.
 const FX_MENU_W: f32 = 6.0;
 /// The least height the controls row keeps (scrolled) when the library is
 /// dragged up as far as it goes.
@@ -188,17 +185,19 @@ impl DeckLayout {
     }
 }
 
-/// How the FX strip (every deck's effects, under the waveforms) shows.
+/// How the FX strip (every deck's effects, under the waveforms) shows. The
+/// DJ opens and closes it with **FX** in the top bar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FxStrip {
     /// Every bank: a row per two decks.
     Open,
-    /// One line naming the effects that are on: folded by the DJ, or the
-    /// window has no room for the whole strip.
-    Folded,
-    /// No room even for the line (a small window, where it would make the
-    /// controls scroll): the effects that are on show on the waveforms.
-    Hidden,
+    /// Opened, on a window with no room for it (it would make the controls
+    /// scroll): each deck's effects show in the corner of its waveform,
+    /// where a click opens the deck's bank.
+    OnWaveforms,
+    /// Closed by the DJ: nothing of it shows. A deck with an effect on
+    /// still says so in its header.
+    Closed,
 }
 
 impl FxStrip {
@@ -207,30 +206,30 @@ impl FxStrip {
         match self {
             FxStrip::Open if four => 2.0 * (FX_ROW_H + ITEM_SPACING_Y),
             FxStrip::Open => FX_ROW_H + ITEM_SPACING_Y,
-            FxStrip::Folded => FX_LINE_H + ITEM_SPACING_Y,
-            FxStrip::Hidden => 0.0,
+            FxStrip::OnWaveforms | FxStrip::Closed => 0.0,
         }
     }
 
     /// How it shows on a window whose library and decks area share `room`
-    /// points, `decks_w` wide. Its height comes from the library first (see
-    /// `library_height`), then from what the waveforms and the four-deck
-    /// panels can give up. So it's open if the DJ left it `open` and it
+    /// points, `decks_w` wide, when the DJ has it `open`. Its height comes
+    /// from the library first (see `library_height`), then from what the
+    /// waveforms and the four-deck panels can give up. So it's open if it
     /// fits with the library at its least and the controls at their least
-    /// without scrolling (compact panels, or four squeezed); otherwise
-    /// folded, if that fits.
+    /// without scrolling (compact panels, or four squeezed); otherwise the
+    /// decks' effects go on the waveforms.
     pub(crate) fn pick(open: bool, room: f32, decks_w: f32, four: bool) -> Self {
+        if !open {
+            return FxStrip::Closed;
+        }
         let least = DeckLayout::pick(four, decks_w, 0.0, 0.0);
         let spare = room
             - crate::ui_library::LIBRARY_MIN_H
             - least.row_h().1
             - least.waves_h(WAVE_MIN_H[least.wave_idx()]);
-        if open && spare >= FxStrip::Open.height(four) {
+        if spare >= FxStrip::Open.height(four) {
             FxStrip::Open
-        } else if spare >= FxStrip::Folded.height(four) {
-            FxStrip::Folded
         } else {
-            FxStrip::Hidden
+            FxStrip::OnWaveforms
         }
     }
 }
@@ -455,6 +454,21 @@ impl TandemApp {
                             self.settings.four_decks = four;
                             self.mark_dirty();
                         }
+                        // The effects panel: open or closed (this booth's view).
+                        let open = self.settings.fx_strip;
+                        let mut tip = String::from(
+                            "Open or close the effects panel under the waveforms: every deck's echo, reverb and phaser. Closing it only hides the controls: effects that are on stay on, and their deck's header says FX.",
+                        );
+                        if open && self.ui.fx_strip == FxStrip::OnWaveforms {
+                            tip.push_str("\n\nThis window has no room for the panel: each deck's effects are in the corner of its waveform instead. Click one to work them.");
+                        }
+                        let r = ui
+                            .add(egui::SelectableLabel::new(open, "FX"))
+                            .on_hover_text(tip);
+                        if r.clicked() {
+                            self.settings.fx_strip = !open;
+                            self.mark_dirty();
+                        }
                     }
                 });
             });
@@ -626,20 +640,17 @@ impl TandemApp {
             .clamp(WAVE_MIN_H[w], WAVE_MAX_H[w]);
         for d in 0..n {
             let rect = scrolling_waveform(ui, d, &view.decks[d], view.now, h, self.ui.grid_edit[d]);
-            if strip == FxStrip::Hidden {
+            if strip == FxStrip::OnWaveforms {
                 self.fx_on_waveform(ui, d, view, rect);
             }
         }
-        match strip {
-            FxStrip::Open => self.fx_strip(ui, view, n),
-            FxStrip::Folded => self.fx_line(ui, view, n),
-            FxStrip::Hidden => {}
+        if strip == FxStrip::Open {
+            self.fx_strip(ui, view, n);
         }
     }
 
     /// The FX strip, open: every shown deck's bank, two to a row in the
-    /// deck panels' order (A and B, then C and D), with the fold toggle at
-    /// the left of the first row.
+    /// deck panels' order (A and B, then C and D).
     fn fx_strip(&mut self, ui: &mut egui::Ui, view: &SessionView, n: usize) {
         let rows: &[[usize; 2]] = if n == DECKS {
             &[[0, 1], [2, 3]]
@@ -656,11 +667,6 @@ impl TandemApp {
                     .layout(Layout::left_to_right(Align::Center)),
             );
             fx_spacing(&mut line);
-            if i == 0 {
-                self.fx_toggle(&mut line);
-            } else {
-                line.add_space(FX_TOGGLE_W);
-            }
             let gap = line.spacing().item_spacing.x;
             let half = ((line.available_width() - 3.0 * gap - 1.0) / 2.0).max(0.0);
             for (k, &d) in row.iter().enumerate() {
@@ -682,97 +688,6 @@ impl TandemApp {
                     },
                 );
             }
-        }
-    }
-
-    /// The FX strip folded to one line: the toggle, then each shown deck's
-    /// effects that are on.
-    fn fx_line(&mut self, ui: &mut egui::Ui, view: &SessionView, n: usize) {
-        let (rect, _) =
-            ui.allocate_exact_size(vec2(ui.available_width(), FX_LINE_H), Sense::hover());
-        let mut line = ui.new_child(
-            egui::UiBuilder::new()
-                .id_salt("fx-line")
-                .max_rect(rect)
-                .layout(Layout::left_to_right(Align::Center)),
-        );
-        fx_spacing(&mut line);
-        line.spacing_mut().interact_size.y = FX_LINE_H;
-        self.fx_toggle(&mut line);
-        line.label(RichText::new("FX").small().strong().weak());
-        for (d, (st, col)) in view.room.decks.iter().zip(DECK_COLORS).enumerate().take(n) {
-            line.add_space(10.0);
-            line.label(
-                RichText::new(deck_letter(d).to_string())
-                    .small()
-                    .strong()
-                    .color(col),
-            );
-            let on: Vec<&str> = st
-                .fx
-                .slots
-                .iter()
-                .filter(|s| s.on)
-                .map(|s| s.kind.label())
-                .collect();
-            if on.is_empty() {
-                line.label(RichText::new("—").small().weak());
-            } else {
-                line.label(RichText::new(on.join(" · ")).small().strong().color(col));
-            }
-        }
-    }
-
-    /// The fold toggle: a triangle pointing down folds the FX strip to one
-    /// line, one pointing right opens it (remembered). On a window with no
-    /// room for the whole strip it can't open.
-    fn fx_toggle(&mut self, ui: &mut egui::Ui) {
-        let open = self.settings.fx_strip && self.ui.fx_strip == FxStrip::Open;
-        let tip = if open {
-            "Fold the FX strip to one line"
-        } else {
-            "Open the FX strip: every deck's effects"
-        };
-        let can = open || self.ui.fx_strip_fits;
-        let size = vec2(
-            FX_TOGGLE_W - ui.spacing().item_spacing.x,
-            ui.spacing().interact_size.y,
-        );
-        let sense = if can { Sense::click() } else { Sense::hover() };
-        let (rect, r) = ui.allocate_exact_size(size, sense);
-        let colour = if !can {
-            ui.visuals().weak_text_color()
-        } else if r.hovered() {
-            ui.visuals().strong_text_color()
-        } else {
-            ui.visuals().text_color()
-        };
-        let c = rect.center();
-        let points = if open {
-            vec![
-                c + vec2(-4.0, -2.5),
-                c + vec2(4.0, -2.5),
-                c + vec2(0.0, 3.5),
-            ]
-        } else {
-            vec![
-                c + vec2(-2.5, -4.0),
-                c + vec2(3.5, 0.0),
-                c + vec2(-2.5, 4.0),
-            ]
-        };
-        ui.painter()
-            .add(egui::Shape::convex_polygon(points, colour, Stroke::NONE));
-        let r = if can {
-            r.on_hover_text(tip)
-        } else {
-            r.on_hover_text(
-                "No room for the whole FX strip on a window this small: the line shows the effects that are on.",
-            )
-        };
-        if r.clicked() {
-            self.settings.fx_strip = !open;
-            self.mark_dirty();
         }
     }
 
@@ -905,8 +820,9 @@ impl TandemApp {
         }
     }
 
-    /// With no room for the FX strip: deck `d`'s effects on its waveform,
-    /// in its top right corner. Clicking it opens the deck's bank.
+    /// The FX strip is opened but the window has no room for it: deck `d`'s
+    /// effects on its waveform, in its top right corner. Clicking it opens
+    /// the deck's bank.
     fn fx_on_waveform(&mut self, ui: &mut egui::Ui, d: usize, view: &SessionView, wave: Rect) {
         let st = &view.room.decks[d];
         let on: Vec<&str> = st
@@ -3038,7 +2954,7 @@ mod tests {
         (lib, layout, controls)
     }
 
-    /// The same, with the FX strip left `open` or folded by the DJ, and how
+    /// The same, with the FX strip `open` or closed by the DJ, and how
     /// it shows.
     fn plan_strip(w: f32, h: f32, four: bool, open: bool) -> (f32, DeckLayout, f32, FxStrip) {
         let (decks_w, room) = space(w, h);
@@ -3075,32 +2991,36 @@ mod tests {
     }
 
     #[test]
-    fn the_fx_strip_folds_then_hides_rather_than_make_the_controls_scroll() {
-        // Folded by hand: one line, whatever the view, and the library gets
-        // the height back.
-        let (lib, _, open, _) = plan_strip(1440.0, 930.0, true, true);
-        let (folded_lib, _, folded, strip) = plan_strip(1440.0, 930.0, true, false);
-        assert_eq!(strip, FxStrip::Folded);
-        assert_eq!(
-            folded_lib - lib,
-            FxStrip::Open.height(true) - FxStrip::Folded.height(true)
-        );
-        assert_eq!(folded, open);
-        assert_eq!(FxStrip::Folded.height(true), FX_LINE_H + ITEM_SPACING_Y);
-        // Four decks on a window short of room for both rows: one line.
+    fn the_fx_strip_closes_or_goes_onto_the_waveforms() {
+        // Closed with FX in the top bar: nothing of it, whatever the view,
+        // and the library has the height it would have without it.
+        for four in [false, true] {
+            let (lib, _, _, _) = plan_strip(1440.0, 930.0, four, true);
+            let (closed_lib, _, _, strip) = plan_strip(1440.0, 930.0, four, false);
+            assert_eq!(strip, FxStrip::Closed);
+            assert_eq!(closed_lib, LIBRARY_H);
+            assert!(closed_lib > lib, "four {four}");
+            assert_eq!(strip.height(four), 0.0);
+        }
+        // Opened on a window short of room for its rows: on the waveforms,
+        // taking no height, so the controls don't scroll.
         let (lib, layout, controls, strip) = plan_strip(1366.0, 670.0, true, true);
-        assert_eq!(strip, FxStrip::Folded);
+        assert_eq!(strip, FxStrip::OnWaveforms);
         assert_eq!(lib, LIBRARY_MIN_H);
         assert!(controls >= layout.row_h().1);
-        // No room even for the line: hidden (the effects that are on show
-        // on the waveforms).
-        assert_eq!(plan_strip(1280.0, 641.0, true, true).3, FxStrip::Hidden);
-        assert_eq!(plan_strip(MIN_W, MIN_H, false, true).3, FxStrip::Hidden);
-        assert_eq!(plan_strip(MIN_W, MIN_H, true, true).3, FxStrip::Hidden);
-        assert_eq!(FxStrip::Hidden.height(true), 0.0);
+        assert_eq!(
+            plan_strip(1280.0, 641.0, true, true).3,
+            FxStrip::OnWaveforms
+        );
+        for four in [false, true] {
+            assert_eq!(plan_strip(MIN_W, MIN_H, four, true).3, FxStrip::OnWaveforms);
+            // Closed is closed there too.
+            assert_eq!(plan_strip(MIN_W, MIN_H, four, false).3, FxStrip::Closed);
+        }
+        assert_eq!(FxStrip::OnWaveforms.height(true), 0.0);
     }
 
-    /// On every window from the smallest up, open or folded: the library
+    /// On every window from the smallest up, open or closed: the library
     /// keeps its least, the controls never scroll because of the strip, and
     /// a dragged library leaves the waveforms and the strip their room.
     #[test]

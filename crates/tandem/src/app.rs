@@ -348,9 +348,8 @@ pub struct UiState {
     /// following the window's.
     pub library_dragged: bool,
     /// How the FX strip shows this frame (the library decides, from the
-    /// window), and whether it could be open.
+    /// window and the DJ's FX button).
     pub fx_strip: crate::ui_decks::FxStrip,
-    pub fx_strip_fits: bool,
 }
 
 /// Developer options: `--screenshot <file.bmp>` saves the window and exits;
@@ -530,7 +529,6 @@ impl TandemApp {
             cd_seen: [(None, false); 2],
             library_dragged: false,
             fx_strip: crate::ui_decks::FxStrip::Open,
-            fx_strip_fits: true,
         };
         let local_edit = settings.local;
         Self {

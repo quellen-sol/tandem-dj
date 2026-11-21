@@ -454,7 +454,7 @@ Work through these in order and note anything that fails. `tandem.log` (Settings
   - **Part of the room,** like the EQ: your partners and the broadcast hear exactly what you hear, and the broadcast has every effect move where it was made.
   - **Switching an effect off lets its tail ring out;** turning its depth down silences it at once. Close the fader or cut the crossfader and an echo rings on: echo out of a track.
   - Your headphone cue hears the deck without its effects.
-- **The FX strip,** under the scrolling waveforms and above the library, has every deck's bank: click a name to switch it on (it lights in the deck's colour), pick the effect, set the depth, step BEATS. It pushes the library down, never under its least; on a small window it folds to one line naming the effects that are on, or (smallest windows) shows them on the waveforms. A deck with an effect on shows **FX** in its header, and the broadcast view names the effects that are on under each channel.
+- **The FX strip,** under the scrolling waveforms and above the library, has every deck's bank: click a name to switch it on (it lights in the deck's colour), pick the effect, set the depth, step BEATS. **FX** in the top bar opens and closes it. Open, it pushes the library down, never under its least; on a window too small for it, each deck's effects show in the corner of its waveform instead. A deck with an effect on shows **FX** in its header, and the broadcast view names the effects that are on under each channel.
 - **The DDJ-FLX6's Beat FX strip works:** FX SELECT, CH SELECT (CH1–4 are decks A–D; MST does nothing yet), BEAT ◀ ▶ and their lights, LEVEL/DEPTH and ON/OFF with its light. Saved FLX6 mappings pick it up (preset version 13). Other controllers can learn the FX unit functions.
 - Effects cost little: a reverb about 0.3% of one core where it's heard, an echo or phaser about 0.1%, and one that's off nothing.
 - The self-test switches effects on and checks every booth renders them the same.
@@ -484,7 +484,7 @@ Work through these in order and note anything that fails. `tandem.log` (Settings
    - One DJ switches an echo on; does the other hear it, and the broadcast have it on the beat?
    - Both DJs work the same slot (one on screen, one on the FLX6): does the knob wait for pickup rather than jump?
    - Leave an echo ringing on a deck with its fader down and load a new track onto it: is the load allowed, and does the tail ring on?
-4. **Small screens.** At 1280 × 641 (1080p at 150%): is the strip there with two decks, and with four decks are the effects shown on the waveforms? Fold the strip with its triangle: is it one line, and still folded next time Tandem starts?
+4. **Small screens.** At 1280 × 641 (1080p at 150%): is the strip there with two decks, and with four decks are the effects shown on the waveforms? Click **FX** in the top bar: does the strip close and the library grow, with the playing decks still marked **FX**, and is it still closed next time Tandem starts?
 
 ## Next candidates
 

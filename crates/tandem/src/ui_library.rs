@@ -96,9 +96,8 @@ impl TandemApp {
             avail.width() - CENTRAL_MARGIN,
         );
         let four = self.settings.four_decks;
-        // The FX strip, open if the DJ left it open and the window has room.
+        // The FX strip, open if the DJ has it open and the window has room.
         self.ui.fx_strip = FxStrip::pick(self.settings.fx_strip, room, decks_w, four);
-        self.ui.fx_strip_fits = FxStrip::pick(true, room, decks_w, four) == FxStrip::Open;
         let strip = self.ui.fx_strip.height(four);
         let max = library_max_height(room, decks_w, four, strip);
         let auto = library_height(room, decks_w, four, strip).min(max);

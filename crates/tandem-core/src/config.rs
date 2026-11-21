@@ -133,8 +133,7 @@ pub struct Settings {
     pub crossfader_curve: XfCurve,
     /// Show decks C and D (they also show whenever one has a track).
     pub four_decks: bool,
-    /// The FX strip under the waveforms is open (false: folded to one line
-    /// naming the effects that are on).
+    /// The FX strip under the waveforms is open (FX in the top bar).
     pub fx_strip: bool,
     /// LOOP IN goes on the nearest beat and LOOP OUT makes the loop 1 bar,
     /// ½ bar, 2 bars … (on tracks with a beatgrid). Off: exactly at the
