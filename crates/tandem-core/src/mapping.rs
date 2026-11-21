@@ -1281,6 +1281,22 @@ impl MidiEngine {
             .collect()
     }
 
+    /// The same, for showing the DJ in `room`: without the effect knobs of
+    /// slots that are off, which take the knob as it is (see
+    /// [`MidiEngine::fx_depth`]).
+    pub fn waiting_for_pickup_in(&self, room: &RoomState) -> Vec<Target> {
+        let mut waiting = self.waiting_for_pickup();
+        waiting.retain(|t| match *t {
+            Target::FxDepth { unit, slot } => self
+                .fx_unit_deck(unit)
+                .and_then(|d| room.decks.get(d as usize))
+                .and_then(|d| d.fx.slots.get(slot as usize))
+                .is_some_and(|s| s.on),
+            _ => true,
+        });
+        waiting
+    }
+
     fn is_fine_half(&self, ch: u8, cc: u8) -> bool {
         (32..64).contains(&cc)
             && (self.msb.contains_key(&(ch, cc - 32)) || self.hires.contains(&(ch, cc - 32)))
@@ -5354,6 +5370,29 @@ mod tests {
             assert_eq!(depths(&room), before);
             assert_eq!((e.fx_unit_deck(0), e.fx_unit_deck(1)), (Some(0), Some(0)));
         }
+    }
+
+    #[test]
+    fn only_running_slots_ask_for_the_fx_knob_to_be_picked_up() {
+        // After FX SELECT the knob sits in the middle, away from every
+        // slot's depth. A slot that's off takes it as it is, so there's
+        // nothing to tell the DJ; one that's on waits for it.
+        let mut e = flx6();
+        let mut room = fx_room();
+        replay(&mut e, &mut room, FLX6_FX_SELECT_ROUND);
+        assert!(!e.waiting_for_pickup().is_empty());
+        assert_eq!(e.waiting_for_pickup_in(&room), []);
+        room.decks[0].fx.slots[1].on = true;
+        let mut waiting = e.waiting_for_pickup_in(&room);
+        waiting.sort_by_key(|t| t.label());
+        // Both units are on deck A, so both units' knobs for its slot 2.
+        assert_eq!(
+            waiting,
+            [
+                Target::FxDepth { unit: 0, slot: 1 },
+                Target::FxDepth { unit: 1, slot: 1 }
+            ]
+        );
     }
 
     #[test]

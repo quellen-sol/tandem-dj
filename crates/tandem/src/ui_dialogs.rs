@@ -635,6 +635,7 @@ impl TandemApp {
             return;
         }
         let mut changed = false;
+        let room = self.session.lock().latest();
         let engine_arc = self.midi.engine.clone();
         let mut engine = engine_arc.lock();
         ui.horizontal(|ui| {
@@ -731,7 +732,7 @@ impl TandemApp {
                 }
             }
         });
-        let waiting = engine.waiting_for_pickup();
+        let waiting = engine.waiting_for_pickup_in(&room);
         if !waiting.is_empty() {
             let names: Vec<String> = waiting.iter().map(|t| t.label()).collect();
             ui.label(
