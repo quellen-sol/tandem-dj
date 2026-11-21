@@ -60,6 +60,7 @@ The self-test lists your audio and MIDI devices, opens your default output for h
    - **Browsing:** the browse knob moves through the tracks. Press it to move through the lists on the left instead (All Music, This room, Shared with me, the lists shared live in the room, your folders, your crates and Serato crates): each list's tracks show as you turn. Press it again to go back into the tracks, pick one and press LOAD. **BACK** also takes the knob to the lists. A blue outline shows which side the knob is on. Clicking a list with the mouse puts the knob back on its tracks, and closing the MY CRATES or SERATO CRATES section makes the knob skip those crates. On other controllers, learn **Library browse press** and **Library back**.
    - **Jog wheel moves the wrong way or jumps?** Tick **1/127 style** or **invert** next to it.
    - **The channel level meters** on the FLX6, FLX4 and DDJ-400 show each channel's deck, like the meters on screen: see [Level meters](#level-meters).
+   - **The FLX6's Beat FX strip works** the deck banks of [Effects](#effects): FX SELECT, CH SELECT, BEAT ◀ ▶, LEVEL/DEPTH and ON/OFF. On other controllers, **Learn** the **FX unit** functions.
    - **MASTER LEVEL and HEADPHONE LEVEL** set your own master and headphone levels, never your partner's, and the sliders on screen follow them. So the master knob works whatever Tandem plays through, your PC's speakers included. They're mapped on the FLX6 and the Inpulse 200 MK2; on other controllers, **Learn** them. When the master (or the headphones) plays through the controller's own sound card, the controller turns it up and down there by itself, so the knob leaves Tandem's level alone rather than turning the sound down twice. Tandem knows the controller's sound card by its name: Windows names it after the controller, e.g. "Line (DDJ-FLX6)". Settings → Controller says what each knob does with your audio settings.
 
 Mappings are saved per controller, so you only do this once. When Tandem's built-in mapping gains new controls, your saved mapping picks them up automatically. Your calibration and changes are kept.
@@ -150,6 +151,32 @@ The mixer has a level meter on the inside of each channel fader, and a stereo ma
 
 The room has one curve, like the curve switch on a club mixer, so changing it changes it for your partner and the stream too. Tandem remembers the curve you last picked and starts on it. When you join a room, you get the host's.
 
+## Effects
+
+Every deck has a bank of three effect slots, after its channel fader and the crossfader. Each slot holds an effect, is on or off, and has a depth; the bank has one **BEATS** value, from 1/16 to 32 beats of that deck. The slots run in series, 1 → 2 → 3. A new bank has ECHO, REVERB and PHASER, all off at half depth, BEATS 1.
+
+- **ECHO** repeats the sound every BEATS, each repeat a little quieter and duller. Depth sets how loud the echoes are and how long they go on.
+- **REVERB** puts a room round the sound. Up to half depth it adds reverb under it; past half the sound itself fades, to reverb alone at full depth. BEATS sets how long it rings: 60 dB in twice BEATS (between 0.3 and 10 seconds).
+- **PHASER** sweeps notches up and back once every BEATS, locked to the beatgrid. Depth sets how deep they cut.
+
+How they behave:
+
+- **After the fader.** Close the channel fader or cut the deck with the crossfader and an echo or reverb rings on: echo out of a track, then bring the next one in. Your headphone cue hears the deck without its effects.
+- **Switching an effect off lets its tail ring out.** Turning its depth down silences it at once. Picking another effect in a slot that's on switches at once, and the old one rings out.
+- **They're part of the room,** like the EQ: your partners and the broadcast hear exactly what you hear. A track loaded on a deck keeps the deck's effects, and you can load over a deck whose echo is still ringing once its fader is down.
+- **Timed by the deck,** from its BPM and tempo, or 120 BPM on a track without a beatgrid. Echoes longer than 2 seconds are halved until they fit.
+
+**On screen,** the FX strip under the scrolling waveforms has every deck's bank (A and B, then C and D in the four-deck view). Click an effect's name to switch it on and off: it lights in the deck's colour. The menu beside it picks the effect, the slider sets its depth (double-click: 50%), and **◀ ▶** step BEATS. Hover over anything to see what it does for that effect. A deck with an effect on shows **FX** in its header, and the broadcast view shows the effects that are on under each channel. The triangle at the strip's left folds it to one line naming the effects that are on; Tandem remembers.
+
+**On the DDJ-FLX6** the Beat FX strip works the banks. FX1 and FX2 are two FX units, each working one deck's bank:
+
+- **CH SELECT** picks the deck: CH1–4 are decks A–D. On **MST** the unit does nothing (there's no master bank yet).
+- **FX SELECT** picks the slot, 1 to 3 on either unit. **LEVEL/DEPTH** and **ON/OFF** work the slot it's on, and ON/OFF flashes while that slot is on. **BEAT ◀ ▶** step the deck's BEATS, and the BEAT lights show it.
+- **The knob never makes a running effect jump.** On a slot that's off it sets the depth straight away. Switching a slot on sets its depth to where the knob is, so with the knob down an effect comes in from nothing as you turn up. On a slot that's already on (your partner switched it on, or you moved the knob for another slot), the knob takes over once it reaches the slot's depth, like the faders. Pressing FX SELECT never changes a depth.
+- **Both units start on deck A,** as the FLX6 does when it's switched on, and Tandem follows them from there: CH SELECT tells it, and so does FX SELECT moving onto the other unit. If the strip works the wrong deck (the channels were changed before Tandem started), press CH SELECT once round, or move FX SELECT across to the other unit and back.
+
+**On other controllers,** learn the **FX unit** functions in Settings → Controller: each slot's on/off, depth and next effect, a depth knob for all three slots, BEATS ◀ and ▶, and which deck the unit works.
+
 ## Small screens
 
 Tandem fits laptop screens, down to a 1080p laptop at 175% display scaling.
@@ -157,6 +184,7 @@ Tandem fits laptop screens, down to a 1080p laptop at 175% display scaling.
 - **It opens maximised** when its usual window doesn't fit the screen.
 - **On a short window the library gets less height first.** Then the two decks switch to compact panels with a shorter mixer: each channel's knobs sit beside its fader, and **🎧 LEVELS** opens your headphone and master levels.
 - **Every scrolling waveform stays on screen.** With four decks on a very short window, the deck panels and mixer scroll instead (a scroll bar shows beside them).
+- **The FX strip takes its height from the waveforms first, then the library,** which keeps its 150 points. Where its rows don't fit without making the deck controls scroll, it folds to one line naming the effects that are on; on the smallest windows (two decks under about 535 points tall, four decks under about 660) the line goes too, and the effects that are on show in the corner of each waveform: click one to work that deck's effects.
 - **Drag the top edge of the library** to change its height. Tandem keeps your height from then on, but the library never covers the waveforms.
 
 ## Play together
@@ -245,9 +273,10 @@ Host in one window and join `127.0.0.1` from the other.
 - **Beatgrids:** detection finds big, steady tempo changes but not gradual drifts, and doesn't find bars (the "1"). Some tracks come out at half or double time (87 instead of 174, say): **½** and **×2** under GRID fix that. Set markers by hand for both: see [Fixing a beatgrid](#fixing-a-beatgrid). A grid can have up to 32 markers, and every bar is 4 beats. Hot cues and play aren't snapped to the beat, except on a synced deck (loops are: see [Loops](#loops)). Quantized loops count bars from the beat you press IN on, not from the grid's bar 1.
 - **Loops:** loop rolls are the only slip feature (no slip mode for scratching, hot cues or loops), there's no beat jump (the FLX6's BEAT JUMP pads roll) and no slicer, no fine-adjusting IN/OUT with the jog wheel, and loops aren't saved with the track.
 - **Keys:** detection is good but not perfect: on a test library it matched reference tools on about 3 tracks in 4, and most misses were a compatible neighbour (the relative major/minor, or one step round the Camelot wheel). A track gets one key, even if it changes key part-way through.
-- **Mixer:** no effects. EQ is a 3-band isolator, plus a filter and trim per channel.
+- **Mixer:** EQ is a 3-band isolator, plus a filter and trim per channel.
+- **Effects:** echo, reverb and phaser only, a bank per deck. There's no master bank (the FLX6's CH SELECT on MST does nothing), no effects in the headphone cue, no repeater, no pad FX or Merge FX, and the DDJ-FLX4 and DDJ-400 Beat FX strips aren't mapped (they send other messages than the FLX6's). Effects add level to a mix that may already reach full scale, so watch the master meter.
 - **Controllers:** MIDI only. Controllers that only speak HID aren't supported.
-- **CPU:** the screen redraws use more CPU than the audio does, and the broadcast window adds about half again. They run at 60 fps by default. **Settings → General → Screen frame rate** goes from 30 fps up to your monitor's full rate, which costs two to three times as much CPU on a 120–144 Hz monitor. Key lock costs under 2% of one core per deck.
+- **CPU:** the screen redraws use more CPU than the audio does, and the broadcast window adds about half again. They run at 60 fps by default. **Settings → General → Screen frame rate** goes from 30 fps up to your monitor's full rate, which costs two to three times as much CPU on a 120–144 Hz monitor. Key lock costs under 2% of one core per deck. A reverb costs about 0.3% of one core in each place it's heard (your speakers, the broadcast feed), an echo or phaser about 0.1%, and an effect that's off and has rung out nothing.
 - **Audio driver:** WASAPI shared mode, roughly 10–20 ms of output latency. No ASIO yet.
 - **Serato data:** crates are read, but Serato cue points and beatgrids aren't imported yet.
 - **Crates:** a crate remembers each track by where the file is, so a file you move drops out of it. There's no picking several tracks at once: drag them in one at a time (a whole folder can be shared live as it is). You can't reorder a crate by hand.

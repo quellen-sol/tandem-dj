@@ -137,6 +137,7 @@ The decks area and the library share the window's height by rule (`DeckLayout` i
 1. **The library gives way first.** Until the DJ drags its edge, its height follows the window: 330 points when there's room, less on a shorter one, never under 150. After a drag it keeps the DJ's height, but can't be dragged over the waveforms' minimum.
 2. **Then the decks.** Two decks swap their full panels for the four-deck view's compact panels, beside a short two-channel mixer: each channel's knobs beside its fader, and the booth levels behind a **🎧 LEVELS** button. They do this as soon as keeping the full panels would leave the library under 180 points, and on a window too narrow for full panels (under about 1190 points wide). Four decks squeeze in stages: thinner track overviews, then tighter panels, with the levels behind the button.
 3. **The waveforms never go under a minimum** (46 points each for two decks, 28 for four). When the controls don't fit above them even squeezed, the controls scroll, with a scroll bar in sight.
+4. **The FX strip** sits under the waveforms: one row (16 points, 19 with its spacing) for two decks, two for four. Its height is part of the decks area (`DeckLayout::roomy_h`, `least_full_h`, `least_h` take it). It takes what the roomy waveforms have over their least first (over 52 points with the full panels), then the library's height, so at 1440 × 930 the library stays at 330 and the waveforms are a little shorter. The full panels need waveforms of at least 48 points (52 before the strip). Which form it takes is worked out from the window by `FxStrip::pick`, with the library at its least and the controls at their least without scrolling (compact panels for two decks, the squeezed row for four): open if the DJ left it open and it fits there, else one line naming the effects that are on, else nothing, and the effects that are on show in each waveform's corner, where a click opens the deck's bank. So the strip never makes the controls scroll or the library go under 150. In practice: open from 1366 × 689 up with four decks and on every window that fits two (1280 × 641, 1097 × 538), one line for four decks between about 660 and 678 points tall, and nothing for two decks under about 535 or four under about 660. A dragged library leaves it its room (`library_max_height`).
 
 Compact panels narrow their buttons on a narrow window rather than spill into the mixer, and below 1300 points wide the top bar moves the room's address and clock spread into hover text. The window opens at 1440 × 930; when that doesn't fit above the taskbar (most laptops at 125% display scaling or more), the app maximises it on its first frame (`TandemApp::fit_window`). It goes down to 1024 × 520, about a 1080p laptop at 175%. `--window-size 1280x641` and `--zoom 1.5` reproduce a small screen and display scaling on a big one.
 
@@ -154,6 +155,55 @@ Peaks rise at once and fall at 24 dB/s, worked out per 64-frame block on the aud
 - **The controller thread** sends them every 25 ms, only when a value changes, and zeroes them when it stops. `disconnect` waits for that, so the lights go out when Tandem closes.
 
 Pioneer's channel meters are a control change per channel (CC 0x02 on the deck's channel, 0–127). Pioneer doesn't publish where each light comes on, so it was measured on a DDJ-FLX6: its five lights turn on at about 37–40, 65–69, 85–88, 101–106 and exactly 119. `pioneer_meter_value` maps dB onto those values so the lights come on at −24, −14, −8 and −3 dBFS, and red only over 0 dBFS. Those are the same marks as on screen.
+
+### Effects
+
+Every deck has a bank of effects after its channel fader and the crossfader, like a Pioneer mixer's Beat FX: three slots in series, each with an effect, on/off and a depth, and one BEATS value per bank (Serato's model). The first effects are echo, reverb and phaser.
+
+**Room state.** `DeckState::fx` is an `FxBank`: three `FxSlot`s (`kind`, `on`, `depth`, `since`) and `beats`, an index into `model::FX_BEATS` (1/16, 1/8, ¼, ½, ¾, 1, 2, 4, 8, 16, 32): an index rather than a float, because JSON floats without `float_roundtrip` have already broken digests. `FxOn`, `FxDepth`, `FxSelect` and `FxBeats` set explicit values (not toggles), so late and reordered moves converge. They touch nothing else: no jump, no anchor, no roll let go. `since` is the time a slot was switched on or changed effect, a starting point every booth agrees on. The bank belongs to the channel: `Load` and `Eject` leave it alone. All of it is in the digest.
+
+**Audio** (`fx.rs`). Each lane has an `FxChain` per deck, with an instance of each effect per slot. Per sub-block, `Lane::render` works each deck to its fader into the deck's buffer, runs its chain over the block, then sums the decks in the same order as before. `FxChain::prepare` reads everything an effect needs from the room at the block's time: the bank, the deck's BPM (`effective_bpm_at`, 120 without a grid) and the phaser's sweep, from `BeatGrid::phase(slip position, 1 / beats)` (from `since` at 120 BPM without a grid). So every lane, the broadcast lane included, works out the same effect at the same moment, whenever it started: a phaser started half a second later agrees within 0.001 once settled, and two lanes rendering the same moment are bit-identical.
+
+- **Off and silent costs nothing and changes nothing.** An effect that's off fades its input out over 10 ms and keeps running until its tail is under −120 dBFS (for the echo, everything it could still play; for the reverb, twice its longest path). Then it goes idle and forgets its buffers: the echo's delay line counts the frames written since it was cleared and reads anything older as silence, so clearing it is free. While every effect of a deck is idle, the deck's signal doesn't go near the chain, and the mix is bit-identical to Tandem's before effects: tests check it against the same room without effect moves and after an echo has rung out, and rendering a busy room with both versions gave the same bytes.
+- **Audio-thread rules.** Every buffer is allocated in `Lane::new` (about 2.6 MB per deck per lane at 48 kHz, mostly echo lines). Nothing in the callback allocates, locks or does unbounded work. Values in feedback paths are flushed to zero under 1e-20, far above denormals, so a minute of silence with every effect on leaves none (tested at 44.1 and 48 kHz).
+- **Switching** feeds a slot's other effect at once; the old one rings out. On/off fades the effect's input over 10 ms, and depth is smoothed over 10 ms like the faders, so turning it down silences it at once.
+
+| Effect | Depth | BEATS | Measured |
+|---|---|---|---|
+| Echo | the echoes' level, 0 to 0.6 of the dry sound (which stays at unity); feedback 0.35 to 0.7 | the delay; over 2 s it halves until it fits | repeats within 1 ms of BEATS × 60 / BPM at 44.1 and 48 kHz; each a little duller (one-pole low-pass at 7 kHz and high-pass at 90 Hz in the loop). A new delay (tempo, BEATS) crossfades over 30 ms: no click, no pitch glide |
+| Reverb | up to half: the tail comes up under the dry sound; above, the dry sound fades out and the tail comes up by 60% more, to reverb alone | decay: 60 dB in 2 × BEATS beats, 0.3 to 10 s | Freeverb's 8 combs and 4 all-passes per channel, lengths scaled to the sample rate, input high-passed at 200 Hz, damping 0.2, no randomness. Its Schroeder decay (300 Hz – 1.5 kHz) lands within 10% of the stated time from 0.3 to 10 s. The tail's level is evened out across decay times (within 0.45×–1.6×) so BEATS doesn't swing it |
+| Phaser | notch depth: 0 is the dry sound exactly; feedback up to 0.3 | the sweep's period | six first-order all-passes, swept 200 Hz – 4 kHz evenly in pitch, coefficient updated per 64-frame block and ramped per frame. No tail |
+
+Levels are conservative, since loud masters already reach the soft clipper: on loud noise at full depth no effect raises the level by more than 2 dB (echo +1.7, reverb at half depth +0.6, phaser −1 to −2 dB). A test holds them there.
+
+**Cost** (`examples/fx_bench.rs`, one lane at 48 kHz in 10 ms callbacks, deck A playing, best of seven): reverb about 0.3–0.4% of one core, echo about 0.05–0.1%, phaser about 0.05–0.12%; settings moved but nothing on, nothing measurable (the lane with every effect off costs what it did before effects). All twelve slots on all four decks: about 2–3%. Measured on Linux and natively on Windows.
+
+### Controller effects
+
+A controller has **FX units**: sections of controls that each work one deck's bank. `MidiEngine::fx_deck` says which deck each unit works, starting from the mapping's `fx_unit_decks`; `FxAssign` and `FxAssignNone` move it. The room never sees units, only the actions they send. Targets: `FxOn`, `FxDepth`, `FxDepthAll` (one knob for all three), `FxBeatsDown` / `FxBeatsUp`, `FxNext`, `FxAssign`, `FxAssignNone` and `FxFocus`, all learnable.
+
+**The depth knob.** The DDJ-FLX6 has one LEVEL/DEPTH knob per unit, shared by its three slots: it sends the selected slot's CC pair, and every FX SELECT press sends the knob's position for the new slot. So:
+
+- **A slot that's off** takes the knob as it is. Nobody can hear it, so there's nothing to pick up.
+- **Switching a slot on** from the controller first sets its depth to where the knob is (if the engine knows), then switches it on, and the knob is in control from there.
+- **A slot that's on** waits for the knob to pick it up, without the "untouched control" shortcut, so touching the knob never makes a running effect jump.
+- **After `FxFocus`** (FX SELECT), the next reading only says where the knob is, like the tempo fader after a DECK button. A 14-bit knob sends two halves, and right after connecting Tandem doesn't know the knob is 14-bit until a fine half arrives, so a coarse half read this way takes the fine half straight after it along (`Takeover::relearn_fine`). The FLX6 can send the position twice in one press (recorded), so a reading that repeats the last one isn't a move either. FX SELECT also drops the knob's hold on a running slot: it may have been turned for another slot meanwhile.
+- **Pointing a unit at another deck** makes a running slot wait for pickup against that deck's depth (the usual "someone else moved it" rule).
+
+**Lights.** `FxOn` bindings light while their slot is on (on the FLX6, 127 flashes the ON/OFF light, 0 makes it steady). A unit's BEATS indicator is `Mapping::fx_beat_lights`: a CC whose value comes from a table per BEATS value, sent like the meters, and a dark value for a unit that works no deck (and when Tandem lets go). The FLX6 shows only the selected slot's ON/OFF light and the selected unit's BEATS, and ignores messages for the others, so on every `FxFocus` the engine asks the controller thread to forget what it sent those two (`take_resend`) and they go out again.
+
+**DDJ-FLX6** (`flx6_beat_fx`, in `ddj_flx6`, not the shared `pioneer_ddj`: the FLX4 and DDJ-400 strips send other messages). FX1 is MIDI channel 5, FX2 channel 6. Recorded and light-probed on the unit:
+
+| Control | Message | Target |
+|---|---|---|
+| ON/OFF | note `0x47 + slot` | `FxOn` |
+| LEVEL/DEPTH | CC `0x02 + 2 × slot`, 14-bit (coarse first, fine +0x20) | `FxDepth` |
+| BEAT ◀ / ▶ | note 0x06 / 0x07 | `FxBeatsDown` / `FxBeatsUp` |
+| FX SELECT | note `0x70 + slot`, 127 for the new slot, then the knob's position for it | `FxFocus` |
+| CH SELECT CH1–4 / MST | note 0x1C–0x1F / 0x14, 127 for the new one | `FxAssign` / `FxAssignNone` |
+| BEATS lights | CC 0x64: 01 and 02 blink ¼ (1/16, 1/8), 03 ¼, 04 ½, 21 ¾, 05 1, 06 1 and 4 (2 beats), 07–0A 4–32; 0B dark | `fx_beat_lights` |
+
+The unit sends nothing on connect and won't say where its strip is. It powers on with FX1-1 selected and both units on CH1, so both start on deck A (`fx_unit_decks` = A, A, C, D), and Tandem follows them from there: CH SELECT reports a unit's channel, and FX SELECT moving onto the other unit reports that unit's. SHIFT + ON/OFF (0x43), SHIFT + BEAT (0x66, 0x6B), MERGE FX, the PAD FX pads and JOG CUTTER stay unbound. Preset version 13 adds the strip, and `upgrade_from` gives saved FLX6 mappings its bindings, its BEATS lights and the units' starting decks.
 
 ### Key lock and key shift
 
@@ -267,10 +317,11 @@ Two places enforce it:
 
 | Shared (in the timeline) | Local (this booth only) |
 |---|---|
-| decks: load, play, cue, hot cues, loops and loop rolls, tempo, bend, nudge, beatgrids | headphone cue (PFL) per deck |
+| decks: load, play, cue, hot cues, loops and loop rolls, tempo, bend, nudge, beatgrids | headphone cue (PFL) per deck, which hears the deck without its effects |
 | channel faders, EQ, crossfader, its curve and the assign switches | headphone mix and level |
 | the sync master | master and broadcast levels, sync click |
-| | showing decks C and D |
+| every deck's effects: each slot's effect, on/off and depth, and the bank's BEATS | showing decks C and D, and the FX strip open or folded |
+| | which deck each of the controller's FX units works |
 
 **Level knobs.** A controller's MASTER LEVEL and HEADPHONE LEVEL knobs (`Target::MasterLevel`, `Target::HeadphoneLevel`) set this booth's `LocalParams` levels directly from the MIDI thread, with soft takeover against the sliders on screen, and never send an action. On a controller with a sound card, the same knobs also turn its own outputs up and down in hardware. So when the master or the headphones play through it, the knob leaves that level alone; otherwise the sound would be turned down twice. `ControllerCard` decides by name: Windows names a controller's sound card after it (MIDI port "DDJ-FLX6", sound card "Line (DDJ-FLX6)"), so it's the controller's when its name contains the port's, ignoring case, punctuation, the "2- " prefix and a trailing "MIDI". The app works it out every frame from the controller's port and the devices the audio actually opened, the system default included. The FLX6 preset has both knobs from preset version 11 (14-bit, CC 0x08 and 0x0D on channel 7), so saved FLX6 mappings pick them up.
 
@@ -312,5 +363,5 @@ Every peer decodes with the same decoder (symphonia) and the loader's exact dura
 
 | Crate | What |
 |---|---|
-| `tandem-core` | Everything platform-independent: `time`, `clock`, `model`, `spin` (records let go mid-spin), `render`, `meter` (level meters), `audio` (decode), `net`, `files`, `session`, `library`, `serato`, `mapping` (MIDI learn and soft takeover), `terms`, `selftest`. Tests run anywhere. |
+| `tandem-core` | Everything platform-independent: `time`, `clock`, `model`, `spin` (records let go mid-spin), `render`, `fx` (effects), `meter` (level meters), `audio` (decode), `net`, `files`, `session`, `library`, `serato`, `mapping` (MIDI learn and soft takeover), `terms`, `selftest`. Tests run anywhere. |
 | `tandem` | The Windows app: egui UI (`ui_*.rs`, including the broadcast window in `ui_broadcast.rs` and a broadcaster booth's main window in `ui_broadcaster.rs`), sound output via cpal/WASAPI (`output.rs`), MIDI via midir (`midi.rs`). |

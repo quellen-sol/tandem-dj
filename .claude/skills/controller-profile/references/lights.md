@@ -58,11 +58,17 @@ a guess isn't.
    rarely gives thresholds; a mapping's meter function shows what its author
    found to work.
 
-7. **Displays, jog rings and motors.** Jog-wheel rings and screens, 7-segment
-   digits, beat indicators. Tandem drives none of these today: record their
+7. **Effect lights.** Each FX slot's ON/OFF light (on its button's note,
+   or only for the selected slot?), what a lit value shows (steady, or
+   flashing as on the FLX6), and any BEATS indicator: its message, a value
+   per beat count, and a value known to be dark. Tandem drives these (see
+   `engine.md`, Lights); write the table down even where a value is unknown.
+
+8. **Displays, jog rings and motors.** Jog-wheel rings and screens, 7-segment
+   digits, beat-position indicators. Tandem drives none of these today: record their
    messages so the work isn't lost, and move on.
 
-8. **What happens when the software leaves?** Does the unit go dark, keep
+9. **What happens when the software leaves?** Does the unit go dark, keep
    its last state, or return to a demo show? Tandem sends 0 to every light
    it lit when it closes; note if this controller's "off" isn't 0 (dim-at-1
    units keep a glow), or if it wants a goodbye message.

@@ -76,8 +76,23 @@ Global: `Crossfader` (0 is the A side), `CueMix` (0 is cue only, 1 master
 only), `HeadphoneLevel`, `MasterLevel`, `Browse` (relative), `BrowsePress`,
 `BrowseBack`, `Shift`.
 
-Tandem has **no** control for: FX units and pad FX, sampler, slicer, beat
-jump, key lock and key shift, slip, reverse/censor, tempo range, quantize, a
+Effects, per **FX unit** (0–3): a controller's FX section works one deck's
+bank of three slots, and `Mapping::fx_unit_decks` says which deck each unit
+works when the controller connects (unit 1 → A … unit 4 → D unless the
+preset sets it; the FLX6 preset starts both units on A, as the unit powers
+on). `FxOn { unit, slot }` (toggles, lit while on), `FxDepth { unit, slot }`
+(absolute: an off slot takes the knob directly, an on slot waits for pickup),
+`FxDepthAll { unit }` (one knob for all three), `FxBeatsDown { unit }`,
+`FxBeatsUp { unit }`, `FxNext { unit, slot }` (the slot's next effect),
+`FxAssign { unit, deck }` and `FxAssignNone { unit }` (a channel select, or
+its MST), `FxFocus { unit, slot }` (an FX SELECT whose knob and ON/OFF are
+shared between slots: the knob's next reading only says where it is, and the
+slot's lights are re-sent). The FLX6 preset (`flx6_beat_fx`) is the worked
+example; DESIGN.md's "Controller effects" has the rules.
+
+Tandem has **no** control for: pad FX and Merge FX, a master FX bank, an
+absolute BEATS knob (SB2's SHIFT + LEVEL), sampler, slicer, beat jump, key
+lock and key shift, slip, reverse/censor, tempo range, quantize, a
 vinyl-mode button (vinyl is a setting in the mapping), loop-size or
 beat-jump encoders, track skip, mic, booth, crossfader curve or assign
 switches, stems, waveform zoom, view/panel buttons. Leave these unmapped and
@@ -139,7 +154,7 @@ function; they are how the existing presets behave.
 
 Which hardware modes become which Tandem pads: hot cue → `HotCue`; a loop
 or beat-loop mode → `BeatLoop`; a roll / loop-roll mode → `Roll`. Modes
-Tandem has nothing for (sampler, slicer, FX, stems, beat jump) stay
+Tandem has nothing for (sampler, slicer, pad FX, stems, beat jump) stay
 unmapped. With fewer than eight pads, use the sizes the pads are labelled
 with; if unlabelled, follow the manufacturer's own software.
 
@@ -198,7 +213,7 @@ these hold:
 - its trigger is a **note** (a CC button gets no light);
 - it isn't a software SHIFT binding;
 - its target has a state: `Play`, `Cue`, `Sync`, `Pfl`, `HotCue`, `LoopIn`,
-  `LoopOut`, `Reloop`, `BeatLoop`, `Roll`, `PadMode`, `Shift`.
+  `LoopOut`, `Reloop`, `BeatLoop`, `Roll`, `PadMode`, `Shift`, `FxOn`.
 
 The message is a note-on to **the binding's own channel and note**, with the
 binding's `light` values, or 127 lit and 0 unlit. A pad with bindings in
@@ -223,6 +238,13 @@ DDJ-FLX6's measured thresholds. Use it only where the controller's meter
 takes a similar proportional value; a bitmask or a different scale would
 show garbage, so leave `meters` empty and note the protocol.
 
+**FX BEATS indicators:** `m.fx_beat_lights.push(FxBeatLight { channel,
+cc, unit, values, dark })` sends a CC whose value is `values[i]` for the
+bank's BEATS (an index into `model::FX_BEATS`) of the deck the unit works,
+and `dark` when it works none and when Tandem closes. Use a value measured
+or listed as dark. A controller that shows only the selected slot's or
+unit's lights (the FLX6) gets them re-sent on `FxFocus`.
+
 **Keep-alive and init:** `midi.rs` sends Pioneer's keep-alive SysEx every
 200 ms to any port whose name contains "DDJ", and nothing to anyone else.
 
@@ -237,7 +259,8 @@ make it only when the profile doesn't work without it, and say you did.
   lack of one).
 - A loop on/off button at the current loop size (see Decisions).
 - Different jog resolutions for the platter's top and its ring.
-- A light at an address that isn't its button's own note, or on a CC.
+- A light at an address that isn't its button's own note, or on a CC
+  (apart from level meters and FX BEATS indicators, above).
 - Blinking, jog rings, displays.
 - A level meter that isn't Pioneer-scaled.
 - A relative encoding other than the two above; absolute-position jogs;

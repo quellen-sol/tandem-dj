@@ -107,9 +107,10 @@ including its SHIFT function and each pad mode, record:
   relative encoding, 7- or 14-bit;
 - each source that says so, and the confidence that follows.
 
-Controls Tandem has no function for (FX, sampler, slicer, beat jump...) go in
-the table too, marked "no Tandem control". The next person to add an FX
-target shouldn't have to redo this research.
+Controls Tandem has no function for (pad FX, sampler, slicer, beat jump...)
+go in the table too, marked "no Tandem control". The next person to add one
+shouldn't have to redo this research. An FX section maps onto the FX unit
+targets (see `references/engine.md`).
 
 **Confidence** is a property of the evidence, not of how sure you feel:
 

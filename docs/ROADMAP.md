@@ -448,6 +448,44 @@ Work through these in order and note anything that fails. `tandem.log` (Settings
 5. Unplug the sharing PC's network for 20 seconds. While it's out, click **Stop sharing**. Once it's back, has the crate gone from the others' libraries, with the tracks on the decks still playing?
 6. Share it again and have that DJ leave the room. Does it go from the others' libraries?
 
+## Round 14 (v0.14): effects
+
+- **A bank of three effects on every deck,** after the channel fader and the crossfader: ECHO, REVERB and PHASER, each slot with its own on/off and depth, and one BEATS value (1/16 to 32 beats) per bank, timed by the deck's BPM. Slots run in series, 1 → 2 → 3.
+  - **Part of the room,** like the EQ: your partners and the broadcast hear exactly what you hear, and the broadcast has every effect move where it was made.
+  - **Switching an effect off lets its tail ring out;** turning its depth down silences it at once. Close the fader or cut the crossfader and an echo rings on: echo out of a track.
+  - Your headphone cue hears the deck without its effects.
+- **The FX strip,** under the scrolling waveforms and above the library, has every deck's bank: click a name to switch it on (it lights in the deck's colour), pick the effect, set the depth, step BEATS. It pushes the library down, never under its least; on a small window it folds to one line naming the effects that are on, or (smallest windows) shows them on the waveforms. A deck with an effect on shows **FX** in its header, and the broadcast view names the effects that are on under each channel.
+- **The DDJ-FLX6's Beat FX strip works:** FX SELECT, CH SELECT (CH1–4 are decks A–D; MST does nothing yet), BEAT ◀ ▶ and their lights, LEVEL/DEPTH and ON/OFF with its light. Saved FLX6 mappings pick it up (preset version 13). Other controllers can learn the FX unit functions.
+- Effects cost little: a reverb about 0.3% of one core where it's heard, an echo or phaser about 0.1%, and one that's off nothing.
+- The self-test switches effects on and checks every booth renders them the same.
+- Protocol version 16 (on this branch; renumbered at release after v0.13's): everyone in the room needs this version.
+
+### Test plan for effects
+
+1. **Solo, with a track playing.**
+   - Click ECHO on deck A. Does it repeat on the beat, every BEATS? Step BEATS with ◀ ▶: does the echo follow, without a click? Move the tempo fader while it echoes: does it stay on the beat?
+   - Pull deck A's fader down, then switch the echo off: does the tail ring on and die away?
+   - Turn the depth down while it echoes: does it go quiet at once?
+   - REVERB: up to half depth, is it under the dry sound? At full depth, is it reverb alone? Does a longer BEATS ring longer?
+   - PHASER: does the sweep line up with the beat (one sweep per BEATS)? At depth 0 is it the dry sound?
+   - With all three on, loud: does the master meter stay out of the red more often than not? (Effects add level; tell us if it's too much.)
+   - Switch a slot from ECHO to REVERB while it's on: does the echo ring out?
+2. **On the DDJ-FLX6** (decks A and B playing):
+   - Power the FLX6 on, start Tandem, press FX SELECT round both units. Does no depth on screen change?
+   - Press CH SELECT on FX1 round its channels (CH2, CH4, MST, CH3, CH1). Does ON/OFF work the right deck's slot each time, and nothing on MST?
+   - With FX1 on CH1 and slot 1 off, turn LEVEL/DEPTH: does slot 1's slider follow? Turn it right down, press ON/OFF, turn up: does the effect come in from nothing?
+   - Turn the slider on screen to 80% while the slot is on, then turn the knob from the bottom: does nothing happen until the knob reaches 80%?
+   - Move FX SELECT to another slot, turn the knob, come back: does the first slot's depth stay where it was until the knob reaches it?
+   - Does ON/OFF flash while its slot is on and go steady when off? After FX SELECT moves, does the new slot's light show its own state?
+   - BEAT ◀ ▶: do the BEAT lights show 1/4 … 32 (3/4 on its own light, 2 lighting 1 and 4, 1/16 and 1/8 blinking 1/4)? On MST, are they all dark?
+   - SHIFT + ON/OFF, SHIFT + BEAT, MERGE FX and the PAD FX pads should do nothing in Tandem.
+   - Close Tandem: do the BEAT lights go dark and ON/OFF stop flashing?
+3. **Together, with a broadcast.**
+   - One DJ switches an echo on; does the other hear it, and the broadcast have it on the beat?
+   - Both DJs work the same slot (one on screen, one on the FLX6): does the knob wait for pickup rather than jump?
+   - Leave an echo ringing on a deck with its fader down and load a new track onto it: is the load allowed, and does the tail ring on?
+4. **Small screens.** At 1280 × 641 (1080p at 150%): is the strip there with two decks, and with four decks are the effects shown on the waveforms? Fold the strip with its triangle: is it one line, and still folded next time Tandem starts?
+
 ## Next candidates
 
 Rough priority order:
@@ -459,6 +497,6 @@ Rough priority order:
 5. **Serato cue points and loops** from the Markers2 tag.
 6. **Lower-latency audio:** WASAPI exclusive mode or ASIO.
 7. **Recording** the broadcast lane to WAV.
-8. **Effects:** beat FX (echo, reverb) on the FLX6's FX section.
+8. **More effects:** a repeater (capturing a beat-long slice every lane agrees on), flanger, filter-echo and echo-out; a master bank for the FLX6's MST; effects in the headphone cue; a DDJ-SB2/SB3 profile with its strip, and the FLX4/DDJ-400 strips; PAD FX and Merge FX on the FLX6.
 9. **Encrypted transport** (QUIC/TLS) and an optional relay server, so neither DJ needs Tailscale or port forwarding.
 10. **Crossfader assign from the controller**, for controllers with assign switches, and a MASTER button to pick the sync master by hand.
