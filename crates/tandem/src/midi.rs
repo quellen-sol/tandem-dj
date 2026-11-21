@@ -211,8 +211,9 @@ impl Midi {
 }
 
 /// The controller's clock: every 5 ms send gathered jog movement (scratch /
-/// search); every 25 ms update the jog-ring pitch bend, the lights and the
-/// level meters; every 200 ms keep Pioneer controllers out of demo mode.
+/// search); every 25 ms update the jog-ring pitch bend, the lights, the
+/// level meters and the effects' BEATS lights; every 200 ms keep Pioneer
+/// controllers out of demo mode.
 fn controller_loop(
     mut out: Option<MidiOutputConnection>,
     session: SessionHandle,
@@ -222,6 +223,7 @@ fn controller_loop(
 ) {
     let mut sent: HashMap<(u8, u8), u8> = HashMap::new();
     let mut sent_meters: HashMap<(u8, u8), u8> = HashMap::new();
+    let mut sent_fx: HashMap<(u8, u8), u8> = HashMap::new();
     let mut last_keepalive = Instant::now() - Duration::from_secs(1);
     let mut last_slow = Instant::now();
     let (clock, meters) = {
@@ -256,10 +258,27 @@ fn controller_loop(
                     (s.latest(), s.local)
                 };
                 let levels = meters.read();
-                let (lights, values) = {
-                    let e = engine.lock();
-                    (e.lights(&room, &local), e.meters(&levels))
+                let (lights, values, fx, again) = {
+                    let mut e = engine.lock();
+                    (
+                        e.lights(&room, &local),
+                        e.meters(&levels),
+                        e.fx_beat_lights(&room),
+                        e.take_resend(),
+                    )
                 };
+                // A controller that shows only the selected effect slot may
+                // have ignored these: send them again.
+                for key in again {
+                    sent.remove(&key);
+                    sent_fx.remove(&key);
+                }
+                for (key, v) in fx {
+                    if sent_fx.get(&key) != Some(&v) {
+                        let _ = o.send(&[key.0, key.1, v]);
+                        sent_fx.insert(key, v);
+                    }
+                }
                 for (key, v) in lights {
                     if sent.get(&key) != Some(&v) {
                         let _ = o.send(&[key.0, key.1, v]);
@@ -285,6 +304,11 @@ fn controller_loop(
         for (key, v) in sent_meters {
             if v > 0 {
                 let _ = o.send(&[key.0, key.1, 0x00]);
+            }
+        }
+        if !sent_fx.is_empty() {
+            for (key, v) in engine.lock().fx_beat_lights_dark() {
+                let _ = o.send(&[key.0, key.1, v]);
             }
         }
     }

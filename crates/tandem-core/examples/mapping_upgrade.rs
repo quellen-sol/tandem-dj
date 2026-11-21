@@ -33,6 +33,8 @@ fn main() {
         return;
     }
     let meters_before = m.meters.len();
+    let beats_before = m.fx_beat_lights.len();
+    let units_before = m.fx_unit_decks;
     let changed = m.upgrade_from(&preset);
     println!(
         "{}: {} bindings, would add or change {changed}; ticks/turn kept: {:?}",
@@ -60,5 +62,25 @@ fn main() {
             l.channel + 1,
             tandem_core::model::deck_letter(l.deck as usize)
         );
+    }
+    for l in &m.fx_beat_lights[beats_before..] {
+        println!(
+            "  + BEATS lights: CC {:#04x} · ch {} -> FX unit {}",
+            l.cc,
+            l.channel + 1,
+            l.unit + 1
+        );
+    }
+    if m.fx_unit_decks != units_before {
+        let decks: Vec<String> = m
+            .fx_unit_decks
+            .iter()
+            .map(|d| {
+                d.map_or("-".into(), |d| {
+                    tandem_core::model::deck_letter(d as usize).to_string()
+                })
+            })
+            .collect();
+        println!("  ~ FX units start on decks {}", decks.join(", "));
     }
 }

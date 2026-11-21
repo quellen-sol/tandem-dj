@@ -15,7 +15,7 @@
 //! *relatively* (see [`MidiEngine::tempo_fader`]).
 
 use crate::meter::{to_db, Levels};
-use crate::model::{deck_letter, Action, RoomState, BEAT_LOOPS, DECKS, ROLLS};
+use crate::model::{deck_letter, Action, RoomState, BEAT_LOOPS, DECKS, FX_BEATS, FX_SLOTS, ROLLS};
 use crate::render::LocalParams;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -220,6 +220,51 @@ pub enum Target {
     /// bindings ([`Binding::shift`]) replace its others. Any SHIFT bound to
     /// it shifts the whole controller.
     Shift,
+    /// An effect slot on or off, on the deck the FX unit works (see
+    /// [`MidiEngine::fx_unit_deck`]). Lit while it's on.
+    FxOn {
+        unit: u8,
+        slot: u8,
+    },
+    /// An effect slot's depth. A slot that's off takes the knob as it is;
+    /// one that's on waits for the knob to pick it up.
+    FxDepth {
+        unit: u8,
+        slot: u8,
+    },
+    /// All three slots' depths at once, for a controller with one knob.
+    FxDepthAll {
+        unit: u8,
+    },
+    /// BEATS one step shorter, or longer.
+    FxBeatsDown {
+        unit: u8,
+    },
+    FxBeatsUp {
+        unit: u8,
+    },
+    /// The next effect in a slot.
+    FxNext {
+        unit: u8,
+        slot: u8,
+    },
+    /// The FX unit works this deck's bank from now on (the DDJ-FLX6's CH
+    /// SELECT).
+    FxAssign {
+        unit: u8,
+        deck: u8,
+    },
+    /// The FX unit works nothing (CH SELECT on MST: there's no master bank).
+    FxAssignNone {
+        unit: u8,
+    },
+    /// The controller's shared knob and ON/OFF button now belong to this
+    /// slot (the DDJ-FLX6's FX SELECT). The knob's next reading only says
+    /// where it is, and the slot's lights are sent again.
+    FxFocus {
+        unit: u8,
+        slot: u8,
+    },
 }
 
 impl Target {
@@ -286,6 +331,31 @@ impl Target {
                 format!("Deck {} · Pad mode: {}", deck(d), mode.label())
             }
             Target::Shift => "SHIFT (for SHIFT + controls)".into(),
+            Target::FxOn { unit, slot } => {
+                format!("FX unit {} · Slot {} on/off", unit + 1, slot + 1)
+            }
+            Target::FxDepth { unit, slot } => {
+                format!("FX unit {} · Slot {} depth", unit + 1, slot + 1)
+            }
+            Target::FxDepthAll { unit } => {
+                format!("FX unit {} · Depth (all three slots)", unit + 1)
+            }
+            Target::FxBeatsDown { unit } => format!("FX unit {} · BEATS ◀", unit + 1),
+            Target::FxBeatsUp { unit } => format!("FX unit {} · BEATS ▶", unit + 1),
+            Target::FxNext { unit, slot } => {
+                format!("FX unit {} · Slot {}: next effect", unit + 1, slot + 1)
+            }
+            Target::FxAssign { unit, deck: d } => {
+                format!("FX unit {} · Works deck {}", unit + 1, deck(d))
+            }
+            Target::FxAssignNone { unit } => format!("FX unit {} · Works no deck", unit + 1),
+            Target::FxFocus { unit, slot } => {
+                format!(
+                    "FX unit {} · Select slot {} (FX SELECT)",
+                    unit + 1,
+                    slot + 1
+                )
+            }
         }
     }
 
@@ -334,8 +404,24 @@ impl Target {
             | BendUp { deck }
             | Load { deck }
             | PadMode { deck, .. } => deck,
-            Crossfader | CueMix | HeadphoneLevel | MasterLevel | Browse | BrowsePress
-            | BrowseBack | Shift => return None,
+            // An FX unit works whichever deck it's pointed at.
+            Crossfader
+            | CueMix
+            | HeadphoneLevel
+            | MasterLevel
+            | Browse
+            | BrowsePress
+            | BrowseBack
+            | Shift
+            | FxOn { .. }
+            | FxDepth { .. }
+            | FxDepthAll { .. }
+            | FxBeatsDown { .. }
+            | FxBeatsUp { .. }
+            | FxNext { .. }
+            | FxAssign { .. }
+            | FxAssignNone { .. }
+            | FxFocus { .. } => return None,
         };
         if let Some(d) = set {
             *deck = d;
@@ -354,7 +440,9 @@ impl Target {
             | Target::Crossfader
             | Target::CueMix
             | Target::HeadphoneLevel
-            | Target::MasterLevel => TargetKind::Absolute,
+            | Target::MasterLevel
+            | Target::FxDepth { .. }
+            | Target::FxDepthAll { .. } => TargetKind::Absolute,
             Target::Jog { .. } | Target::Browse => TargetKind::Relative,
             _ => TargetKind::Button,
         }
@@ -434,6 +522,26 @@ impl Target {
         v.push(Target::BrowsePress);
         v.push(Target::BrowseBack);
         v.push(Target::Shift);
+        for unit in 0..FX_UNITS as u8 {
+            v.push(Target::FxFocus { unit, slot: 0 });
+            for slot in 0..FX_SLOTS as u8 {
+                if slot > 0 {
+                    v.push(Target::FxFocus { unit, slot });
+                }
+            }
+            for slot in 0..FX_SLOTS as u8 {
+                v.push(Target::FxOn { unit, slot });
+                v.push(Target::FxDepth { unit, slot });
+                v.push(Target::FxNext { unit, slot });
+            }
+            v.push(Target::FxDepthAll { unit });
+            v.push(Target::FxBeatsDown { unit });
+            v.push(Target::FxBeatsUp { unit });
+            for deck in 0..DECKS as u8 {
+                v.push(Target::FxAssign { unit, deck });
+            }
+            v.push(Target::FxAssignNone { unit });
+        }
         v
     }
 }
@@ -525,6 +633,28 @@ pub struct MeterLight {
     pub deck: u8,
 }
 
+/// An FX unit's BEATS indicator: a control change whose value lights the
+/// beat count of the deck the unit works (the DDJ-FLX6: CC 0x64 on the
+/// unit's channel).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FxBeatLight {
+    pub channel: u8,
+    pub cc: u8,
+    pub unit: u8,
+    /// The value for each of [`FX_BEATS`].
+    pub values: Vec<u8>,
+    /// The value while the unit works no deck, and when Tandem lets go.
+    pub dark: u8,
+}
+
+/// How many FX units a controller can have.
+pub const FX_UNITS: usize = 4;
+
+/// Unit 1 works deck A … unit 4 deck D, unless a preset says otherwise.
+fn default_fx_unit_decks() -> [Option<u8>; FX_UNITS] {
+    std::array::from_fn(|u| Some(u as u8))
+}
+
 fn one() -> f32 {
     1.0
 }
@@ -560,10 +690,20 @@ pub struct Mapping {
     /// Channel level meters on the controller (built-in presets only).
     #[serde(default)]
     pub meters: Vec<MeterLight>,
+    /// The deck each FX unit works when the controller connects. The
+    /// controller can't be asked, so this is how it powers on.
+    #[serde(default = "default_fx_unit_decks")]
+    pub fx_unit_decks: [Option<u8>; FX_UNITS],
+    /// FX units' BEATS indicators (built-in presets only).
+    #[serde(default)]
+    pub fx_beat_lights: Vec<FxBeatLight>,
 }
 
 /// Bump when built-in presets gain controls; saved mappings pick them up.
-pub const PRESET_VERSION: u32 = 12;
+pub const PRESET_VERSION: u32 = 13;
+/// The first preset version with effects: older mappings start their FX
+/// units where the preset says.
+const FIRST_FX_PRESET: u32 = 13;
 /// Up to this preset version, four-deck controllers drove Tandem's two
 /// decks: decks 1 and 3 drove A, decks 2 and 4 drove B.
 const LAST_TWO_DECK_PRESET: u32 = 6;
@@ -580,6 +720,8 @@ impl Mapping {
             preset: None,
             preset_version: 0,
             meters: Vec::new(),
+            fx_unit_decks: default_fx_unit_decks(),
+            fx_beat_lights: Vec::new(),
         }
     }
 
@@ -620,6 +762,21 @@ impl Mapping {
                 self.meters.push(*m);
                 added += 1;
             }
+        }
+        for l in &preset.fx_beat_lights {
+            if !self
+                .fx_beat_lights
+                .iter()
+                .any(|x| (x.channel, x.cc) == (l.channel, l.cc))
+            {
+                self.fx_beat_lights.push(l.clone());
+                added += 1;
+            }
+        }
+        if self.preset_version < FIRST_FX_PRESET {
+            // Saved before there were effects: start the units the way the
+            // controller powers on.
+            self.fx_unit_decks = preset.fx_unit_decks;
         }
         self.preset_version = preset.preset_version;
         added
@@ -871,9 +1028,14 @@ struct Takeover {
     /// Tempo fader only: how far (in tempo) it has moved past the room's
     /// limit, up to one coarse step (see [`MidiEngine::tempo_fader`]).
     past_limit: f64,
-    /// Tempo fader only: readings still to come that only say where the
-    /// fader is, after a DECK button gave it this deck back.
+    /// Readings still to come that only say where the control is: the
+    /// tempo fader's after a DECK button gave it this deck back, an effect
+    /// knob's after FX SELECT moved onto its slot.
     relearn: u8,
+    /// Effect knobs: the last relearned reading was a coarse half, so a
+    /// fine half straight after it is part of it. (Right after connecting,
+    /// a 14-bit knob isn't known to be one until its first fine half.)
+    relearn_fine: bool,
 }
 
 pub struct MidiEngine {
@@ -918,6 +1080,19 @@ pub struct MidiEngine {
     /// same targets, even if SHIFT or the pad mode changed in between (a
     /// roll always ends when its pad is let go).
     held: HashMap<Trigger, Vec<Target>>,
+    /// The deck whose effects each FX unit works (None: nothing). The room
+    /// never sees units: only the actions they send.
+    fx_deck: [Option<u8>; FX_UNITS],
+    /// Lights (status, number) the controller thread should send again
+    /// even if they haven't changed: a controller that shows only the
+    /// selected slot's lights may have ignored them (see
+    /// [`MidiEngine::take_resend`]).
+    resend: Vec<(u8, u8)>,
+}
+
+/// Where a mapping's FX units start (decks past D work nothing).
+fn mapping_fx_decks(m: &Mapping) -> [Option<u8>; FX_UNITS] {
+    m.fx_unit_decks.map(|d| d.filter(|&d| (d as usize) < DECKS))
 }
 
 const BEND: f64 = 0.04;
@@ -937,7 +1112,6 @@ const FREEWHEEL_MAX_US: i64 = 2_000_000;
 impl MidiEngine {
     pub fn new(mapping: Mapping, tempo_range: f64) -> Self {
         Self {
-            mapping,
             learn: None,
             tempo_range,
             quantize_loops: true,
@@ -958,17 +1132,33 @@ impl MidiEngine {
             pad_modes: [PadMode::default(); DECKS],
             shift: HashSet::new(),
             held: HashMap::new(),
+            fx_deck: mapping_fx_decks(&mapping),
+            resend: Vec::new(),
+            mapping,
         }
     }
 
     /// Use another mapping (a controller just connected): nothing held,
-    /// every deck's pads on hot cues.
+    /// every deck's pads on hot cues, the FX units where it powers on.
     pub fn load(&mut self, mapping: Mapping) {
+        self.fx_deck = mapping_fx_decks(&mapping);
         self.mapping = mapping;
         self.learn = None;
         self.pad_modes = [PadMode::default(); DECKS];
         self.shift.clear();
         self.held.clear();
+        self.resend.clear();
+    }
+
+    /// The deck FX unit `unit` works, if any.
+    pub fn fx_unit_deck(&self, unit: u8) -> Option<u8> {
+        self.fx_deck.get(unit as usize).copied().flatten()
+    }
+
+    /// Lights to send again whether or not they've changed: the controller
+    /// thread forgets what it last sent them.
+    pub fn take_resend(&mut self) -> Vec<(u8, u8)> {
+        std::mem::take(&mut self.resend)
     }
 
     /// Deck `deck`'s pad mode.
@@ -1351,7 +1541,102 @@ impl MidiEngine {
                         self.shift.remove(&trig);
                     }
                 }
+                Target::FxOn { unit, slot } if down => self.fx_on(unit, slot, room, out),
+                Target::FxBeatsDown { unit } | Target::FxBeatsUp { unit } if down => {
+                    let Some(deck) = self.fx_unit_deck(unit) else {
+                        continue;
+                    };
+                    let now = room.decks[deck as usize].fx.beats;
+                    let beats = if matches!(target, Target::FxBeatsUp { .. }) {
+                        (now + 1).min(FX_BEATS.len() as u8 - 1)
+                    } else {
+                        now.saturating_sub(1)
+                    };
+                    if beats != now {
+                        out.push(MidiOut::Action(Action::FxBeats { deck, beats }));
+                    }
+                }
+                Target::FxNext { unit, slot } if down => {
+                    let Some(deck) = self.fx_unit_deck(unit) else {
+                        continue;
+                    };
+                    if let Some(s) = room.decks[deck as usize].fx.slots.get(slot as usize) {
+                        out.push(MidiOut::Action(Action::FxSelect {
+                            deck,
+                            slot,
+                            kind: s.kind.next(),
+                        }));
+                    }
+                }
+                Target::FxAssign { unit, deck } if down => {
+                    if let Some(d) = self.fx_deck.get_mut(unit as usize) {
+                        *d = Some(deck).filter(|&d| (d as usize) < DECKS);
+                    }
+                }
+                Target::FxAssignNone { unit } if down => {
+                    if let Some(d) = self.fx_deck.get_mut(unit as usize) {
+                        *d = None;
+                    }
+                }
+                Target::FxFocus { unit, slot } if down => self.fx_focus(unit, slot),
                 _ => {}
+            }
+        }
+    }
+
+    /// An FX unit's ON/OFF for `slot`. Switching a slot on first sets its
+    /// depth to where the knob is, when that's known, and the knob is in
+    /// control from there: knob at zero, press ON, turn up, and the effect
+    /// comes in from nothing.
+    fn fx_on(&mut self, unit: u8, slot: u8, room: &RoomState, out: &mut Vec<MidiOut>) {
+        let Some(deck) = self.fx_unit_deck(unit) else {
+            return;
+        };
+        let Some(s) = room.decks[deck as usize].fx.slots.get(slot as usize) else {
+            return;
+        };
+        let on = !s.on;
+        if on {
+            let t = self
+                .takeover
+                .entry(Target::FxDepth { unit, slot })
+                .or_default();
+            if let Some(v) = t.last_hw {
+                t.engaged = true;
+                t.last_sent = Some(v);
+                if v != s.depth {
+                    out.push(MidiOut::Action(Action::FxDepth { deck, slot, v }));
+                }
+            }
+        }
+        out.push(MidiOut::Action(Action::FxOn { deck, slot, on }));
+    }
+
+    /// FX SELECT moved onto `slot` of `unit`. The knob, shared between the
+    /// slots, may have moved since this slot last heard from it, and the
+    /// controller now says where it is: that reading (both halves of a
+    /// 14-bit knob) only says where it is, so selecting a slot never
+    /// changes its depth. The controller shows only the selected slot's
+    /// lights, so they go out again.
+    fn fx_focus(&mut self, unit: u8, slot: u8) {
+        let t = self
+            .takeover
+            .entry(Target::FxDepth { unit, slot })
+            .or_default();
+        t.relearn = 1;
+        t.relearn_fine = false;
+        // It may have been turned for another slot: a slot that's on waits
+        // for it to come back.
+        t.engaged = false;
+        for b in &self.mapping.bindings {
+            if b.target == (Target::FxOn { unit, slot }) && b.trigger.kind == MidiKind::Note {
+                self.resend
+                    .push((0x90 | b.trigger.channel, b.trigger.number));
+            }
+        }
+        for l in &self.mapping.fx_beat_lights {
+            if l.unit == unit {
+                self.resend.push((0xB0 | l.channel, l.cc));
             }
         }
     }
@@ -1515,6 +1800,20 @@ impl MidiEngine {
                         }
                         continue;
                     }
+                    let fine = raw7.is_none() && trig.kind == MidiKind::Cc;
+                    match b.target {
+                        Target::FxDepth { unit, slot } => {
+                            self.fx_depth(unit, slot, v, fine, room, out);
+                            continue;
+                        }
+                        Target::FxDepthAll { unit } => {
+                            for slot in 0..FX_SLOTS as u8 {
+                                self.fx_depth(unit, slot, v, fine, room, out);
+                            }
+                            continue;
+                        }
+                        _ => {}
+                    }
                     let current = self.current(b.target, room, local);
                     if !self.pickup(b.target, v, current) {
                         continue;
@@ -1617,6 +1916,57 @@ impl MidiEngine {
         (next != current).then_some(next)
     }
 
+    /// An effect knob at `v` for `slot` of `unit` (`fine`: the fine half of
+    /// a 14-bit knob). A reading that only says where the knob is (after FX
+    /// SELECT) or repeats the last one isn't a move. Otherwise a slot
+    /// that's off takes the knob as it is: nobody hears it, so there's
+    /// nothing to wait for. One that's on waits for the knob to pick its
+    /// depth up, and never takes it just because nobody has moved it, so
+    /// touching the knob never makes a running effect jump.
+    fn fx_depth(
+        &mut self,
+        unit: u8,
+        slot: u8,
+        v: f32,
+        fine: bool,
+        room: &RoomState,
+        out: &mut Vec<MidiOut>,
+    ) {
+        let target = Target::FxDepth { unit, slot };
+        let t = self.takeover.entry(target).or_default();
+        if t.relearn > 0 || (t.relearn_fine && fine) {
+            if fine {
+                t.relearn_fine = false;
+            } else {
+                t.relearn -= 1;
+                t.relearn_fine = true;
+            }
+            t.last_hw = Some(v);
+            return;
+        }
+        t.relearn_fine = false;
+        if t.last_hw == Some(v) {
+            return;
+        }
+        let Some(deck) = self.fx_unit_deck(unit) else {
+            self.takeover.entry(target).or_default().last_hw = Some(v);
+            return;
+        };
+        let Some(s) = room.decks[deck as usize].fx.slots.get(slot as usize) else {
+            return;
+        };
+        let send = if s.on {
+            self.pickup(target, v, s.depth)
+        } else {
+            let t = self.takeover.entry(target).or_default();
+            (t.last_hw, t.last_sent, t.engaged) = (Some(v), Some(v), true);
+            true
+        };
+        if send && v != s.depth {
+            out.push(MidiOut::Action(Action::FxDepth { deck, slot, v }));
+        }
+    }
+
     /// Deck `deck`'s tempo fader. Its `last_hw` is where the fader
     /// physically is, whichever message (with or without SHIFT) said so last.
     fn tempo_takeover(&mut self, deck: u8) -> &mut Takeover {
@@ -1673,6 +2023,10 @@ impl MidiEngine {
 
     /// The value nobody has changed yet, so the hardware can take it directly.
     fn pristine(target: Target, current: f32) -> bool {
+        if matches!(target, Target::FxDepth { .. } | Target::FxDepthAll { .. }) {
+            // A running effect never jumps to the knob.
+            return false;
+        }
         let local = LocalParams::default();
         let default = match target {
             Target::Volume { .. } => 1.0,
@@ -1799,8 +2153,42 @@ impl MidiEngine {
             // The deck's pad mode, and SHIFT while it's held.
             Target::PadMode { deck, mode } => self.pad_mode(deck) == mode,
             Target::Shift => self.shift_held(),
+            // The slot on the deck the unit works, if it works one.
+            Target::FxOn { unit, slot } => self.fx_unit_deck(unit).is_some_and(|d| {
+                room.decks[d as usize]
+                    .fx
+                    .slots
+                    .get(slot as usize)
+                    .is_some_and(|s| s.on)
+            }),
             _ => return None,
         })
+    }
+
+    /// Desired value of every FX unit's BEATS indicator: (status, CC) ->
+    /// value, for the BEATS of the deck the unit works.
+    pub fn fx_beat_lights(&self, room: &RoomState) -> Vec<((u8, u8), u8)> {
+        self.mapping
+            .fx_beat_lights
+            .iter()
+            .map(|l| {
+                let value = self
+                    .fx_unit_deck(l.unit)
+                    .and_then(|d| l.values.get(room.decks[d as usize].fx.beats as usize))
+                    .copied()
+                    .unwrap_or(l.dark);
+                ((0xB0 | l.channel, l.cc), value)
+            })
+            .collect()
+    }
+
+    /// Every FX unit's BEATS indicator, dark: for when Tandem lets go.
+    pub fn fx_beat_lights_dark(&self) -> Vec<((u8, u8), u8)> {
+        self.mapping
+            .fx_beat_lights
+            .iter()
+            .map(|l| ((0xB0 | l.channel, l.cc), l.dark))
+            .collect()
     }
 
     /// Desired value of every level meter: (status, CC) -> value.
@@ -1911,7 +2299,72 @@ fn ddj_flx6(device: &str) -> Mapping {
     for deck in 0..4 {
         m.bind(Trigger::note(deck, 0x3C), Target::DeckSelect { deck });
     }
+    flx6_beat_fx(&mut m);
     m
+}
+
+/// The DDJ-FLX6's BEAT FX values for its BEATS lights (CC 0x64), for each
+/// of [`FX_BEATS`]: 1/16 and 1/8 blink the 1/4 light, 3/4 is 0x21 (not in
+/// Pioneer's list) and 2 lights 1 and 4. Measured on the unit; 0x03, 0x04
+/// and 0x07–0x0A are also in Pioneer's list.
+const FLX6_BEAT_LIGHTS: [u8; 11] = [
+    0x01, 0x02, 0x03, 0x04, 0x21, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A,
+];
+/// A value that lights none of them (measured; 0x00's isn't known).
+const FLX6_BEATS_DARK: u8 = 0x0B;
+
+/// The DDJ-FLX6's Beat FX strip: two FX units, FX1 on MIDI channel 5 and
+/// FX2 on channel 6, each three slots (recorded and light-probed on the
+/// unit, and in Pioneer's MIDI list). Only the FLX6: the FLX4 and DDJ-400
+/// share [`pioneer_ddj`] and their strips send other messages.
+///
+/// - FX SELECT moves one cursor across both units' slots: `0x70 + slot`,
+///   on (127) for the slot selected and off for the old one, then the
+///   LEVEL/DEPTH knob's position on the new slot's CC pair. Moving onto
+///   the other unit also sends that unit's channel.
+/// - LEVEL/DEPTH and ON/OFF send the selected slot's messages only: CC
+///   `0x02 + 2 × slot` (14-bit, coarse half first) and note `0x47 + slot`.
+///   The ON/OFF light flashes with 127 on that note and is steady with 0;
+///   the unit ignores the other slots' notes.
+/// - BEAT ◀ ▶: notes 0x06 and 0x07. The BEATS lights are CC 0x64.
+/// - CH SELECT points the selected unit at a channel: notes 0x1C–0x1F for
+///   CH1–4, 0x14 for MST, on (127) for the new one. Both units power on at
+///   CH1, so both start on deck A.
+///
+/// SHIFT + ON/OFF (0x43), SHIFT + BEAT (0x66, 0x6B), MERGE FX, the PAD FX
+/// pads and JOG CUTTER are left alone.
+fn flx6_beat_fx(m: &mut Mapping) {
+    for unit in 0..2u8 {
+        let ch = 4 + unit;
+        for slot in 0..FX_SLOTS as u8 {
+            m.bind(Trigger::note(ch, 0x47 + slot), Target::FxOn { unit, slot });
+            m.bind(
+                Trigger::cc(ch, 0x02 + 2 * slot),
+                Target::FxDepth { unit, slot },
+            );
+            m.bind(
+                Trigger::note(ch, 0x70 + slot),
+                Target::FxFocus { unit, slot },
+            );
+        }
+        m.bind(Trigger::note(ch, 0x06), Target::FxBeatsDown { unit });
+        m.bind(Trigger::note(ch, 0x07), Target::FxBeatsUp { unit });
+        for deck in 0..4u8 {
+            m.bind(
+                Trigger::note(ch, 0x1C + deck),
+                Target::FxAssign { unit, deck },
+            );
+        }
+        m.bind(Trigger::note(ch, 0x14), Target::FxAssignNone { unit });
+        m.fx_beat_lights.push(FxBeatLight {
+            channel: ch,
+            cc: 0x64,
+            unit,
+            values: FLX6_BEAT_LIGHTS.to_vec(),
+            dark: FLX6_BEATS_DARK,
+        });
+    }
+    m.fx_unit_decks = [Some(0), Some(0), Some(2), Some(3)];
 }
 
 /// Pioneer DDJ layout (DDJ-400 / FLX4 / FLX6 generation). Deck N and mixer
@@ -3799,7 +4252,7 @@ mod tests {
     #[test]
     fn saved_v7_to_v11_flx6_mappings_gain_the_level_knobs() {
         let preset = builtin_preset("DDJ-FLX6").unwrap();
-        assert_eq!(preset.preset_version, 12);
+        assert_eq!(preset.preset_version, 13);
         let level = |t: &Target| matches!(t, Target::MasterLevel | Target::HeadphoneLevel);
         let rolls = |t: &Target| matches!(t, Target::Roll { .. });
         let shift_tempo = |t: &Target| matches!(t, Target::TempoShift { .. });
@@ -3865,10 +4318,10 @@ mod tests {
             16
         );
         assert!(small.binding_for(Target::BrowsePress).is_some());
-        // The FLX6 is the family's four-deck layout plus the two knobs and
-        // the four DECK messages.
+        // The FLX6 is the family's four-deck layout plus the two knobs, the
+        // four DECK messages and the Beat FX strip's 32.
         let family = pioneer_ddj("DDJ-FLX6", "Pioneer DDJ-FLX6", 4, 2048.0);
-        assert_eq!(preset.bindings.len(), family.bindings.len() + 2 + 4);
+        assert_eq!(preset.bindings.len(), family.bindings.len() + 2 + 4 + 32);
         assert!(family.bindings.iter().all(|b| preset.bindings.contains(b)));
     }
 
@@ -4778,5 +5231,491 @@ mod tests {
         for field in ["\"shift\"", "\"mode\"", "\"light\""] {
             assert!(!flx.contains(field), "{field}");
         }
+    }
+
+    /// Messages recorded from a DDJ-FLX6 with `--midi-monitor`, as it
+    /// prints them: seconds, the bytes, what they are.
+    fn recorded(lines: &str) -> Vec<(i64, [u8; 3])> {
+        lines
+            .lines()
+            .filter_map(|l| {
+                let mut w = l.split_whitespace();
+                let t: f64 = w.next()?.parse().ok()?;
+                let mut b = [0u8; 3];
+                for x in &mut b {
+                    *x = u8::from_str_radix(w.next()?, 16).ok()?;
+                }
+                Some(((t * 1e6) as i64, b))
+            })
+            .collect()
+    }
+
+    /// Play recorded messages into the engine at their times, applying the
+    /// actions it sends to the room. Returns the actions.
+    fn replay(e: &mut MidiEngine, room: &mut RoomState, lines: &str) -> Vec<Action> {
+        let local = LocalParams::default();
+        let mut acts = Vec::new();
+        for (t, m) in recorded(lines) {
+            for o in e.handle_at(&m, t, room, &local) {
+                if let MidiOut::Action(a) = o {
+                    room.apply(&crate::model::Event {
+                        time: t,
+                        origin: 1,
+                        seq: acts.len() as u64 + 1,
+                        action: a.clone(),
+                    });
+                    acts.push(a);
+                }
+            }
+        }
+        acts
+    }
+
+    fn flx6() -> MidiEngine {
+        MidiEngine::new(builtin_preset("DDJ-FLX6").unwrap(), 0.08)
+    }
+
+    /// A room whose effect slots all have depths of their own, to catch one
+    /// changing.
+    fn fx_room() -> RoomState {
+        let mut room = RoomState::default();
+        for (d, deck) in room.decks.iter_mut().enumerate() {
+            for (i, s) in deck.fx.slots.iter_mut().enumerate() {
+                s.depth = 0.1 + 0.2 * i as f32 + 0.05 * d as f32;
+            }
+        }
+        room
+    }
+
+    fn depths(room: &RoomState) -> Vec<f32> {
+        room.decks
+            .iter()
+            .flat_map(|d| d.fx.slots.map(|s| s.depth))
+            .collect()
+    }
+
+    /// Recorded right after a power cycle (the knob in the middle): FX
+    /// SELECT pressed six times, once round both units. Each press sends
+    /// the knob's position for the new slot, and moving onto the other unit
+    /// its channel too.
+    const FLX6_FX_SELECT_ROUND: &str = "
+  23.153  94 71 7F                 Note 0x71 on (127) · ch 5
+  23.153  94 70 00                 Note 0x70 off · ch 5
+  23.153  B4 04 40                 CC 0x04 = 64 · ch 5
+  23.153  B4 24 00                 CC 0x24 = 0 · ch 5
+  24.171  94 72 7F                 Note 0x72 on (127) · ch 5
+  24.171  94 71 00                 Note 0x71 off · ch 5
+  24.171  B4 06 40                 CC 0x06 = 64 · ch 5
+  24.171  B4 26 00                 CC 0x26 = 0 · ch 5
+  25.191  95 70 7F                 Note 0x70 on (127) · ch 6
+  25.191  94 72 00                 Note 0x72 off · ch 5
+  25.191  B5 02 40                 CC 0x02 = 64 · ch 6
+  25.191  B5 22 00                 CC 0x22 = 0 · ch 6
+  25.191  95 1C 7F                 Note 0x1c on (127) · ch 6
+  25.191  95 1E 00                 Note 0x1e off · ch 6
+  25.191  95 1D 00                 Note 0x1d off · ch 6
+  25.191  95 1F 00                 Note 0x1f off · ch 6
+  25.191  95 14 00                 Note 0x14 off · ch 6
+  26.219  95 71 7F                 Note 0x71 on (127) · ch 6
+  26.219  95 70 00                 Note 0x70 off · ch 6
+  26.219  B5 04 40                 CC 0x04 = 64 · ch 6
+  26.219  B5 24 00                 CC 0x24 = 0 · ch 6
+  27.231  95 72 7F                 Note 0x72 on (127) · ch 6
+  27.231  95 71 00                 Note 0x71 off · ch 6
+  27.231  B5 06 40                 CC 0x06 = 64 · ch 6
+  27.231  B5 26 00                 CC 0x26 = 0 · ch 6
+  28.275  94 70 7F                 Note 0x70 on (127) · ch 5
+  28.275  95 72 00                 Note 0x72 off · ch 6
+  28.275  B4 02 40                 CC 0x02 = 64 · ch 5
+  28.275  B4 22 00                 CC 0x22 = 0 · ch 5
+  28.275  94 1C 7F                 Note 0x1c on (127) · ch 5
+  28.275  94 1E 00                 Note 0x1e off · ch 5
+  28.275  94 1D 00                 Note 0x1d off · ch 5
+  28.275  94 1F 00                 Note 0x1f off · ch 5
+  28.275  94 14 00                 Note 0x14 off · ch 5
+";
+
+    #[test]
+    fn flx6_fx_select_round_after_power_on_changes_no_depth() {
+        let mut e = flx6();
+        // Both units power on at CH1.
+        assert_eq!((e.fx_unit_deck(0), e.fx_unit_deck(1)), (Some(0), Some(0)));
+        for on in [false, true] {
+            let mut room = fx_room();
+            for d in &mut room.decks {
+                for s in &mut d.fx.slots {
+                    s.on = on;
+                }
+            }
+            let before = depths(&room);
+            let acts = replay(&mut e, &mut room, FLX6_FX_SELECT_ROUND);
+            assert_eq!(acts, [], "slots on: {on}");
+            assert_eq!(depths(&room), before);
+            assert_eq!((e.fx_unit_deck(0), e.fx_unit_deck(1)), (Some(0), Some(0)));
+        }
+    }
+
+    #[test]
+    fn flx6_ch_select_points_a_unit_at_a_deck_and_mst_parks_it() {
+        let mut e = flx6();
+        let mut room = fx_room();
+        // CH SELECT pressed round on FX1, then on FX2 (as recorded: CH2,
+        // CH4, MST, CH3, CH1).
+        let fx1 = [
+            ("  76.972  94 1D 7F\n  76.972  94 1C 00", Some(1)),
+            ("  77.326  94 1F 7F\n  77.326  94 1D 00", Some(3)),
+            ("  77.682  94 14 7F\n  77.682  94 1F 00", None),
+            ("  78.054  94 1E 7F\n  78.054  94 14 00", Some(2)),
+            ("  78.454  94 1C 7F\n  78.454  94 1E 00", Some(0)),
+        ];
+        for (lines, deck) in fx1 {
+            assert_eq!(replay(&mut e, &mut room, lines), []);
+            assert_eq!(e.fx_unit_deck(0), deck, "{lines}");
+            assert_eq!(e.fx_unit_deck(1), Some(0));
+        }
+        replay(&mut e, &mut room, "  83.032  95 1D 7F\n  83.032  95 1C 00");
+        assert_eq!((e.fx_unit_deck(0), e.fx_unit_deck(1)), (Some(0), Some(1)));
+        // A parked unit does nothing.
+        replay(&mut e, &mut room, "  83.716  95 14 7F\n  83.716  95 1F 00");
+        assert_eq!(e.fx_unit_deck(1), None);
+        let before = room;
+        let acts = replay(
+            &mut e,
+            &mut room,
+            "  104.486  95 48 7F\n  104.624  95 48 00\n  108.972  95 06 7F\n  89.112  B5 02 01\n  89.112  B5 22 6F",
+        );
+        assert_eq!(acts, []);
+        assert_eq!(room, before);
+    }
+
+    #[test]
+    fn flx6_fx_knob_and_on_off() {
+        let mut e = flx6();
+        let mut room = fx_room();
+        let knob = |coarse: u16, fine: u16| ((coarse << 7) | fine) as f32 / 16383.0;
+        // FX SELECT onto FX2-1 (the knob at zero), then the knob turned up:
+        // the slot is off, so it takes the knob as it is.
+        replay(
+            &mut e,
+            &mut room,
+            "
+  82.140  95 70 7F                 Note 0x70 on (127) · ch 6
+  82.140  94 72 00                 Note 0x72 off · ch 5
+  82.140  B5 02 00                 CC 0x02 = 0 · ch 6
+  82.140  B5 22 00                 CC 0x22 = 0 · ch 6
+",
+        );
+        assert_eq!(depths(&room), depths(&fx_room()));
+        let acts = replay(
+            &mut e,
+            &mut room,
+            "
+  89.112  B5 02 01                 CC 0x02 = 1 · ch 6
+  89.112  B5 22 6F                 CC 0x22 = 111 · ch 6
+  89.119  B5 02 04                 CC 0x02 = 4 · ch 6
+  89.119  B5 22 02                 CC 0x22 = 2 · ch 6
+  89.124  B5 02 06                 CC 0x02 = 6 · ch 6
+  89.124  B5 22 14                 CC 0x22 = 20 · ch 6
+  89.130  B5 02 07                 CC 0x02 = 7 · ch 6
+  89.130  B5 22 62                 CC 0x22 = 98 · ch 6
+  89.136  B5 02 08                 CC 0x02 = 8 · ch 6
+  89.136  B5 22 6B                 CC 0x22 = 107 · ch 6
+",
+        );
+        assert!(acts.iter().all(|a| matches!(
+            a,
+            Action::FxDepth {
+                deck: 0,
+                slot: 0,
+                ..
+            }
+        )));
+        assert_eq!(room.decks[0].fx.slots[0].depth, knob(8, 107));
+        // FX SELECT onto FX2-2: its position comes twice, and neither
+        // reading changes the slot. Then the knob, turned down a little, sets it.
+        let acts = replay(
+            &mut e,
+            &mut room,
+            "
+  99.204  95 71 7F                 Note 0x71 on (127) · ch 6
+  99.204  95 70 00                 Note 0x70 off · ch 6
+  99.204  B5 04 40                 CC 0x04 = 64 · ch 6
+  99.204  B5 24 00                 CC 0x24 = 0 · ch 6
+  99.204  B5 04 40                 CC 0x04 = 64 · ch 6
+  99.204  B5 24 00                 CC 0x24 = 0 · ch 6
+",
+        );
+        assert_eq!(acts, []);
+        assert_eq!(
+            room.decks[0].fx.slots[1].depth,
+            fx_room().decks[0].fx.slots[1].depth
+        );
+        let lines = "
+ 100.608  B5 04 3F                 CC 0x04 = 63 · ch 6
+ 100.608  B5 24 08                 CC 0x24 = 8 · ch 6
+ 100.614  B5 04 3E                 CC 0x04 = 62 · ch 6
+ 100.614  B5 24 32                 CC 0x24 = 50 · ch 6
+";
+        replay(&mut e, &mut room, lines);
+        assert_eq!(room.decks[0].fx.slots[1].depth, knob(62, 50));
+        // Meanwhile the partner turns it right down. ON/OFF: first the
+        // depth goes to where the knob is, then the slot comes on.
+        room.decks[0].fx.slots[1].depth = 0.0;
+        let on = "
+ 104.486  95 48 7F                 Note 0x48 on (127) · ch 6
+ 104.624  95 48 00                 Note 0x48 off · ch 6
+";
+        assert_eq!(
+            replay(&mut e, &mut room, on),
+            [
+                Action::FxDepth {
+                    deck: 0,
+                    slot: 1,
+                    v: knob(62, 50)
+                },
+                Action::FxOn {
+                    deck: 0,
+                    slot: 1,
+                    on: true
+                }
+            ]
+        );
+        // Running, and the partner moves it to 0.8: the knob has to come up
+        // past it before it takes over.
+        room.decks[0].fx.slots[1].depth = 0.8;
+        let turn = |from: u16, to: u16| -> String {
+            let mut v = String::new();
+            let step = if to > from { 1 } else { -1i32 };
+            let mut c = from as i32;
+            while c != to as i32 {
+                c += step;
+                v += &format!("  101.000  B5 04 {c:02X}\n  101.000  B5 24 00\n");
+            }
+            v
+        };
+        assert_eq!(replay(&mut e, &mut room, &turn(62, 50)), []);
+        // (Within 0.04 of it counts as there, as for every soft takeover.)
+        assert_eq!(replay(&mut e, &mut room, &turn(50, 96)), []);
+        let acts = replay(&mut e, &mut room, &turn(96, 106));
+        assert!(!acts.is_empty());
+        assert_eq!(room.decks[0].fx.slots[1].depth, knob(106, 0));
+        // Off again (the tail rings out); the knob sets it directly again.
+        assert_eq!(
+            replay(
+                &mut e,
+                &mut room,
+                "  106.092  95 48 7F\n  106.274  95 48 00"
+            ),
+            [Action::FxOn {
+                deck: 0,
+                slot: 1,
+                on: false
+            }]
+        );
+        replay(&mut e, &mut room, &turn(106, 20));
+        assert_eq!(room.decks[0].fx.slots[1].depth, knob(20, 0));
+        // FX SELECT away and back, the knob turned meanwhile for another
+        // slot: coming back on a running slot doesn't make it jump either.
+        replay(&mut e, &mut room, "  106.5  95 48 7F\n  106.6  95 48 00");
+        assert!(room.decks[0].fx.slots[1].on);
+        let away_and_back = "
+  107.0  95 72 7F
+  107.0  95 71 00
+  107.0  B5 06 14
+  107.0  B5 26 00
+  107.2  B5 06 60
+  107.2  B5 26 00
+  107.4  95 71 7F
+  107.4  95 72 00
+  107.4  B5 04 60
+  107.4  B5 24 00
+  107.6  B5 04 61
+  107.6  B5 24 00
+";
+        let before = room.decks[0].fx.slots[1].depth;
+        let acts = replay(&mut e, &mut room, away_and_back);
+        assert!(
+            !acts
+                .iter()
+                .any(|a| matches!(a, Action::FxDepth { slot: 1, .. })),
+            "{acts:?}"
+        );
+        assert_eq!(room.decks[0].fx.slots[1].depth, before);
+    }
+
+    #[test]
+    fn flx6_beat_buttons_and_lights() {
+        let mut e = flx6();
+        let mut room = fx_room();
+        let local = LocalParams::default();
+        let beat_lights = |e: &MidiEngine, room: &RoomState| e.fx_beat_lights(room);
+        assert_eq!(
+            beat_lights(&e, &room),
+            [((0xB4, 0x64), 0x05), ((0xB5, 0x64), 0x05)],
+            "1 beat on deck A, for both units"
+        );
+        // BEAT ◀ twice, then ▶ twice, on FX2 (deck A).
+        let acts = replay(
+            &mut e,
+            &mut room,
+            "
+ 108.972  95 06 7F                 Note 0x06 on (127) · ch 6
+ 109.096  95 06 00                 Note 0x06 off · ch 6
+ 109.296  95 06 7F                 Note 0x06 on (127) · ch 6
+ 109.412  95 06 00                 Note 0x06 off · ch 6
+",
+        );
+        assert_eq!(
+            acts,
+            [
+                Action::FxBeats { deck: 0, beats: 4 },
+                Action::FxBeats { deck: 0, beats: 3 }
+            ]
+        );
+        assert_eq!(beat_lights(&e, &room)[1], ((0xB5, 0x64), 0x04), "½");
+        replay(
+            &mut e,
+            &mut room,
+            "
+ 110.476  95 07 7F                 Note 0x07 on (127) · ch 6
+ 110.612  95 07 00                 Note 0x07 off · ch 6
+ 110.812  95 07 7F                 Note 0x07 on (127) · ch 6
+ 110.944  95 07 00                 Note 0x07 off · ch 6
+",
+        );
+        assert_eq!(room.decks[0].fx.beats, 5);
+        // Every BEATS value's light, as measured.
+        let want = [
+            0x01, 0x02, 0x03, 0x04, 0x21, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A,
+        ];
+        for (i, &v) in want.iter().enumerate() {
+            room.decks[0].fx.beats = i as u8;
+            assert_eq!(beat_lights(&e, &room)[0].1, v, "{} beats", FX_BEATS[i]);
+        }
+        // At the ends, a step further does nothing.
+        room.decks[0].fx.beats = 10;
+        assert_eq!(
+            replay(&mut e, &mut room, "  1.0  95 07 7F\n  1.1  95 07 00"),
+            []
+        );
+        room.decks[0].fx.beats = 0;
+        assert_eq!(
+            replay(&mut e, &mut room, "  1.0  95 06 7F\n  1.1  95 06 00"),
+            []
+        );
+        // ON/OFF lights: flashing (127) while the slot is on.
+        room.decks[0].fx.slots[1].on = true;
+        let lights = e.lights(&room, &local);
+        let light = |key| lights.iter().find(|l| l.0 == key).map(|l| l.1);
+        assert_eq!(light((0x95, 0x48)), Some(0x7F));
+        assert_eq!(light((0x94, 0x48)), Some(0x7F));
+        assert_eq!(light((0x95, 0x47)), Some(0x00));
+        // FX1 on MST: its lights go dark (0x0B lights no BEATS light).
+        replay(&mut e, &mut room, "  2.0  94 14 7F");
+        let lights = e.lights(&room, &local);
+        assert_eq!(lights.iter().find(|l| l.0 == (0x94, 0x48)).unwrap().1, 0);
+        assert_eq!(beat_lights(&e, &room)[0], ((0xB4, 0x64), 0x0B));
+        assert_eq!(
+            e.fx_beat_lights_dark(),
+            [((0xB4, 0x64), 0x0B), ((0xB5, 0x64), 0x0B)]
+        );
+        // FX SELECT onto a slot: its ON/OFF light and its unit's BEATS
+        // light go out again.
+        assert_eq!(e.take_resend(), []);
+        replay(&mut e, &mut room, "  3.0  95 71 7F\n  3.0  95 70 00");
+        assert_eq!(e.take_resend(), [(0x95, 0x48), (0xB5, 0x64)]);
+        assert_eq!(e.take_resend(), []);
+    }
+
+    #[test]
+    fn effects_can_be_learned_and_a_one_knob_controller_sets_all_three() {
+        let all = Target::all();
+        for unit in 0..FX_UNITS as u8 {
+            for slot in 0..FX_SLOTS as u8 {
+                for t in [
+                    Target::FxOn { unit, slot },
+                    Target::FxDepth { unit, slot },
+                    Target::FxNext { unit, slot },
+                    Target::FxFocus { unit, slot },
+                ] {
+                    assert_eq!(all.iter().filter(|&&x| x == t).count(), 1, "{t:?}");
+                }
+            }
+            assert!(all.contains(&Target::FxAssignNone { unit }));
+            assert!(all.contains(&Target::FxDepthAll { unit }));
+        }
+        assert!(Target::FxDepth { unit: 0, slot: 0 }.is_absolute());
+        assert_eq!(Target::FxOn { unit: 0, slot: 0 }.deck(), None);
+        // Learned onto a plain controller: unit 2 works deck B.
+        let mut e = engine();
+        let (mut room, local) = (fx_room(), LocalParams::default());
+        e.learn = Some(Target::FxDepthAll { unit: 1 });
+        e.handle(&[0xB0, 0x30, 0x10], &room, &local);
+        e.learn = Some(Target::FxNext { unit: 1, slot: 2 });
+        e.handle(&[0x90, 0x31, 0x7F], &room, &local);
+        e.learn = Some(Target::FxOn { unit: 1, slot: 2 });
+        e.handle(&[0x90, 0x32, 0x7F], &room, &local);
+        room.decks[1].fx.slots[2].on = true;
+        // Off slots take the knob; the one that's on waits for it.
+        let outs = follow(&mut e, &mut room, &[[0xB0, 0x30, 0x40]]);
+        assert_eq!(outs.len(), 2);
+        let d = room.decks[1].fx.slots.map(|s| s.depth);
+        assert_eq!((d[0], d[1]), (64.0 / 127.0, 64.0 / 127.0));
+        assert_eq!(d[2], fx_room().decks[1].fx.slots[2].depth);
+        assert_eq!(
+            follow(&mut e, &mut room, &[[0x90, 0x31, 0x7F]]),
+            [MidiOut::Action(Action::FxSelect {
+                deck: 1,
+                slot: 2,
+                kind: crate::model::FxKind::Echo
+            })]
+        );
+        assert_eq!(
+            follow(&mut e, &mut room, &[[0x90, 0x32, 0x7F]]),
+            [MidiOut::Action(Action::FxOn {
+                deck: 1,
+                slot: 2,
+                on: false
+            })]
+        );
+    }
+
+    #[test]
+    fn saved_v12_flx6_mappings_gain_the_beat_fx_strip() {
+        let preset = builtin_preset("DDJ-FLX6").unwrap();
+        let fx = |t: &Target| t.deck().is_none() && t.label().starts_with("FX unit");
+        assert_eq!(preset.bindings.iter().filter(|b| fx(&b.target)).count(), 32);
+        // As saved by preset 12: no strip, no BEATS lights, no unit decks.
+        let mut json: serde_json::Value = serde_json::to_value(&preset).unwrap();
+        let o = json.as_object_mut().unwrap();
+        o.remove("fx_unit_decks");
+        o.remove("fx_beat_lights");
+        o.insert("preset_version".into(), 12.into());
+        let mut saved: Mapping = serde_json::from_value(json).unwrap();
+        saved.bindings.retain(|b| !fx(&b.target));
+        saved.jog_ticks_per_rev = Some(6387.0);
+        assert_eq!(saved.fx_unit_decks, [Some(0), Some(1), Some(2), Some(3)]);
+        assert_eq!(saved.upgrade_from(&preset), 32 + 2);
+        assert_eq!(saved.bindings.len(), preset.bindings.len());
+        assert_eq!(saved.fx_beat_lights, preset.fx_beat_lights);
+        assert_eq!(saved.fx_unit_decks, [Some(0), Some(0), Some(2), Some(3)]);
+        assert_eq!(saved.jog_ticks_per_rev, Some(6387.0));
+        assert_eq!(saved.upgrade_from(&preset), 0, "only once");
+        // And it works.
+        let mut e = MidiEngine::new(saved, 0.08);
+        let mut room = fx_room();
+        assert_eq!(
+            replay(&mut e, &mut room, "  1.0  94 47 7F"),
+            [Action::FxOn {
+                deck: 0,
+                slot: 0,
+                on: true
+            }]
+        );
+        // The FLX4 and DDJ-400 share the family's layout, but their strips
+        // send other messages: they get none of it.
+        let small = builtin_preset("DDJ-FLX4").unwrap();
+        assert!(!small.bindings.iter().any(|b| fx(&b.target)));
+        assert!(small.fx_beat_lights.is_empty());
     }
 }
