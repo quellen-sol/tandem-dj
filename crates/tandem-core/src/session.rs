@@ -780,7 +780,7 @@ impl Session {
     // ------------------------------------------------------------ actions
 
     pub fn act(&mut self, a: Action) {
-        let t = self.now();
+        let t = self.clock.stamp();
         self.act_at(a, t);
     }
 
@@ -2064,7 +2064,7 @@ impl Session {
         // Hosting now: no room is holding this booth's place.
         self.lost = None;
         self.own_moves.clear();
-        self.clock.set_offset(0);
+        self.clock.start(0);
     }
 
     pub fn has_peer(&self) -> bool {
@@ -3638,6 +3638,48 @@ mod tests {
             assert_eq!(b.room.xf_touch, s.me.id);
             assert_eq!(b.dj_name(s.me.id), Some("Alice"));
             assert_eq!(b.dj_name(0), None);
+        }
+        drop(h);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A joiner's clock estimate can step its room clock back a few ms. A
+    /// crossfader cut made across the step still ends where the hardware
+    /// is: the moves after the step aren't stamped under the ones before
+    /// it, so the room doesn't keep an old value and soft takeover doesn't
+    /// take it for the partner's move and let go.
+    #[test]
+    fn a_clock_step_back_mid_cut_keeps_the_crossfader_with_the_hardware() {
+        use crate::mapping::{builtin_preset, MidiEngine, MidiOut};
+        let root = std::env::temp_dir().join(format!("tandem-xfstep-{}", fastrand::u64(..)));
+        let h = solo(&root);
+        {
+            let mut s = h.lock();
+            let clock = s.clock();
+            let mut engine = MidiEngine::new(builtin_preset("DDJ-FLX6").unwrap(), 0.08);
+            // The FLX6 crossfader: 14 bits, the coarse half on CC 0x1F and
+            // the fine half on 0x3F, channel 7. A cut from A to B.
+            for i in 0..=100u32 {
+                if i == 30 {
+                    clock.set_offset(clock.offset() - 5_000);
+                }
+                let raw = i * 16383 / 100;
+                for msg in [
+                    [0xB6, 0x1F, (raw >> 7) as u8],
+                    [0xB6, 0x3F, (raw & 0x7F) as u8],
+                ] {
+                    // As the controller's MIDI input does.
+                    let t = clock.stamp();
+                    let (room, local) = (s.latest(), s.local);
+                    for out in engine.handle_at(&msg, t, &room, &local) {
+                        if let MidiOut::Action(a) = out {
+                            s.act_at(a, t);
+                        }
+                    }
+                }
+            }
+            assert_eq!(s.latest().crossfader, 1.0);
+            assert!(engine.waiting_for_pickup().is_empty());
         }
         drop(h);
         let _ = std::fs::remove_dir_all(&root);

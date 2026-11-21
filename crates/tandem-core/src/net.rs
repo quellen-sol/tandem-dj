@@ -545,7 +545,7 @@ fn start_link(
     let mut reader = stream;
     reader.set_read_timeout(Some(timeout))?;
     let clock = ses.clock();
-    clock.set_offset(offset_us);
+    clock.start(offset_us);
     let serial = ses.on_joined(
         conn,
         host,

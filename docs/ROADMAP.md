@@ -417,6 +417,12 @@ Work through these in order and note anything that fails. `tandem.log` (Settings
   - Test: with Tandem closed and a controller plugged in, run record-midi.bat, type `test` and press a few buttons. Does each press show up? Press Enter: does `test.txt` next to `tandem.exe` hold the same lines, and does a window open showing it? Run it again with the same name: is the new one saved as `test-2.txt`? With Tandem open, does it ask you to close Tandem first?
 - No protocol change: v0.12.0 and v0.12.1 can share a room.
 
+### v0.12.2
+
+- **Fixed: a fast cut on a joining DJ's controller could leave the crossfader (or any fader) stuck partway,** not following the hardware until it was swept back past that point. Each joining PC re-checks its clock against the host's about once a second, and a check that put it a few milliseconds earlier made the next move look older than the one before. The room kept the earlier value, and the controller let go as if someone else had moved it. Moves now never go back in time: after such a check they wait on the last time, for at most half a second, until the clock catches up. The host's own controller was never affected.
+  - Test: join a room with a controller and make fast crossfader cuts, edge to edge, for a few minutes. Does the on-screen crossfader always end where the hardware is, on your PC and the host's?
+- No protocol change: v0.12.0, v0.12.1 and v0.12.2 can share a room. The fix is on the joining DJ's side, so joining DJs need v0.12.2 for it.
+
 ## Next candidates
 
 Rough priority order:

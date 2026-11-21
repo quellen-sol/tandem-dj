@@ -155,7 +155,7 @@ impl Midi {
                 &port,
                 "tandem-in",
                 move |_stamp, msg, _| {
-                    let t = clock.now();
+                    let t = clock.stamp();
                     let (room, local) = {
                         let s = s2.lock();
                         (s.latest(), s.local)
@@ -239,7 +239,7 @@ fn controller_loop(
         };
         let actions = engine.lock().flush(window);
         if !actions.is_empty() {
-            let t = clock.now();
+            let t = clock.stamp();
             let mut s = session.lock();
             for a in actions {
                 s.act_at(a, t);
