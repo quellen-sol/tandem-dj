@@ -324,6 +324,8 @@ pub struct UiState {
     pub live_sent: HashMap<String, LiveSent>,
     pub show_settings: bool,
     pub settings_tab: SettingsTab,
+    /// The step-by-step controller setup, while it's open.
+    pub wizard: Option<crate::ui_wizard::WizardUi>,
     pub show_terms: bool,
     pub host_open: bool,
     pub join_open: bool,
@@ -371,7 +373,11 @@ pub struct UiState {
 /// like a 1080p laptop at 150%); `--dev-settings <audio|controller|general>`
 /// opens Settings on that tab; `--dev-crate` makes a crate "Friday warm-up"
 /// of the first tracks on show and, hosting, shares it live once someone
-/// joins, or, joining, shows the first list shared live in the room.
+/// joins, or, joining, shows the first list shared live in the room;
+/// `--dev-wizard <start|N|4:N|done>` opens the controller setup: on its
+/// first page, or N steps in with a pretend Pioneer doing them (`4:N`: a
+/// four-deck one with DECK buttons; `N!` then presses a button twice, to
+/// see it refused), or on its last page.
 pub struct DevOpts {
     pub screenshot: Option<PathBuf>,
     pub shot_frame: u64,
@@ -388,6 +394,7 @@ pub struct DevOpts {
     pub window_size: Option<[f32; 2]>,
     pub zoom: Option<f32>,
     pub settings: Option<String>,
+    pub wizard: Option<String>,
     pub crate_demo: bool,
     pub crate_step: u8,
     /// The window has been checked against the screen (`fit_window`).
@@ -511,6 +518,7 @@ impl TandemApp {
             live_sent: HashMap::new(),
             show_settings: false,
             settings_tab: SettingsTab::Audio,
+            wizard: None,
             show_terms: false,
             host_open: false,
             join_open: false,
@@ -1335,6 +1343,46 @@ impl TandemApp {
         }
     }
 
+    /// `--dev-wizard`: the controller setup, some way in (see [`DevOpts`]).
+    fn dev_wizard(&mut self, how: &str) {
+        use tandem_core::mapping::{builtin_preset, Mapping, MidiKind, RawMidi};
+        use tandem_core::wizard::{Decks, Demo, Setup, Wizard};
+        self.open_wizard();
+        if how == "start" {
+            return;
+        }
+        let (four, steps) = match how.strip_prefix("4:") {
+            Some(rest) => (true, rest),
+            None => (false, how),
+        };
+        let twice = steps.ends_with('!');
+        let stop = steps.trim_end_matches('!').parse().unwrap_or(usize::MAX);
+        let port = if four { "DDJ-FLX6" } else { "DDJ-FLX4" };
+        let Some(controller) = builtin_preset(port) else {
+            return;
+        };
+        let setup = Setup {
+            decks: if four { Decks::TwoSwitched } else { Decks::Two },
+            ..Setup::default()
+        };
+        if let Some(ui) = self.ui.wizard.as_mut() {
+            ui.setup = setup.clone();
+        }
+        let mut w = Wizard::new(Mapping::empty("My controller"), setup);
+        let demo = Demo {
+            controller,
+            fine: true,
+        };
+        let (t, _) = demo.run_to(&mut w, 0, stop);
+        // The button just learned, pressed again for the next step.
+        let last = w.draft().bindings.last().map(|b| b.trigger);
+        if let (true, Some(trig)) = (twice, last.filter(|t| t.kind == MidiKind::Note)) {
+            let (ch, note) = (trig.channel, trig.number);
+            w.feed(RawMidi::NoteOn { ch, note, vel: 127 }, t + 1_000_000);
+        }
+        self.midi.engine.lock().wizard = Some(w);
+    }
+
     fn dev_hooks(&mut self, ctx: &egui::Context, view: &SessionView) {
         self.dev.frame += 1;
         let f = self.dev.frame;
@@ -1349,6 +1397,9 @@ impl TandemApp {
                     "general" => SettingsTab::General,
                     _ => SettingsTab::Audio,
                 };
+            }
+            if let Some(how) = self.dev.wizard.clone() {
+                self.dev_wizard(&how);
             }
         }
         if self.dev.demo {

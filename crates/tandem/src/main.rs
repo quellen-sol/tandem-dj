@@ -11,6 +11,7 @@ mod ui_decks;
 mod ui_dialogs;
 mod ui_library;
 mod ui_meters;
+mod ui_wizard;
 
 use eframe::egui;
 use tandem_core::config::Paths;
@@ -68,6 +69,7 @@ fn main() {
         window_size: arg_after("--window-size").and_then(|p| parse_size(&p.to_string_lossy())),
         zoom: arg_after("--zoom").and_then(|p| p.to_string_lossy().parse().ok()),
         settings: arg_after("--dev-settings").map(|p| p.to_string_lossy().to_string()),
+        wizard: arg_after("--dev-wizard").map(|p| p.to_string_lossy().to_string()),
         crate_demo: args.iter().any(|a| a == "--dev-crate"),
         crate_step: 0,
         fitted: false,

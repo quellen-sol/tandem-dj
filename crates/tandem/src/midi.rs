@@ -199,6 +199,18 @@ impl Midi {
         Ok(())
     }
 
+    /// Keep the mapping file as it is now beside it, as `<name>.json.bak`:
+    /// the step-by-step setup is about to replace it.
+    pub fn backup_mapping(&self, mappings_dir: &Path) {
+        let Some(port) = &self.port else { return };
+        let path = Self::mapping_path(mappings_dir, port);
+        if path.exists() {
+            if let Err(e) = std::fs::copy(&path, path.with_extension("json.bak")) {
+                log::warn!("couldn't back up the mapping: {e}");
+            }
+        }
+    }
+
     pub fn save_mapping(&self, mappings_dir: &Path) {
         let Some(port) = &self.port else { return };
         let mapping = self.engine.lock().mapping.clone();

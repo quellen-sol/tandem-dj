@@ -106,6 +106,7 @@ impl TandemApp {
         self.host_window(ctx);
         self.join_window(ctx);
         self.settings_window(ctx);
+        self.wizard_window(ctx);
         self.terms_window(ctx);
     }
 
@@ -638,6 +639,23 @@ impl TandemApp {
         let room = self.session.lock().latest();
         let engine_arc = self.midi.engine.clone();
         let mut engine = engine_arc.lock();
+        let mut set_up = false;
+        ui.horizontal(|ui| {
+            set_up = ui
+                .button(RichText::new("Set up step by step…").strong())
+                .on_hover_text("Tandem asks for one control at a time, and you press or move it on the controller.")
+                .clicked();
+            let mapped = engine.mapping.bindings.len();
+            ui.label(
+                RichText::new(if mapped == 0 {
+                    "Nothing is mapped yet: this goes through your controller one control at a time.".to_string()
+                } else {
+                    format!("{mapped} controls mapped. This goes through the rest, or all of them again, one at a time.")
+                })
+                .small()
+                .weak(),
+            );
+        });
         ui.horizontal(|ui| {
             ui.label("Last message:");
             ui.monospace(
@@ -742,7 +760,7 @@ impl TandemApp {
             );
         }
         ui.label(
-            RichText::new("Click Learn, then press or move the control on your controller. If your SHIFT or pad mode buttons are mapped here, hold SHIFT or pick the pad mode first: the control then does it only with SHIFT, or only in that pad mode. Faders pick up once they reach the current value, so you never jump over your partner. Tempo faders never wait: when SYNC has moved the tempo they move it relatively (SHIFT + SYNC puts the deck back on the fader). SHIFT + tempo fader moves the fader but not the tempo, so you can slide it back and keep going.")
+            RichText::new("To change one control, open its group below and click Learn, then press or move the control on your controller. If your SHIFT or pad mode buttons are mapped here, hold SHIFT or pick the pad mode first: the control then does it only with SHIFT, or only in that pad mode. Faders pick up once they reach the current value, so you never jump over your partner. Tempo faders never wait: when SYNC has moved the tempo they move it relatively (SHIFT + SYNC puts the deck back on the fader). SHIFT + tempo fader moves the fader but not the tempo, so you can slide it back and keep going.")
                 .small()
                 .weak(),
         );
@@ -792,51 +810,74 @@ impl TandemApp {
         }
         ui.separator();
         let learning = engine.learn;
-        let list_h = (ui.ctx().screen_rect().height() - 400.0).clamp(150.0, 380.0);
-        egui::ScrollArea::vertical().max_height(list_h).show(ui, |ui| {
-            egui::Grid::new("mapping").num_columns(4).striped(true).show(ui, |ui| {
-                for target in Target::all() {
-                    ui.label(target.label());
-                    let binding = engine.mapping.bindings.iter().position(|b| b.target == target);
-                    match binding {
-                        Some(i) => ui.monospace(engine.mapping.bindings[i].label()),
-                        None => ui.label(RichText::new("-").weak()),
-                    };
-                    ui.horizontal(|ui| {
-                        let is_learning = learning == Some(target);
-                        let b = egui::Button::new(if is_learning { "Move a control…" } else { "Learn" }).selected(is_learning);
-                        if ui.add(b).clicked() {
-                            engine.learn = if is_learning { None } else { Some(target) };
-                        }
-                        if let Some(i) = binding {
-                            if ui.small_button("✖").on_hover_text("Clear").clicked() {
-                                engine.mapping.bindings.remove(i);
-                                changed = true;
+        let list_h = (ui.ctx().screen_rect().height() - 430.0).clamp(150.0, 380.0);
+        let all = Target::all();
+        egui::ScrollArea::vertical().max_height(list_h).auto_shrink([false, true]).show(ui, |ui| {
+            // One header for each part of the controller (see `Target::group`).
+            let mut from = 0;
+            while from < all.len() {
+                let group = all[from].group();
+                let to = (from..all.len()).find(|&i| all[i].group() != group).unwrap_or(all.len());
+                let targets = &all[from..to];
+                from = to;
+                let mapped = targets.iter().filter(|t| engine.mapping.binding_for(**t).is_some()).count();
+                let title = format!("{} · {mapped} of {} mapped", group.0.title(group.1), targets.len());
+                // The group of the control being learned stays open.
+                let open = targets.iter().any(|t| learning == Some(*t)).then_some(true);
+                egui::CollapsingHeader::new(title).id_salt(("mapping-group", group)).open(open).show(ui, |ui| {
+                    egui::Grid::new(("mapping", group)).num_columns(4).striped(true).show(ui, |ui| {
+                        for &target in targets {
+                            ui.label(target.label());
+                            let labels: Vec<String> = engine.mapping.bindings.iter().filter(|b| b.target == target).map(|b| b.label()).collect();
+                            if labels.is_empty() {
+                                ui.label(RichText::new("-").weak());
+                            } else {
+                                ui.monospace(labels.join(", "));
                             }
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        if let Some(i) = engine.mapping.bindings.iter().position(|b| b.target == target) {
-                            let b = &mut engine.mapping.bindings[i];
-                            if target.is_absolute() {
-                                changed |= ui.checkbox(&mut b.invert, "invert").changed();
-                            } else if target.is_relative() {
-                                let mut two = b.rel == RelMode::TwosComplement;
-                                if ui.checkbox(&mut two, "1/127 style").on_hover_text("Tick this if the wheel/encoder moves the wrong way or jumps").changed() {
-                                    b.rel = if two { RelMode::TwosComplement } else { RelMode::Offset64 };
+                            ui.horizontal(|ui| {
+                                let is_learning = learning == Some(target);
+                                let b = egui::Button::new(if is_learning { "Move a control…" } else { "Learn" }).selected(is_learning);
+                                if ui.add(b).clicked() {
+                                    engine.learn = if is_learning { None } else { Some(target) };
+                                }
+                                if !labels.is_empty() && ui.small_button("✖").on_hover_text("Clear").clicked() {
+                                    engine.mapping.bindings.retain(|b| b.target != target);
                                     changed = true;
                                 }
-                                changed |= ui.checkbox(&mut b.invert, "invert").changed();
-                            }
+                            });
+                            ui.horizontal(|ui| {
+                                // A control with several messages (a jog wheel's top and edge) runs the same way on all of them.
+                                let Some(first) = engine.mapping.binding_for(target).cloned() else {
+                                    return;
+                                };
+                                let (mut invert, mut two) = (first.invert, first.rel == RelMode::TwosComplement);
+                                let mut edited = false;
+                                if target.is_relative() {
+                                    edited |= ui.checkbox(&mut two, "1/127 style").on_hover_text("Tick this if the wheel/encoder moves the wrong way or jumps").changed();
+                                }
+                                if target.is_absolute() || target.is_relative() {
+                                    edited |= ui.checkbox(&mut invert, "invert").changed();
+                                }
+                                if edited {
+                                    for b in engine.mapping.bindings.iter_mut().filter(|b| b.target == target) {
+                                        b.invert = invert;
+                                        b.rel = if two { RelMode::TwosComplement } else { RelMode::Offset64 };
+                                    }
+                                    changed = true;
+                                }
+                            });
+                            ui.end_row();
                         }
                     });
-                    ui.end_row();
-                }
-            });
+                });
+            }
         });
         drop(engine);
         if changed {
             self.midi.save_mapping(&self.paths.mappings_dir);
+        }
+        if set_up {
+            self.open_wizard();
         }
     }
 
