@@ -15,6 +15,8 @@
 //! * [`spin`] — a record let go mid-spin running on and slowing down.
 //! * [`grid`] — beatgrids: markers, bars, and the edits a DJ can make.
 //! * [`net`] / [`files`] — rooms over TCP and track transfer.
+//! * [`mapping`] / [`wizard`] — MIDI controller mappings, and the
+//!   step-by-step setup that writes one.
 //! * [`session`] — glue the UI talks to.
 
 pub mod analysis;
@@ -40,5 +42,6 @@ pub mod spin;
 pub mod stretch;
 pub mod terms;
 pub mod time;
+pub mod wizard;
 
 pub use model::{Action, DeckState, Event, RoomState, Timeline, TrackId, DECKS};

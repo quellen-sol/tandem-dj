@@ -1,9 +1,13 @@
 //! MIDI controller mapping ("MIDI learn"), built-in presets, soft takeover
 //! and LED feedback.
 //!
-//! A binding can need SHIFT held, or its deck's pads in a given pad mode, for
-//! controllers that tell neither in their messages (see [`Target::Shift`]
-//! and [`PadMode`]).
+//! A binding can need SHIFT held, its deck's pads in a given pad mode, or
+//! its deck to have its side of the controller, for controllers that tell
+//! none of these in their messages (see [`Target::Shift`], [`PadMode`] and
+//! [`Binding::layered`]).
+//!
+//! [`crate::wizard`] walks a DJ through a controller control by control and
+//! writes the mapping for them.
 //!
 //! Each DJ maps their own controller; mappings are local files and never
 //! shared. Because two people control one mixer, absolute controls (faders,
@@ -17,6 +21,7 @@
 use crate::meter::{to_db, Levels};
 use crate::model::{deck_letter, Action, RoomState, BEAT_LOOPS, DECKS, FX_BEATS, FX_SLOTS, ROLLS};
 use crate::render::LocalParams;
+use crate::wizard::Wizard;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -160,7 +165,11 @@ pub enum Target {
     /// A four-deck controller's DECK button gave its side to this deck (the
     /// DDJ-FLX6 says so with a message of its own). The tempo fader may have
     /// moved while it drove the other deck, so it starts again from wherever
-    /// it is (see [`MidiEngine::tempo_fader`]).
+    /// it is (see [`MidiEngine::tempo_fader`]). On a controller whose
+    /// controls send the same messages for both of a side's decks, this is
+    /// also how Tandem knows which deck they drive now (see
+    /// [`Binding::layered`]); one button bound to both of a side's decks
+    /// switches to the other one each time it's pressed.
     DeckSelect {
         deck: u8,
     },
@@ -472,40 +481,117 @@ impl Target {
         matches!(self, Target::Shift | Target::PadMode { .. })
     }
 
-    /// Every mappable target, in the order the mapping screen shows them.
+    /// The FX unit this control belongs to, if it's one's.
+    pub fn unit(&self) -> Option<u8> {
+        use Target::*;
+        match *self {
+            FxOn { unit, .. }
+            | FxDepth { unit, .. }
+            | FxDepthAll { unit }
+            | FxBeatsDown { unit }
+            | FxBeatsUp { unit }
+            | FxNext { unit, .. }
+            | FxAssign { unit, .. }
+            | FxAssignNone { unit }
+            | FxFocus { unit, .. } => Some(unit),
+            _ => None,
+        }
+    }
+
+    /// The part of the controller this control sits in.
+    pub fn part(&self) -> Part {
+        use Target::*;
+        match self {
+            Shift => Part::Shift,
+            JogTouch { .. } | Jog { .. } => Part::Jog,
+            Play { .. }
+            | Cue { .. }
+            | BackToStart { .. }
+            | Sync { .. }
+            | SyncOff { .. }
+            | Load { .. }
+            | DeckSelect { .. } => Part::Transport,
+            Tempo { .. } | TempoShift { .. } | BendDown { .. } | BendUp { .. } => Part::Tempo,
+            LoopIn { .. }
+            | LoopOut { .. }
+            | Reloop { .. }
+            | LoopHalve { .. }
+            | LoopDouble { .. } => Part::Loops,
+            HotCue { .. } | HotCueClear { .. } => Part::HotCues,
+            BeatLoop { .. } => Part::BeatLoops,
+            Roll { .. } => Part::Rolls,
+            PadMode { mode, .. } => match mode {
+                self::PadMode::HotCues => Part::HotCues,
+                self::PadMode::BeatLoops => Part::BeatLoops,
+                self::PadMode::Rolls => Part::Rolls,
+            },
+            Trim { .. } | Eq { .. } | Filter { .. } | Volume { .. } | Pfl { .. } => Part::Channel,
+            Crossfader | CueMix | HeadphoneLevel | MasterLevel => Part::Mixer,
+            Browse | BrowsePress | BrowseBack => Part::Browse,
+            FxOn { .. }
+            | FxDepth { .. }
+            | FxDepthAll { .. }
+            | FxBeatsDown { .. }
+            | FxBeatsUp { .. }
+            | FxNext { .. }
+            | FxAssign { .. }
+            | FxAssignNone { .. }
+            | FxFocus { .. } => Part::Fx,
+        }
+    }
+
+    /// The group the mapping screen and the step-by-step setup show this
+    /// control in: its part of the controller, on its deck or FX unit.
+    pub fn group(&self) -> (Part, Option<u8>) {
+        (self.part(), self.deck().or(self.unit()))
+    }
+
+    /// Every mappable target, in the order the mapping screen shows them:
+    /// group by group (see [`Target::group`]).
     pub fn all() -> Vec<Target> {
-        let mut v = Vec::new();
+        let mut v = vec![Target::Shift];
         for d in 0..DECKS as u8 {
+            v.push(Target::JogTouch { deck: d });
+            v.push(Target::Jog { deck: d });
             v.push(Target::Play { deck: d });
             v.push(Target::Cue { deck: d });
-            v.push(Target::BackToStart { deck: d });
             v.push(Target::Sync { deck: d });
+            v.push(Target::BackToStart { deck: d });
             v.push(Target::SyncOff { deck: d });
-            for slot in 0..8 {
-                v.push(Target::HotCue { deck: d, slot });
-            }
+            v.push(Target::Load { deck: d });
+            v.push(Target::DeckSelect { deck: d });
+            v.push(Target::Tempo { deck: d });
+            v.push(Target::TempoShift { deck: d });
+            v.push(Target::BendDown { deck: d });
+            v.push(Target::BendUp { deck: d });
             v.push(Target::LoopIn { deck: d });
             v.push(Target::LoopOut { deck: d });
             v.push(Target::Reloop { deck: d });
             v.push(Target::LoopHalve { deck: d });
             v.push(Target::LoopDouble { deck: d });
-            for size in 0..BEAT_LOOPS.len() as u8 {
-                v.push(Target::BeatLoop { deck: d, size });
-            }
-            for size in 0..ROLLS.len() as u8 {
-                v.push(Target::Roll { deck: d, size });
-            }
             for mode in PadMode::ALL {
                 v.push(Target::PadMode { deck: d, mode });
+                match mode {
+                    PadMode::HotCues => {
+                        for slot in 0..8 {
+                            v.push(Target::HotCue { deck: d, slot });
+                        }
+                        for slot in 0..8 {
+                            v.push(Target::HotCueClear { deck: d, slot });
+                        }
+                    }
+                    PadMode::BeatLoops => {
+                        for size in 0..BEAT_LOOPS.len() as u8 {
+                            v.push(Target::BeatLoop { deck: d, size });
+                        }
+                    }
+                    PadMode::Rolls => {
+                        for size in 0..ROLLS.len() as u8 {
+                            v.push(Target::Roll { deck: d, size });
+                        }
+                    }
+                }
             }
-            v.push(Target::Load { deck: d });
-            v.push(Target::JogTouch { deck: d });
-            v.push(Target::Jog { deck: d });
-            v.push(Target::BendDown { deck: d });
-            v.push(Target::BendUp { deck: d });
-            v.push(Target::Tempo { deck: d });
-            v.push(Target::TempoShift { deck: d });
-            v.push(Target::DeckSelect { deck: d });
             v.push(Target::Trim { deck: d });
             for band in (0..3).rev() {
                 v.push(Target::Eq { deck: d, band });
@@ -521,13 +607,9 @@ impl Target {
         v.push(Target::Browse);
         v.push(Target::BrowsePress);
         v.push(Target::BrowseBack);
-        v.push(Target::Shift);
         for unit in 0..FX_UNITS as u8 {
-            v.push(Target::FxFocus { unit, slot: 0 });
             for slot in 0..FX_SLOTS as u8 {
-                if slot > 0 {
-                    v.push(Target::FxFocus { unit, slot });
-                }
+                v.push(Target::FxFocus { unit, slot });
             }
             for slot in 0..FX_SLOTS as u8 {
                 v.push(Target::FxOn { unit, slot });
@@ -543,6 +625,47 @@ impl Target {
             v.push(Target::FxAssignNone { unit });
         }
         v
+    }
+}
+
+/// A part of a controller: what the mapping screen and the step-by-step
+/// setup group its controls by (see [`Target::group`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Part {
+    Shift,
+    Jog,
+    Transport,
+    Tempo,
+    Loops,
+    HotCues,
+    BeatLoops,
+    Rolls,
+    /// A deck's mixer channel.
+    Channel,
+    /// The crossfader, and the headphone and master knobs.
+    Mixer,
+    Browse,
+    Fx,
+}
+
+impl Part {
+    /// The name of this part on deck or FX unit `n`: "Deck A · Jog wheel".
+    pub fn title(&self, n: Option<u8>) -> String {
+        let name = match self {
+            Part::Shift => return "SHIFT".into(),
+            Part::Mixer => return "Mixer".into(),
+            Part::Browse => return "Browse".into(),
+            Part::Fx => return format!("FX unit {}", n.unwrap_or(0) + 1),
+            Part::Jog => "Jog wheel",
+            Part::Transport => "Transport",
+            Part::Tempo => "Tempo",
+            Part::Loops => "Loops",
+            Part::HotCues => "Pads: hot cues",
+            Part::BeatLoops => "Pads: beat loops",
+            Part::Rolls => "Pads: rolls",
+            Part::Channel => "Mixer channel",
+        };
+        format!("Deck {} · {name}", deck_letter(n.unwrap_or(0) as usize))
     }
 }
 
@@ -598,6 +721,12 @@ pub struct Binding {
     /// buttons are dim at 1, and their pads take a colour number).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub light: Option<(u8, u8)>,
+    /// Only while the target's deck has its side of the controller: for a
+    /// controller with two decks' worth of controls whose DECK buttons
+    /// ([`Target::DeckSelect`]) don't change what the controls send. The
+    /// left side starts on deck A, the right side on deck B.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub layered: bool,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -606,22 +735,40 @@ fn is_false(b: &bool) -> bool {
 
 impl Binding {
     /// Whether both can answer the same message: the same button or knob,
-    /// both with SHIFT or both without, and in a pad mode they share.
-    fn overlaps(&self, other: &Binding) -> bool {
+    /// both with SHIFT or both without, in a pad mode they share, and not
+    /// on two decks that take turns on one side of the controller.
+    pub fn overlaps(&self, other: &Binding) -> bool {
+        let turns = self.layered
+            && other.layered
+            && matches!(
+                (self.target.deck(), other.target.deck()),
+                (Some(a), Some(b)) if a != b && side_of(a) == side_of(b)
+            );
         self.trigger == other.trigger
             && self.shift == other.shift
             && (self.mode.is_none() || other.mode.is_none() || self.mode == other.mode)
+            && !turns
     }
 
     /// The control, and what else it needs: "SHIFT + Note 0x0f · ch 5 (pad
     /// mode: rolls)".
     pub fn label(&self) -> String {
         let shift = if self.shift { "SHIFT + " } else { "" };
-        match self.mode {
+        let mut s = match self.mode {
             Some(m) => format!("{shift}{} (pad mode: {})", self.trigger.label(), m.label()),
             None => format!("{shift}{}", self.trigger.label()),
+        };
+        if let (true, Some(d)) = (self.layered, self.target.deck()) {
+            s.push_str(&format!(" (side on deck {})", deck_letter(d as usize)));
         }
+        s
     }
+}
+
+/// The side of a controller a deck plays on: 0 for the left (decks A and
+/// C), 1 for the right (B and D).
+pub fn side_of(deck: u8) -> usize {
+    (deck % 2) as usize
 }
 
 /// A level meter on the controller: a control change whose value sets how
@@ -858,7 +1005,7 @@ impl Mapping {
         moved
     }
 
-    fn bind(&mut self, trigger: Trigger, target: Target) -> &mut Binding {
+    pub(crate) fn bind(&mut self, trigger: Trigger, target: Target) -> &mut Binding {
         self.bindings.push(Binding {
             trigger,
             target,
@@ -867,6 +1014,7 @@ impl Mapping {
             shift: false,
             mode: None,
             light: None,
+            layered: false,
         });
         self.bindings.last_mut().unwrap()
     }
@@ -1043,6 +1191,9 @@ pub struct MidiEngine {
     pub mapping: Mapping,
     /// Set by the mapping screen; the next matching control you touch gets bound.
     pub learn: Option<Target>,
+    /// The step-by-step setup, while it's open: it takes every message, and
+    /// nothing reaches the room.
+    pub wizard: Option<Wizard>,
     pub tempo_range: f64,
     /// LOOP IN and OUT snap to the beatgrid (this DJ's setting).
     pub quantize_loops: bool,
@@ -1075,6 +1226,9 @@ pub struct MidiEngine {
     rolls: [Vec<u8>; DECKS],
     /// Each deck's pad mode, set by [`Target::PadMode`] buttons.
     pad_modes: [PadMode; DECKS],
+    /// The deck each side of the controller is on (left, right), set by
+    /// [`Target::DeckSelect`] buttons.
+    sides: [u8; 2],
     /// [`Target::Shift`] buttons held.
     shift: HashSet<Trigger>,
     /// Buttons held, and what pressing them did: letting go goes to the
@@ -1114,6 +1268,7 @@ impl MidiEngine {
     pub fn new(mapping: Mapping, tempo_range: f64) -> Self {
         Self {
             learn: None,
+            wizard: None,
             tempo_range,
             quantize_loops: true,
             last_message: None,
@@ -1131,6 +1286,7 @@ impl MidiEngine {
             free: [None; DECKS],
             rolls: std::array::from_fn(|_| Vec::new()),
             pad_modes: [PadMode::default(); DECKS],
+            sides: [0, 1],
             shift: HashSet::new(),
             held: HashMap::new(),
             fx_deck: mapping_fx_decks(&mapping),
@@ -1140,12 +1296,15 @@ impl MidiEngine {
     }
 
     /// Use another mapping (a controller just connected): nothing held,
-    /// every deck's pads on hot cues, the FX units where it powers on.
+    /// every deck's pads on hot cues, the sides on decks A and B, the FX
+    /// units where it powers on.
     pub fn load(&mut self, mapping: Mapping) {
         self.fx_deck = mapping_fx_decks(&mapping);
         self.mapping = mapping;
         self.learn = None;
+        self.wizard = None;
         self.pad_modes = [PadMode::default(); DECKS];
+        self.sides = [0, 1];
         self.shift.clear();
         self.held.clear();
         self.resend.clear();
@@ -1175,12 +1334,19 @@ impl MidiEngine {
         !self.shift.is_empty()
     }
 
-    /// Whether a binding's pad mode, if it has one, is its deck's.
+    /// The deck a side of the controller (0 left, 1 right) is on.
+    pub fn side_deck(&self, side: usize) -> u8 {
+        self.sides[side.min(1)]
+    }
+
+    /// Whether a binding's pad mode, if it has one, is its deck's, and its
+    /// deck has its side of the controller, if it needs that.
     fn in_mode(&self, b: &Binding) -> bool {
-        match (b.mode, b.target.deck()) {
-            (Some(mode), Some(deck)) => self.pad_mode(deck) == mode,
-            _ => true,
-        }
+        let Some(deck) = b.target.deck() else {
+            return true;
+        };
+        b.mode.is_none_or(|mode| self.pad_mode(deck) == mode)
+            && (!b.layered || self.sides[side_of(deck)] == deck)
     }
 
     /// The bindings a message on `trig` drives now: those whose deck is in
@@ -1342,6 +1508,11 @@ impl MidiEngine {
         };
         self.last_message = Some(raw.label());
 
+        if let Some(w) = self.wizard.as_mut() {
+            w.feed(raw, t);
+            return Vec::new();
+        }
+
         if let Some(target) = self.learn.filter(|&t| !self.modifier_message(raw, t)) {
             // Only accept a message that suits the target: a fader can't be
             // learned from a button press, a jog not from its touch sensor.
@@ -1370,6 +1541,14 @@ impl MidiEngine {
                         .iter()
                         .any(|b| matches!(b.target, Target::PadMode { deck, .. } if deck == d))
             });
+            // A control that already takes turns between a side's two decks
+            // (the setup found it sends the same for both) still does.
+            let layered = target.deck().is_some()
+                && self
+                    .mapping
+                    .bindings
+                    .iter()
+                    .any(|b| b.layered && b.trigger == trigger);
             let binding = Binding {
                 trigger,
                 target,
@@ -1378,6 +1557,7 @@ impl MidiEngine {
                 shift: self.shift_held() && target != Target::Shift,
                 mode: mode.map(|d| self.pad_mode(d)),
                 light: None,
+                layered,
             };
             self.mapping.bindings.retain(|b| b.target != target);
             self.mapping.bindings.push(binding.clone());
@@ -1433,11 +1613,20 @@ impl MidiEngine {
     }
 
     fn button(&mut self, trig: Trigger, down: bool, room: &RoomState, out: &mut Vec<MidiOut>) {
-        let targets: Vec<Target> = match (down, self.held.remove(&trig)) {
+        let mut targets: Vec<Target> = match (down, self.held.remove(&trig)) {
             (false, Some(pressed)) => pressed,
             _ => self.active(trig).iter().map(|b| b.target).collect(),
         };
         if down {
+            // One DECK button for both of a side's decks: each press goes
+            // to the one the side isn't on.
+            for (side, &deck) in self.sides.iter().enumerate() {
+                let on = Target::DeckSelect { deck };
+                let other = |t: &Target| matches!(t, Target::DeckSelect { deck: d } if *d != deck && side_of(*d) == side);
+                if targets.contains(&on) && targets.iter().any(other) {
+                    targets.retain(|t| *t != on);
+                }
+            }
             self.held.insert(trig, targets.clone());
         }
         for target in targets {
@@ -1998,6 +2187,7 @@ impl MidiEngine {
     /// A deck whose fader hasn't sent anything yet is taken to be 14-bit
     /// when another deck's is.
     fn deck_selected(&mut self, deck: u8) {
+        self.sides[side_of(deck)] = deck;
         let tempo_cc = |b: &Binding| {
             matches!(b.target, Target::Tempo { .. } | Target::TempoShift { .. })
                 && b.trigger.kind == MidiKind::Cc
@@ -2112,7 +2302,7 @@ impl MidiEngine {
             if b.trigger.kind != MidiKind::Note || b.shift {
                 continue;
             }
-            let Some(on) = self.lit(b.target, room, local) else {
+            let Some(on) = self.lit(b, room, local) else {
                 continue;
             };
             let key = (0x90 | b.trigger.channel, b.trigger.number);
@@ -2135,7 +2325,8 @@ impl MidiEngine {
     }
 
     /// Whether a control's light is lit, if it has one.
-    fn lit(&self, target: Target, room: &RoomState, local: &LocalParams) -> Option<bool> {
+    fn lit(&self, b: &Binding, room: &RoomState, local: &LocalParams) -> Option<bool> {
+        let target = b.target;
         Some(match target {
             Target::Play { deck } => {
                 let d = &room.decks[deck as usize];
@@ -2170,6 +2361,17 @@ impl MidiEngine {
             // The deck's pad mode, and SHIFT while it's held.
             Target::PadMode { deck, mode } => self.pad_mode(deck) == mode,
             Target::Shift => self.shift_held(),
+            // A DECK button, where Tandem keeps track of the decks (a
+            // controller that does it itself lights its own): lit for the
+            // deck the side is on, and one button for both decks while the
+            // side is on deck C or D.
+            Target::DeckSelect { deck } if self.mapping.bindings.iter().any(|x| x.layered) => {
+                let shared = self.mapping.bindings.iter().any(|x| {
+                    x.trigger == b.trigger
+                        && matches!(x.target, Target::DeckSelect { deck: d } if d != deck)
+                });
+                self.sides[side_of(deck)] == deck && (!shared || deck >= 2)
+            }
             // The slot on the deck the unit works, if it works one.
             Target::FxOn { unit, slot } => self.fx_unit_deck(unit).is_some_and(|d| {
                 room.decks[d as usize]
@@ -5757,5 +5959,161 @@ mod tests {
         let small = builtin_preset("DDJ-FLX4").unwrap();
         assert!(!small.bindings.iter().any(|b| fx(&b.target)));
         assert!(small.fx_beat_lights.is_empty());
+    }
+
+    /// A controller with two decks' worth of controls for four decks, whose
+    /// controls send the same whichever deck a side is on: SYNC and the
+    /// tempo fader of the left side, for decks A and C.
+    fn layered(deck_buttons: [(u8, u8); 2]) -> MidiEngine {
+        let mut m = Mapping::empty("test");
+        for deck in [0u8, 2] {
+            m.bind(Trigger::note(4, 0x08), Target::Sync { deck })
+                .layered = true;
+            m.bind(Trigger::cc(4, 0x1F), Target::Tempo { deck }).layered = true;
+        }
+        // The right side has decks of its own.
+        m.bind(Trigger::note(5, 0x08), Target::Sync { deck: 1 });
+        for (deck, note) in deck_buttons {
+            m.bind(Trigger::note(4, note), Target::DeckSelect { deck });
+        }
+        MidiEngine::new(m, 0.08)
+    }
+
+    #[test]
+    fn a_side_that_shares_its_controls_follows_its_deck_buttons() {
+        // DECK 1 and DECK 3 buttons.
+        let mut e = layered([(0, 0x30), (2, 0x31)]);
+        let sync = |deck| act(Action::Sync { deck, on: true });
+        assert_eq!(e.side_deck(0), 0);
+        assert_eq!(send(&mut e, [0x94, 0x08, 0x7F]), sync(0));
+        assert_eq!(tap(&mut e, 0x94, 0x31), []);
+        assert_eq!((e.side_deck(0), e.side_deck(1)), (2, 1));
+        assert_eq!(send(&mut e, [0x94, 0x08, 0x7F]), sync(2));
+        // The other side's controls don't take turns.
+        assert_eq!(send(&mut e, [0x95, 0x08, 0x7F]), sync(1));
+        // The lights are deck C's, and DECK 3 is lit.
+        let mut room = RoomState::default();
+        room.decks[2].synced = true;
+        let lit = |e: &MidiEngine, room: &RoomState, key: (u8, u8)| {
+            e.leds(room, &LocalParams::default())
+                .into_iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, on)| on)
+        };
+        assert_eq!(lit(&e, &room, (0x94, 0x08)), Some(true));
+        assert_eq!(lit(&e, &room, (0x94, 0x31)), Some(true));
+        assert_eq!(lit(&e, &room, (0x94, 0x30)), Some(false));
+        tap(&mut e, 0x94, 0x30);
+        assert_eq!(e.side_deck(0), 0);
+        assert_eq!(lit(&e, &room, (0x94, 0x08)), Some(false));
+        assert_eq!(send(&mut e, [0x94, 0x08, 0x7F]), sync(0));
+        // The fader moved while it was deck C's: its first reading back on
+        // deck A only says where it is.
+        tap(&mut e, 0x94, 0x31);
+        let (room, local) = (RoomState::default(), LocalParams::default());
+        assert_eq!(e.handle(&[0xB4, 0x1F, 100], &room, &local), []);
+        let out = e.handle(&[0xB4, 0x1F, 101], &room, &local);
+        assert!(
+            matches!(out[..], [MidiOut::Action(Action::Tempo { deck: 2, .. })]),
+            "{out:?}"
+        );
+        // Another mapping starts on decks A and B again.
+        let mapping = e.mapping.clone();
+        e.load(mapping);
+        assert_eq!(e.side_deck(0), 0);
+    }
+
+    #[test]
+    fn one_deck_button_switches_back_and_forth() {
+        let mut e = layered([(0, 0x1F), (2, 0x1F)]);
+        let sync = |deck| act(Action::Sync { deck, on: true });
+        let lit = |e: &MidiEngine| {
+            e.leds(&RoomState::default(), &LocalParams::default())
+                .into_iter()
+                .find(|(k, _)| *k == (0x94, 0x1F))
+                .map(|(_, on)| on)
+        };
+        assert_eq!(lit(&e), Some(false));
+        assert_eq!(tap(&mut e, 0x94, 0x1F), []);
+        assert_eq!(e.side_deck(0), 2);
+        assert_eq!(lit(&e), Some(true), "lit while the side is on deck C");
+        assert_eq!(send(&mut e, [0x94, 0x08, 0x7F]), sync(2));
+        tap(&mut e, 0x94, 0x1F);
+        assert_eq!(e.side_deck(0), 0);
+        assert_eq!(lit(&e), Some(false));
+        assert_eq!(send(&mut e, [0x94, 0x08, 0x7F]), sync(0));
+    }
+
+    #[test]
+    fn controls_that_take_turns_are_saved_and_named_as_such() {
+        let e = layered([(0, 0x1F), (2, 0x1F)]);
+        let b = e.mapping.binding_for(Target::Sync { deck: 2 }).unwrap();
+        assert_eq!(b.label(), "Note 0x08 · ch 5 (side on deck C)");
+        let json = serde_json::to_string(&e.mapping).unwrap();
+        assert_eq!(json.matches("\"layered\":true").count(), 4);
+        assert!(
+            !json.contains("\"layered\":false"),
+            "left out when it isn't"
+        );
+        let back: Mapping = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, e.mapping);
+        // The two decks' bindings don't stand in each other's way, but
+        // another control on the same note does.
+        let [a, c] = [0u8, 2].map(|deck| back.binding_for(Target::Sync { deck }).unwrap().clone());
+        assert!(!a.overlaps(&c));
+        let mut cue = a.clone();
+        cue.target = Target::Cue { deck: 2 };
+        assert!(cue.overlaps(&c) && !cue.overlaps(&a));
+        // A DDJ-FLX6 keeps track of its decks itself: Tandem leaves its
+        // DECK lights alone.
+        let flx6 = flx6();
+        assert!(!flx6.mapping.bindings.iter().any(|b| b.layered));
+        assert!(!flx6
+            .leds(&RoomState::default(), &LocalParams::default())
+            .iter()
+            .any(|(k, _)| k.1 == 0x3C));
+    }
+
+    #[test]
+    fn learning_a_control_that_takes_turns_keeps_it_taking_turns() {
+        let mut e = layered([(0, 0x30), (2, 0x31)]);
+        // Deck C's SYNC, learned again from the list.
+        e.learn = Some(Target::Sync { deck: 2 });
+        let out = send(&mut e, [0x94, 0x08, 0x7F]);
+        assert!(
+            matches!(&out[..], [MidiOut::Learned(b)] if b.layered),
+            "{out:?}"
+        );
+        // A control of its own isn't.
+        e.learn = Some(Target::Play { deck: 2 });
+        let out = send(&mut e, [0x92, 0x0B, 0x7F]);
+        assert!(
+            matches!(&out[..], [MidiOut::Learned(b)] if !b.layered),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn the_mapping_screen_lists_every_control_once_group_by_group() {
+        let all = Target::all();
+        let unique: HashSet<Target> = all.iter().copied().collect();
+        assert_eq!(unique.len(), all.len());
+        for d in 0..DECKS as u8 {
+            for slot in 0..8 {
+                assert!(all.contains(&Target::HotCueClear { deck: d, slot }));
+            }
+        }
+        // A group's controls sit together.
+        let mut seen = Vec::new();
+        for t in &all {
+            if seen.last() != Some(&t.group()) {
+                assert!(!seen.contains(&t.group()), "{:?} comes back", t.group());
+                seen.push(t.group());
+            }
+        }
+        assert_eq!(seen[0], (Part::Shift, None));
+        assert_eq!(seen[1], (Part::Jog, Some(0)));
+        assert_eq!(Part::Jog.title(Some(2)), "Deck C · Jog wheel");
+        assert_eq!(Part::Fx.title(Some(1)), "FX unit 2");
     }
 }
