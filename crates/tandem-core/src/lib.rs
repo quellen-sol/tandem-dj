@@ -15,14 +15,16 @@
 //! * [`spin`] — a record let go mid-spin running on and slowing down.
 //! * [`grid`] — beatgrids: markers, bars, and the edits a DJ can make.
 //! * [`net`] / [`files`] — rooms over TCP and track transfer.
-//! * [`mapping`] / [`wizard`] — MIDI controller mappings, and the
-//!   step-by-step setup that writes one.
+//! * [`mapping`] / [`wizard`] / [`deck_check`] — MIDI controller mappings,
+//!   the step-by-step setup that writes one, and the check that finds out
+//!   what a controller's DECK buttons send.
 //! * [`session`] — glue the UI talks to.
 
 pub mod analysis;
 pub mod audio;
 pub mod clock;
 pub mod config;
+pub mod deck_check;
 pub mod files;
 pub mod fx;
 pub mod grid;

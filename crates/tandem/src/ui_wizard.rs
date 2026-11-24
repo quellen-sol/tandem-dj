@@ -89,6 +89,12 @@ fn guess(mapping: &Mapping) -> Setup {
 impl TandemApp {
     /// Open the setup on its first page (Settings closes meanwhile).
     pub(crate) fn open_wizard(&mut self) {
+        // The DECK button check takes the controller's messages before the
+        // setup would hear them, and its results can put an older mapping
+        // back.
+        if let Some(mut check) = self.ui.deck_check.take() {
+            self.close_deck_check(&mut check);
+        }
         let setup = guess(&self.midi.engine.lock().mapping);
         self.ui.wizard = Some(WizardUi {
             setup,

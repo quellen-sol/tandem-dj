@@ -522,6 +522,30 @@ Not yet tried on a controller: the tests replay the built-in Pioneer, Denon and 
 4. **On the Denon SC Live 4** (with Nerg): choose "Two decks, each with a DECK button". After the DECK step for deck C, does the first control ask whether decks A and C share their controls? After saying yes, are the rest of deck C's controls filled in, and mixer channel 3 asked for? Saved: does DECK switch the left side between A and C, with the button lit on C?
 5. **Small screens.** At 1280 × 641 (1080p at 150%): does the whole window fit, buttons included?
 
+### v0.15.1
+
+- **Settings → Controller → Check the DECK buttons…** finds out what a controller's DECK buttons send, for the Denon SC Live 4 owner whose DECK does nothing in Tandem. It asks for PLAY, LOAD and DECK on each side, one at a time (PLAY before DECK, after one press and after the second), then the mixer's channel 3 and 4 faders, and moves on by itself after each press. While it's open the controller plays nothing in the room.
+  - **What it tells apart:** a controller that leaves deck switching to the software (after DECK it sends what it sent before), one that switches decks itself (after DECK a side sends on another MIDI channel, as the FLX6 does), and a DECK button that sends nothing. It says which in a sentence or two, with the details and every message underneath.
+  - **Switches decks itself:** **Map decks C and D** copies the side's controls to the channel it heard, and mixer channels 1 and 2 to where channels 3 and 4 were heard, so DECK works at once. It says what it couldn't map, and **Undo** puts the mapping back.
+  - **On the SC Live 4** it also asks the left jog wheel's screen to show deck 3 (with Mixxx's messages) and asks the DJ whether it did, so Tandem can show there which deck a side is on.
+  - The report is saved as `deck-check-<date>.txt` in the data folder and written into the log; **Copy report** puts it on the clipboard.
+- **If DECK changes nothing the controller sends,** the check points to v0.15.0's **Set up step by step…**, which can map it: a test goes from the SC Live 4's built-in mapping, skipping what's mapped, and ends with DECK switching both sides, mixer channels 3 and 4 on decks C and D, and every built-in control and light kept.
+- **Setup and check don't overlap:** opening the setup closes the check.
+- **Why the SC Live 4's DECK does nothing:** the built-in mapping binds nothing to DECK and has no decks C and D. Mixxx's mapping (tested on a unit) and Traktor's both have DECK change nothing the unit sends, so the software must switch decks; the owner thought the unit switches them itself, which it does without a computer. Research and what to build: [controllers/denon-sc-live-4.md](controllers/denon-sc-live-4.md).
+- System exclusive messages now reach Tandem (the check records them); the mapping ignores them as before.
+- No protocol change: v0.15.1 shares rooms with v0.14 and v0.15.0.
+
+#### Test plan for the DECK button check
+
+Nothing here has been tried on a controller yet: the check was tested with a pretend one.
+
+1. **On the Denon SC Live 4**, in computer mode before opening Tandem: Settings → Controller → **Check the DECK buttons…**, then **Start**.
+   - Does each press move it on by itself, with "Got it."? Did any step need **It sent nothing**?
+   - At the jog wheel screen step, did the left screen show 3? Does it show 1 again after answering?
+   - What does the last page say? Click **Copy report** and send it over, or send the `deck-check-….txt` file (**Show the file**).
+   - Afterwards, does the controller play the room as before?
+2. **On the DDJ-FLX6** (it switches decks itself: deck 3 is MIDI channel 3): does the check say so, "channel 3 instead of 1" on the left? **Map decks C and D** shouldn't be offered (the mapping has decks C and D already).
+
 ## Next candidates
 
 Rough priority order:

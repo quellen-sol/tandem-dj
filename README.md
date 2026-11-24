@@ -152,7 +152,19 @@ Every room has four decks, A to D. Click **4 decks** in the top bar to show C an
 - **It switches on by itself** when deck C or D gets a track or starts playing, whether you, your controller or your partner did it, so nothing that's playing is ever off screen. You can switch it off again while C and D are stopped.
 - **Loading:** **Load to A B C D** in the library, the right-click menu on a track, or the controller's LOAD buttons. A double-click loads onto the first deck on screen that's stopped, otherwise onto one that's playing but silent in the mix (see [BPM, sync and keys](#bpm-sync-and-keys)).
 - **On the DDJ-FLX6,** press a side's **DECK** button to switch it between decks 1 and 3 (or 2 and 4): decks 3 and 4 are C and D, with their own pads, loops, jog and tempo fader. Mixer channels 3 and 4 are C and D's channels, with their meters. A mapping you saved with v0.10 or earlier moves its deck 3 and 4 controls over by itself, keeping your jog calibration and any controls you changed. Soft takeover and the tempo fader work per deck, just as on A and B. Switching never makes a deck's tempo jump: after a switch, the tempo fader moves the deck you switched to by as much as you move it, from that deck's own tempo, as it does after SYNC. **SHIFT + SYNC** puts the deck back on the fader.
+- **On the Denon SC Live 4,** the built-in mapping doesn't use DECK yet: each side stays on deck A or B. To add it, use **[Set up step by step…](#setting-up-a-controller-step-by-step)**: choose two decks with a **DECK** button on each side, and skip the controls that are mapped. **Settings → Controller → Check the DECK buttons…** finds out what your unit sends when you press DECK, in about a minute, and saves a report to send to us. See [Checking the DECK buttons](#checking-the-deck-buttons). None of this has been tried on the unit yet.
 - **Sync** works across all four: every synced deck follows the master. See [BPM, sync and keys](#bpm-sync-and-keys).
+
+### Checking the DECK buttons
+
+For a controller whose DECK buttons don't switch decks in Tandem: **Settings → Controller → Check the DECK buttons…** (shown for the SC Live 4, the FLX6 and mappings you made yourself). It maps nothing unless you ask it to. It asks you to press PLAY, LOAD and DECK on each side, one at a time, and to move the mixer's channel 3 and 4 faders, and moves on by itself after each press. Press each button once: the result says if DECK seems to have been pressed twice. **◀ Back** does a step again (but never back past a DECK press: **Start again** instead), and **It sent nothing** goes on when a press shows nothing. On the SC Live 4 it also asks the left jog wheel's screen to show deck 3, and asks you whether it did.
+
+While it's open, the controller plays nothing in the room. At the end it says what DECK does on your controller:
+
+- **It doesn't switch decks itself:** after DECK, the controller sends exactly what it sent before, so Tandem has to keep track of DECK. That's what Mixxx and Traktor do for the SC Live 4. Tandem's built-in mapping for it doesn't yet; **Set up step by step…** can add it.
+- **It switches decks itself:** after DECK, a side sends on another MIDI channel. **Map decks C and D** copies deck A's and B's controls to where it heard decks 3 and 4, so DECK works straight away (**Undo** puts your mapping back).
+
+The report is saved in Tandem's data folder as `deck-check-<date>.txt` and written into the log. **Copy report** puts it on the clipboard to send to us.
 
 ## Level meters
 
@@ -301,7 +313,7 @@ Host in one window and join `127.0.0.1` from the other.
 - **Keys:** detection is good but not perfect: on a test library it matched reference tools on about 3 tracks in 4, and most misses were a compatible neighbour (the relative major/minor, or one step round the Camelot wheel). A track gets one key, even if it changes key part-way through.
 - **Mixer:** EQ is a 3-band isolator, plus a filter and trim per channel.
 - **Effects:** echo, reverb and phaser only, a bank per deck. There's no master bank (the FLX6's CH SELECT on MST does nothing), no effects in the headphone cue, no repeater, no pad FX or Merge FX, and the DDJ-FLX4 and DDJ-400 Beat FX strips aren't mapped (they send other messages than the FLX6's). Effects add level to a mix that may already reach full scale, so watch the master meter.
-- **Controllers:** MIDI only. Controllers that only speak HID aren't supported. The step-by-step setup maps what a controller sends, not its lights: a control mapped that way stays dark, and only the built-in mappings light a controller (a control you map again to the message it had keeps its light).
+- **Controllers:** MIDI only. Controllers that only speak HID aren't supported. The step-by-step setup maps what a controller sends, not its lights: a control mapped that way stays dark, and only the built-in mappings light a controller (a control you map again to the message it had keeps its light). The SC Live 4's built-in mapping has no DECK buttons, and no mixer channels 3 and 4: the step-by-step setup can add them (see [Checking the DECK buttons](#checking-the-deck-buttons)).
 - **CPU:** the screen redraws use more CPU than the audio does, and the broadcast window adds about half again. They run at 60 fps by default. **Settings → General → Screen frame rate** goes from 30 fps up to your monitor's full rate, which costs two to three times as much CPU on a 120–144 Hz monitor. Key lock costs under 2% of one core per deck. A reverb costs about 0.3% of one core in each place it's heard (your speakers, the broadcast feed), an echo or phaser about 0.1%, and an effect that's off and has rung out nothing.
 - **Audio driver:** WASAPI shared mode, roughly 10–20 ms of output latency. No ASIO yet.
 - **Serato data:** crates are read, but Serato cue points and beatgrids aren't imported yet.
@@ -318,6 +330,7 @@ Host in one window and join `127.0.0.1` from the other.
   - **"This room already has 4 DJs":** to join just to stream, tick **Broadcaster only**. A DJ whose connection dropped keeps their seat for 5 minutes while they reconnect.
 - **The broadcaster says moves arrive late.** Click the raise button in its TIMING. If it only happens while tracks are being sent, lower **Upload speed limit** (Settings → General) on the host. That limit covers all of a PC's uploads together, so it keeps track transfers from filling the connection that carries the DJs' moves.
 - **Controller not listed.** Close other DJ software, replug it, then click **Refresh**.
+- **DECK doesn't switch decks.** Run **Settings → Controller → Check the DECK buttons…** and send us the report it saves. See [Checking the DECK buttons](#checking-the-deck-buttons).
 - **A control does nothing, or the wrong thing.** Record what the controller sends: close Tandem, double-click **record-midi.bat** (next to `tandem.exe`), type a name for the recording, then press the controls you were asked to, about a second apart. Each message shows up as it arrives. Press Enter when you're done. The file is saved next to `tandem.exe`, and a window opens showing it, ready to send to whoever is fixing the mapping.
 - **No sound.** Pick the right devices in **Settings → Audio** and check **Status** there.
 - **Logs.** `%LOCALAPPDATA%\Tandem\data\tandem.log`. Settings → General has buttons to open every folder.

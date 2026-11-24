@@ -107,6 +107,7 @@ impl TandemApp {
         self.join_window(ctx);
         self.settings_window(ctx);
         self.wizard_window(ctx);
+        self.deck_check_window(ctx);
         self.terms_window(ctx);
     }
 
@@ -750,6 +751,21 @@ impl TandemApp {
                 }
             }
         });
+        let mut open_check = false;
+        let port = self.midi.port.clone().unwrap_or_default();
+        if TandemApp::deck_check_fits(&engine.mapping, &port) {
+            ui.horizontal(|ui| {
+                open_check = ui
+                    .button("Check the DECK buttons…")
+                    .on_hover_text("Press PLAY, LOAD and DECK when it asks: it finds out what your controller sends, and saves a report to send to us.")
+                    .clicked();
+                ui.label(
+                    RichText::new("If DECK doesn't switch decks.")
+                        .small()
+                        .weak(),
+                );
+            });
+        }
         let waiting = engine.waiting_for_pickup_in(&room);
         if !waiting.is_empty() {
             let names: Vec<String> = waiting.iter().map(|t| t.label()).collect();
@@ -878,6 +894,9 @@ impl TandemApp {
         }
         if set_up {
             self.open_wizard();
+        }
+        if open_check {
+            self.open_deck_check();
         }
     }
 

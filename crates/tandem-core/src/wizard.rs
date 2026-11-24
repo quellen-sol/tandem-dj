@@ -2555,6 +2555,71 @@ mod tests {
         assert_eq!(e.handle(&[0x95, 0x0A, 0x7F], &room, &local), play(1));
     }
 
+    /// What the DECK button check tells an SC Live 4's DJ to do: from the
+    /// built-in mapping, asked only for what it lacks.
+    #[test]
+    fn the_sc_live_4s_built_in_mapping_gains_decks_c_and_d() {
+        let preset = builtin_preset("SC LIVE 4").unwrap();
+        let demo = Demo {
+            controller: sc_live_4_on_four_decks(),
+            fine: false,
+        };
+        let setup = Setup {
+            decks: Decks::TwoSwitched,
+            skip_mapped: true,
+            ..Setup::default()
+        };
+        let mut w = Wizard::new(preset.clone(), setup);
+        let (_, refused) = demo.run(&mut w, 0);
+        assert_eq!(refusals(&w, &refused), [] as [String; 0]);
+        let made = w.finish();
+        // Everything the built-in mapping does is still there (a deck's
+        // controls take turns now).
+        let mut turns = preset.clone();
+        for b in &mut turns.bindings {
+            b.layered = made
+                .bindings
+                .iter()
+                .any(|x| x.layered && x.trigger == b.trigger && x.target == b.target);
+        }
+        assert_eq!(missing(&turns, &made), [] as [String; 0]);
+        // DECK switches each side, the mixer's channels 3 and 4 are decks
+        // C's and D's, and the lights stay.
+        let mut e = MidiEngine::new(made, 0.08);
+        let (room, local) = (RoomState::default(), LocalParams::default());
+        let play = |deck| vec![MidiOut::Action(Action::Play { deck })];
+        for side in 0..2u8 {
+            for deck in [side, side + 2, side] {
+                assert_eq!(
+                    e.handle(&[0x94 + side, 0x0A, 0x7F], &room, &local),
+                    play(deck),
+                    "side {side}"
+                );
+                e.handle(&[0x84 + side, 0x0A, 0], &room, &local);
+                e.handle(&[0x94 + side, 0x1F, 0x7F], &room, &local);
+                e.handle(&[0x84 + side, 0x1F, 0], &room, &local);
+            }
+        }
+        for deck in 2..4u8 {
+            assert_eq!(
+                e.mapping
+                    .binding_for(Target::Volume { deck })
+                    .map(|b| b.trigger),
+                Some(Trigger::cc(deck, 0x0E))
+            );
+        }
+        for b in preset.bindings.iter().filter(|b| b.light.is_some()) {
+            assert!(
+                e.mapping
+                    .bindings
+                    .iter()
+                    .any(|x| x.target == b.target && x.trigger == b.trigger && x.light == b.light),
+                "{}",
+                b.target.label()
+            );
+        }
+    }
+
     #[test]
     fn a_shared_control_is_refused_while_the_deck_button_is_unknown() {
         let setup = Setup {

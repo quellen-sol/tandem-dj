@@ -1334,6 +1334,19 @@ impl MidiEngine {
         !self.shift.is_empty()
     }
 
+    /// Let go of every button held, as if it were let go now: SHIFT, a jog
+    /// wheel touched, a cue or a roll held. For when the controller's
+    /// messages stop reaching the engine for a while (the DECK button
+    /// check), so nothing stays held in the room meanwhile.
+    pub fn let_go(&mut self, room: &RoomState) -> Vec<MidiOut> {
+        let mut out = Vec::new();
+        let held: Vec<Trigger> = self.held.keys().copied().collect();
+        for t in held {
+            self.button(t, false, room, &mut out);
+        }
+        out
+    }
+
     /// The deck a side of the controller (0 left, 1 right) is on.
     pub fn side_deck(&self, side: usize) -> u8 {
         self.sides[side.min(1)]

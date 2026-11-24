@@ -51,7 +51,15 @@ pub struct Midi {
     /// Things the UI handles (browse, load, learned bindings).
     pub ui_queue: Arc<Mutex<Vec<MidiOut>>>,
     pub error: Option<String>,
+    /// While the DECK button check runs: every message the controller
+    /// sends, with when it came, instead of the mapping (so the controller
+    /// plays nothing in the room). None the rest of the time.
+    pub tap: Tap,
+    /// Messages for the controller thread to send to the controller.
+    outbox: Arc<Mutex<Vec<Vec<u8>>>>,
 }
+
+pub type Tap = Arc<Mutex<Option<Vec<(Instant, Vec<u8>)>>>>;
 
 impl Midi {
     pub fn new(tempo_range: f64, quantize_loops: bool) -> Self {
@@ -65,6 +73,15 @@ impl Midi {
             has_output: false,
             ui_queue: Arc::new(Mutex::new(Vec::new())),
             error: None,
+            tap: Arc::new(Mutex::new(None)),
+            outbox: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Send these messages to the controller (if it has an output port).
+    pub fn send(&self, msgs: &[Vec<u8>]) {
+        if self.has_output {
+            self.outbox.lock().extend(msgs.iter().cloned());
         }
     }
 
@@ -140,7 +157,9 @@ impl Midi {
         };
         self.engine.lock().load(mapping);
         let mut input = MidiInput::new("tandem")?;
-        input.ignore(Ignore::All);
+        // System exclusive messages reach the DECK button check; the
+        // mapping never sees them.
+        input.ignore(Ignore::TimeAndActiveSense);
         let port = input
             .ports()
             .into_iter()
@@ -150,11 +169,19 @@ impl Midi {
         let queue = self.ui_queue.clone();
         let clock = session.lock().clock();
         let s2 = session.clone();
+        let tap = self.tap.clone();
         let conn = input
             .connect(
                 &port,
                 "tandem-in",
                 move |_stamp, msg, _| {
+                    if let Some(heard) = tap.lock().as_mut() {
+                        heard.push((Instant::now(), msg.to_vec()));
+                        return;
+                    }
+                    if msg.first().is_none_or(|&b| b >= 0xF0) {
+                        return;
+                    }
                     let t = clock.stamp();
                     let (room, local) = {
                         let s = s2.lock();
@@ -192,9 +219,11 @@ impl Midi {
         let pioneer = port_name.to_uppercase().contains("DDJ");
         let engine = self.engine.clone();
         let flag = stop.clone();
+        let outbox = self.outbox.clone();
+        outbox.lock().clear();
         let thread = std::thread::Builder::new()
             .name("tandem-controller".into())
-            .spawn(move || controller_loop(out, session, engine, flag, pioneer))?;
+            .spawn(move || controller_loop(out, session, engine, flag, pioneer, outbox))?;
         self.feedback = Some((stop, thread));
         Ok(())
     }
@@ -223,15 +252,16 @@ impl Midi {
 }
 
 /// The controller's clock: every 5 ms send gathered jog movement (scratch /
-/// search); every 25 ms update the jog-ring pitch bend, the lights, the
-/// level meters and the effects' BEATS lights; every 200 ms keep Pioneer
-/// controllers out of demo mode.
+/// search) and anything in `outbox`; every 25 ms update the jog-ring pitch
+/// bend, the lights, the level meters and the effects' BEATS lights; every
+/// 200 ms keep Pioneer controllers out of demo mode.
 fn controller_loop(
     mut out: Option<MidiOutputConnection>,
     session: SessionHandle,
     engine: Arc<Mutex<MidiEngine>>,
     stop: Arc<AtomicBool>,
     pioneer: bool,
+    outbox: Arc<Mutex<Vec<Vec<u8>>>>,
 ) {
     let mut sent: HashMap<(u8, u8), u8> = HashMap::new();
     let mut sent_meters: HashMap<(u8, u8), u8> = HashMap::new();
@@ -260,6 +290,10 @@ fn controller_loop(
             }
         }
         if let Some(o) = out.as_mut() {
+            let queued = std::mem::take(&mut *outbox.lock());
+            for msg in queued {
+                let _ = o.send(&msg);
+            }
             if pioneer && last_keepalive.elapsed() >= Duration::from_millis(200) {
                 let _ = o.send(&PIONEER_KEEPALIVE);
                 last_keepalive = Instant::now();

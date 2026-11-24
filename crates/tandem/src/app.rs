@@ -326,6 +326,8 @@ pub struct UiState {
     pub settings_tab: SettingsTab,
     /// The step-by-step controller setup, while it's open.
     pub wizard: Option<crate::ui_wizard::WizardUi>,
+    /// The DECK button check, while it's open.
+    pub deck_check: Option<crate::ui_deck_check::DeckCheckUi>,
     pub show_terms: bool,
     pub host_open: bool,
     pub join_open: bool,
@@ -378,6 +380,10 @@ pub struct UiState {
 /// first page, or N steps in with a pretend Pioneer doing them (`4:N`: a
 /// four-deck one with DECK buttons; `N!` then presses a button twice, to
 /// see it refused), or on its last page.
+/// `--dev-deck-check <start|software|hardware|quiet>[:N]` opens the DECK
+/// button check: on its first page, or with a pretend Denon SC Live 4
+/// whose DECK button works that way doing every step (up to step N;
+/// `hardware+map` then clicks "Map decks C and D").
 pub struct DevOpts {
     pub screenshot: Option<PathBuf>,
     pub shot_frame: u64,
@@ -395,6 +401,7 @@ pub struct DevOpts {
     pub zoom: Option<f32>,
     pub settings: Option<String>,
     pub wizard: Option<String>,
+    pub deck_check: Option<String>,
     pub crate_demo: bool,
     pub crate_step: u8,
     /// The window has been checked against the screen (`fit_window`).
@@ -519,6 +526,7 @@ impl TandemApp {
             show_settings: false,
             settings_tab: SettingsTab::Audio,
             wizard: None,
+            deck_check: None,
             show_terms: false,
             host_open: false,
             join_open: false,
@@ -1400,6 +1408,9 @@ impl TandemApp {
             }
             if let Some(how) = self.dev.wizard.clone() {
                 self.dev_wizard(&how);
+            }
+            if let Some(how) = self.dev.deck_check.clone() {
+                self.dev_deck_check(&how);
             }
         }
         if self.dev.demo {
