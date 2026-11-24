@@ -486,6 +486,42 @@ Work through these in order and note anything that fails. `tandem.log` (Settings
    - Leave an echo ringing on a deck with its fader down and load a new track onto it: is the load allowed, and does the tail ring on?
 4. **Small screens.** At 1280 × 641 (1080p at 150%): is the strip there with two decks, and with four decks are the effects shown on the waveforms? Click **FX** in the top bar: does the strip close and the library grow, with the playing decks still marked **FX**, and is it still closed next time Tandem starts?
 
+## Round 15 (v0.15): setting up a controller step by step
+
+- **Settings → Controller → Set up step by step…** goes through a controller one control at a time: "Press PLAY/PAUSE", "Slide the channel fader all the way down, then all the way up". You press or move the control and Tandem goes on to the next by itself. A drawing of a controller shows where each control is.
+  - First it asks what the controller has: two decks, two with DECK buttons for decks 3 and 4, or four; 8 or 4 pads; which sections (effects start left out). With controls mapped already, it asks whether to skip those or go through everything again.
+  - **Space** skips, **Shift + Space** skips the rest of a group, **Backspace** goes back, **Delete** unmaps, **Esc** closes and asks whether to keep what's mapped. Click a group in the list to go to it.
+  - It says what it heard and why it didn't take it: a knob where a button was wanted, a fader not left at its end, a control already used for something else (with a button to use it here instead).
+  - The last page lists what isn't mapped and has a **Try it** box that says what the control you touch does now. Nothing is saved before **Save and close**, and the old mapping is kept beside the new one as `.json.bak`.
+  - While it's open, the controller plays nothing in the room.
+- **It works these out, so nobody ticks boxes:** which way each fader and knob runs; how a jog wheel and the browse knob count and which way; a jog wheel's second message from its edge, and its ticks per turn; whether SHIFT and the pad modes change what the controller sends, or Tandem has to keep track of them; and the same for the DECK buttons.
+- **Decks that take turns.** On a controller whose DECK button changes nothing it sends (the Denon SC Live 4), decks A and C can now share one side's controls, and B and D the other's: Tandem keeps track of the DECK button itself. One button for both of a side's decks switches back and forth, and lights while the side is on C or D. Only the setup makes such a mapping so far; the SC Live 4's built-in mapping still has decks A and B only.
+- **The mapping list** in Settings → Controller is grouped by part of the controller, each group folded with "n of m mapped", and has the SHIFT + pad hot cue clears, which could only come from a built-in mapping before. A control with several messages (a jog wheel's top and edge) shows them all.
+- No change to the room or the mapping files' format: v0.15 shares rooms with v0.14, and older mapping files load as they are.
+
+### Test plan for the controller setup
+
+Not yet tried on a controller: the tests replay the built-in Pioneer, Denon and Hercules mappings through it as pretend controllers.
+
+1. **On the DDJ-FLX6, from nothing.** Copy your mapping file somewhere safe, then in Settings → Controller choose **Set up step by step…**, "Two decks, each with a DECK button", 8 pads, and "Go through every control again".
+   - Does every step take the control it names at the first try, and go on by itself? Which steps didn't?
+   - SHIFT: is it taken at the first step, and are SHIFT + CUE and SHIFT + SYNC taken as controls of their own (no "SHIFT +" in the line under the drawing)?
+   - Jog wheel by its edge: with your hand still on top, does it tell you to let go rather than take the top's message for the edge's?
+   - Jog wheel: hand on top, then turned by the edge. Does it say "counts around 64" both times, and count about 6,400 ticks for one full turn?
+   - Tempo fader left at +: is it taken, and not marked "inverted"? Is the channel fader?
+   - Does a fader you're still moving when the step changes get left alone, and does pressing PLAY again at the CUE step say it's already used?
+   - Pads: HOT CUE, then SHIFT + each pad, then BEAT LOOP mode, then BEAT JUMP mode for the rolls. Are all taken?
+   - DECK 3: after pressing it, do deck C's steps take the left deck's controls without asking whether the decks share them?
+   - On the last page, does **Try it** name each control you touch? After **Save and close**, does the controller play as it did with the built-in mapping (lights aside: the setup maps no level meters, and the Beat FX strip isn't part of it)? Is the old file there as `.json.bak`?
+   - Put your own mapping file back afterwards, or click **Reset to built-in mapping**.
+2. **On the DDJ-FLX6, with the built-in mapping.** Open the setup and choose "Skip the controls that are mapped": is it asked for the pitch bend buttons only (the one thing the built-in mapping lacks)? Skip them and save: is the mapping unchanged?
+3. **On a controller without a built-in mapping** (any MIDI controller, or a keyboard for the buttons).
+   - Do the questions on the first page make sense for it? Is anything it has missing from the steps, or asked for that no controller has?
+   - Are the words in the steps the ones printed on it? Tell us which weren't.
+   - Does the drawing help find the control, or mislead?
+4. **On the Denon SC Live 4** (with Nerg): choose "Two decks, each with a DECK button". After the DECK step for deck C, does the first control ask whether decks A and C share their controls? After saying yes, are the rest of deck C's controls filled in, and mixer channel 3 asked for? Saved: does DECK switch the left side between A and C, with the button lit on C?
+5. **Small screens.** At 1280 × 641 (1080p at 150%): does the whole window fit, buttons included?
+
 ## Next candidates
 
 Rough priority order:
