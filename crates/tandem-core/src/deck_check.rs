@@ -1015,11 +1015,15 @@ impl DeckCheck {
                 continue;
             };
             let deck = mixer - 2;
-            let Some(vol) = mapping.binding_for(Target::Volume { deck }) else {
+            // (The one like it, on a deck with several faders.)
+            let Some(vol) = mapping.bindings.iter().find(|b| {
+                b.target == Target::Volume { deck }
+                    && b.trigger.kind == heard.kind
+                    && b.trigger.number == heard.number
+            }) else {
                 continue;
             };
-            let same_kind = vol.trigger.kind == heard.kind && vol.trigger.number == heard.number;
-            if same_kind && vol.trigger.channel != heard.channel {
+            if vol.trigger.channel != heard.channel {
                 copy_channel(
                     &mut m,
                     mapping,

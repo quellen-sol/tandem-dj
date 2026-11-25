@@ -1016,8 +1016,96 @@ impl Mapping {
         self.jog_ticks_per_rev.unwrap_or(720.0).max(16.0) as f64
     }
 
+    /// The first control bound to `target` (there may be several).
     pub fn binding_for(&self, target: Target) -> Option<&Binding> {
         self.bindings.iter().find(|b| b.target == target)
+    }
+
+    /// Every control bound to `target`.
+    pub fn bound(&self, target: Target) -> impl Iterator<Item = &Binding> + '_ {
+        self.bindings.iter().filter(move |b| b.target == target)
+    }
+
+    /// Whether `target`'s controls aren't exactly the built-in preset's: the
+    /// DJ has changed them, added one or taken one away.
+    pub fn differs(&self, target: Target, preset: &Mapping) -> bool {
+        let mine: Vec<&Binding> = self.bound(target).collect();
+        let theirs: Vec<&Binding> = preset.bound(target).collect();
+        mine.len() != theirs.len() || theirs.iter().any(|b| !mine.contains(b))
+    }
+
+    /// Put `target` back on the built-in preset's controls (on none, if the
+    /// preset has none for it), and touch nothing else: a control the DJ has
+    /// on something else does both.
+    pub fn reset_target(&mut self, target: Target, preset: &Mapping) {
+        let at = self.bindings.iter().position(|b| b.target == target);
+        let at = at.unwrap_or(self.bindings.len());
+        self.bindings.retain(|b| b.target != target);
+        self.bindings.splice(at..at, preset.bound(target).cloned());
+    }
+
+    /// What else a binding's control does when it's pressed or moved.
+    pub fn also(&self, b: &Binding) -> Vec<Target> {
+        // (One DECK button for both of a side's decks does one thing.)
+        let toggles = |t: Target| {
+            matches!(
+                (t, b.target),
+                (Target::DeckSelect { deck: x }, Target::DeckSelect { deck: y })
+                    if side_of(x) == side_of(y)
+            )
+        };
+        let mut also = Vec::new();
+        for x in self.bindings.iter().filter(|x| x.overlaps(b)) {
+            if x.target != b.target && !toggles(x.target) && !also.contains(&x.target) {
+                also.push(x.target);
+            }
+        }
+        also
+    }
+
+    /// The tempo fader of deck `deck` that sends `trig`: the one bound to
+    /// it, or for a message that's bound to SHIFT + tempo fader, the one
+    /// that sends it with SHIFT held. With several tempo faders that's the
+    /// one whose own message it's most like (the same channel or number,
+    /// then the nearest number, then the one bound first), and each fader
+    /// has one such message before any has a second.
+    pub(crate) fn fader_behind(&self, deck: u8, trig: Trigger) -> Trigger {
+        let on = |target: Target| {
+            let mut v: Vec<Trigger> = Vec::new();
+            for b in self.bound(target) {
+                if !v.contains(&b.trigger) {
+                    v.push(b.trigger);
+                }
+            }
+            v
+        };
+        let faders = on(Target::Tempo { deck });
+        let mut shifts = on(Target::TempoShift { deck });
+        if !shifts.contains(&trig) {
+            shifts.push(trig);
+        }
+        let mut free = faders.clone();
+        for shifted in shifts {
+            let like = |f: &&Trigger| {
+                let same =
+                    (f.channel == shifted.channel) as u8 + (f.number == shifted.number) as u8;
+                (2 - same, f.number.abs_diff(shifted.number))
+            };
+            let mine = if faders.contains(&shifted) {
+                shifted
+            } else {
+                let of = if free.is_empty() { &faders } else { &free };
+                match of.iter().min_by_key(like) {
+                    Some(f) => *f,
+                    None => shifted,
+                }
+            };
+            free.retain(|f| *f != mine);
+            if shifted == trig {
+                return mine;
+            }
+        }
+        trig
     }
 
     /// A mapping saved from an older built-in preset: add the controls the
@@ -1105,7 +1193,11 @@ impl Mapping {
             return false;
         }
         let same = |a: &Binding, b: &Binding| a.trigger == b.trigger && a.target == b.target;
-        let known = |b: &Binding| preset.bindings.iter().any(|p| same(p, b));
+        // SHIFT + it, or it in another pad mode, is a control of the DJ's own.
+        let known = |b: &Binding| {
+            let own = |p: &Binding| (b.shift && !p.shift) || (b.mode.is_some() && b.mode != p.mode);
+            preset.bindings.iter().any(|p| same(p, b) && !own(p))
+        };
         if self.bindings.iter().filter(|b| known(b)).count() * 2 < self.bindings.len() {
             return false;
         }
@@ -1367,6 +1459,9 @@ pub enum MidiOut {
     BrowseBack,
     LoadSelected(u8),
     Learned(Binding),
+    /// A control was to be added to a target ([`MidiEngine::learn_adds`])
+    /// that it does already.
+    AlreadyBound(Binding),
 }
 
 /// Which of this booth's outputs play through the controller's own sound
@@ -1457,8 +1552,16 @@ pub fn is_controller_card(port: &str, device: &str) -> bool {
     key.len() >= 4 && squash(device).contains(&key)
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+/// One control on a target: where it is, and whether it's in control. A
+/// target with several controls has one of these for each.
+#[derive(Clone, Copy, Debug)]
 struct Takeover {
+    trigger: Trigger,
+    /// When it last said where it is (shared time, us).
+    at: i64,
+    /// Its reading is the first since another control on the target was
+    /// heard, and it was still meanwhile (see [`MidiEngine::heard`]).
+    back: bool,
     engaged: bool,
     last_sent: Option<f32>,
     last_hw: Option<f32>,
@@ -1469,17 +1572,36 @@ struct Takeover {
     /// tempo fader's after a DECK button gave it this deck back, an effect
     /// knob's after FX SELECT moved onto its slot.
     relearn: u8,
-    /// Tempo faders and effect knobs: the last relearned reading was a
-    /// coarse half, so a fine half straight after it is part of it. (Right
-    /// after connecting, a 14-bit fader or knob isn't known to be one until
-    /// its first fine half.)
+    /// The last relearned reading was a coarse half, so a fine half
+    /// straight after it is part of it. (Right after connecting, a 14-bit
+    /// control isn't known to be one until its first fine half.)
     relearn_fine: bool,
+}
+
+impl Takeover {
+    fn new(trigger: Trigger) -> Self {
+        Self {
+            trigger,
+            at: 0,
+            back: false,
+            engaged: false,
+            last_sent: None,
+            last_hw: None,
+            past_limit: 0.0,
+            relearn: 0,
+            relearn_fine: false,
+        }
+    }
 }
 
 pub struct MidiEngine {
     pub mapping: Mapping,
-    /// Set by the mapping screen; the next matching control you touch gets bound.
+    /// Set by the mapping screen; the next matching control you touch gets
+    /// bound, instead of the target's controls.
     pub learn: Option<Target>,
+    /// The control being learned joins the target's others, rather than
+    /// replacing them.
+    pub learn_adds: bool,
     /// The step-by-step setup, while it's open: it takes every message, and
     /// nothing reaches the room.
     pub wizard: Option<Wizard>,
@@ -1490,7 +1612,8 @@ pub struct MidiEngine {
     /// Which outputs play through the controller's own sound card (the app
     /// keeps it up to date).
     pub card: ControllerCard,
-    takeover: HashMap<Target, Takeover>,
+    /// Every control heard on each target, the one heard last at the end.
+    takeover: HashMap<Target, Vec<Takeover>>,
     msb: HashMap<(u8, u8), u8>,
     lsb: HashMap<(u8, u8), u8>,
     /// (channel, coarse CC) pairs seen sending a fine half on CC+32.
@@ -1522,7 +1645,8 @@ pub struct MidiEngine {
     shift: HashSet<Trigger>,
     /// Buttons held, and what pressing them did: letting go goes to the
     /// same targets, even if SHIFT or the pad mode changed in between (a
-    /// roll always ends when its pad is let go).
+    /// roll always ends when its pad is let go). What two of them hold ends
+    /// with the last one let go.
     held: HashMap<Trigger, Vec<Target>>,
     /// The deck whose effects each FX unit works (None: nothing). The room
     /// never sees units: only the actions they send.
@@ -1569,11 +1693,17 @@ const HAND_WINDOW_US: i64 = 20_000;
 const PLATTER_STILL_US: i64 = 50_000;
 /// Longest a released platter is left to turn by itself.
 const FREEWHEEL_MAX_US: i64 = 2_000_000;
+/// A fader or knob that has sent nothing for this long has been left alone.
+const CONTROL_STILL_US: i64 = 200_000;
+/// Further than this between two readings, a fader or knob was moved
+/// meanwhile without saying so.
+const CONTROL_STEP: f32 = 0.1;
 
 impl MidiEngine {
     pub fn new(mapping: Mapping, tempo_range: f64) -> Self {
         Self {
             learn: None,
+            learn_adds: false,
             wizard: None,
             tempo_range,
             quantize_loops: true,
@@ -1606,7 +1736,7 @@ impl MidiEngine {
     /// units where it powers on.
     pub fn load(&mut self, mapping: Mapping) {
         self.fx_deck = mapping_fx_decks(&mapping);
-        self.mapping = mapping;
+        self.edit(|m| *m = mapping);
         self.learn = None;
         self.wizard = None;
         self.pad_modes = [PadMode::default(); DECKS];
@@ -1614,6 +1744,29 @@ impl MidiEngine {
         self.shift.clear();
         self.held.clear();
         self.resend.clear();
+    }
+
+    /// Change the mapping in use, and forget where the controls were that
+    /// no longer work what they did.
+    pub fn edit(&mut self, change: impl FnOnce(&mut Mapping)) {
+        change(&mut self.mapping);
+        let bindings = &self.mapping.bindings;
+        self.takeover.retain(|target, controls| {
+            controls.retain(|t| {
+                bindings.iter().any(|b| {
+                    b.trigger == t.trigger
+                        && match (b.target, *target) {
+                            // Both keep their state under these targets.
+                            (Target::TempoShift { deck }, Target::Tempo { deck: d }) => deck == d,
+                            (Target::FxDepthAll { unit }, Target::FxDepth { unit: u, .. }) => {
+                                unit == u
+                            }
+                            (a, b) => a == b,
+                        }
+                })
+            });
+            !controls.is_empty()
+        });
     }
 
     /// The deck FX unit `unit` works, if any.
@@ -1675,7 +1828,9 @@ impl MidiEngine {
 
     /// The bindings a message on `trig` drives now: those whose deck is in
     /// their pad mode, and while SHIFT is held, the SHIFT + ones if the
-    /// control has any (otherwise SHIFT doesn't change what it does).
+    /// control has any (otherwise SHIFT doesn't change what it does). One
+    /// for each target, however many the control has on it (a pad bound in
+    /// one pad mode and in all of them).
     fn active(&self, trig: Trigger) -> Vec<Binding> {
         let shift = self.shift_held();
         let mut v: Vec<Binding> = self
@@ -1688,6 +1843,8 @@ impl MidiEngine {
         if shift && v.iter().any(|b| b.shift) {
             v.retain(|b| b.shift);
         }
+        let mut seen = HashSet::new();
+        v.retain(|b| seen.insert(b.target));
         v
     }
 
@@ -1754,20 +1911,25 @@ impl MidiEngine {
         out
     }
 
-    /// Tempo the hardware tempo fader is physically set to, if we've seen it.
+    /// Tempo the hardware tempo fader is physically set to, if we've seen it
+    /// (with several, the one moved last).
     pub fn hardware_tempo(&self, deck: u8) -> Option<f64> {
-        let v = self.takeover.get(&Target::Tempo { deck })?.last_hw?;
+        let v = self.moved_last(Target::Tempo { deck })?.last_hw?;
         Some(1.0 + (v as f64 - 0.5) * 2.0 * self.tempo_range)
     }
 
-    /// Targets whose hardware control hasn't "picked up" the room value yet.
-    /// (Never the tempo fader: it works relatively instead of waiting.)
+    /// Targets whose hardware control hasn't "picked up" the room value yet:
+    /// with several, the one moved last. (Never the tempo fader: it works
+    /// relatively instead of waiting.)
     pub fn waiting_for_pickup(&self) -> Vec<Target> {
         self.takeover
-            .iter()
-            .filter(|(k, _)| !matches!(k, Target::Tempo { .. }))
-            .filter(|(_, t)| !t.engaged && t.last_hw.is_some())
-            .map(|(k, _)| *k)
+            .keys()
+            .filter(|k| !matches!(k, Target::Tempo { .. }))
+            .filter(|k| {
+                self.moved_last(**k)
+                    .is_some_and(|t| !t.engaged && t.last_hw.is_some())
+            })
+            .copied()
             .collect()
     }
 
@@ -1832,12 +1994,25 @@ impl MidiEngine {
         };
         self.last_message = Some(raw.label());
 
+        // A button held since before learning or the setup started is let
+        // go in the room too, or it would go on holding its action there.
+        let mut out = Vec::new();
+        let release = match raw {
+            RawMidi::NoteOff { ch, note } => Some(Trigger::note(ch, note)),
+            RawMidi::Cc { ch, cc, val } if val < 64 => Some(Trigger::cc(ch, cc)),
+            _ => None,
+        };
+        let release = release.filter(|t| self.held.contains_key(t));
         if let Some(w) = self.wizard.as_mut() {
             w.feed(raw, t);
-            return Vec::new();
+            if let Some(trig) = release {
+                self.button(trig, false, room, &mut out);
+            }
+            return out;
         }
 
-        if let Some(target) = self.learn.filter(|&t| !self.modifier_message(raw, t)) {
+        let learning = self.learn.filter(|_| release.is_none());
+        if let Some(target) = learning.filter(|&t| !self.modifier_message(raw, t)) {
             // Only accept a message that suits the target: a fader can't be
             // learned from a button press, a jog not from its touch sensor.
             let trigger = self.learn_trigger(raw, target.kind());
@@ -1885,12 +2060,28 @@ impl MidiEngine {
                 light: None,
                 layered,
             };
-            self.mapping.bindings.retain(|b| b.target != target);
-            self.mapping.bindings.push(binding.clone());
+            if std::mem::take(&mut self.learn_adds) {
+                // What it has already counts if it works wherever this
+                // would.
+                let has = self.mapping.bindings.iter().any(|b| {
+                    b.target == target
+                        && b.overlaps(&binding)
+                        && (b.mode.is_none() || b.mode == binding.mode)
+                        && (!b.layered || binding.layered)
+                });
+                if has {
+                    return vec![MidiOut::AlreadyBound(binding)];
+                }
+                self.mapping.bindings.push(binding.clone());
+            } else {
+                self.edit(|m| {
+                    m.bindings.retain(|b| b.target != target);
+                    m.bindings.push(binding.clone());
+                });
+            }
             return vec![MidiOut::Learned(binding)];
         }
 
-        let mut out = Vec::new();
         match raw {
             RawMidi::NoteOn { ch, note, .. } => {
                 self.button(Trigger::note(ch, note), true, room, &mut out)
@@ -1954,6 +2145,10 @@ impl MidiEngine {
                 }
             }
             self.held.insert(trig, targets.clone());
+        } else {
+            // Another button still holds it. (SHIFT keeps count itself.)
+            let held = |t: &Target| self.held.values().any(|v| v.contains(t));
+            targets.retain(|t| *t == Target::Shift || !held(t));
         }
         for target in targets {
             match target {
@@ -1983,7 +2178,8 @@ impl MidiEngine {
                     let tempo = self.hardware_tempo(deck).unwrap_or(1.0);
                     out.push(MidiOut::Action(Action::Tempo { deck, tempo }));
                     // The fader is in control again straight away, no pickup.
-                    if let Some(t) = self.takeover.get_mut(&Target::Tempo { deck }) {
+                    let faders = self.takeover.get_mut(&Target::Tempo { deck });
+                    if let Some(t) = faders.and_then(|v| v.last_mut()) {
                         t.engaged = true;
                         t.last_sent = t.last_hw;
                     }
@@ -2133,11 +2329,12 @@ impl MidiEngine {
         };
         let on = !s.on;
         if on {
-            let t = self
-                .takeover
-                .entry(Target::FxDepth { unit, slot })
-                .or_default();
-            if let Some(v) = t.last_hw {
+            // (The knob moved last, of several.)
+            let knobs = self.takeover.get_mut(&Target::FxDepth { unit, slot });
+            if let Some((t, v)) = knobs
+                .and_then(|v| v.last_mut())
+                .and_then(|t| t.last_hw.map(|v| (t, v)))
+            {
                 t.engaged = true;
                 t.last_sent = Some(v);
                 if v != s.depth {
@@ -2155,15 +2352,15 @@ impl MidiEngine {
     /// changes its depth. The controller shows only the selected slot's
     /// lights, so they go out again.
     fn fx_focus(&mut self, unit: u8, slot: u8) {
-        let t = self
-            .takeover
-            .entry(Target::FxDepth { unit, slot })
-            .or_default();
-        t.relearn = 1;
-        t.relearn_fine = false;
-        // It may have been turned for another slot: a slot that's on waits
-        // for it to come back.
-        t.engaged = false;
+        let target = Target::FxDepth { unit, slot };
+        for trig in self.triggers(&[target, Target::FxDepthAll { unit }]) {
+            let t = self.control(target, trig);
+            t.relearn = 1;
+            t.relearn_fine = false;
+            // It may have been turned for another slot: a slot that's on
+            // waits for it to come back.
+            t.engaged = false;
+        }
         for b in &self.mapping.bindings {
             if b.target == (Target::FxOn { unit, slot }) && b.trigger.kind == MidiKind::Note {
                 self.resend
@@ -2321,7 +2518,7 @@ impl MidiEngine {
                     let v = if b.invert { 1.0 - v } else { v };
                     let fine = raw7.is_none() && trig.kind == MidiKind::Cc;
                     if let Target::Tempo { deck } = b.target {
-                        if let Some(tempo) = self.tempo_fader(deck, v, fine, room) {
+                        if let Some(tempo) = self.tempo_fader(deck, trig, v, fine, room) {
                             out.push(MidiOut::Action(Action::Tempo { deck, tempo }));
                         }
                         continue;
@@ -2331,7 +2528,8 @@ impl MidiEngine {
                         // SHIFT held can't tell the two apart: the plain
                         // fader wins.
                         if !bindings.iter().any(|x| x.target == Target::Tempo { deck }) {
-                            let t = self.tempo_takeover(deck);
+                            let fader = self.mapping.fader_behind(deck, trig);
+                            let t = self.heard(Target::Tempo { deck }, fader);
                             t.last_hw = Some(v);
                             t.past_limit = 0.0;
                         }
@@ -2339,19 +2537,20 @@ impl MidiEngine {
                     }
                     match b.target {
                         Target::FxDepth { unit, slot } => {
-                            self.fx_depth(unit, slot, v, fine, room, out);
+                            self.fx_depth(unit, slot, trig, v, fine, room, out);
                             continue;
                         }
                         Target::FxDepthAll { unit } => {
                             for slot in 0..FX_SLOTS as u8 {
-                                self.fx_depth(unit, slot, v, fine, room, out);
+                                self.fx_depth(unit, slot, trig, v, fine, room, out);
                             }
                             continue;
                         }
                         _ => {}
                     }
                     let current = self.current(b.target, room, local);
-                    if !self.pickup(b.target, v, current) {
+                    self.heard(b.target, trig);
+                    if !self.pickup(b.target, trig, v, current) {
                         continue;
                     }
                     let range = self.tempo_range;
@@ -2407,21 +2606,38 @@ impl MidiEngine {
     /// the first reading (both halves, on a 14-bit fader) only says where it
     /// is, and from there it works as above. So switching decks never makes
     /// a tempo jump, and the deck is usually off the fader afterwards.
-    fn tempo_fader(&mut self, deck: u8, v: f32, fine: bool, room: &RoomState) -> Option<f64> {
+    ///
+    /// A deck can have several faders, on `trig` and others, each with a
+    /// place of its own. Moving one after another was moved works the same
+    /// way: its first reading (`fine`: the fine half of one) only says where
+    /// it is, so a second fader, or one fader on two messages, never makes
+    /// the tempo jump either.
+    fn tempo_fader(
+        &mut self,
+        deck: u8,
+        trig: Trigger,
+        v: f32,
+        fine: bool,
+        room: &RoomState,
+    ) -> Option<f64> {
         /// Closer than this (0.05%) counts as "on the fader".
         const MATCH: f64 = 0.0005;
         let range = self.tempo_range;
         let at = |v: f32| 1.0 + (v as f64 - 0.5) * 2.0 * range;
         let d = room.decks.get(deck as usize)?;
         let current = d.tempo;
-        let t = self.tempo_takeover(deck);
+        let target = Target::Tempo { deck };
+        let untouched = !d.tempo_set && !self.set_here(target);
+        let t = self.heard(target, trig);
         let prev = t.last_hw.replace(v);
         if t.relearn > 0 {
             t.relearn -= 1;
             t.relearn_fine = t.relearn == 0 && !fine;
             return None;
         }
-        if std::mem::take(&mut t.relearn_fine) && fine {
+        if (std::mem::take(&mut t.relearn_fine) && fine) || t.back {
+            t.relearn_fine = !fine;
+            t.past_limit = 0.0;
             return None;
         }
         let past_limit = std::mem::take(&mut t.past_limit);
@@ -2432,7 +2648,7 @@ impl MidiEngine {
             // already there or nobody has touched the deck; otherwise we
             // only learn where it is.
             None if (hw - current).abs() < MATCH => hw,
-            None if t.last_sent.is_none() && !d.tempo_set && (current - 1.0).abs() < 1e-9 => hw,
+            None if untouched && (current - 1.0).abs() < 1e-9 => hw,
             None => {
                 t.relearn_fine = !fine;
                 return None;
@@ -2470,17 +2686,19 @@ impl MidiEngine {
     /// nothing to wait for. One that's on waits for the knob to pick its
     /// depth up, and never takes it just because nobody has moved it, so
     /// touching the knob never makes a running effect jump.
+    #[allow(clippy::too_many_arguments)]
     fn fx_depth(
         &mut self,
         unit: u8,
         slot: u8,
+        trig: Trigger,
         v: f32,
         fine: bool,
         room: &RoomState,
         out: &mut Vec<MidiOut>,
     ) {
         let target = Target::FxDepth { unit, slot };
-        let t = self.takeover.entry(target).or_default();
+        let t = self.heard(target, trig);
         if t.relearn > 0 || (t.relearn_fine && fine) {
             if fine {
                 t.relearn_fine = false;
@@ -2496,16 +2714,16 @@ impl MidiEngine {
             return;
         }
         let Some(deck) = self.fx_unit_deck(unit) else {
-            self.takeover.entry(target).or_default().last_hw = Some(v);
+            self.control(target, trig).last_hw = Some(v);
             return;
         };
         let Some(s) = room.decks[deck as usize].fx.slots.get(slot as usize) else {
             return;
         };
         let send = if s.on {
-            self.pickup(target, v, s.depth)
+            self.pickup(target, trig, v, s.depth)
         } else {
-            let t = self.takeover.entry(target).or_default();
+            let t = self.control(target, trig);
             (t.last_hw, t.last_sent, t.engaged) = (Some(v), Some(v), true);
             true
         };
@@ -2514,10 +2732,58 @@ impl MidiEngine {
         }
     }
 
-    /// Deck `deck`'s tempo fader. Its `last_hw` is where the fader
-    /// physically is, whichever message (with or without SHIFT) said so last.
-    fn tempo_takeover(&mut self, deck: u8) -> &mut Takeover {
-        self.takeover.entry(Target::Tempo { deck }).or_default()
+    /// The control on `target` that was moved last.
+    fn moved_last(&self, target: Target) -> Option<&Takeover> {
+        self.takeover.get(&target)?.last()
+    }
+
+    /// The control on `trig` that drives `target`. One that hasn't been
+    /// heard yet goes before the others.
+    fn control(&mut self, target: Target, trig: Trigger) -> &mut Takeover {
+        let controls = self.takeover.entry(target).or_default();
+        let at = controls.iter().position(|t| t.trigger == trig);
+        let at = at.unwrap_or_else(|| {
+            controls.insert(0, Takeover::new(trig));
+            0
+        });
+        &mut controls[at]
+    }
+
+    /// A reading from the control on `trig` that drives `target`: it's the
+    /// one moved last from now on. If another was moved since this one was,
+    /// and this one was left alone meanwhile, it's [`Takeover::back`]: the
+    /// two may be one fader that sends another message with SHIFT held, so
+    /// where it was before doesn't tell how far it has moved.
+    fn heard(&mut self, target: Target, trig: Trigger) -> &mut Takeover {
+        let now = self.now;
+        let controls = self.takeover.entry(target).or_default();
+        let at = controls.iter().position(|t| t.trigger == trig);
+        let mut t = match at {
+            Some(at) => controls.remove(at),
+            None => Takeover::new(trig),
+        };
+        let since = &controls[at.unwrap_or(0)..];
+        t.back = since.iter().any(|o| o.last_hw.is_some()) && now - t.at > CONTROL_STILL_US;
+        t.at = now;
+        controls.push(t);
+        let last = controls.len() - 1;
+        &mut controls[last]
+    }
+
+    /// Whether a control on `target` has set it from here.
+    fn set_here(&self, target: Target) -> bool {
+        let controls = self.takeover.get(&target);
+        controls.is_some_and(|c| c.iter().any(|t| t.last_sent.is_some()))
+    }
+
+    /// The controls bound to any of `targets`.
+    fn triggers(&self, targets: &[Target]) -> Vec<Trigger> {
+        self.mapping
+            .bindings
+            .iter()
+            .filter(|b| targets.contains(&b.target))
+            .map(|b| b.trigger)
+            .collect()
     }
 
     /// A DECK button gave its side to `deck`. The side's tempo fader drove
@@ -2544,10 +2810,15 @@ impl MidiEngine {
                 self.msb.remove(&(b.trigger.channel, b.trigger.number));
             }
         }
-        let t = self.tempo_takeover(deck);
-        t.last_hw = None;
-        t.past_limit = 0.0;
-        t.relearn = if hires { 2 } else { 1 };
+        let target = Target::Tempo { deck };
+        for trig in self.triggers(&[target, Target::TempoShift { deck }]) {
+            let fader = self.mapping.fader_behind(deck, trig);
+            let t = self.control(target, fader);
+            t.last_hw = None;
+            t.past_limit = 0.0;
+            t.relearn = if hires { 2 } else { 1 };
+            t.relearn_fine = false;
+        }
     }
 
     /// Where the control currently is in the room, in 0..1 fader units.
@@ -2586,8 +2857,11 @@ impl MidiEngine {
         (current - default).abs() < 1e-6
     }
 
-    fn pickup(&mut self, target: Target, v: f32, current: f32) -> bool {
-        let t = self.takeover.entry(target).or_default();
+    /// Whether the control on `trig`, which was just heard at `v`, is in
+    /// control of `target`, now at `current`.
+    fn pickup(&mut self, target: Target, trig: Trigger, v: f32, current: f32) -> bool {
+        let untouched = !self.set_here(target);
+        let t = self.control(target, trig);
         if t.engaged {
             if let Some(sent) = t.last_sent {
                 if (current - sent).abs() > 0.02 {
@@ -2598,11 +2872,12 @@ impl MidiEngine {
         if !t.engaged {
             let crossed = t
                 .last_hw
+                .filter(|h| !t.back || (v - h).abs() < CONTROL_STEP)
                 .map(|h| (h - current).signum() != (v - current).signum())
                 .unwrap_or(false);
             if (v - current).abs() < 0.04
                 || crossed
-                || (t.last_sent.is_none() && Self::pristine(target, current))
+                || (untouched && Self::pristine(target, current))
             {
                 t.engaged = true;
             }
@@ -7342,6 +7617,829 @@ mod tests {
             matches!(&out[..], [MidiOut::Learned(b)] if !b.layered),
             "{out:?}"
         );
+    }
+
+    // Several controls on one target.
+
+    /// Plays messages in, `dt` ms after one another from `t`, and lets the
+    /// room follow. Returns everything they sent.
+    fn play(
+        e: &mut MidiEngine,
+        room: &mut RoomState,
+        t: &mut i64,
+        dt: i64,
+        msgs: &[[u8; 3]],
+    ) -> Vec<MidiOut> {
+        let local = LocalParams::default();
+        let mut all = Vec::new();
+        for m in msgs {
+            *t += dt * 1000;
+            for o in e.handle_at(m, *t, room, &local) {
+                if let MidiOut::Action(a) = &o {
+                    room.apply(&crate::model::Event {
+                        time: *t,
+                        origin: 1,
+                        seq: *t as u64 + all.len() as u64,
+                        action: a.clone(),
+                    });
+                }
+                all.push(o);
+            }
+        }
+        all
+    }
+
+    /// The largest change of deck A's tempo from one message to the next.
+    fn biggest_step(
+        e: &mut MidiEngine,
+        room: &mut RoomState,
+        t: &mut i64,
+        msgs: &[[u8; 3]],
+    ) -> f64 {
+        let mut most = 0.0f64;
+        for m in msgs {
+            let before = room.decks[0].tempo;
+            play(e, room, t, 5, &[*m]);
+            most = most.max((room.decks[0].tempo - before).abs());
+        }
+        most
+    }
+
+    /// The learned bindings of a target, in order.
+    fn on(e: &MidiEngine, target: Target) -> Vec<Trigger> {
+        e.mapping.bound(target).map(|b| b.trigger).collect()
+    }
+
+    /// A 7-bit fader on MIDI channel 4, CC 0x1A (the FLX6 has none), from `from` to `to`.
+    fn knob4(from: u8, to: u8) -> Vec<[u8; 3]> {
+        let mut v: Vec<u8> = (from.min(to)..=from.max(to)).collect();
+        if from > to {
+            v.reverse();
+        }
+        v.into_iter().map(|x| [0xB3, 0x1A, x]).collect()
+    }
+
+    #[test]
+    fn two_tempo_faders_move_the_tempo_from_where_it_is() {
+        let mut e = MidiEngine::new(builtin_preset("DDJ-FLX6").unwrap(), 0.08);
+        e.mapping
+            .bind(Trigger::cc(3, 0x1A), Target::Tempo { deck: 0 });
+        let (mut room, mut t) = (RoomState::default(), 1_000_000);
+        // The first fader sets the deck, to +4%.
+        play(
+            &mut e,
+            &mut room,
+            &mut t,
+            5,
+            &fader(0, 0, CENTRE, CENTRE, 1),
+        );
+        play(
+            &mut e,
+            &mut room,
+            &mut t,
+            5,
+            &fader(0, 0, CENTRE, 12288, 20),
+        );
+        let first = room.decks[0].tempo;
+        assert!((first - (1.0 + (12288.0 / 16383.0 - 0.5) * 0.16)).abs() < 1e-9);
+        // The second is at the bottom: its first reading only says so, and
+        // from there the tempo moves by as much as it does.
+        t += 2_000_000;
+        assert_eq!(play(&mut e, &mut room, &mut t, 5, &knob4(0, 0)), []);
+        let step = 0.16 / 127.0 + 1e-6;
+        assert!(biggest_step(&mut e, &mut room, &mut t, &knob4(1, 20)) < step);
+        let want = first + 20.0 * 0.16 / 127.0;
+        assert!((room.decks[0].tempo - want).abs() < 1e-6);
+        // SHIFT + SYNC goes to the one moved last.
+        let hw = e.hardware_tempo(0).unwrap();
+        assert!((hw - (1.0 + (20.0 / 127.0 - 0.5) * 0.16)).abs() < 1e-6);
+        // Back on the first, which hasn't moved since: no jump either way
+        // (the fader's own steps are far smaller than the 8% between them).
+        t += 2_000_000;
+        let before = room.decks[0].tempo;
+        let down = fader(0, 0, 12288, 8000, 100);
+        let most = biggest_step(&mut e, &mut room, &mut t, &down);
+        assert!(most < 0.0015, "{most}");
+        // (The first pair said where it was: 1/100 of the way.)
+        let want = before + (8000.0 - (12288.0 - 42.88)) / 16383.0 * 0.16;
+        assert!((room.decks[0].tempo - want).abs() < 2e-5);
+        // Both moved at once, message about message: each moves the tempo
+        // by what it moved itself.
+        let before = room.decks[0].tempo;
+        let (a, b) = (fader(0, 0, 8000, 9000, 20), knob4(21, 40));
+        t += 2_000_000;
+        play(&mut e, &mut room, &mut t, 5, &knob4(20, 20));
+        play(&mut e, &mut room, &mut t, 5, &fader(0, 0, 8000, 8000, 1));
+        let mixed: Vec<[u8; 3]> = a
+            .chunks(2)
+            .zip(b)
+            .flat_map(|(a, b)| [a[0], a[1], b])
+            .collect();
+        play(&mut e, &mut room, &mut t, 3, &mixed);
+        let want = before + (1000.0 / 16383.0 + 20.0 / 127.0) * 0.16;
+        assert!((room.decks[0].tempo - want).abs() < 1e-4);
+        // SHIFT + SYNC, with the second moved last, and the deck is on it.
+        play(
+            &mut e,
+            &mut room,
+            &mut t,
+            5,
+            &[[0x90, FLX6_SHIFT_SYNC, 127]],
+        );
+        let at = |v: f64| 1.0 + (v / 127.0 - 0.5) * 0.16;
+        assert!((room.decks[0].tempo - at(40.0)).abs() < 1e-6);
+        play(&mut e, &mut room, &mut t, 5, &knob4(41, 50));
+        assert!((room.decks[0].tempo - at(50.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_fader_with_two_messages_counts_each_move_once() {
+        // The FLX6's tempo fader, its SHIFT message added as a tempo fader
+        // too: it's one fader, whichever message it sends.
+        let mut e = MidiEngine::new(builtin_preset("DDJ-FLX6").unwrap(), 0.08);
+        e.learn = Some(Target::Tempo { deck: 0 });
+        e.learn_adds = true;
+        let local = LocalParams::default();
+        e.handle(&[0xB0, 0x05, 64], &RoomState::default(), &local);
+        assert_eq!(
+            on(&e, Target::Tempo { deck: 0 }),
+            [Trigger::cc(0, 0x00), Trigger::cc(0, 0x05)]
+        );
+        let (mut room, mut t) = (RoomState::default(), 1_000_000);
+        play(
+            &mut e,
+            &mut room,
+            &mut t,
+            5,
+            &fader(0, 0, CENTRE, CENTRE, 1),
+        );
+        play(&mut e, &mut room, &mut t, 5, &fader(0, 0, CENTRE, 4096, 40));
+        t += 1_000_000;
+        play(&mut e, &mut room, &mut t, 5, &fader(0, 5, 4096, 9000, 40));
+        t += 1_000_000;
+        let back = fader(0, 0, 9000, 6000, 40);
+        let most = biggest_step(&mut e, &mut room, &mut t, &back);
+        assert!(most < 0.0015, "{most}");
+        // Where the fader is, but for what its two first readings (1/40 of
+        // a move each) only said.
+        let at = |p: f64| 1.0 + (p / 16383.0 - 0.5) * 0.16;
+        let slack = (4904.0 + 3000.0) / 40.0 / 16383.0 * 0.16 + 1e-4;
+        assert!((room.decks[0].tempo - at(6000.0)).abs() < slack);
+    }
+
+    #[test]
+    fn shift_moves_the_tempo_fader_that_sent_it() {
+        let cc = Trigger::cc;
+        let mut e = MidiEngine::new(builtin_preset("DDJ-FLX6").unwrap(), 0.08);
+        e.mapping.bind(cc(3, 0x1A), Target::Tempo { deck: 0 });
+        let (mut room, mut t) = (RoomState::default(), 1_000_000);
+        play(
+            &mut e,
+            &mut room,
+            &mut t,
+            5,
+            &fader(0, 0, CENTRE, CENTRE, 1),
+        );
+        play(&mut e, &mut room, &mut t, 5, &knob4(10, 14));
+        let tempo = room.decks[0].tempo;
+        // SHIFT + the first fader moves it alone, and no tempo.
+        assert_eq!(
+            play(&mut e, &mut room, &mut t, 5, &fader(0, 5, CENTRE, 2000, 30)),
+            []
+        );
+        // It goes on from there without a jump, and so does the second.
+        let most = biggest_step(&mut e, &mut room, &mut t, &fader(0, 0, 2000, 3000, 30));
+        assert!(most > 0.0 && most < 0.0015, "{most}");
+        let moved = room.decks[0].tempo - tempo;
+        assert!((moved - 1000.0 / 16383.0 * 0.16).abs() < 1e-5, "{moved}");
+        let most = biggest_step(&mut e, &mut room, &mut t, &knob4(15, 30));
+        assert!(most > 0.0 && most < 0.16 / 127.0 + 1e-6, "{most}");
+
+        // Which fader a SHIFT message comes from.
+        let tempo = Target::Tempo { deck: 0 };
+        let shift = Target::TempoShift { deck: 0 };
+        let of = |m: &Mapping, t: Trigger| m.fader_behind(0, t);
+        let flx6 = builtin_preset("DDJ-FLX6").unwrap();
+        assert_eq!(of(&flx6, cc(0, 0x05)), cc(0, 0x00));
+        assert_eq!(of(&e.mapping, cc(0, 0x05)), cc(0, 0x00));
+        assert_eq!(of(&e.mapping, cc(3, 0x1A)), cc(3, 0x1A));
+        // The same message with SHIFT held (SC Live 4), and another channel
+        // (Inpulse 200 MK2).
+        let mut sc = builtin_preset("SC LIVE 4").unwrap();
+        sc.bind(cc(3, 0x1A), tempo);
+        assert_eq!(of(&sc, cc(4, 0x1F)), cc(4, 0x1F));
+        let mut inpulse = builtin_preset("DJControl Inpulse 200 Mk2").unwrap();
+        inpulse.bind(cc(1, 0x00), tempo);
+        assert_eq!(of(&inpulse, cc(4, 0x08)), cc(1, 0x08));
+        // Two faders with a SHIFT message each, bound in any order.
+        let mut m = Mapping::empty("test");
+        for (t, target) in [
+            (cc(0, 0x21), tempo),
+            (cc(0, 0x00), tempo),
+            (cc(0, 0x05), shift),
+            (cc(0, 0x26), shift),
+        ] {
+            m.bind(t, target);
+        }
+        assert_eq!(of(&m, cc(0, 0x05)), cc(0, 0x00));
+        assert_eq!(of(&m, cc(0, 0x26)), cc(0, 0x21));
+        // SHIFT + tempo fader on its own, and one nothing is bound to.
+        let mut m = Mapping::empty("test");
+        m.bind(cc(0, 0x05), shift);
+        assert_eq!(of(&m, cc(0, 0x05)), cc(0, 0x05));
+    }
+
+    #[test]
+    fn a_deck_switch_forgets_where_every_tempo_fader_was() {
+        let mut e = MidiEngine::new(builtin_preset("DDJ-FLX6").unwrap(), 0.08);
+        e.mapping
+            .bind(Trigger::cc(3, 0x1A), Target::Tempo { deck: 0 });
+        let (mut room, mut t) = (RoomState::default(), 1_000_000);
+        play(&mut e, &mut room, &mut t, 5, &fader(0, 0, CENTRE, 4096, 10));
+        play(&mut e, &mut room, &mut t, 5, &knob4(60, 64));
+        let a = room.decks[0].tempo;
+        // Deck 3, where the fader goes to the top, and back to deck 1.
+        play(&mut e, &mut room, &mut t, 5, &[[0x92, 0x3C, 0x7F]]);
+        play(&mut e, &mut room, &mut t, 5, &fader(2, 0, 4096, 16000, 10));
+        play(&mut e, &mut room, &mut t, 5, &[[0x90, 0x3C, 0x7F]]);
+        assert_eq!(e.hardware_tempo(0), None);
+        let up = fader(0, 0, 16000, 16383, 10);
+        assert_eq!(play(&mut e, &mut room, &mut t, 5, &up[..2]), []);
+        assert!(biggest_step(&mut e, &mut room, &mut t, &up[2..]) < 0.0015);
+        t += 1_000_000;
+        assert!(biggest_step(&mut e, &mut room, &mut t, &knob4(10, 30)) < 0.0013);
+        assert!((room.decks[0].tempo - a).abs() < 0.03);
+    }
+
+    #[test]
+    fn two_faders_on_a_volume_each_pick_it_up() {
+        let mut e = engine();
+        let target = Target::Volume { deck: 0 };
+        e.mapping.bind(Trigger::cc(0, 0x13), target);
+        e.mapping.bind(Trigger::cc(3, 0x1A), target);
+        let (mut room, mut t) = (RoomState::default(), 1_000_000);
+        let a = |v: u8| [0xB0, 0x13, v];
+        // The first sets it (nobody has touched it).
+        play(&mut e, &mut room, &mut t, 5, &[a(100), a(102)]);
+        assert_eq!(room.decks[0].volume, 102.0 / 127.0);
+        assert_eq!(e.waiting_for_pickup(), []);
+        // The second, at the bottom, waits until it gets there.
+        t += 1_000_000;
+        assert_eq!(play(&mut e, &mut room, &mut t, 5, &knob4(5, 90)), []);
+        assert_eq!(e.waiting_for_pickup(), [target]);
+        // (The first still has it, and moving it says nothing of waiting.)
+        assert_eq!(play(&mut e, &mut room, &mut t, 5, &[a(103)]).len(), 1);
+        assert_eq!(e.waiting_for_pickup(), []);
+        play(&mut e, &mut room, &mut t, 5, &knob4(91, 110));
+        assert_eq!(room.decks[0].volume, 110.0 / 127.0);
+        assert_eq!(e.waiting_for_pickup(), []);
+        play(&mut e, &mut room, &mut t, 5, &knob4(109, 20));
+        assert_eq!(room.decks[0].volume, 20.0 / 127.0);
+        // The first, where it was left, doesn't pull it back up…
+        t += 1_000_000;
+        assert_eq!(
+            play(&mut e, &mut room, &mut t, 5, &[a(101), a(99), a(60), a(40)]),
+            []
+        );
+        assert_eq!(e.waiting_for_pickup(), [target]);
+        // …but picks it up when it comes to it, and goes on from there.
+        let out = play(&mut e, &mut room, &mut t, 5, &[a(21), a(18), a(30)]);
+        assert_eq!(out.len(), 3);
+        assert_eq!(room.decks[0].volume, 30.0 / 127.0);
+        assert_eq!(e.waiting_for_pickup(), []);
+
+        // Neither has the value: moving one and then the other, on either
+        // side of it, isn't crossing it.
+        room.decks[0].volume = 0.5;
+        for _ in 0..4 {
+            assert_eq!(play(&mut e, &mut room, &mut t, 5, &[a(10)]), []);
+            assert_eq!(play(&mut e, &mut room, &mut t, 5, &knob4(120, 120)), []);
+        }
+        // Nor does one take it because it's back where nobody had moved it.
+        let mut e = engine();
+        e.mapping.bind(Trigger::cc(0, 0x13), target);
+        e.mapping.bind(Trigger::cc(3, 0x1A), target);
+        let mut room = RoomState::default();
+        play(&mut e, &mut room, &mut t, 5, &[a(60), a(127)]);
+        assert_eq!(room.decks[0].volume, 1.0);
+        assert_eq!(play(&mut e, &mut room, &mut t, 5, &knob4(3, 4)), []);
+    }
+
+    #[test]
+    fn a_fader_on_two_messages_doesnt_cross_where_it_hasnt_been() {
+        // One fader that sends another message with SHIFT held, with both
+        // on the volume: moved with SHIFT, then the partner moves the
+        // volume. Without SHIFT it isn't where that message left it.
+        let mut e = engine();
+        let target = Target::Volume { deck: 0 };
+        e.mapping.bind(Trigger::cc(0, 0x13), target);
+        e.mapping.bind(Trigger::cc(3, 0x1A), target);
+        let (mut room, mut t) = (RoomState::default(), 1_000_000);
+        let a = |v: u8| [0xB0, 0x13, v];
+        play(&mut e, &mut room, &mut t, 5, &[a(30), a(25)]);
+        t += 1_000_000;
+        play(&mut e, &mut room, &mut t, 5, &knob4(25, 110));
+        assert_eq!(room.decks[0].volume, 110.0 / 127.0);
+        room.decks[0].volume = 0.5;
+        t += 1_000_000;
+        assert_eq!(play(&mut e, &mut room, &mut t, 5, &[a(111), a(112)]), []);
+        // Coming down to it, it picks it up.
+        let down: Vec<[u8; 3]> = (60..112).rev().map(a).collect();
+        assert!(!play(&mut e, &mut room, &mut t, 5, &down).is_empty());
+    }
+
+    #[test]
+    fn two_knobs_on_an_effect_dont_fight() {
+        let mut e = flx6();
+        e.mapping
+            .bind(Trigger::cc(3, 0x1A), Target::FxDepth { unit: 0, slot: 0 });
+        let (mut room, mut t) = (fx_room(), 1_000_000);
+        // Off, it takes whichever moves; the same reading again isn't one.
+        let depth = |room: &RoomState| room.decks[0].fx.slots[0].depth;
+        play(&mut e, &mut room, &mut t, 5, &knob4(90, 100));
+        assert_eq!(depth(&room), 100.0 / 127.0);
+        play(&mut e, &mut room, &mut t, 5, &[[0xB4, 0x02, 20]]);
+        assert_eq!(depth(&room), 20.0 / 127.0);
+        assert_eq!(play(&mut e, &mut room, &mut t, 5, &knob4(100, 100)), []);
+        // On: the knob moved last has it (that was the second one again,
+        // where it was), and the other waits.
+        play(&mut e, &mut room, &mut t, 5, &[[0x94, 0x47, 0x7F]]);
+        assert!(room.decks[0].fx.slots[0].on);
+        assert_eq!(depth(&room), 100.0 / 127.0);
+        t += 1_000_000;
+        let strip = |v: u8| [0xB4, 0x02, v];
+        assert_eq!(
+            play(&mut e, &mut room, &mut t, 5, &[strip(21), strip(60)]),
+            []
+        );
+        play(&mut e, &mut room, &mut t, 5, &knob4(99, 80));
+        assert_eq!(depth(&room), 80.0 / 127.0);
+        // FX SELECT: each one's next reading only says where it is.
+        play(&mut e, &mut room, &mut t, 5, &[[0x94, 0x70, 0x7F]]);
+        assert_eq!(play(&mut e, &mut room, &mut t, 5, &[strip(79)]), []);
+        assert_eq!(play(&mut e, &mut room, &mut t, 5, &knob4(40, 40)), []);
+        assert_eq!(depth(&room), 80.0 / 127.0);
+    }
+
+    #[test]
+    fn what_two_buttons_hold_ends_with_the_last_one_let_go() {
+        let d = 0u8;
+        let held = [
+            Target::Cue { deck: d },
+            Target::HotCue { deck: d, slot: 2 },
+            Target::Roll { deck: d, size: 3 },
+            Target::BendUp { deck: d },
+            Target::BendDown { deck: d },
+            Target::JogTouch { deck: d },
+        ];
+        for target in held {
+            let mut e = engine();
+            e.mapping.bind(Trigger::note(0, 1), target);
+            e.mapping.bind(Trigger::cc(0, 0x40), target);
+            let mut room = RoomState::default();
+            room.decks[0].track = Some(crate::model::TrackId([1; 32]));
+            room.decks[0].duration = 100.0;
+            let mut t = 1_000_000;
+            let name = target.label();
+            let note = |v: u8| [0x90, 1, v];
+            let cc = |v: u8| [0xB0, 0x40, v];
+            let down = play(&mut e, &mut room, &mut t, 5, &[note(127)]);
+            assert_eq!(down.len(), 1, "{name}");
+            play(&mut e, &mut room, &mut t, 5, &[cc(127)]);
+            // Either one first.
+            assert_eq!(
+                play(&mut e, &mut room, &mut t, 5, &[note(0)]),
+                [],
+                "{name} is still held"
+            );
+            assert_eq!(play(&mut e, &mut room, &mut t, 5, &[cc(0)]).len(), 1);
+            play(&mut e, &mut room, &mut t, 5, &[note(127), cc(127)]);
+            assert_eq!(play(&mut e, &mut room, &mut t, 5, &[cc(0)]), []);
+            let up = play(&mut e, &mut room, &mut t, 5, &[note(0)]);
+            let [MidiOut::Action(up)] = &up[..] else {
+                panic!("{name}: {up:?}");
+            };
+            let ends = match target {
+                Target::Cue { deck } => *up == Action::CueUp { deck },
+                Target::HotCue { deck, slot } => *up == Action::HotCueUp { deck, slot },
+                Target::Roll { .. } => matches!(up, Action::Roll { on: false, .. }),
+                Target::JogTouch { .. } => matches!(up, Action::JogTouch { down: false, .. }),
+                _ => matches!(up, Action::Bend { bend, .. } if *bend == 0.0),
+            };
+            assert!(ends, "{name}: {up:?}");
+            // Everything let go at once ends it once.
+            play(&mut e, &mut room, &mut t, 5, &[note(127), cc(127)]);
+            assert_eq!(e.let_go(&room).len(), 1, "{name}");
+            assert!(e.let_go(&room).is_empty());
+        }
+    }
+
+    #[test]
+    fn two_shifts_and_two_toggles() {
+        let mut e = engine();
+        for ch in [0, 1] {
+            e.mapping.bind(Trigger::note(ch, 0x3F), Target::Shift);
+            e.mapping
+                .bind(Trigger::note(ch, 0x0B), Target::Play { deck: 0 });
+            e.mapping
+                .bind(Trigger::note(ch, 0x0C), Target::Pfl { deck: 0 });
+        }
+        send(&mut e, [0x90, 0x3F, 127]);
+        send(&mut e, [0x91, 0x3F, 127]);
+        send(&mut e, [0x90, 0x3F, 0]);
+        assert!(e.shift_held());
+        send(&mut e, [0x91, 0x3F, 0]);
+        assert!(!e.shift_held());
+        // A toggle turns over once for each press, however they overlap.
+        let mut room = RoomState::default();
+        room.decks[0].track = Some(crate::model::TrackId([1; 32]));
+        let mut t = 1_000_000;
+        let press = |ch: u8| [0x90 | ch, 0x0B, 127];
+        for (msg, playing) in [(press(0), true), (press(1), false), (press(1), true)] {
+            let out = play(&mut e, &mut room, &mut t, 5, &[msg]);
+            assert_eq!(out.len(), 1);
+            assert_eq!(room.decks[0].playing, playing);
+        }
+        assert_eq!(tap(&mut e, 0x90, 0x0C), [MidiOut::TogglePfl(0)]);
+        assert_eq!(tap(&mut e, 0x91, 0x0C), [MidiOut::TogglePfl(0)]);
+        // Both buttons' lights follow.
+        let lit = |e: &MidiEngine, on: bool| {
+            let local = LocalParams {
+                pfl: [on; DECKS],
+                ..LocalParams::default()
+            };
+            e.leds(&RoomState::default(), &local)
+                .into_iter()
+                .filter(|(k, _)| k.1 == 0x0C)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(lit(&e, true), [((0x90, 0x0C), true), ((0x91, 0x0C), true)]);
+        assert_eq!(
+            lit(&e, false),
+            [((0x90, 0x0C), false), ((0x91, 0x0C), false)]
+        );
+        // One message on one target twice (a pad in every mode, and in the
+        // one it's in) is still one press.
+        let again = e.mapping.bindings[1].clone();
+        assert_eq!(again.target, Target::Play { deck: 0 });
+        e.mapping.bindings.push(again);
+        assert_eq!(tap(&mut e, 0x90, 0x0B).len(), 1);
+    }
+
+    #[test]
+    fn a_button_held_when_learning_starts_is_let_go() {
+        let mut e = engine();
+        let cue = Target::Cue { deck: 0 };
+        e.mapping.bind(Trigger::note(0, 1), cue);
+        e.mapping.bind(Trigger::note(0, 2), cue);
+        send(&mut e, [0x90, 1, 127]);
+        e.learn = Some(Target::Play { deck: 0 });
+        assert_eq!(send(&mut e, [0x90, 1, 0]), act(Action::CueUp { deck: 0 }));
+        assert_eq!(e.learn, Some(Target::Play { deck: 0 }), "still learning");
+        e.learn = None;
+        // So the other button's release isn't held up.
+        send(&mut e, [0x90, 2, 127]);
+        assert_eq!(send(&mut e, [0x90, 2, 0]), act(Action::CueUp { deck: 0 }));
+        // The same for the step-by-step setup.
+        send(&mut e, [0x90, 1, 127]);
+        e.wizard = Some(Wizard::new(e.mapping.clone(), Default::default()));
+        assert_eq!(send(&mut e, [0x90, 1, 0]), act(Action::CueUp { deck: 0 }));
+        assert_eq!(send(&mut e, [0x90, 1, 127]), []);
+        assert_eq!(send(&mut e, [0x90, 1, 0]), []);
+    }
+
+    #[test]
+    fn controls_are_added_and_taken_away_one_by_one() {
+        let mut e = engine();
+        let play = Target::Play { deck: 0 };
+        let note = |n: u8| Trigger::note(0, n);
+        let add = |e: &mut MidiEngine, target: Target, adds: bool, n: u8| {
+            (e.learn, e.learn_adds) = (Some(target), adds);
+            let out = send(e, [0x90, n, 127]);
+            send(e, [0x80, n, 0]);
+            out
+        };
+        // Learn, then two more.
+        for (n, adds) in [(1, false), (2, true), (3, true)] {
+            let out = add(&mut e, play, adds, n);
+            assert!(matches!(&out[..], [MidiOut::Learned(b)] if b.trigger == note(n)));
+            assert_eq!((e.learn, e.learn_adds), (None, false));
+        }
+        assert_eq!(on(&e, play), [note(1), note(2), note(3)]);
+        for n in 1..=3 {
+            assert_eq!(tap(&mut e, 0x90, n), act(Action::Play { deck: 0 }));
+        }
+        // One it has already: nothing changes, and it says so.
+        let before = e.mapping.clone();
+        let out = add(&mut e, play, true, 2);
+        assert!(matches!(&out[..], [MidiOut::AlreadyBound(b)] if b.trigger == note(2)));
+        assert_eq!((e.learn, e.learn_adds), (None, false));
+        assert_eq!(e.mapping, before);
+        // One that does something else does both, and it's named.
+        add(&mut e, Target::Cue { deck: 1 }, false, 4);
+        add(&mut e, play, true, 4);
+        let both = e.mapping.bound(play).last().unwrap().clone();
+        assert_eq!(e.mapping.also(&both), [Target::Cue { deck: 1 }]);
+        assert_eq!(send(&mut e, [0x90, 4, 127]).len(), 2);
+        send(&mut e, [0x80, 4, 0]);
+        let first = e.mapping.bound(play).next().unwrap();
+        assert_eq!(e.mapping.also(first), []);
+        // With SHIFT held it's another control.
+        e.mapping.bind(Trigger::note(0, 9), Target::Shift);
+        send(&mut e, [0x90, 9, 127]);
+        let out = add(&mut e, play, true, 1);
+        assert!(
+            matches!(&out[..], [MidiOut::Learned(b)] if b.shift),
+            "{out:?}"
+        );
+        send(&mut e, [0x80, 9, 0]);
+        assert_eq!(on(&e, play).len(), 5);
+        // Taking one away leaves the others.
+        e.edit(|m| m.bindings.retain(|b| b.trigger != note(2)));
+        assert_eq!(on(&e, play), [note(1), note(3), note(4), note(1)]);
+        assert_eq!(tap(&mut e, 0x90, 2), []);
+        assert_eq!(tap(&mut e, 0x90, 3), act(Action::Play { deck: 0 }));
+        // Learn puts one in place of them all.
+        add(&mut e, play, false, 5);
+        assert_eq!(on(&e, play), [note(5)]);
+        assert_eq!(on(&e, Target::Cue { deck: 1 }), [note(4)]);
+    }
+
+    #[test]
+    fn a_control_taken_away_is_forgotten() {
+        let mut e = MidiEngine::new(builtin_preset("DDJ-FLX6").unwrap(), 0.08);
+        let (tempo, volume) = (Target::Tempo { deck: 0 }, Target::Volume { deck: 1 });
+        e.mapping.bind(Trigger::cc(3, 0x14), tempo);
+        e.mapping.bind(Trigger::cc(3, 0x15), volume);
+        let (mut room, mut t) = (RoomState::default(), 1_000_000);
+        room.decks[1].volume = 0.5;
+        play(&mut e, &mut room, &mut t, 5, &fader(0, 0, CENTRE, 4096, 3));
+        let first = e.hardware_tempo(0);
+        play(&mut e, &mut room, &mut t, 5, &[[0xB3, 0x14, 3]]);
+        play(&mut e, &mut room, &mut t, 5, &[[0xB3, 0x15, 3]]);
+        assert_ne!(e.hardware_tempo(0), first);
+        assert_eq!(e.waiting_for_pickup(), [volume]);
+        e.edit(|m| {
+            m.bindings
+                .retain(|b| b.trigger.number < 0x14 || b.trigger.channel != 3)
+        });
+        assert_eq!(e.hardware_tempo(0), first, "the fader that's left");
+        assert_eq!(e.waiting_for_pickup(), []);
+    }
+
+    #[test]
+    fn upgrades_keep_the_controls_the_dj_added() {
+        let preset = builtin_preset("DDJ-FLX6").unwrap();
+        let play = Target::Play { deck: 0 };
+        // An FLX6 mapping from before effects, with a second PLAY, a spare
+        // message of the strip as a third, and PLAY's own button gone.
+        let mut saved = preset.clone();
+        saved.preset_version = 12;
+        saved.bindings.retain(|b| b.target.part() != Part::Fx);
+        saved
+            .bindings
+            .retain(|b| b.target != Target::Sync { deck: 1 });
+        saved.bind(Trigger::note(0, 0x7A), play);
+        saved.bind(Trigger::note(4, 0x47), play);
+        let mut up = saved.clone();
+        assert!(up.upgrade_from(&preset) > 0);
+        let of = |m: &Mapping, target| m.bound(target).map(|b| b.trigger).collect::<Vec<_>>();
+        assert_eq!(
+            of(&up, play),
+            [
+                Trigger::note(0, 0x0B),
+                Trigger::note(0, 0x7A),
+                Trigger::note(4, 0x47)
+            ]
+        );
+        assert_eq!(of(&up, Target::FxOn { unit: 0, slot: 0 }), [], "in use");
+        assert_eq!(of(&up, Target::FxOn { unit: 0, slot: 1 }).len(), 1);
+        for b in &saved.bindings {
+            assert!(up.bindings.contains(b), "{}", b.label());
+        }
+        // What the DJ takes away from here on stays away.
+        up.bindings.retain(|b| b.trigger != Trigger::note(0, 0x0B));
+        let json = serde_json::to_string(&up).unwrap();
+        let mut again: Mapping = serde_json::from_str(&json).unwrap();
+        assert_eq!(again.upgrade_from(&preset), 0);
+        assert!(!again.adopt(&preset));
+        assert_eq!(again, up);
+
+        // An SC Live 4 mapping from before decks C and D, with a second
+        // PLAY and a second volume: the PLAY takes turns as the first does.
+        let preset = builtin_preset("SC LIVE 4").unwrap();
+        let mut saved = sc_live_4_preset_13();
+        let added = Trigger::note(4, 0x60);
+        saved.bind(added, play);
+        saved.bind(Trigger::cc(6, 0x20), Target::Volume { deck: 0 });
+        assert!(saved.upgrade_from(&preset) > 0);
+        assert_eq!(of(&saved, play), [Trigger::note(4, 0x0A), added]);
+        assert_eq!(of(&saved, Target::Play { deck: 2 }).len(), 2);
+        assert_eq!(of(&saved, Target::Volume { deck: 0 }).len(), 2);
+        let mut e = MidiEngine::new(saved, 0.08);
+        assert_eq!(tap(&mut e, 0x94, 0x60), act(Action::Play { deck: 0 }));
+        tap(&mut e, 0x94, 0x1F);
+        assert_eq!(tap(&mut e, 0x94, 0x60), act(Action::Play { deck: 2 }));
+
+        // One that becomes the preset: an added control, one added with
+        // SHIFT held and a pad added in another pad mode are all kept.
+        let mut made: Mapping = serde_json::from_str(SC_LIVE_4_FILE).unwrap();
+        made.bind(added, play);
+        made.bind(Trigger::note(4, 0x0A), play).shift = true;
+        let pad = Trigger::note(5, 0x0F);
+        made.bind(pad, Target::HotCue { deck: 1, slot: 0 }).mode = Some(PadMode::Rolls);
+        assert!(made.adopt(&preset));
+        let has = |t, shift, mode| {
+            made.bindings
+                .iter()
+                .any(|b| (b.trigger, b.shift, b.mode) == (t, shift, mode) && b.layered)
+        };
+        assert!(has(added, false, None));
+        assert!(has(Trigger::note(4, 0x0A), true, None));
+        assert!(has(Trigger::note(4, 0x0A), false, None));
+        assert!(has(pad, false, Some(PadMode::Rolls)));
+    }
+
+    #[test]
+    fn several_controls_are_saved_as_before() {
+        let mut m = Mapping::empty("test");
+        m.bind(Trigger::note(0, 1), Target::Play { deck: 0 });
+        m.bind(Trigger::note(0, 2), Target::Play { deck: 0 });
+        m.bind(Trigger::cc(0, 3), Target::Jog { deck: 0 }).invert = true;
+        let json = serde_json::to_value(&m).unwrap();
+        assert_eq!(serde_json::from_value::<Mapping>(json.clone()).unwrap(), m);
+        // Only what every version of Tandem has known a binding to be.
+        for b in json["bindings"].as_array().unwrap() {
+            let keys: Vec<&String> = b.as_object().unwrap().keys().collect();
+            assert_eq!(keys, ["invert", "rel", "target", "trigger"]);
+        }
+    }
+
+    #[test]
+    fn resetting_one_control_puts_the_presets_back() {
+        // An SC Live 4 with its jog wheel learned again, on the CC it was
+        // on, counting wrong; and calibrated.
+        let preset = builtin_preset("SC LIVE 4").unwrap();
+        let mut e = MidiEngine::new(preset.clone(), 0.08);
+        e.mapping.jog_ticks_per_rev = Some(1012.0);
+        e.mapping.scratch_sensitivity = 1.5;
+        let target = Target::Jog { deck: 0 };
+        e.mapping.bindings.retain(|b| b.target != target);
+        e.mapping.bind(Trigger::cc(4, 0x36), target).layered = true;
+        assert!(e.mapping.differs(target, &preset));
+        let others: Vec<Target> = Target::all();
+        let others: Vec<&Target> = others.iter().filter(|t| **t != target).collect();
+        assert!(others.iter().all(|t| !e.mapping.differs(**t, &preset)));
+        let (mut room, mut t) = (RoomState::default(), 1_000_000);
+        room.decks[0].track = Some(crate::model::TrackId([1; 32]));
+        room.decks[0].duration = 100.0;
+        // One tick forwards went 63 back.
+        play(&mut e, &mut room, &mut t, 5, &[[0xB4, 0x36, 1]]);
+        assert!(matches!(
+            e.flush(None)[..],
+            [Action::Nudge { deck: 0, delta }] if delta < 0.0
+        ));
+        e.edit(|m| m.reset_target(target, &preset));
+        assert!(!e.mapping.differs(target, &preset));
+        assert_eq!(lacks(&preset, &e.mapping), [] as [String; 0]);
+        assert_eq!(lacks(&e.mapping, &preset), [] as [String; 0]);
+        assert_eq!(e.mapping.jog_ticks_per_rev, Some(1012.0));
+        assert_eq!(e.mapping.scratch_sensitivity, 1.5);
+        play(&mut e, &mut room, &mut t, 5, &[[0xB4, 0x36, 1]]);
+        assert!(matches!(
+            e.flush(None)[..],
+            [Action::Nudge { deck: 0, delta }] if delta > 0.0
+        ));
+
+        // Its every part counts as different: the control itself, invert,
+        // the style, SHIFT, the pad mode, the light and taking turns.
+        let jog = preset.binding_for(target).unwrap().clone();
+        let pad = Target::HotCue { deck: 0, slot: 0 };
+        let pad = preset.binding_for(pad).unwrap().clone();
+        let other = Trigger::cc(9, 9);
+        let changed = [
+            (
+                Binding {
+                    trigger: other,
+                    ..jog.clone()
+                },
+                &jog,
+            ),
+            (
+                Binding {
+                    invert: true,
+                    ..jog.clone()
+                },
+                &jog,
+            ),
+            (
+                Binding {
+                    rel: RelMode::Offset64,
+                    ..jog.clone()
+                },
+                &jog,
+            ),
+            (
+                Binding {
+                    shift: true,
+                    ..jog.clone()
+                },
+                &jog,
+            ),
+            (
+                Binding {
+                    layered: false,
+                    ..jog.clone()
+                },
+                &jog,
+            ),
+            (
+                Binding {
+                    mode: None,
+                    ..pad.clone()
+                },
+                &pad,
+            ),
+            (
+                Binding {
+                    light: None,
+                    ..pad.clone()
+                },
+                &pad,
+            ),
+        ];
+        for (b, was) in changed {
+            let mut m = preset.clone();
+            *m.bindings.iter_mut().find(|x| *x == was).unwrap() = b.clone();
+            assert!(m.differs(b.target, &preset), "{b:?}");
+            m.reset_target(b.target, &preset);
+            assert_eq!(m, preset);
+        }
+
+        // Added to, taken away, and something the preset hasn't got.
+        let mut m = preset.clone();
+        let (cue, back) = (Target::Cue { deck: 1 }, Target::BrowseBack);
+        m.bind(Trigger::note(5, 0x60), cue);
+        m.bindings.retain(|b| b.target != Target::Crossfader);
+        m.bind(Trigger::note(15, 0x40), back);
+        let differ = |m: &Mapping| {
+            let all = Target::all().into_iter();
+            all.filter(|t| m.differs(*t, &preset)).collect::<Vec<_>>()
+        };
+        assert_eq!(differ(&m), [cue, Target::Crossfader, back]);
+        m.reset_target(back, &preset);
+        assert_eq!(m.binding_for(back), None);
+        m.reset_target(cue, &preset);
+        assert_eq!(differ(&m), [Target::Crossfader]);
+        m.reset_target(Target::Crossfader, &preset);
+        assert_eq!(lacks(&preset, &m), [] as [String; 0]);
+        assert_eq!(m.bindings.len(), preset.bindings.len());
+
+        // A control the DJ has on something else does both afterwards, and
+        // says so, until that's reset as well.
+        let mut m = preset.clone();
+        let play = Target::Play { deck: 0 };
+        let theirs = preset.binding_for(play).unwrap().clone();
+        m.bindings.retain(|b| b.target != play && b.target != cue);
+        m.bind(theirs.trigger, cue);
+        m.reset_target(play, &preset);
+        assert_eq!(m.binding_for(play), Some(&theirs));
+        assert_eq!(m.also(&theirs), [cue]);
+        m.reset_target(cue, &preset);
+        assert_eq!(m.also(&theirs), []);
+    }
+
+    #[test]
+    fn every_preset_resets_row_by_row_and_no_control_does_two_things() {
+        for port in [
+            "DDJ-FLX6",
+            "DDJ-FLX4",
+            "SC LIVE 4",
+            "DJControl Inpulse 200 Mk2",
+        ] {
+            let preset = builtin_preset(port).unwrap();
+            // (Two decks that take turns, or a DECK button for both, isn't
+            // one control doing two things.)
+            for b in &preset.bindings {
+                assert_eq!(preset.also(b), [], "{port}: {}", b.label());
+            }
+            // Everything changed, then reset one target at a time.
+            let mut m = preset.clone();
+            for b in &mut m.bindings {
+                b.trigger.channel = 15 - b.trigger.channel;
+                b.invert = !b.invert;
+            }
+            m.jog_ticks_per_rev = Some(321.0);
+            for t in Target::all() {
+                assert_eq!(m.differs(t, &preset), preset.binding_for(t).is_some());
+                m.reset_target(t, &preset);
+                assert!(!m.differs(t, &preset));
+            }
+            assert_eq!(lacks(&preset, &m), [] as [String; 0]);
+            assert_eq!(lacks(&m, &preset), [] as [String; 0]);
+            assert_eq!(m.bindings.len(), preset.bindings.len());
+            assert_eq!(m.jog_ticks_per_rev, Some(321.0));
+        }
     }
 
     #[test]

@@ -44,6 +44,7 @@ enum Do {
     Clear,
     Accept,
     Confirm,
+    More,
     Jump(usize),
     End,
     Resume,
@@ -150,6 +151,8 @@ impl TandemApp {
                     Some(Do::Clear)
                 } else if i.key_pressed(Key::Enter) {
                     Some(Do::Accept)
+                } else if i.key_pressed(Key::A) {
+                    Some(Do::More)
                 } else {
                     None
                 }
@@ -193,6 +196,7 @@ impl TandemApp {
                 }
             }
             (Do::Confirm, Some(w)) => w.confirm(),
+            (Do::More, Some(w)) => w.more(),
             (Do::Jump(g), Some(w)) => w.jump(g),
             (Do::End, Some(w)) => w.end(),
             (Do::Resume, Some(w)) => w.resume(),
@@ -393,13 +397,17 @@ fn step_page(
                     });
                 }
                 if let Some(b) = w.bound(step) {
-                    ui.label(
-                        RichText::new(format!(
-                            "Now: {b}. Do the step to change it, or skip it to keep it."
-                        ))
-                        .small()
-                        .weak(),
-                    );
+                    let text = if w.adding() {
+                        format!("Now: {b}. Do the step with another control to add it, or skip.")
+                    } else {
+                        format!("Now: {b}. Do the step to change it, or skip it to keep it.")
+                    };
+                    let text = RichText::new(text).small();
+                    ui.label(if w.adding() {
+                        text.color(AMBER)
+                    } else {
+                        text.weak()
+                    });
                 }
             },
         );
@@ -421,6 +429,11 @@ fn step_page(
                         if let Some(action) = &said.action {
                             if ui.button(format!("{action} (Enter)")).clicked() {
                                 *act = Some(Do::Accept);
+                            }
+                        } else if w.more_for().is_some_and(|m| m != i) {
+                            let r = ui.button("+ Another control does this too (A)");
+                            if r.clicked() {
+                                *act = Some(Do::More);
                             }
                         }
                     }
@@ -459,6 +472,14 @@ fn step_page(
             "On to the next part of the controller (Shift + Space)",
             Do::SkipGroup,
         );
+        if w.more_for() == Some(i) {
+            button(
+                ui,
+                "+ Another control (A)",
+                "Add another control that does this too (A)",
+                Do::More,
+            );
+        }
         if step.state.mapped() {
             button(
                 ui,

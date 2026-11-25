@@ -6,7 +6,7 @@ use crate::output;
 use eframe::egui::{self, Color32, RichText};
 use std::net::IpAddr;
 use tandem_core::config::{FrameRate, Route};
-use tandem_core::mapping::{RelMode, Target};
+use tandem_core::mapping::{builtin_preset, Binding, Mapping, MidiEngine, RelMode, Target};
 use tandem_core::session::{SessionView, ShareState};
 use tandem_core::terms::{
     self, ConsentRecord, TERMS_SUMMARY, TERMS_TEXT, TERMS_TITLE, TERMS_VERSION,
@@ -637,6 +637,7 @@ impl TandemApp {
             return;
         }
         let mut changed = false;
+        let preset = self.midi.port.as_deref().and_then(builtin_preset);
         let room = self.session.lock().latest();
         let engine_arc = self.midi.engine.clone();
         let mut engine = engine_arc.lock();
@@ -696,19 +697,38 @@ impl TandemApp {
                 .add(egui::Slider::new(&mut engine.mapping.jog_sensitivity, 0.1..=5.0).logarithmic(true))
                 .changed();
         });
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             match &engine.mapping.preset {
                 Some(p) => ui.label(
                     RichText::new(format!("Started from the built-in {p} mapping.")).small(),
                 ),
                 None => ui.label(RichText::new("Custom mapping.").small()),
             };
-            let port = self.midi.port.clone().unwrap_or_default();
-            if let Some(preset) = tandem_core::mapping::builtin_preset(&port) {
-                if ui.small_button("Reset to built-in mapping").clicked() {
-                    engine.mapping = preset;
-                    changed = true;
+            if let Some(preset) = &preset {
+                // It can't be undone, so it asks first.
+                let asked = egui::Id::new("reset-whole-mapping");
+                let mut asking = ui.data(|d| d.get_temp(asked).unwrap_or(false));
+                if !asking {
+                    asking = ui
+                        .small_button("Reset the whole mapping…")
+                        .on_hover_text("Every control, the jog calibration and the jog settings, back to the built-in mapping. To put back one control, use Reset beside it in the list.")
+                        .clicked();
+                } else {
+                    ui.label(
+                        RichText::new("Every control, the jog calibration and the jog settings go back, and there's no undo:")
+                            .small()
+                            .color(AMBER),
+                    );
+                    if ui.small_button("Reset everything").clicked() {
+                        engine.edit(|m| *m = preset.clone());
+                        changed = true;
+                        asking = false;
+                    }
+                    if ui.small_button("Cancel").clicked() {
+                        asking = false;
+                    }
                 }
+                ui.data_mut(|d| d.insert_temp(asked, asking));
             }
             ui.label(
                 RichText::new(if self.midi.has_output {
@@ -775,8 +795,12 @@ impl TandemApp {
                     .color(AMBER),
             );
         }
+        let back = match &preset {
+            Some(_) => "; Reset puts the built-in one back",
+            None => "",
+        };
         ui.label(
-            RichText::new("To change one control, open its group below and click Learn, then press or move the control on your controller. If your SHIFT or pad mode buttons are mapped here, hold SHIFT or pick the pad mode first: the control then does it only with SHIFT, or only in that pad mode. Faders pick up once they reach the current value, so you never jump over your partner. Tempo faders never wait: when SYNC has moved the tempo they move it relatively (SHIFT + SYNC puts the deck back on the fader). SHIFT + tempo fader moves the fader but not the tempo, so you can slide it back and keep going.")
+            RichText::new(format!("To change one control, open its group below and click Learn, then press or move the control on your controller. + Add gives an action another control as well, and ✖ takes one off it{back}. If your SHIFT or pad mode buttons are mapped here, hold SHIFT or pick the pad mode first: the control then does it only with SHIFT, or only in that pad mode. Faders pick up once they reach the current value, so you never jump over your partner. Tempo faders never wait: when SYNC has moved the tempo they move it relatively (SHIFT + SYNC puts the deck back on the fader). SHIFT + tempo fader moves the fader but not the tempo, so you can slide it back and keep going."))
                 .small()
                 .weak(),
         );
@@ -800,11 +824,17 @@ impl TandemApp {
             ),
         ];
         for (target, what, output, it, on_card, device) in levels {
-            if engine.mapping.binding_for(target).is_none() {
+            let knobs = engine.mapping.bound(target).count();
+            if knobs == 0 {
                 continue;
             }
             let name = target.label();
             let text = match device {
+                _ if on_card && knobs > 1 => format!(
+                    "{name} controls: {output} through this controller's own sound card, and its own knob \
+                     turns {it} up and down there by itself, so they all leave Tandem's {what} level alone."
+                ),
+                _ if knobs > 1 => format!("{name} controls: each sets Tandem's {what} level."),
                 _ if on_card => format!(
                     "{name} knob: {output} through this controller's own sound card, and the knob \
                      turns {it} up and down there by itself, so it leaves Tandem's {what} level alone."
@@ -828,66 +858,69 @@ impl TandemApp {
         let learning = engine.learn;
         let list_h = (ui.ctx().screen_rect().height() - 430.0).clamp(150.0, 380.0);
         let all = Target::all();
-        egui::ScrollArea::vertical().max_height(list_h).auto_shrink([false, true]).show(ui, |ui| {
-            // One header for each part of the controller (see `Target::group`).
-            let mut from = 0;
-            while from < all.len() {
-                let group = all[from].group();
-                let to = (from..all.len()).find(|&i| all[i].group() != group).unwrap_or(all.len());
-                let targets = &all[from..to];
-                from = to;
-                let mapped = targets.iter().filter(|t| engine.mapping.binding_for(**t).is_some()).count();
-                let title = format!("{} · {mapped} of {} mapped", group.0.title(group.1), targets.len());
-                // The group of the control being learned stays open.
-                let open = targets.iter().any(|t| learning == Some(*t)).then_some(true);
-                egui::CollapsingHeader::new(title).id_salt(("mapping-group", group)).open(open).show(ui, |ui| {
-                    egui::Grid::new(("mapping", group)).num_columns(4).striped(true).show(ui, |ui| {
-                        for &target in targets {
-                            ui.label(target.label());
-                            let labels: Vec<String> = engine.mapping.bindings.iter().filter(|b| b.target == target).map(|b| b.label()).collect();
-                            if labels.is_empty() {
-                                ui.label(RichText::new("-").weak());
-                            } else {
-                                ui.monospace(labels.join(", "));
-                            }
-                            ui.horizontal(|ui| {
-                                let is_learning = learning == Some(target);
-                                let b = egui::Button::new(if is_learning { "Move a control…" } else { "Learn" }).selected(is_learning);
-                                if ui.add(b).clicked() {
-                                    engine.learn = if is_learning { None } else { Some(target) };
-                                }
-                                if !labels.is_empty() && ui.small_button("✖").on_hover_text("Clear").clicked() {
-                                    engine.mapping.bindings.retain(|b| b.target != target);
-                                    changed = true;
-                                }
-                            });
-                            ui.horizontal(|ui| {
-                                // A control with several messages (a jog wheel's top and edge) runs the same way on all of them.
-                                let Some(first) = engine.mapping.binding_for(target).cloned() else {
-                                    return;
-                                };
-                                let (mut invert, mut two) = (first.invert, first.rel == RelMode::TwosComplement);
-                                let mut edited = false;
-                                if target.is_relative() {
-                                    edited |= ui.checkbox(&mut two, "1/127 style").on_hover_text("Tick this if the wheel/encoder moves the wrong way or jumps").changed();
-                                }
-                                if target.is_absolute() || target.is_relative() {
-                                    edited |= ui.checkbox(&mut invert, "invert").changed();
-                                }
-                                if edited {
-                                    for b in engine.mapping.bindings.iter_mut().filter(|b| b.target == target) {
-                                        b.invert = invert;
-                                        b.rel = if two { RelMode::TwosComplement } else { RelMode::Offset64 };
-                                    }
-                                    changed = true;
-                                }
-                            });
-                            ui.end_row();
-                        }
+        egui::ScrollArea::vertical()
+            .max_height(list_h)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                // One header for each part of the controller (see `Target::group`).
+                let mut from = 0;
+                while from < all.len() {
+                    let group = all[from].group();
+                    let to = (from..all.len())
+                        .find(|&i| all[i].group() != group)
+                        .unwrap_or(all.len());
+                    let targets = &all[from..to];
+                    from = to;
+                    let mapped = targets
+                        .iter()
+                        .filter(|t| engine.mapping.binding_for(**t).is_some())
+                        .count();
+                    let mut title = format!(
+                        "{} · {mapped} of {} mapped",
+                        group.0.title(group.1),
+                        targets.len()
+                    );
+                    let changes = preset.as_ref().map_or(0, |p| {
+                        targets
+                            .iter()
+                            .filter(|t| engine.mapping.differs(**t, p))
+                            .count()
                     });
-                });
-            }
-        });
+                    if changes > 0 {
+                        title.push_str(&format!(" · {changes} changed"));
+                    }
+                    // The group of the control being learned stays open.
+                    let open = targets.iter().any(|t| learning == Some(*t)).then_some(true);
+                    egui::CollapsingHeader::new(title)
+                        .id_salt(("mapping-group", group))
+                        .open(open)
+                        .show(ui, |ui| {
+                            // Each control has a line, and a target's lines share a stripe.
+                            let lines = |t: &Target| engine.mapping.bound(*t).count().max(1);
+                            let stripes: Vec<bool> = targets
+                                .iter()
+                                .enumerate()
+                                .flat_map(|(i, t)| std::iter::repeat_n(i % 2 == 1, lines(t)))
+                                .collect();
+                            let stripe = move |row: usize, style: &egui::Style| {
+                                stripes
+                                    .get(row)
+                                    .copied()
+                                    .unwrap_or(false)
+                                    .then_some(style.visuals.faint_bg_color)
+                            };
+                            egui::Grid::new(("mapping", group))
+                                .num_columns(5)
+                                .with_row_color(stripe)
+                                .show(ui, |ui| {
+                                    for &target in targets {
+                                        changed |=
+                                            mapping_rows(ui, &mut engine, target, preset.as_ref());
+                                    }
+                                });
+                        });
+                }
+            });
         drop(engine);
         if changed {
             self.midi.save_mapping(&self.paths.mappings_dir);
@@ -982,6 +1015,131 @@ impl TandemApp {
                 .weak(),
         );
     }
+}
+
+/// How a control of the mapping list is shown: "CC 0x36 · ch 5, 1/127
+/// style".
+fn control_label(b: &Binding) -> String {
+    let mut s = b.label();
+    if b.target.is_relative() && b.rel == RelMode::TwosComplement {
+        s.push_str(", 1/127 style");
+    }
+    if b.invert {
+        s.push_str(", inverted");
+    }
+    s
+}
+
+/// One target of the mapping list: its buttons, and a line for each of its
+/// controls. Returns whether it changed the mapping.
+fn mapping_rows(
+    ui: &mut egui::Ui,
+    engine: &mut MidiEngine,
+    target: Target,
+    preset: Option<&Mapping>,
+) -> bool {
+    let controls: Vec<(usize, Binding)> = engine
+        .mapping
+        .bindings
+        .iter()
+        .cloned()
+        .enumerate()
+        .filter(|(_, b)| b.target == target)
+        .collect();
+    let (mut remove, mut reset, mut changed) = (None, None, false);
+    ui.label(target.label());
+    ui.horizontal(|ui| {
+        let learning = engine.learn == Some(target);
+        let mut learn = |ui: &mut egui::Ui, text: &str, adds: bool, hover: &str| {
+            let on = learning && engine.learn_adds == adds;
+            if learning && !on {
+                // The one that's waiting is enough, and wide.
+                return;
+            }
+            let b = egui::Button::new(if on { "Move a control…" } else { text }).selected(on);
+            if ui.add(b).on_hover_text(hover).clicked() {
+                engine.learn = (!on).then_some(target);
+                engine.learn_adds = adds && !on;
+            }
+        };
+        let mut hover = "Press or move the control that does this";
+        if !controls.is_empty() {
+            hover = "Press or move the control that does this, instead of what's here";
+        }
+        learn(ui, "Learn", false, hover);
+        if !controls.is_empty() {
+            let hover = "Press or move another control that does this too";
+            learn(ui, "+ Add", true, hover);
+        }
+        if let Some(preset) = preset.filter(|p| engine.mapping.differs(target, p)) {
+            let theirs: Vec<String> = preset.bound(target).map(control_label).collect();
+            let hover = match &theirs[..] {
+                [] => "The built-in mapping has nothing here: this clears it".into(),
+                [one] => format!("Back to the built-in control: {one}"),
+                more => format!("Back to the built-in controls:\n{}", more.join("\n")),
+            };
+            if ui.button("Reset").on_hover_text(hover).clicked() {
+                reset = Some(preset);
+            }
+        }
+    });
+    if controls.is_empty() {
+        ui.label(RichText::new("-").weak());
+        ui.end_row();
+    }
+    for (n, (i, b)) in controls.iter().enumerate() {
+        if n > 0 {
+            ui.label("");
+            ui.label("");
+        }
+        ui.monospace(b.label());
+        if ui
+            .small_button("✖")
+            .on_hover_text("Take this control off it")
+            .clicked()
+        {
+            remove = Some(*i);
+        }
+        ui.horizontal(|ui| {
+            let (mut invert, mut two) = (b.invert, b.rel == RelMode::TwosComplement);
+            let mut edited = false;
+            if target.is_relative() {
+                edited |= ui
+                    .checkbox(&mut two, "1/127 style")
+                    .on_hover_text("Tick this if the wheel/encoder moves the wrong way or jumps")
+                    .changed();
+            }
+            if target.is_absolute() || target.is_relative() {
+                edited |= ui.checkbox(&mut invert, "invert").changed();
+            }
+            if edited {
+                let b = &mut engine.mapping.bindings[*i];
+                b.invert = invert;
+                b.rel = if two {
+                    RelMode::TwosComplement
+                } else {
+                    RelMode::Offset64
+                };
+                changed = true;
+            }
+            let also: Vec<String> = engine.mapping.also(b).iter().map(Target::label).collect();
+            if !also.is_empty() {
+                let text = format!("also does {}", also.join(", "));
+                ui.label(RichText::new(text).small().color(AMBER));
+            }
+        });
+        ui.end_row();
+    }
+    if let Some(preset) = reset {
+        engine.edit(|m| m.reset_target(target, preset));
+        changed = true;
+    } else if let Some(i) = remove {
+        engine.edit(|m| {
+            m.bindings.remove(i);
+        });
+        changed = true;
+    }
+    changed
 }
 
 fn route_editor(

@@ -1329,12 +1329,19 @@ impl TandemApp {
                 }
                 MidiOut::Learned(b) => {
                     self.midi.save_mapping(&self.paths.mappings_dir);
-                    self.toast(format!(
-                        "Mapped {} to {}",
-                        b.trigger.label(),
-                        b.target.label()
-                    ));
+                    let also = self.midi.engine.lock().mapping.also(&b);
+                    let mut text = format!("Mapped {} to {}", b.trigger.label(), b.target.label());
+                    if !also.is_empty() {
+                        let also: Vec<String> = also.iter().map(|t| t.label()).collect();
+                        text.push_str(&format!(" (it also does {})", also.join(" and ")));
+                    }
+                    self.toast(text);
                 }
+                MidiOut::AlreadyBound(b) => self.toast(format!(
+                    "{} does {} already: nothing added",
+                    b.label(),
+                    b.target.label()
+                )),
                 _ => {}
             }
         }

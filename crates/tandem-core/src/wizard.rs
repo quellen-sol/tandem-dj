@@ -397,6 +397,10 @@ pub struct Wizard {
     count: i64,
     said: Option<Said>,
     offer: Option<Offer>,
+    /// The step whose control [`Wizard::said`] says was just taken.
+    taken: Option<usize>,
+    /// The step being asked wants another control, beside those it has.
+    adding: bool,
     /// After the last step: what the control just touched would do.
     tried: Option<String>,
 }
@@ -880,6 +884,8 @@ impl Wizard {
             count: 0,
             said: None,
             offer: None,
+            taken: None,
+            adding: false,
             tried: None,
         };
         // A side whose decks take turns already still does.
@@ -965,14 +971,24 @@ impl Wizard {
                 .map(|t| format!("{t:.0} ticks per turn"));
         }
         let mode = pad_mode(self.groups[step.group].part);
-        let own = !step.made.is_empty() || (step.adds && step.state != State::Kept);
+        // What the step made is all there is, unless it added to what was
+        // there before the run.
+        let own = match step.adds {
+            true => step.state != State::Kept,
+            false => !step.made.is_empty() && self.cleared.contains(&step.target),
+        };
+        let made = |s: &Step, b: &Binding| s.made.contains(&(b.trigger, b.shift));
+        let anothers = |b: &Binding| {
+            let mut others = self.steps.iter().filter(|s| !std::ptr::eq(*s, step));
+            others.any(|s| s.target == b.target && made(s, b))
+        };
         let labels: Vec<String> = self
             .draft
             .bindings
             .iter()
             .filter(|b| b.target == step.target)
             .filter(|b| b.mode.is_none() || mode.is_none() || b.mode == mode)
-            .filter(|b| !own || step.made.contains(&(b.trigger, b.shift)))
+            .filter(|b| made(step, b) || (!own && !anothers(b)))
             .map(|b| b.label())
             .collect();
         (!labels.is_empty()).then(|| labels.join(", "))
@@ -1031,10 +1047,38 @@ impl Wizard {
         self.tracks.clear();
         self.count = 0;
         self.offer = None;
+        self.adding = false;
         if self.said.as_ref().is_some_and(|s| s.tone != Tone::Good) {
             self.said = None;
         }
         self.tried = None;
+    }
+
+    /// The step that [`Wizard::more`] would ask another control for: this
+    /// one, if it's mapped, or the one just taken.
+    pub fn more_for(&self) -> Option<usize> {
+        let mapped = |i: &usize| {
+            let s = &self.steps[*i];
+            s.ask != Ask::FullTurn && s.state.mapped() && !self.adding
+        };
+        let said = self.said.as_ref().is_some_and(|s| s.tone == Tone::Good);
+        let taken = self.taken.filter(|_| said);
+        self.at().filter(mapped).or(taken.filter(mapped))
+    }
+
+    /// Ask for another control that does the same: what's heard next joins
+    /// what the step has.
+    pub fn more(&mut self) {
+        if let Some(i) = self.more_for() {
+            self.said = None;
+            self.go(i);
+            self.adding = true;
+        }
+    }
+
+    /// The step being asked wants another control, beside those it has.
+    pub fn adding(&self) -> bool {
+        self.adding
     }
 
     /// Pass over this step (a step that's mapped stays mapped).
@@ -1163,6 +1207,7 @@ impl Wizard {
                 tone: Tone::Good,
                 action: None,
             });
+            self.taken = None;
             self.go(self.next_todo(self.at + 1));
         }
     }
@@ -1214,6 +1259,7 @@ impl Wizard {
 
     fn say(&mut self, tone: Tone, text: impl Into<String>) {
         self.offer = None;
+        self.taken = None;
         self.said = Some(Said {
             text: text.into(),
             tone,
@@ -1500,11 +1546,12 @@ impl Wizard {
                     _ => {
                         // SHIFT + tempo runs the way the tempo fader does.
                         let fader = target.deck().map(|deck| Target::Tempo { deck });
+                        let of = target.deck().map(|d| self.draft.fader_behind(d, trig));
                         let invert = self
                             .draft
                             .bindings
                             .iter()
-                            .find(|x| Some(x.target) == fader)
+                            .find(|x| Some(x.target) == fader && Some(x.trigger) == of)
                             .is_some_and(|x| x.invert);
                         self.tracks.clear();
                         self.offered(i, binding(trig, invert), tr.shifted);
@@ -1600,6 +1647,13 @@ impl Wizard {
         let again = self
             .uses(b.trigger)
             .any(|x| x.target == target && x.shift == b.shift && x.mode == b.mode);
+        if again && self.adding {
+            self.say(
+                Tone::Info,
+                format!("{label} does this already. Press or move the other control, or skip."),
+            );
+            return;
+        }
         if again && self.steps[i].adds && self.steps[i].made.is_empty() {
             let mine = self
                 .steps
@@ -1713,7 +1767,8 @@ impl Wizard {
     /// Put a binding in the mapping for step `i`, and move on.
     fn bind(&mut self, i: usize, b: Binding) {
         let target = b.target;
-        self.put(i, b.clone());
+        let too = if self.adding { " too" } else { "" };
+        self.put(i, b.clone(), self.adding);
         self.steps[i].state = State::Done;
         let what = match self.steps[i].ask {
             Ask::Move(_) | Ask::ShiftMove if b.invert => " (runs backwards: inverted)",
@@ -1727,8 +1782,9 @@ impl Wizard {
         };
         self.say(
             Tone::Good,
-            format!("✔ {} is {}{what}", target.label(), b.label()),
+            format!("✔ {} is {}{too}{what}", target.label(), b.label()),
         );
+        self.taken = Some(i);
         if target == Target::Shift {
             // It's still held.
             self.shift.insert(b.trigger);
@@ -1749,10 +1805,14 @@ impl Wizard {
     }
 
     /// Put a binding in the mapping as step `i`'s, in place of what the
-    /// step made before.
-    fn put(&mut self, i: usize, b: Binding) {
+    /// step made before, or beside it.
+    fn put(&mut self, i: usize, b: Binding, adds: bool) {
         let target = b.target;
-        let made = std::mem::take(&mut self.steps[i].made);
+        let made = if adds {
+            Vec::new()
+        } else {
+            std::mem::take(&mut self.steps[i].made)
+        };
         self.draft
             .bindings
             .retain(|x| !(x.target == target && made.contains(&(x.trigger, x.shift))));
@@ -1769,7 +1829,7 @@ impl Wizard {
                 x.layered |= b.layered;
             }
             None => {
-                if !self.steps[i].adds && self.cleared.insert(target) {
+                if !adds && !self.steps[i].adds && self.cleared.insert(target) {
                     let kept: Vec<(Trigger, bool)> = self
                         .steps
                         .iter()
@@ -1783,7 +1843,7 @@ impl Wizard {
                 self.draft.bindings.push(b.clone());
             }
         }
-        self.steps[i].made = vec![(b.trigger, b.shift)];
+        self.steps[i].made.push((b.trigger, b.shift));
         if b.layered {
             // Its twin on the side's other deck takes turns with it.
             for x in &mut self.draft.bindings {
@@ -1810,30 +1870,31 @@ impl Wizard {
             if d != deck || self.steps[i].state != State::Todo {
                 continue;
             }
-            let pad = self
+            // (Every pad of that hot cue, if it has several.)
+            let pads: Vec<Trigger> = self
                 .draft
-                .bindings
-                .iter()
-                .find(|b| b.target == Target::HotCue { deck, slot } && !b.shift)
-                .map(|b| b.trigger);
-            let Some(trigger) = pad else {
-                continue;
-            };
-            let b = Binding {
-                trigger,
-                target: self.steps[i].target,
-                invert: false,
-                rel: RelMode::Offset64,
-                shift: true,
-                mode,
-                light: None,
-                layered,
-            };
-            if self.draft.bindings.iter().any(|x| x.overlaps(&b)) {
-                continue;
+                .bound(Target::HotCue { deck, slot })
+                .filter(|b| !b.shift)
+                .map(|b| b.trigger)
+                .collect();
+            for trigger in pads {
+                let b = Binding {
+                    trigger,
+                    target: self.steps[i].target,
+                    invert: false,
+                    rel: RelMode::Offset64,
+                    shift: true,
+                    mode,
+                    light: None,
+                    layered,
+                };
+                if self.draft.bindings.iter().any(|x| x.overlaps(&b)) {
+                    continue;
+                }
+                let more = self.steps[i].state == State::Filled;
+                self.put(i, b, more);
+                self.steps[i].state = State::Filled;
             }
-            self.put(i, b);
-            self.steps[i].state = State::Filled;
         }
     }
 
@@ -1989,15 +2050,13 @@ impl Wizard {
                         .is_some_and(|d| side_of(d) == side_of(lower))
             });
             let back = m.binding_for(Target::DeckSelect { deck: lower }).is_some();
-            if let (true, false, Some(b)) = (
-                layered,
-                back,
-                m.binding_for(Target::DeckSelect { deck: upper }).cloned(),
-            ) {
-                m.bindings.push(Binding {
+            if layered && !back {
+                let mut switch = m.bindings.clone();
+                switch.retain(|b| b.target == Target::DeckSelect { deck: upper });
+                m.bindings.extend(switch.into_iter().map(|b| Binding {
                     target: Target::DeckSelect { deck: lower },
                     ..b
-                });
+                }));
             }
         }
         // An FX unit with one knob: it sets all three effects.
@@ -2895,6 +2954,184 @@ mod tests {
         w.feed(RawMidi::NoteOn { ch, note, vel: 127 }, *t);
         *t += 60_000;
         w.feed(RawMidi::NoteOff { ch, note }, *t);
+    }
+
+    /// What a target is bound to in the mapping so far.
+    fn on(w: &Wizard, target: Target) -> Vec<Trigger> {
+        w.draft().bound(target).map(|b| b.trigger).collect()
+    }
+
+    #[test]
+    fn a_step_takes_another_control_that_does_the_same() {
+        let mut w = transport();
+        let mut t = 0;
+        let (play, cue) = (Target::Play { deck: 0 }, Target::Cue { deck: 0 });
+        assert_eq!(w.more_for(), None, "nothing mapped yet");
+        let at = w.at().unwrap();
+        press(&mut w, &mut t, 0, 1);
+        assert_eq!(w.more_for(), Some(at), "the step just done");
+        w.more();
+        assert!(w.adding());
+        assert_eq!((w.at(), w.more_for()), (Some(at), None));
+        // The control it has: nothing to add, and it goes on waiting.
+        press(&mut w, &mut t, 0, 1);
+        assert_eq!(w.said().unwrap().tone, Tone::Info);
+        assert_eq!((w.at(), w.adding()), (Some(at), true));
+        press(&mut w, &mut t, 0, 2);
+        assert!(w.said().unwrap().text.contains("too"));
+        assert_eq!(on(&w, play), [Trigger::note(0, 1), Trigger::note(0, 2)]);
+        assert_eq!(
+            w.bound(&w.steps[at]).as_deref(),
+            Some("Note 0x01 · ch 1, Note 0x02 · ch 1")
+        );
+        // On to the next step, which replaces as before.
+        assert_eq!(w.step().unwrap().target, cue);
+        assert!(!w.adding());
+        press(&mut w, &mut t, 0, 3);
+        // From going back to it: a third. Skipping instead adds nothing.
+        w.back();
+        w.back();
+        assert_eq!((w.at(), w.more_for()), (Some(at), Some(at)));
+        w.more();
+        w.skip();
+        assert_eq!(on(&w, play).len(), 2);
+        w.back();
+        w.back();
+        w.more();
+        // One that's used already is refused, and can be moved here.
+        press(&mut w, &mut t, 0, 3);
+        assert!(w.said().unwrap().text.contains("already used for"));
+        w.accept();
+        assert_eq!(on(&w, play).len(), 3);
+        assert_eq!(on(&w, cue), []);
+        assert_eq!(w.step().unwrap().target, cue, "to do again");
+        // Doing the step again, rather than adding, puts one in its place.
+        w.back();
+        assert_eq!(w.at(), Some(at));
+        press(&mut w, &mut t, 0, 5);
+        assert_eq!(on(&w, play), [Trigger::note(0, 5)]);
+        assert_eq!(w.bound(&w.steps[at]).as_deref(), Some("Note 0x05 · ch 1"));
+    }
+
+    #[test]
+    fn another_control_joins_what_was_mapped_before_the_run() {
+        let mut before = Mapping::empty("test");
+        let play = Target::Play { deck: 0 };
+        before.bind(Trigger::note(0, 1), play);
+        before.bind(Trigger::note(0, 2), play);
+        let setup = Setup {
+            sections: vec![Section::Transport],
+            skip_mapped: false,
+            ..Setup::default()
+        };
+        let mut w = Wizard::new(before, setup);
+        past_shift(&mut w);
+        let mut t = 0;
+        // The one it has is kept, and so is the other.
+        press(&mut w, &mut t, 0, 2);
+        assert_eq!(on(&w, play).len(), 2);
+        w.more();
+        press(&mut w, &mut t, 0, 3);
+        let notes: Vec<u8> = on(&w, play).iter().map(|t| t.number).collect();
+        assert_eq!(notes, [1, 2, 3]);
+        w.back();
+        assert_eq!(
+            w.bound(w.step().unwrap()).as_deref(),
+            Some("Note 0x01 · ch 1, Note 0x02 · ch 1, Note 0x03 · ch 1")
+        );
+        // A new one instead of it replaces them all, as Learn does.
+        press(&mut w, &mut t, 0, 4);
+        assert_eq!(on(&w, play), [Trigger::note(0, 4)]);
+    }
+
+    #[test]
+    fn shift_and_a_pad_clears_on_every_pad_of_a_hot_cue() {
+        let setup = Setup {
+            sections: vec![Section::Pads],
+            pads: 4,
+            ..Setup::default()
+        };
+        let mut w = Wizard::new(Mapping::empty("test"), setup);
+        let mut t = 0;
+        press(&mut w, &mut t, 0, 9);
+        assert_eq!(on(&w, Target::Shift), [Trigger::note(0, 9)]);
+        // No other SHIFT, and no pad mode button.
+        w.skip();
+        w.skip();
+        for note in [1, 2] {
+            press(&mut w, &mut t, 0, note);
+        }
+        w.more();
+        for note in [12, 3, 4] {
+            press(&mut w, &mut t, 0, note);
+        }
+        let clear = |slot| Target::HotCueClear { deck: 0, slot };
+        assert_eq!(w.step().unwrap().target, clear(0));
+        t += 400_000;
+        let (ch, note, vel) = (0, 9, 127);
+        w.feed(RawMidi::NoteOn { ch, note, vel }, t);
+        press(&mut w, &mut t, 0, 1);
+        w.feed(RawMidi::NoteOff { ch, note }, t);
+        let notes = |slot| -> Vec<u8> {
+            w.draft()
+                .bound(clear(slot))
+                .filter(|b| b.shift)
+                .map(|b| b.trigger.number)
+                .collect()
+        };
+        assert_eq!(
+            [0, 1, 2, 3].map(notes),
+            [vec![1], vec![2, 12], vec![3], vec![4]]
+        );
+    }
+
+    #[test]
+    fn two_controls_take_turns_and_switch_decks_as_one_does() {
+        // A side with two PLAYs and two DECK buttons that switch nothing
+        // the controller sends.
+        let setup = Setup {
+            decks: Decks::TwoSwitched,
+            sections: vec![Section::Transport],
+            ..Setup::default()
+        };
+        let mut w = Wizard::new(Mapping::empty("test"), setup);
+        past_shift(&mut w);
+        let mut t = 0;
+        let play = |deck| Target::Play { deck };
+        let select = |deck| Target::DeckSelect { deck };
+        press(&mut w, &mut t, 0, 1);
+        w.more();
+        press(&mut w, &mut t, 0, 2);
+        let step = w.steps.iter().position(|s| s.target == select(2));
+        w.jump_to(step.unwrap());
+        press(&mut w, &mut t, 0, 8);
+        w.more();
+        press(&mut w, &mut t, 0, 9);
+        assert_eq!(w.step().unwrap().target, play(2));
+        // Deck C's PLAY is deck A's: both of its controls are filled in.
+        press(&mut w, &mut t, 0, 1);
+        w.accept();
+        assert_eq!(on(&w, play(2)), [Trigger::note(0, 1)]);
+        w.more();
+        press(&mut w, &mut t, 0, 2);
+        let made = w.finish();
+        for deck in [0, 2] {
+            let mine: Vec<(u8, bool)> = made
+                .bound(play(deck))
+                .map(|b| (b.trigger.number, b.layered))
+                .collect();
+            assert_eq!(mine, [(1, true), (2, true)]);
+            let decks: Vec<u8> = made.bound(select(deck)).map(|b| b.trigger.number).collect();
+            assert_eq!(decks, [8, 9], "deck {deck}");
+        }
+        // Either DECK button goes back and forth.
+        let mut e = MidiEngine::new(made, 0.08);
+        let (room, local) = (RoomState::default(), LocalParams::default());
+        for (note, deck) in [(8, 2), (9, 0), (9, 2), (8, 0)] {
+            e.handle(&[0x90, note, 127], &room, &local);
+            e.handle(&[0x80, note, 0], &room, &local);
+            assert_eq!(e.side_deck(0), deck);
+        }
     }
 
     #[test]
