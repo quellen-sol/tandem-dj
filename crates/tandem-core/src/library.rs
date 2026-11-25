@@ -1706,7 +1706,8 @@ mod tests {
         file("a/D - Four.wav");
         std::fs::remove_file(&old).unwrap();
         resync(&lib, None);
-        assert!(resyncing(&lib));
+        // Under way, unless the scans have finished already.
+        assert!(resyncing(&lib) || lib.lock().resynced.is_some());
         wait_for("the resync", || !resyncing(&lib));
         assert_eq!(
             lib.lock().resynced,
