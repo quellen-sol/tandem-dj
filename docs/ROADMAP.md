@@ -546,15 +546,105 @@ Nothing here has been tried on a controller yet: the check was tested with a pre
    - Afterwards, does the controller play the room as before?
 2. **On the DDJ-FLX6** (it switches decks itself: deck 3 is MIDI channel 3): does the check say so, "channel 3 instead of 1" on the left? **Map decks C and D** shouldn't be offered (the mapping has decks C and D already).
 
-### v0.15.2
+## Round 16 (v0.16): the sync master, controllers, eject and saving tracks
 
+- **MASTER buttons.** Every deck has a MASTER button, on screen and on the DDJ-FLX6 (hold BEAT SYNC on a DDJ-400), lit on the deck the others are matched to. The first track played becomes the master; MASTER on another deck moves it, and synced decks follow the new one.
+  - **SYNC lights both decks.** SYNC on a deck lights its SYNC and the master's. On a master nobody follows, SYNC does nothing: press it on another deck, or MASTER on another deck first.
+  - **SYNC off goes back to the track's own BPM,** whatever the tempo fader says. From there the fader moves the tempo by exactly as much as you move it, with no jump. SHIFT + SYNC still puts the deck back on the fader.
+  - **Handover.** When the master stops, runs out, is ejected or gets a new track, a synced deck that's playing takes over, or else the deck playing longest. The old master leaves the group then, so a stopped deck can be prepared without dragging the one you're hearing; one deck left on its own isn't synced any more, and keeps its tempo.
+  - **MATCH KEY matches the master,** synced or not, and is greyed out on the master or when the master's key isn't known. Green keys compare with the master too.
+  - **FLX6: SHIFT + MASTER no longer turns sync off, and SHIFT + SYNC now does.** Saved mappings pick both up by themselves.
+- **SHIFT + LOAD ejects** the track from that LOAD button's deck, for everyone in the room. A deck the room can hear can't be ejected ("Deck A is playing: pause it or pull its fader down to eject it."). The deck's fader, knobs, effects and tempo stay; its hot cues and loop go with the track. A track you were still loading onto the deck doesn't land on it. Right-clicking a deck's letter beside **Load to** does the same. It's in the built-in DDJ-FLX6, DDJ-FLX4/DDJ-400, SC Live 4 and Inpulse 200 MK2 mappings (saved ones pick it up), in Learn and in the step-by-step setup.
+- **Several controls on one action.** Settings → Controller lists each control on its own line with its own ✖, invert and 1/127 style; **+ Add** beside **Learn** adds one (Learn replaces them all). Two faders on one action each pick it up, a second tempo fader moves the tempo from where it is, and what two buttons hold ends with the last one let go. The step-by-step setup takes another control with **A**.
+- **Reset one control.** A row that isn't as the built-in mapping has it shows **Reset**, and its group says how many are changed. It puts that one action back and touches nothing else. **Reset the whole mapping…** asks first and says it clears the jog calibration too.
+- **Jog wheels: the platter (scratch) and the edge (nudge) are separate controls;** a wheel with one message for both keeps one, and its touch sensor decides. A platter without a touch sensor holds the record by turning. The FLX6's jog is unchanged: a 25-minute recording of one replays bit for bit.
+  - **Learn works out how a wheel counts,** recognises or refuses a wheel that sends its position, and never takes a wheel for a button. Until now it took every wheel to count around 64, so a wheel that counts 1 and 127 (the SC Live 4's, by Traktor's mapping) only went one way, much too fast. Saved mappings get a wrongly learned encoding back.
+  - **Settings → Controller → Check the jog wheels…** asks for touch, platter, edge, one full turn and a flick; says whether the mapping fits; fixes it, with Undo; and saves a report.
+  - **The SC Live 4's jog is read both ways its sources give** (ticks or a position): the check will say which is right. See [controllers/denon-sc-live-4.md](controllers/denon-sc-live-4.md).
+- **Save a track off a deck:** drag a deck's overview or scrolling waveform onto a crate or ➕ New crate. Your own file goes in, matched by content, never a session copy of another DJ's track. Dragging out of an overview never seeks, Escape cancels, and MY CRATES opens while you drag.
 - **DECK works on the Denon SC Live 4.** A DJ's check on the unit confirmed that it leaves deck switching to the software, so the built-in mapping (preset 14) now does it: DECK switches the left side between decks A and C and the right between B and D, LOAD included; mixer channels 3 and 4 are C and D's; and each jog wheel's screen shows the deck its side is on.
   - **Saved mappings pick it up by themselves,** with the DJ's own controls and calibration kept and carried over to C and D. A DECK button learned as something on deck C or D becomes DECK again (that DJ's left one played deck D); one used for anything else is left alone.
   - **Learn** on a side whose decks take turns makes a control that takes turns too.
 - **The DECK button check no longer takes the wrong button.** On that unit it took a brushed jog wheel for DECK and CUE for PLAY, and said the left side switches decks itself. Now a control the mapping knows as something else isn't taken: it says what it was, with **That was it** to take it anyway, and a wrong button after DECK is never read as a verdict.
-- No protocol change: v0.15.2 shares rooms with v0.14 to v0.15.1.
+- Protocol version 18: v0.16 can't share a room with v0.15 or earlier, so everyone in the room, broadcasters included, needs v0.16. An older Tandem doesn't know the new controls: it falls back to the built-in mapping with a mapping file v0.16 saved.
 
-#### Test plan for DECK on the Denon SC Live 4
+Nothing here has been tried on a controller or by hand yet, apart from the DECK messages.
+
+### Test plan for the sync master
+
+On the DDJ-FLX6, on your own:
+
+1. Load A and B, play A: is A's MASTER lit, and only A's? Press SYNC on A: does nothing happen?
+2. Press SYNC on B: do both SYNC buttons light, on the controller and on screen? Start B: is it on the beat?
+3. Press MASTER on B: does its light move, with nothing to hear? Press it on A: back?
+4. Move either tempo fader: do both decks move?
+5. A's fader at +3%, press SYNC on A (off): does A go to 0.00%? Push the fader up 1%: exactly +1.00%, with no jump?
+6. Switch the side to deck 3 and back, move the fader: no jump on deck 1?
+7. Restart Tandem with the fader at +5%. Sync a deck, turn SYNC off, then touch the fader for the first time: does the tempo stay at 0%?
+8. SHIFT + SYNC: sync off, and the deck on its fader? SHIFT + MASTER: nothing?
+9. Stop the master while B plays: does MASTER move to B? Does A's fader leave B alone?
+10. Let the master run off the end of its track: does MASTER move by itself?
+11. MATCH KEY on B: A's key, or its relative? Greyed out on A? Press MASTER on B: does it swap?
+12. Decks 3 and 4: MASTER and SYNC, and their lights.
+
+In a room with two DJs:
+
+1. DJ 1 plays A, DJ 2 presses SYNC on B: both SYNCs lit in both booths?
+2. DJ 2 presses MASTER on B: does it move in both booths?
+3. DJ 1 turns SYNC off on B: 0.00% in both, whatever DJ 2's fader says? Does DJ 2's fader then move it from there?
+4. Both press MASTER on different decks at once: do both booths end on the same one?
+5. Pull one DJ's network for 20 s, with moves on both sides: same master and SYNC lights afterwards?
+6. Watch a broadcaster booth: MASTER and SYNC chips only while decks are synced?
+
+### Test plan for eject
+
+1. FLX6: load A and B, paused. SHIFT + LOAD left: does A go empty, B stay, and nothing load? The same on the right.
+2. Press DECK on both sides and repeat for C and D. Does SHIFT + LOAD eject C and D, not A and B?
+3. Play A with its fader up and press SHIFT + LOAD: is there a note at the bottom, and does A play on? Pull the fader down and press again: does it go empty, with no click in the headphones?
+4. After an eject, are PLAY, CUE, SYNC, loop and pad lights dark? Press LOAD: does it load at once and play?
+5. Press VIEW and SHIFT + VIEW: does neither eject anything?
+6. SC Live 4: the same on both sides before and after DECK, with either SHIFT. Does LOAD without SHIFT still load, and never both?
+7. In a room: each DJ ejects a deck the other loaded. Does it go empty on both?
+8. Right-click A beside **Load to** in the library: does deck A (paused) go empty?
+
+### Test plan for several controls and Reset
+
+1. FLX6, **+ Add** a spare button to Deck A · Cue. Hold both CUEs on a paused deck, let go of one: does it keep playing until the second? Do both lights follow?
+2. **+ Add** a spare knob to Deck A · Channel fader. Fader up, then the knob from 0: silent until it reaches the fader, then in control? Back to the fader: no jump?
+3. **+ Add** a spare fader or knob to Deck A · Tempo fader on a playing deck. Move one, wait, move the other: any jump? Is SHIFT + SYNC on the one moved last?
+4. With a second tempo fader bound, switch DECK 1 → 3 → 1 and move the fader: any jump?
+5. **+ Add** a control the action already has: "does … already", and nothing added? Add one that does something else: "also does …"?
+6. Remove one of the jog platter's two messages with ✖, scratch and nudge, then **Reset**: both back, calibration kept?
+7. **Reset the whole mapping…**: does it ask, and does Cancel change nothing?
+8. Setup: after PLAY is taken, press **A** and another button: do both play?
+
+### Test plan for the jog wheels
+
+On the Denon SC Live 4, in computer mode before opening Tandem:
+
+1. Before changing anything, try both jog wheels: hand on top, then by the edge, on decks 1/2 and 3/4. What happens?
+2. Settings → Controller → **Check the jog wheels…**, all steps, then **Copy report** and send it, whatever it says.
+3. If it offers **Fix the mapping**, click it and repeat 1. **Undo**, then fix again.
+4. Learn "Deck A · Jog wheel, both (touch decides)" by turning slowly: does it finish, and go both ways? **Reset** on that row afterwards.
+5. Scratch, backspin and let go, nudge by the edge while playing, search while paused.
+
+On the DDJ-FLX6:
+
+1. Jog as before: scratch, backspin, let go still, nudge by the edge, search paused, decks 1–4, vinyl mode off. Nothing should feel different.
+2. The mapping list shows the platter (0x22, 0x23) and the edge (0x21), and the calibration is kept.
+3. **Check the jog wheels…** should say the mapping is right, measure about 6387 ticks, and ask the right side only three steps.
+
+### Test plan for saving a track off a deck
+
+1. With a deck playing out loud, drag its overview onto a crate: "Added to …", and the deck plays on. Again: "Already in …". Same with the scrolling waveform, four decks and a stopped deck.
+2. Click the overview and drag along it: it seeks. Drag out and let go on the library, then back on the overview: no jump. Escape mid-drag: nothing happens.
+3. Close MY CRATES, then drag: it opens, and closes after. On a short window, hold the drag at the list's bottom edge: it scrolls.
+4. In a room, drag a track only the other DJ has: the crate stays unlit, and dropping names them. Have them send copies, then drag again: it goes in from Shared with me.
+5. Drag a track the other DJ loaded that you also have: your own file goes in.
+6. Drop onto a crate shared live: the others see the track within a second or so.
+7. On a short window, click the FX chip on a waveform: its effects open.
+
+### Test plan for DECK on the Denon SC Live 4
 
 In computer mode before opening Tandem. Only the check's own messages have been seen on a unit.
 
@@ -579,4 +669,5 @@ Rough priority order:
 7. **Recording** the broadcast lane to WAV.
 8. **More effects:** a repeater (capturing a beat-long slice every lane agrees on), flanger, filter-echo and echo-out; a master bank for the FLX6's MST; effects in the headphone cue; a DDJ-SB2/SB3 profile with its strip, and the FLX4/DDJ-400 strips; PAD FX and Merge FX on the FLX6.
 9. **Encrypted transport** (QUIC/TLS) and an optional relay server, so neither DJ needs Tailscale or port forwarding.
-10. **Crossfader assign from the controller**, for controllers with assign switches, and a MASTER button to pick the sync master by hand.
+10. **Crossfader assign from the controller**, for controllers with assign switches.
+11. **"→" shows as a box** in some of the app's text (egui's font lacks it).

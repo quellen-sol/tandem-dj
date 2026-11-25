@@ -13,7 +13,7 @@ use crate::model::{Event, Timeline, TrackId};
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
-pub const PROTOCOL_VERSION: u32 = 17;
+pub const PROTOCOL_VERSION: u32 = 18;
 pub const DEFAULT_PORT: u16 = 47800;
 const MAX_JSON: u32 = 64 << 20;
 const MAX_PAYLOAD: u32 = 8 << 20;
