@@ -10042,4 +10042,89 @@ mod tests {
             assert_eq!((t.part(), t.kind()), (Part::Jog, TargetKind::Relative));
         }
     }
+
+    /// Everything that came with preset 14 at once, on a mapping like the one
+    /// an SC Live 4 owner had: DECK learned as Play on deck D, and both jog
+    /// wheels learned again, counting the wrong way. It comes out as the
+    /// built-in mapping, with nothing left to Reset.
+    #[test]
+    fn a_relearned_sc_live_4_mapping_comes_out_as_the_preset() {
+        let preset = builtin_preset("SC LIVE 4").unwrap();
+        let mut saved = sc_live_4_preset_13();
+        saved.bind(Trigger::note(4, 0x1F), Target::Play { deck: 3 });
+        for (ch, deck) in [(4, 0), (5, 1)] {
+            saved.bindings.retain(|b| b.target != Target::Jog { deck });
+            saved.bind(Trigger::cc(ch, 0x36), Target::Jog { deck });
+        }
+        assert!(saved.upgrade_from(&preset) > 0);
+        let changed: Vec<String> = Target::all()
+            .iter()
+            .filter(|t| saved.differs(**t, &preset))
+            .map(Target::label)
+            .collect();
+        assert_eq!(changed, [] as [String; 0]);
+        let mut e = MidiEngine::new(saved, 0.08);
+        // DECK switches and plays nothing; SHIFT + LOAD ejects the side's deck.
+        assert_eq!(tap(&mut e, 0x94, 0x1F), []);
+        send(&mut e, [0x94, 0x1C, 0x7F]);
+        assert_eq!(tap(&mut e, 0x9F, 0x01), act(Action::Eject { deck: 2 }));
+        send(&mut e, [0x94, 0x1C, 0x00]);
+        // The left wheel nudges deck C, by as much as it's turned.
+        let turn = ccs(0, 4_000, 4, 0x36, &[1; 250]);
+        let acts = jogged(&mut e, &mut jog_room(true), &turn, 0);
+        assert!(acts.iter().all(|(_, a)| a.deck() == Some(2)));
+        let bend = bend_peak(&acts);
+        assert!(bend > 0.01 && bend < 0.05, "{bend}");
+    }
+
+    /// Adding a wheel waits until it has been read, as Learn does. One that
+    /// drives the deck already isn't added twice, and one that drove it some
+    /// other way does only the new thing.
+    #[test]
+    fn add_takes_a_wheel_once_it_has_been_read() {
+        let (room, local) = (RoomState::default(), LocalParams::default());
+        let mut e = MidiEngine::new(builtin_preset("DDJ-FLX6").unwrap(), 0.08);
+        let platter = Target::JogPlatter { deck: 0 };
+        let before = e.mapping.bound(platter).count();
+        let add = |e: &mut MidiEngine, target: Target, ch: u8, cc: u8| {
+            (e.learn, e.learn_adds) = (Some(target), true);
+            let turns = ccs(0, 10_000, ch, cc, &[65, 65, 66, 65, 65, 66, 65, 65, 65, 66]);
+            let mut out = Vec::new();
+            for (n, (t, m)) in turns.iter().enumerate() {
+                let o = e.handle_at(m, *t, &room, &local);
+                if n == 0 {
+                    assert_eq!(o, [], "one message can't tell how it counts");
+                    assert!(e.learn_adds);
+                }
+                out.extend(
+                    o.into_iter()
+                        .filter(|o| matches!(o, MidiOut::Learned(_) | MidiOut::AlreadyBound(_))),
+                );
+            }
+            assert_eq!((e.learn, e.learn_adds), (None, false));
+            out
+        };
+        // Another wheel: added, and the others stay.
+        let out = add(&mut e, platter, 3, 0x1A);
+        assert!(matches!(&out[..], [MidiOut::Learned(b)] if b.trigger == Trigger::cc(3, 0x1A)));
+        assert_eq!(e.mapping.bound(platter).count(), before + 1);
+        // Its own message: it does that already.
+        let out = add(&mut e, platter, 0, 0x22);
+        assert!(matches!(&out[..], [MidiOut::AlreadyBound(_)]));
+        assert_eq!(e.mapping.bound(platter).count(), before + 1);
+        // The edge's message for the platter: it's for both now, and not the
+        // edge's alone.
+        let (edge, both) = (Target::JogEdge { deck: 0 }, Target::Jog { deck: 0 });
+        let out = add(&mut e, platter, 0, 0x21);
+        assert!(matches!(&out[..], [MidiOut::Learned(b)] if b.target == both));
+        assert_eq!(e.mapping.bound(edge).count(), 0);
+        assert_eq!(e.mapping.bound(platter).count(), before + 1);
+        // Reset puts each back.
+        let preset = builtin_preset("DDJ-FLX6").unwrap();
+        for t in [platter, edge, both] {
+            assert!(e.mapping.differs(t, &preset));
+            e.edit(|m| m.reset_target(t, &preset));
+            assert!(!e.mapping.differs(t, &preset));
+        }
+    }
 }
