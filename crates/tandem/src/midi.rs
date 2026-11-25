@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tandem_core::mapping::{builtin_preset, mapping_key, Mapping, MidiEngine, MidiOut};
+use tandem_core::mapping::{
+    builtin_preset, mapping_key, DeckDisplayPace, Mapping, MidiEngine, MidiOut,
+};
 use tandem_core::session::SessionHandle;
 
 pub fn ports() -> Vec<String> {
@@ -221,9 +223,10 @@ impl Midi {
         let flag = stop.clone();
         let outbox = self.outbox.clone();
         outbox.lock().clear();
+        let tap = self.tap.clone();
         let thread = std::thread::Builder::new()
             .name("tandem-controller".into())
-            .spawn(move || controller_loop(out, session, engine, flag, pioneer, outbox))?;
+            .spawn(move || controller_loop(out, session, engine, flag, pioneer, outbox, tap))?;
         self.feedback = Some((stop, thread));
         Ok(())
     }
@@ -253,8 +256,10 @@ impl Midi {
 
 /// The controller's clock: every 5 ms send gathered jog movement (scratch /
 /// search) and anything in `outbox`; every 25 ms update the jog-ring pitch
-/// bend, the lights, the level meters and the effects' BEATS lights; every
-/// 200 ms keep Pioneer controllers out of demo mode.
+/// bend, the lights, the level meters, the effects' BEATS lights and the
+/// screens that show which deck a side is on (left alone while `tap` is
+/// open: the DECK button check writes to them); every 200 ms keep Pioneer
+/// controllers out of demo mode.
 fn controller_loop(
     mut out: Option<MidiOutputConnection>,
     session: SessionHandle,
@@ -262,7 +267,10 @@ fn controller_loop(
     stop: Arc<AtomicBool>,
     pioneer: bool,
     outbox: Arc<Mutex<Vec<Vec<u8>>>>,
+    tap: Tap,
 ) {
+    let begun = Instant::now();
+    let mut displays = DeckDisplayPace::default();
     let mut sent: HashMap<(u8, u8), u8> = HashMap::new();
     let mut sent_meters: HashMap<(u8, u8), u8> = HashMap::new();
     let mut sent_fx: HashMap<(u8, u8), u8> = HashMap::new();
@@ -304,15 +312,26 @@ fn controller_loop(
                     (s.latest(), s.local)
                 };
                 let levels = meters.read();
-                let (lights, values, fx, again) = {
+                let checking = tap.lock().is_some();
+                let (lights, values, fx, again, numbers) = {
                     let mut e = engine.lock();
                     (
                         e.lights(&room, &local),
                         e.meters(&levels),
                         e.fx_beat_lights(&room),
                         e.take_resend(),
+                        if checking {
+                            displays.forget();
+                            Vec::new()
+                        } else {
+                            let now = begun.elapsed().as_secs_f64();
+                            displays.due(now, &e.mapping.deck_displays, e.side_decks())
+                        },
                     )
                 };
+                for msg in numbers {
+                    let _ = o.send(&msg);
+                }
                 // A controller that shows only the selected effect slot may
                 // have ignored these: send them again.
                 for key in again {
@@ -356,6 +375,9 @@ fn controller_loop(
             for (key, v) in engine.lock().fx_beat_lights_dark() {
                 let _ = o.send(&[key.0, key.1, v]);
             }
+        }
+        for msg in displays.dark(&engine.lock().mapping.deck_displays) {
+            let _ = o.send(&msg);
         }
     }
 }

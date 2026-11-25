@@ -546,6 +546,26 @@ Nothing here has been tried on a controller yet: the check was tested with a pre
    - Afterwards, does the controller play the room as before?
 2. **On the DDJ-FLX6** (it switches decks itself: deck 3 is MIDI channel 3): does the check say so, "channel 3 instead of 1" on the left? **Map decks C and D** shouldn't be offered (the mapping has decks C and D already).
 
+### v0.15.2
+
+- **DECK works on the Denon SC Live 4.** A DJ's check on the unit confirmed that it leaves deck switching to the software, so the built-in mapping (preset 14) now does it: DECK switches the left side between decks A and C and the right between B and D, LOAD included; mixer channels 3 and 4 are C and D's; and each jog wheel's screen shows the deck its side is on.
+  - **Saved mappings pick it up by themselves,** with the DJ's own controls and calibration kept and carried over to C and D. A DECK button learned as something on deck C or D becomes DECK again (that DJ's left one played deck D); one used for anything else is left alone.
+  - **Learn** on a side whose decks take turns makes a control that takes turns too.
+- **The DECK button check no longer takes the wrong button.** On that unit it took a brushed jog wheel for DECK and CUE for PLAY, and said the left side switches decks itself. Now a control the mapping knows as something else isn't taken: it says what it was, with **That was it** to take it anyway, and a wrong button after DECK is never read as a verdict.
+- No protocol change: v0.15.2 shares rooms with v0.14 to v0.15.1.
+
+#### Test plan for DECK on the Denon SC Live 4
+
+In computer mode before opening Tandem. Only the check's own messages have been seen on a unit.
+
+1. On connecting, do the jog wheel screens show **DECK 1** and **DECK 2**?
+2. Press DECK on the left: does the screen show 3 at once? Load a track with LOAD: does it go on deck C (four decks appear by themselves)? Do PLAY, CUE, SYNC, the pads, the jog wheel and the tempo fader work deck C, and the button lights show it? Press DECK again: is deck A back, and did its tempo stay where it was?
+3. The same on the right, for decks B and D.
+4. Do mixer channels 3 and 4 (gain, EQ, sweep FX, fader, cue) work decks C and D?
+5. Hold a pad or the jog wheel and press DECK, then let go: does anything stay held?
+6. Does DECK have a light, and is it lit on C and D?
+7. Leave it a while, and play: does either screen ever show the wrong number or flicker?
+
 ## Next candidates
 
 Rough priority order:

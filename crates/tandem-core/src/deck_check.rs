@@ -254,6 +254,14 @@ pub struct DeckCheck {
     answers: Vec<Option<Seen>>,
     /// When the step being done got what it waits for.
     got: Option<f64>,
+    /// What the controller's mapping does with each control, to tell the one
+    /// a step asks for from another pressed or touched by mistake.
+    known: Vec<(Trigger, Target)>,
+    /// The last control pressed in the step being done that isn't the one
+    /// asked for, as far as the mapping knows.
+    refused: Option<Trigger>,
+    /// Controls the DJ said were the one asked for all the same.
+    taken: Vec<Option<Trigger>>,
 }
 
 impl DeckCheck {
@@ -292,6 +300,31 @@ impl DeckCheck {
             heard: vec![Vec::new(); n],
             answers: vec![None; n],
             got: None,
+            known: Vec::new(),
+            refused: None,
+            taken: vec![None; n],
+        }
+    }
+
+    /// The same, for a controller with this mapping: a press of a control
+    /// that the mapping knows as another one isn't taken.
+    pub fn for_mapping(screen_test: bool, mapping: &Mapping) -> Self {
+        Self {
+            known: known(mapping),
+            ..Self::new(screen_test)
+        }
+    }
+
+    /// The control pressed last in this step that isn't the one asked for.
+    pub fn refused(&self) -> Option<Trigger> {
+        self.refused
+    }
+
+    /// It was the one asked for ("That was it"): on to the next step.
+    pub fn take_refused(&mut self) {
+        if let Some(t) = self.refused {
+            self.taken[self.at] = Some(t);
+            self.next();
         }
     }
 
@@ -341,13 +374,102 @@ impl DeckCheck {
                 self.got = Some(t)
             }
             _ if self.got.is_some() => {}
-            (Want::Button, Some(RawMidi::NoteOn { .. })) => self.got = Some(t),
+            (Want::Button, Some(RawMidi::NoteOn { ch, note, .. })) => {
+                self.press(t, Trigger::note(ch, note))
+            }
             (Want::Button, Some(RawMidi::Cc { ch, cc, val: 0 }))
                 if cc_press(&self.heard[at], ch, cc) =>
             {
-                self.got = Some(t)
+                self.press(t, Trigger::cc(ch, cc))
             }
             _ => {}
+        }
+    }
+
+    /// A control pressed in a button step: the one asked for, or not.
+    fn press(&mut self, t: f64, trigger: Trigger) {
+        let Some(step) = self.step() else { return };
+        if self.suits(step, trigger, &self.known) {
+            self.got = Some(t);
+            self.refused = None;
+        } else {
+            self.refused = Some(trigger);
+        }
+    }
+
+    /// Whether `t` can be the control `step` asks for, going by what the
+    /// mapping does with it (`known`) and by the steps before. A control the
+    /// mapping doesn't know can: it's what the check is there to find.
+    fn suits(&self, step: Step, t: Trigger, known: &[(Trigger, Target)]) -> bool {
+        let Step::Press {
+            side,
+            button,
+            round,
+        } = step
+        else {
+            return true;
+        };
+        let targets = |t: Trigger| -> Vec<Target> {
+            known.iter().filter(|k| k.0 == t).map(|k| k.1).collect()
+        };
+        let does = targets(t);
+        // A hand on the platter isn't a button.
+        if does.iter().any(|x| matches!(x, Target::JogTouch { .. })) {
+            return false;
+        }
+        let alike =
+            |a: Option<Trigger>| a.is_some_and(|a| (a.kind, a.number) == (t.kind, t.number));
+        let heard = |button, round| {
+            let step = Step::Press {
+                side,
+                button,
+                round,
+            };
+            self.control(step, known)
+        };
+        let wanted = |x: &Target| {
+            matches!(
+                (button, x),
+                (Button::Play, Target::Play { .. })
+                    | (Button::Load, Target::Load { .. })
+                    | (Button::Deck, Target::DeckSelect { .. })
+            )
+        };
+        let asked: Vec<&Target> = does.iter().filter(|x| wanted(x)).collect();
+        if !asked.is_empty() {
+            // This side's, not the other's.
+            return asked
+                .iter()
+                .any(|x| x.deck().is_some_and(|d| d % 2 == side));
+        }
+        match button {
+            Button::Deck => {
+                // Not this side's PLAY or LOAD, nor a control of deck A's or
+                // B's. (One of C's or D's may well be DECK, learned as that
+                // while looking for a way to reach them.)
+                !alike(heard(Button::Play, 0))
+                    && !alike(heard(Button::Load, 0))
+                    && does.iter().all(|x| x.deck().is_some_and(|d| d >= 2))
+            }
+            Button::Play | Button::Load => {
+                let first = (round > 0).then(|| heard(button, 0)).flatten();
+                // The same control, on the channel DECK moved it to.
+                if alike(first) {
+                    return true;
+                }
+                let deck = (0..round).any(|r| alike(heard(Button::Deck, r)));
+                let load = button == Button::Play && round > 0 && alike(heard(Button::Load, 0));
+                let play = button == Button::Load && alike(heard(Button::Play, 0));
+                // Another of the side's controls, moved by DECK.
+                let moved = first.is_some_and(|f| {
+                    !targets(Trigger {
+                        channel: f.channel,
+                        ..t
+                    })
+                    .is_empty()
+                });
+                does.is_empty() && !deck && !load && !play && !moved
+            }
         }
     }
 
@@ -368,6 +490,7 @@ impl DeckCheck {
         if !self.done() {
             self.at += 1;
             self.got = None;
+            self.refused = None;
         }
     }
 
@@ -399,10 +522,15 @@ impl DeckCheck {
         if let Some(a) = self.answers.get_mut(self.at) {
             *a = None;
         }
+        if let Some(t) = self.taken.get_mut(self.at) {
+            *t = None;
+        }
         self.at -= 1;
         self.heard[self.at].clear();
         self.answers[self.at] = None;
+        self.taken[self.at] = None;
         self.got = None;
+        self.refused = None;
     }
 
     pub fn answer(&mut self, seen: Seen) {
@@ -416,17 +544,14 @@ impl DeckCheck {
         self.steps.iter().position(|&s| s == step)
     }
 
-    /// The control a button step heard pressed: a note on, or a control
-    /// change that went above 0 and back to 0 (a button that sends control
-    /// changes). The first one `prefer` likes (so a jog wheel touched by
-    /// accident doesn't count), else the first one `reject` doesn't.
-    fn pressed(
-        &self,
-        step: Step,
-        prefer: impl Fn(Trigger) -> bool,
-        reject: impl Fn(Trigger) -> bool,
-    ) -> Option<Trigger> {
-        let heard = self.heard(self.index(step)?);
+    /// The controls a button step heard pressed, each once: a note on, or a
+    /// control change that went above 0 and back to 0 (a button that sends
+    /// control changes).
+    fn presses(&self, step: Step) -> Vec<Trigger> {
+        let Some(i) = self.index(step) else {
+            return Vec::new();
+        };
+        let heard = self.heard(i);
         let mut presses: Vec<Trigger> = Vec::new();
         for (i, h) in heard.iter().enumerate() {
             let t = match h.raw() {
@@ -446,67 +571,95 @@ impl DeckCheck {
                 presses.push(t);
             }
         }
-        let found = presses.iter().copied().find(|&t| prefer(t));
-        found.or_else(|| presses.iter().copied().find(|&t| !reject(t)))
+        presses
+    }
+
+    /// The control a button step asked for, if it was pressed: what the DJ
+    /// said it was, else the first that can be it, one the mapping knows as
+    /// that (or that moved with DECK) before one it doesn't know.
+    fn control(&self, step: Step, known: &[(Trigger, Target)]) -> Option<Trigger> {
+        if let Some(t) = self.taken.get(self.index(step)?).copied().flatten() {
+            return Some(t);
+        }
+        let can: Vec<Trigger> = self
+            .presses(step)
+            .into_iter()
+            .filter(|&t| self.suits(step, t, known))
+            .collect();
+        let Step::Press {
+            side,
+            button,
+            round,
+        } = step
+        else {
+            return None;
+        };
+        let first = (round > 0)
+            .then(|| {
+                self.control(
+                    Step::Press {
+                        side,
+                        button,
+                        round: 0,
+                    },
+                    known,
+                )
+            })
+            .flatten();
+        let sure = |t: Trigger| {
+            known.iter().any(|k| k.0 == t)
+                || first.is_some_and(|f| (f.kind, f.number) == (t.kind, t.number))
+        };
+        can.iter()
+            .copied()
+            .find(|&t| sure(t))
+            .or(can.first().copied())
     }
 
     /// What the check found on one side, read with `mapping` (to tell PLAY
     /// from a stray press).
     pub fn side(&self, side: u8, mapping: &Mapping) -> SideFindings {
+        let known = known(mapping);
         let press = |button, round| Step::Press {
             side,
             button,
             round,
         };
-        // PLAY or LOAD for one of this side's decks (`mine`), or the other
-        // side's (pressed by mistake: never taken).
-        let bound = |t: Trigger, load: bool, mine: bool| {
-            mapping.bindings.iter().any(|b| {
-                b.trigger == t
-                    && match b.target {
-                        Target::Play { deck } if !load => (deck % 2 == side) == mine,
-                        Target::Load { deck } if load => (deck % 2 == side) == mine,
-                        _ => false,
-                    }
-            })
+        let control = |button, round| self.control(press(button, round), &known);
+        // Pressed, but not what was asked for.
+        let other = |round| {
+            control(Button::Play, round).is_none()
+                && !self.presses(press(Button::Play, round)).is_empty()
         };
-        let play0 = self.pressed(
-            press(Button::Play, 0),
-            |t| bound(t, false, true),
-            |t| bound(t, false, false),
-        );
-        let load0 = self.pressed(
-            press(Button::Load, 0),
-            |t| bound(t, true, true),
-            |t| bound(t, true, false),
-        );
-        // After DECK, the same note on another channel counts too.
-        let same = |first: Option<Trigger>, t: Trigger| {
-            first.is_some_and(|f| f.kind == t.kind && f.number == t.number)
-        };
-        let play_like =
-            |t: Trigger| !bound(t, false, false) && (bound(t, false, true) || same(play0, t));
-        let load_like =
-            |t: Trigger| !bound(t, true, false) && (bound(t, true, true) || same(load0, t));
-        let not_play = |t: Trigger| bound(t, false, false);
-        let not_load = |t: Trigger| bound(t, true, false);
+        // What DECK sent, without what another control sent meanwhile.
         let deck_sent = |round| {
-            self.index(press(Button::Deck, round))
-                .map(|i| self.heard(i).to_vec())
-                .unwrap_or_default()
+            let step = press(Button::Deck, round);
+            let Some(i) = self.index(step) else {
+                return Vec::new();
+            };
+            let forced = self.taken.get(i).copied().flatten();
+            let keep = |h: &&Heard| {
+                let t = match h.raw() {
+                    None => return true,
+                    Some(RawMidi::NoteOn { ch, note, .. } | RawMidi::NoteOff { ch, note }) => {
+                        Trigger::note(ch, note)
+                    }
+                    Some(raw) => trigger_of(raw),
+                };
+                forced == Some(t) || self.suits(step, t, &known)
+            };
+            self.heard(i).iter().filter(keep).cloned().collect()
         };
         SideFindings {
             side,
             play: [
-                play0,
-                self.pressed(press(Button::Play, 1), play_like, not_play),
-                self.pressed(press(Button::Play, 2), play_like, not_play),
+                control(Button::Play, 0),
+                control(Button::Play, 1),
+                control(Button::Play, 2),
             ],
-            load: [
-                load0,
-                self.pressed(press(Button::Load, 1), load_like, not_load),
-            ],
+            load: [control(Button::Load, 0), control(Button::Load, 1)],
             deck: [deck_sent(0), deck_sent(1)],
+            other_pressed: other(1),
             screen_changed: self
                 .index(Step::ScreenChanged { side })
                 .and_then(|i| self.answer_of(i)),
@@ -635,6 +788,10 @@ impl DeckCheck {
                             }
                         ),
                         Switch::Quiet => format!("{name}: after DECK, PLAY sent nothing at all."),
+                        Switch::Unclear => format!(
+                            "{name}: not clear. After DECK, something other than PLAY was \
+                             pressed. Click \"Do it again\"."
+                        ),
                         Switch::Unknown => format!(
                             "{name}: PLAY sent nothing at the first step. Is the controller in \
                              computer mode, and picked in Settings > Controller?"
@@ -673,7 +830,10 @@ impl DeckCheck {
         let software = sides.iter().any(|s| s.switch() == Switch::Software);
         let used = sides.iter().any(|s| deck_used(s, mapping));
         let silent = sides.iter().all(|s| s.deck.iter().all(|d| d.is_empty()));
-        if mapped {
+        let unclear = sides.iter().any(|s| s.switch() == Switch::Unclear);
+        if unclear {
+            "Click \"Do it again\": one side isn't clear yet."
+        } else if mapped {
             "Copy the report and send it to us too, so the built-in mapping can do the same."
         } else if hardware && self.fix(mapping).is_some() {
             "Click \"Map decks C and D\" below, then try DECK. Copy the report and send it to \
@@ -701,7 +861,11 @@ impl DeckCheck {
                 return false;
             };
             let mut presses = self.heard(i).iter().filter_map(|h| match h.raw() {
-                Some(RawMidi::NoteOn { note, .. }) => Some((h.t, note)),
+                Some(RawMidi::NoteOn { ch, note, .. })
+                    if self.suits(*step, Trigger::note(ch, note), &self.known) =>
+                {
+                    Some((h.t, note))
+                }
                 _ => None,
             });
             let Some((first, deck)) = presses.next() else {
@@ -1056,6 +1220,8 @@ pub enum Switch {
     },
     /// After DECK, PLAY sends nothing.
     Quiet,
+    /// After DECK, another control was pressed instead of PLAY.
+    Unclear,
 }
 
 /// What the check heard on one side.
@@ -1068,6 +1234,8 @@ pub struct SideFindings {
     pub load: [Option<Trigger>; 2],
     /// What each DECK press sent.
     pub deck: [Vec<Heard>; 2],
+    /// After DECK, another control was pressed instead of PLAY.
+    pub other_pressed: bool,
     pub screen_changed: Option<Seen>,
 }
 
@@ -1075,6 +1243,7 @@ impl SideFindings {
     pub fn switch(&self) -> Switch {
         match self.play {
             [None, ..] => Switch::Unknown,
+            [Some(_), None, _] if self.other_pressed => Switch::Unclear,
             [Some(_), None, _] => Switch::Quiet,
             [Some(a), Some(b), _] if a == b => Switch::Software,
             [Some(a), Some(b), c] => Switch::Hardware {
@@ -1166,6 +1335,10 @@ impl SideFindings {
                  in Settings > Controller? {deck}"
             ),
             Switch::Quiet => format!("{name} side: after DECK, PLAY sent nothing at all. {deck}"),
+            Switch::Unclear => format!(
+                "{name} side: after DECK, something other than PLAY was pressed, so it isn't \
+                 clear what DECK does. {deck}"
+            ),
             Switch::Software => {
                 let play = self.play[0].map(a_label).unwrap_or_default();
                 let uses = deck_used(self, mapping);
@@ -1212,6 +1385,16 @@ impl SideFindings {
             }
         }
     }
+}
+
+/// What a mapping does with each control, without SHIFT.
+fn known(mapping: &Mapping) -> Vec<(Trigger, Target)> {
+    mapping
+        .bindings
+        .iter()
+        .filter(|b| !b.shift)
+        .map(|b| (b.trigger, b.target))
+        .collect()
 }
 
 /// "Note 0x0a on MIDI channel 5".
@@ -1327,12 +1510,14 @@ impl Pretend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mapping::{builtin_preset, MidiEngine, MidiOut};
+    use crate::mapping::{builtin_preset, sc_live_4_preset_13, MidiEngine, MidiOut};
     use crate::model::{Action, RoomState};
     use crate::render::LocalParams;
 
+    /// Two decks and no DECK buttons, as the SC Live 4's was when the check
+    /// was made for it.
     fn sc_live_4() -> Mapping {
-        builtin_preset("SC LIVE 4").unwrap()
+        sc_live_4_preset_13()
     }
 
     /// Run the whole check against a pretend controller, answering every
@@ -1636,6 +1821,164 @@ mod tests {
             "{text}"
         );
         assert!(c.fix(&m).is_none());
+    }
+
+    /// The first real check: a DJ's Denon SC Live 4 (2026-11-24, v0.15.1),
+    /// with mixer channels 3 and 4 mapped, and the left DECK button learned
+    /// as deck D's Play. Brushing the left jog wheel was taken for DECK and
+    /// CUE for PLAY, so the check said the left side switches decks itself.
+    fn sc_live_4_checked() -> Mapping {
+        let mut m = sc_live_4_preset_13();
+        m.bindings.extend(
+            builtin_preset("SC LIVE 4")
+                .unwrap()
+                .bindings
+                .into_iter()
+                .filter(|b| !b.layered && b.target.deck().is_some_and(|d| d >= 2))
+                .filter(|b| !matches!(b.target, Target::DeckSelect { .. })),
+        );
+        m.bind(Trigger::note(4, 0x1F), Target::Play { deck: 3 });
+        assert_eq!(m.bindings.len(), 137, "as its report says");
+        m
+    }
+
+    /// What the unit sent, in order (each button pressed and let go).
+    const CHECKED: &[(f64, [u8; 3])] = &[
+        (9.126, [0x94, 0x0A, 0x7F]),
+        (9.284, [0x94, 0x0A, 0x00]),
+        (33.557, [0x9F, 0x01, 0x7F]),
+        (33.686, [0x9F, 0x01, 0x00]),
+        (37.583, [0x94, 0x21, 0x7F]), // the jog wheel, brushed
+        (38.137, [0x94, 0x21, 0x00]),
+        (40.283, [0x94, 0x1F, 0x7F]), // DECK
+        (40.386, [0x94, 0x1F, 0x00]),
+        (50.749, [0x94, 0x09, 0x7F]), // CUE, for PLAY
+        (50.894, [0x94, 0x09, 0x00]),
+    ];
+    const CHECKED_ON: &[(f64, [u8; 3])] = &[
+        (53.849, [0x9F, 0x01, 0x7F]),
+        (53.970, [0x9F, 0x01, 0x00]),
+        (58.800, [0x94, 0x1F, 0x7F]),
+        (58.954, [0x94, 0x1F, 0x00]),
+        (65.009, [0x94, 0x0A, 0x7F]),
+        (65.171, [0x94, 0x0A, 0x00]),
+        (68.386, [0x95, 0x0A, 0x7F]),
+        (68.516, [0x95, 0x0A, 0x00]),
+        (71.334, [0x9F, 0x02, 0x7F]),
+        (71.471, [0x9F, 0x02, 0x00]),
+        (77.840, [0x95, 0x1F, 0x7F]),
+        (77.978, [0x95, 0x1F, 0x00]),
+        (82.977, [0x95, 0x0A, 0x7F]),
+        (83.117, [0x95, 0x0A, 0x00]),
+        (89.240, [0x9F, 0x02, 0x7F]),
+        (89.375, [0x9F, 0x02, 0x00]),
+        (92.844, [0x95, 0x1F, 0x7F]),
+        (92.996, [0x95, 0x1F, 0x00]),
+        (97.088, [0x95, 0x0A, 0x7F]),
+        (97.208, [0x95, 0x0A, 0x00]),
+        (100.184, [0xB2, 0x0E, 0x7E]),
+        (100.298, [0xB2, 0x0E, 0x00]),
+        (100.562, [0xB2, 0x0E, 0x7F]),
+        (104.278, [0xB3, 0x0E, 0x02]),
+        (104.417, [0xB3, 0x0E, 0x7F]),
+        (104.684, [0xB3, 0x0E, 0x00]),
+    ];
+
+    /// Feed it messages at their times, moving on and answering as it goes.
+    fn feed(c: &mut DeckCheck, msgs: &[(f64, [u8; 3])]) {
+        for (t, m) in msgs {
+            c.tick(*t);
+            while c.step().is_some_and(|s| s.wants() == Want::Answer) {
+                c.answer(Seen::No);
+            }
+            c.hear(*t, m);
+        }
+    }
+
+    #[test]
+    fn a_real_sc_live_4_leaves_decks_to_the_software() {
+        let m = sc_live_4_checked();
+        let mut c = DeckCheck::for_mapping(true, &m);
+        feed(&mut c, CHECKED);
+        // The jog wheel wasn't taken for DECK, and DECK was (though it's
+        // learned as something else). CUE isn't taken for PLAY.
+        assert_eq!(
+            c.step(),
+            Some(Step::Press {
+                side: 0,
+                button: Button::Play,
+                round: 1
+            })
+        );
+        assert_eq!(c.refused(), Some(Trigger::note(4, 0x09)));
+        assert_eq!(c.got(), None);
+        // Nor is LOAD, or DECK.
+        c.hear(51.5, &[0x9F, 0x01, 0x7F]);
+        c.hear(52.0, &[0x94, 0x1F, 0x7F]);
+        assert_eq!(c.got(), None);
+        c.hear(52.5, &[0x94, 0x0A, 0x7F]);
+        assert_eq!((c.got(), c.refused()), (Some(52.5), None));
+        feed(&mut c, CHECKED_ON);
+        assert!(c.tick(110.0));
+        assert_eq!(c.step(), Some(Step::ScreenShows));
+        c.answer(Seen::Yes);
+        assert!(c.done());
+        let text = [c.summary(&m), c.details(&m)].concat().join("\n");
+        for side in 0..2 {
+            let s = c.side(side, &m);
+            assert_eq!(s.switch(), Switch::Software, "{text}");
+            assert!(s
+                .deck
+                .iter()
+                .all(|d| d.iter().all(|h| h.bytes[1] == 0x1F) && d.len() == 2));
+        }
+        assert!(
+            text.contains("both sides send exactly what they sent before"),
+            "{text}"
+        );
+        assert!(!text.contains("0x21"), "{text}");
+        assert!(
+            text.contains("channel 4 fader sends CC 0x0e · ch 4"),
+            "{text}"
+        );
+        assert!(!c.deck_pressed_twice());
+    }
+
+    /// The steps exactly as that check took them (it took any button): read
+    /// again, the left side isn't clear rather than switching by itself.
+    #[test]
+    fn a_wrong_button_is_unclear_not_a_verdict() {
+        let m = sc_live_4_checked();
+        let mut c = DeckCheck::new(true);
+        feed(&mut c, CHECKED);
+        feed(&mut c, CHECKED_ON);
+        assert!(c.tick(110.0));
+        c.answer(Seen::Yes);
+        assert!(c.done());
+        assert_eq!(c.side(0, &m).switch(), Switch::Unclear);
+        assert_eq!(c.side(1, &m).switch(), Switch::Software);
+        let text = c.summary(&m).join("\n");
+        assert!(text.contains("Left side: not clear"), "{text}");
+        assert!(!text.contains("switches decks itself"), "{text}");
+        assert!(c.next_step(&m, false).contains("Do it again"));
+        assert!(c.fix(&m).is_none());
+    }
+
+    #[test]
+    fn the_dj_can_say_that_was_it() {
+        let mut m = sc_live_4();
+        // PLAY learned as something else.
+        m.bindings.retain(|b| b.trigger != Trigger::note(4, 0x0A));
+        m.bind(Trigger::note(4, 0x0A), Target::Sync { deck: 0 });
+        let mut c = DeckCheck::for_mapping(false, &m);
+        c.hear(1.0, &[0x94, 0x0A, 0x7F]);
+        assert_eq!((c.got(), c.refused()), (None, Some(Trigger::note(4, 0x0A))));
+        c.take_refused();
+        assert_eq!((c.at, c.refused()), (1, None));
+        assert_eq!(c.side(0, &m).play[0], Some(Trigger::note(4, 0x0A)));
+        // Back forgets it.
+        c.back();
+        assert_eq!(c.side(0, &m).play[0], None);
     }
 
     #[test]

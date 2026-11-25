@@ -383,7 +383,8 @@ pub struct UiState {
 /// `--dev-deck-check <start|software|hardware|quiet>[:N]` opens the DECK
 /// button check: on its first page, or with a pretend Denon SC Live 4
 /// whose DECK button works that way doing every step (up to step N;
-/// `hardware+map` then clicks "Map decks C and D").
+/// `hardware+map` then clicks "Map decks C and D"; `N!` presses the wrong
+/// button at step N, to see it refused).
 pub struct DevOpts {
     pub screenshot: Option<PathBuf>,
     pub shot_frame: u64,

@@ -540,6 +540,23 @@ impl Target {
         }
     }
 
+    /// Whether this is a control of a deck's own side of a controller, so
+    /// that two decks can take turns on it: not its mixer channel, nor the
+    /// DECK button itself.
+    fn takes_turns(&self) -> bool {
+        !matches!(self, Target::DeckSelect { .. })
+            && matches!(
+                self.part(),
+                Part::Jog
+                    | Part::Transport
+                    | Part::Tempo
+                    | Part::Loops
+                    | Part::HotCues
+                    | Part::BeatLoops
+                    | Part::Rolls
+            )
+    }
+
     /// The group the mapping screen and the step-by-step setup show this
     /// control in: its part of the controller, on its deck or FX unit.
     pub fn group(&self) -> (Part, Option<u8>) {
@@ -845,10 +862,105 @@ pub struct Mapping {
     /// FX units' BEATS indicators (built-in presets only).
     #[serde(default)]
     pub fx_beat_lights: Vec<FxBeatLight>,
+    /// Screens that show which deck a side is on (built-in presets only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deck_displays: Vec<DeckDisplay>,
+}
+
+/// A controller's screen that shows which deck a side of it is on, where
+/// the software has to say so (the Denon SC Live 4's jog wheel screens).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeckDisplay {
+    /// The side whose deck it shows: 0 left, 1 right.
+    pub side: u8,
+    pub channel: u8,
+    /// The note that sets the number: its velocity is the deck, 1 to 4.
+    pub note: u8,
+    /// Control changes that show what's around the number, sent 127 (and 0
+    /// when Tandem lets go).
+    pub frame: Vec<u8>,
+}
+
+impl DeckDisplay {
+    /// What shows deck number `n`.
+    fn number(&self, n: u8) -> [u8; 3] {
+        [0x90 | self.channel, self.note, n]
+    }
+
+    /// What's around the number, shown or not.
+    fn framed(&self, on: bool) -> impl Iterator<Item = [u8; 3]> + '_ {
+        let v = if on { 0x7F } else { 0 };
+        self.frame
+            .iter()
+            .map(move |&cc| [0xB0 | self.channel, cc, v])
+    }
+}
+
+/// When to send the controller's deck numbers (see [`DeckDisplay`]): when a
+/// side changes deck, the number again [`DISPLAY_AGAIN`] later (the unit can
+/// drop one in a burst of messages), and everything every
+/// [`DISPLAY_EVERY`], so a screen never stays wrong.
+#[derive(Default)]
+pub struct DeckDisplayPace {
+    /// What each display was last told, and when; and whether the number
+    /// has been sent again since.
+    shown: Vec<Option<(u8, f64, bool)>>,
+}
+
+/// As Mixxx's Denon SC Live 4 mapping does it.
+const DISPLAY_AGAIN: f64 = 0.15;
+const DISPLAY_EVERY: f64 = 1.0;
+
+impl DeckDisplayPace {
+    /// The messages due `now` (seconds), for these displays and the deck
+    /// each side is on.
+    pub fn due(&mut self, now: f64, displays: &[DeckDisplay], sides: [u8; 2]) -> Vec<[u8; 3]> {
+        self.shown.resize(displays.len(), None);
+        let mut out = Vec::new();
+        for (d, shown) in displays.iter().zip(&mut self.shown) {
+            let n = sides[(d.side as usize).min(1)] + 1;
+            match shown {
+                Some((was, t, again)) if *was == n && now - *t < DISPLAY_EVERY => {
+                    if !*again && now - *t >= DISPLAY_AGAIN {
+                        out.push(d.number(n));
+                        *again = true;
+                    }
+                }
+                _ => {
+                    // Only a change is worth the second number: the next
+                    // one a second on is sent anyway.
+                    let changed = shown.is_none_or(|(was, _, _)| was != n);
+                    out.extend(d.framed(true));
+                    out.push(d.number(n));
+                    *shown = Some((n, now, !changed));
+                }
+            }
+        }
+        out
+    }
+
+    /// Something else has written to the screens: send everything again.
+    pub fn forget(&mut self) {
+        self.shown.clear();
+    }
+
+    /// Everything off again, if anything was shown: for when Tandem lets go.
+    pub fn dark(&mut self, displays: &[DeckDisplay]) -> Vec<[u8; 3]> {
+        let shown = std::mem::take(&mut self.shown);
+        displays
+            .iter()
+            .zip(shown)
+            .filter(|(_, s)| s.is_some())
+            .flat_map(|(d, _)| d.framed(false).chain([d.number(0)]).collect::<Vec<_>>())
+            .collect()
+    }
 }
 
 /// Bump when built-in presets gain controls; saved mappings pick them up.
-pub const PRESET_VERSION: u32 = 13;
+pub const PRESET_VERSION: u32 = 14;
+/// The first preset version whose decks can take turns on a side's controls
+/// (see [`Binding::layered`]): the Denon SC Live 4's.
+const FIRST_LAYERED_PRESET: u32 = 14;
 /// The first preset version with effects: older mappings start their FX
 /// units where the preset says.
 const FIRST_FX_PRESET: u32 = 13;
@@ -870,6 +982,7 @@ impl Mapping {
             meters: Vec::new(),
             fx_unit_decks: default_fx_unit_decks(),
             fx_beat_lights: Vec::new(),
+            deck_displays: Vec::new(),
         }
     }
 
@@ -894,8 +1007,14 @@ impl Mapping {
         if self.preset_version <= LAST_TWO_DECK_PRESET {
             added += self.unfold_decks(preset);
         }
+        if self.preset_version < FIRST_LAYERED_PRESET && preset.bindings.iter().any(|b| b.layered) {
+            added += self.take_turns(preset);
+        }
+        // Only what the DJ has on a control keeps the preset's off it: a
+        // DECK button the preset binds to two decks gets both.
+        let own = self.bindings.clone();
         for b in &preset.bindings {
-            let trigger_used = self.bindings.iter().any(|x| x.overlaps(b));
+            let trigger_used = own.iter().any(|x| x.overlaps(b));
             if !trigger_used {
                 self.bindings.push(b.clone());
                 added += 1;
@@ -918,6 +1037,16 @@ impl Mapping {
                 .any(|x| (x.channel, x.cc) == (l.channel, l.cc))
             {
                 self.fx_beat_lights.push(l.clone());
+                added += 1;
+            }
+        }
+        for d in &preset.deck_displays {
+            if !self
+                .deck_displays
+                .iter()
+                .any(|x| (x.channel, x.note) == (d.channel, d.note))
+            {
+                self.deck_displays.push(d.clone());
                 added += 1;
             }
         }
@@ -981,6 +1110,9 @@ impl Mapping {
             vinyl: self.vinyl,
             ..preset.clone()
         };
+        if preset.bindings.iter().any(|b| b.layered) {
+            self.take_turns(preset);
+        }
         true
     }
 
@@ -1003,6 +1135,69 @@ impl Mapping {
             }
         }
         moved
+    }
+
+    /// The preset's decks now take turns on each side's controls, switched
+    /// by its DECK buttons. What this mapping has on deck A's or B's
+    /// controls, the DJ's own choices included, does the same for deck C or
+    /// D, where nothing else is on the control. A DECK button bound to
+    /// something on deck C or D, from when the preset had no use for it, is
+    /// given up to the preset; one bound to anything else keeps it. Returns
+    /// how many controls changed.
+    fn take_turns(&mut self, preset: &Mapping) -> usize {
+        let mut changed = 0;
+        let deck_select = |t: &Target| matches!(t, Target::DeckSelect { .. });
+        let before = self.bindings.len();
+        self.bindings.retain(|b| {
+            deck_select(&b.target)
+                || b.target.deck().is_none_or(|d| d < 2)
+                || !preset
+                    .bindings
+                    .iter()
+                    .any(|p| deck_select(&p.target) && p.trigger == b.trigger)
+        });
+        changed += before - self.bindings.len();
+        let own = self.bindings.clone();
+        for p in preset.bindings.iter().filter(|p| deck_select(&p.target)) {
+            if !own.iter().any(|b| b.overlaps(p)) {
+                self.bindings.push(p.clone());
+                changed += 1;
+            }
+        }
+        for b in &mut self.bindings {
+            // A control learned for what the preset has on it now gets the
+            // preset's light.
+            let p = preset.bindings.iter().find(|p| {
+                p.trigger == b.trigger
+                    && p.target == b.target
+                    && p.shift == b.shift
+                    && p.mode == b.mode
+            });
+            b.light = b.light.or(p.and_then(|p| p.light));
+            if b.target.deck().is_some_and(|d| d < 2) && b.target.takes_turns() {
+                b.layered = true;
+            }
+        }
+        let copies: Vec<Binding> = self
+            .bindings
+            .iter()
+            .filter(|b| b.layered)
+            .filter_map(|b| {
+                let deck = b.target.deck().filter(|&d| d < 2)?;
+                let mut c = b.clone();
+                c.target = b.target.with_deck(deck + 2);
+                Some(c)
+            })
+            .collect();
+        // (A control with two bindings gets both.)
+        let own = self.bindings.clone();
+        for c in copies {
+            if !own.iter().any(|b| b.overlaps(&c)) {
+                self.bindings.push(c);
+                changed += 1;
+            }
+        }
+        changed
     }
 
     pub(crate) fn bind(&mut self, trigger: Trigger, target: Target) -> &mut Binding {
@@ -1246,6 +1441,22 @@ pub struct MidiEngine {
 }
 
 /// Where a mapping's FX units start (decks past D work nothing).
+/// The Denon SC Live 4's built-in mapping as it was up to preset 13: decks
+/// A and B only, and no DECK buttons.
+#[cfg(test)]
+pub(crate) fn sc_live_4_preset_13() -> Mapping {
+    let mut m = builtin_preset("SC LIVE 4").unwrap();
+    m.preset_version = 13;
+    m.deck_displays.clear();
+    m.bindings.retain(|b| {
+        !matches!(b.target, Target::DeckSelect { .. }) && b.target.deck().is_none_or(|d| d < 2)
+    });
+    for b in &mut m.bindings {
+        b.layered = false;
+    }
+    m
+}
+
 fn mapping_fx_decks(m: &Mapping) -> [Option<u8>; FX_UNITS] {
     m.fx_unit_decks.map(|d| d.filter(|&d| (d as usize) < DECKS))
 }
@@ -1350,6 +1561,11 @@ impl MidiEngine {
     /// The deck a side of the controller (0 left, 1 right) is on.
     pub fn side_deck(&self, side: usize) -> u8 {
         self.sides[side.min(1)]
+    }
+
+    /// The decks both sides are on.
+    pub fn side_decks(&self) -> [u8; 2] {
+        self.sides
     }
 
     /// Whether a binding's pad mode, if it has one, is its deck's, and its
@@ -1555,13 +1771,15 @@ impl MidiEngine {
                         .any(|b| matches!(b.target, Target::PadMode { deck, .. } if deck == d))
             });
             // A control that already takes turns between a side's two decks
-            // (the setup found it sends the same for both) still does.
-            let layered = target.deck().is_some()
-                && self
-                    .mapping
-                    .bindings
-                    .iter()
-                    .any(|b| b.layered && b.trigger == trigger);
+            // (the setup found it sends the same for both) still does, and
+            // so does any other of the side's deck controls.
+            let layered = self.mapping.bindings.iter().any(|b| {
+                b.layered
+                    && ((target.deck().is_some() && b.trigger == trigger)
+                        || (target.takes_turns()
+                            && b.trigger.channel == trigger.channel
+                            && b.target.deck().map(side_of) == target.deck().map(side_of)))
+            });
             let binding = Binding {
                 trigger,
                 target,
@@ -2698,13 +2916,18 @@ const DENON_BEAT_LOOP_PAD: Option<(u8, u8)> = Some((63, 4));
 const DENON_ROLL_PAD: Option<(u8, u8)> = Some((63, 17));
 
 /// Denon SC Live 4, in computer mode. Denon publishes no MIDI list for it:
-/// this comes from two Traktor mappings for it and Mixxx's Denon Prime 4
-/// mapping (the same family and messages), and hasn't been tried on the
-/// unit yet. The left side sends on MIDI channel 5 and drives deck A, the
-/// right side channel 6 and deck B (its DECK 3/4 button only switches a
-/// layer in software, so C and D aren't on it); mixer channels 1 and 2 are
-/// A and B's, and the browse section, crossfader, MASTER and the headphone
-/// knobs are on channel 16.
+/// this comes from two Traktor mappings for it, Mixxx's Denon Prime 4
+/// mapping (the same family and messages) and Mixxx's one for the SC Live 4,
+/// and a DJ's check of the DECK buttons on the unit (PLAY, CUE, LOAD, DECK,
+/// the faders of mixer channels 3 and 4, and the left jog wheel's screen:
+/// `docs/controllers/denon-sc-live-4.md`). The rest hasn't been tried on it.
+///
+/// The left side sends on MIDI channel 5, for decks A and C, and the right
+/// side on channel 6, for B and D. DECK (note 0x1F) changes nothing a side
+/// sends, so the two decks take turns on its controls and Tandem keeps track
+/// of which it's on, which the jog wheel screens show. Mixer channels 1 to 4
+/// are decks A to D, on channels 1 to 4, and LOAD, the browse section,
+/// crossfader, MASTER and the headphone knobs are on channel 16.
 ///
 /// The pads send notes 0x0F–0x16 in every pad mode, and SHIFT doesn't
 /// change what anything sends, so Tandem keeps track of both: SHIFT (note
@@ -2721,8 +2944,26 @@ fn denon_sc_live_4(device: &str) -> Mapping {
     m.jog_ticks_per_rev = Some(1000.0);
     for side in 0..2u8 {
         let ch = 4 + side;
-        let deck = side;
         m.bind(Trigger::note(ch, 0x1C), Target::Shift).light = DENON_BUTTON;
+        // One DECK button for both of the side's decks: each press goes to
+        // the one it isn't on.
+        for deck in [side, side + 2] {
+            m.bind(Trigger::note(ch, 0x1F), Target::DeckSelect { deck })
+                .light = DENON_BUTTON;
+        }
+        // The jog wheel's screen: the number, and the box and the word
+        // "DECK" around it.
+        m.deck_displays.push(DeckDisplay {
+            side,
+            channel: ch,
+            note: 0x38,
+            frame: vec![0x35, 0x36, 0x37],
+        });
+    }
+    for deck in 0..4u8 {
+        let side = deck % 2;
+        let ch = 4 + side;
+        let first = m.bindings.len();
         m.bind(Trigger::note(ch, 0x0A), Target::Play { deck }).light = DENON_BUTTON;
         m.bind(Trigger::note(ch, 0x09), Target::Cue { deck }).light = DENON_BUTTON;
         m.bind(Trigger::note(ch, 0x09), Target::BackToStart { deck })
@@ -2748,8 +2989,8 @@ fn denon_sc_live_4(device: &str) -> Mapping {
         m.bind(Trigger::note(ch, 0x26), Target::LoopOut { deck })
             .light = DENON_BUTTON;
         m.bind(Trigger::note(ch, 0x27), Target::BeatLoop { deck, size: 4 });
-        // Mixer channel 1 or 2.
-        let mx = side;
+        // Mixer channels 1 to 4.
+        let mx = deck;
         m.bind(Trigger::cc(mx, 0x03), Target::Trim { deck });
         m.bind(Trigger::cc(mx, 0x04), Target::Eq { deck, band: 2 });
         m.bind(Trigger::cc(mx, 0x06), Target::Eq { deck, band: 1 });
@@ -2780,6 +3021,10 @@ fn denon_sc_live_4(device: &str) -> Mapping {
             let b = m.bind(pad, Target::Roll { deck, size: i });
             b.mode = Some(PadMode::Rolls);
             b.light = DENON_ROLL_PAD;
+        }
+        // All but the mixer channel take turns.
+        for b in &mut m.bindings[first..] {
+            b.layered = b.target.takes_turns();
         }
     }
     m.bind(Trigger::cc(15, 0x0E), Target::Crossfader);
@@ -4484,7 +4729,7 @@ mod tests {
     #[test]
     fn saved_v7_to_v11_flx6_mappings_gain_the_level_knobs() {
         let preset = builtin_preset("DDJ-FLX6").unwrap();
-        assert_eq!(preset.preset_version, 13);
+        assert_eq!(preset.preset_version, PRESET_VERSION);
         let level = |t: &Target| matches!(t, Target::MasterLevel | Target::HeadphoneLevel);
         let rolls = |t: &Target| matches!(t, Target::Roll { .. });
         let shift_tempo = |t: &Target| matches!(t, Target::TempoShift { .. });
@@ -4674,6 +4919,261 @@ mod tests {
             act(Action::HotCue { deck: 0, slot: 7 })
         );
         assert_eq!(send(&mut e, [0x95, 0x12, 0x7F]), roll(1, 0.5, true));
+    }
+
+    /// Everything `a` does that `b` doesn't, lights included.
+    fn lacks(a: &Mapping, b: &Mapping) -> Vec<String> {
+        a.bindings
+            .iter()
+            .filter(|x| !b.bindings.contains(x))
+            .map(|x| format!("{} on {}", x.target.label(), x.label()))
+            .collect()
+    }
+
+    #[test]
+    fn sc_live_4_deck_switches_each_side() {
+        let mut e = sc_live_4();
+        for side in 0..2u8 {
+            let (notes, ccs) = (0x94 + side, 0xB4 + side);
+            for deck in [side, side + 2, side, side + 2] {
+                assert_eq!(e.side_deck(side as usize), deck);
+                assert_eq!(tap(&mut e, notes, 0x0A), act(Action::Play { deck }));
+                assert_eq!(
+                    tap(&mut e, notes, 0x09),
+                    [
+                        MidiOut::Action(Action::CueDown { deck }),
+                        MidiOut::Action(Action::CueUp { deck }),
+                    ]
+                );
+                // LOAD sends the same on both decks too.
+                assert_eq!(
+                    tap(&mut e, 0x9F, 1 + side),
+                    [MidiOut::LoadSelected(deck)],
+                    "deck {deck}"
+                );
+                assert_eq!(
+                    tap(&mut e, notes, 0x0F)[0],
+                    MidiOut::Action(Action::HotCue { deck, slot: 0 })
+                );
+                // The jog wheel, with the deck stopped.
+                assert!(send(&mut e, [ccs, 0x36, 1]).is_empty(), "gathered");
+                let turned = e.flush(None);
+                assert!(
+                    matches!(turned[..], [Action::Nudge { deck: d, .. }] if d == deck),
+                    "deck {deck}: {turned:?}"
+                );
+                assert_eq!(tap(&mut e, notes, 0x1F), []);
+            }
+            // The other side stayed where it was.
+            assert_eq!(e.side_deck(1 - side as usize), 1 - side);
+        }
+        // The mixer's four channels are the four decks', whatever the sides
+        // are on.
+        for deck in 0..4u8 {
+            assert!(
+                send(&mut e, [0xB0 + deck, 0x0E, 0x7F]).iter().all(
+                    |o| matches!(o, MidiOut::Action(Action::Volume { deck: d, .. }) if *d == deck)
+                ),
+                "deck {deck}"
+            );
+            assert_eq!(
+                send(&mut e, [0x90 + deck, 0x0D, 0x7F]),
+                [MidiOut::TogglePfl(deck)]
+            );
+        }
+        // Each deck keeps its own pad mode.
+        tap(&mut e, 0x94, 0x0D);
+        assert_eq!(e.pad_mode(0), PadMode::Rolls);
+        tap(&mut e, 0x94, 0x1F);
+        assert_eq!(
+            tap(&mut e, 0x94, 0x0F)[0],
+            MidiOut::Action(Action::HotCue { deck: 2, slot: 0 })
+        );
+        tap(&mut e, 0x94, 0x1F);
+        assert_eq!(send(&mut e, [0x94, 0x0F, 0x7F]), roll(0, 1.0 / 16.0, true));
+        // Let go on deck C, a pad pressed on deck A lets go on A.
+        tap(&mut e, 0x94, 0x1F);
+        assert_eq!(send(&mut e, [0x94, 0x0F, 0x00]), roll(0, 1.0 / 16.0, false));
+    }
+
+    #[test]
+    fn sc_live_4_deck_doesnt_make_the_tempo_jump() {
+        let mut e = sc_live_4();
+        let mut room = RoomState::default();
+        let local = LocalParams::default();
+        room.decks[2].tempo = 1.03;
+        // Deck A's tempo fader ends up near the top.
+        for v in [64, 80, 100, 120] {
+            e.handle(&[0xB4, 0x1F, v], &room, &local);
+        }
+        e.handle(&[0x94, 0x1F, 0x7F], &room, &local);
+        e.handle(&[0x94, 0x1F, 0x00], &room, &local);
+        // Deck C: the first reading only says where the fader is.
+        assert!(e.handle(&[0xB4, 0x1F, 118], &room, &local).is_empty());
+        let out = e.handle(&[0xB4, 0x1F, 116], &room, &local);
+        let [MidiOut::Action(Action::Tempo { deck: 2, tempo })] = out[..] else {
+            panic!("{out:?}");
+        };
+        let moved = 2.0 / 127.0 * 0.16;
+        assert!((tempo - (1.03 - moved)).abs() < 1e-6, "{tempo}");
+    }
+
+    #[test]
+    fn sc_live_4_lights_follow_deck() {
+        let mut e = sc_live_4();
+        let mut room = RoomState::default();
+        room.decks[2].playing = true;
+        let light = |e: &MidiEngine, key: (u8, u8)| {
+            e.lights(&room, &LocalParams::default())
+                .into_iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v)
+        };
+        // PLAY (deck A stopped, C playing) and DECK itself.
+        assert_eq!(light(&e, (0x94, 0x0A)), Some(1));
+        assert_eq!(light(&e, (0x94, 0x1F)), Some(1));
+        tap(&mut e, 0x94, 0x1F);
+        assert_eq!(light(&e, (0x94, 0x0A)), Some(127));
+        assert_eq!(light(&e, (0x94, 0x1F)), Some(127));
+        assert_eq!(light(&e, (0x95, 0x1F)), Some(1));
+    }
+
+    #[test]
+    fn jog_screens_show_the_sides_decks() {
+        let preset = builtin_preset("SC LIVE 4").unwrap();
+        let displays = &preset.deck_displays;
+        let mut pace = DeckDisplayPace::default();
+        let frame = |ch: u8| [0x35, 0x36, 0x37].map(|cc| [0xB0 | ch, cc, 0x7F]);
+        let shown = |ch: u8, n: u8| {
+            let mut v = frame(ch).to_vec();
+            v.push([0x90 | ch, 0x38, n]);
+            v
+        };
+        // What the check sent the unit, which showed it.
+        assert_eq!(
+            shown(4, 3),
+            crate::deck_check::jog_screen_deck(4, 3)
+                .iter()
+                .map(|m| [m[0], m[1], m[2]])
+                .collect::<Vec<_>>()
+        );
+        // Connecting: both screens, and their numbers again.
+        let both = [shown(4, 1), shown(5, 2)].concat();
+        assert_eq!(pace.due(10.0, displays, [0, 1]), both);
+        assert_eq!(pace.due(10.1, displays, [0, 1]), [] as [[u8; 3]; 0]);
+        assert_eq!(
+            pace.due(10.16, displays, [0, 1]),
+            [[0x94, 0x38, 1], [0x95, 0x38, 2]]
+        );
+        assert_eq!(pace.due(10.5, displays, [0, 1]), [] as [[u8; 3]; 0]);
+        // DECK on the left: that screen at once, and its number again.
+        assert_eq!(pace.due(10.6, displays, [2, 1]), shown(4, 3));
+        assert_eq!(pace.due(10.76, displays, [2, 1]), [[0x94, 0x38, 3]]);
+        // Every second, everything, once.
+        assert_eq!(pace.due(11.0, displays, [2, 1]), shown(5, 2));
+        assert_eq!(pace.due(11.2, displays, [2, 1]), [] as [[u8; 3]; 0]);
+        assert_eq!(pace.due(11.6, displays, [2, 1]), shown(4, 3));
+        // The check wrote to them: all again.
+        pace.forget();
+        assert_eq!(
+            pace.due(11.7, displays, [2, 1]),
+            [shown(4, 3), shown(5, 2)].concat()
+        );
+        // Letting go turns them off, once.
+        let dark = pace.dark(displays);
+        assert_eq!(dark.len(), 8);
+        assert!(dark.iter().all(|m| m[2] == 0));
+        assert!(pace.dark(displays).is_empty());
+    }
+
+    /// As saved on the unit the DECK button check was first run on: mixer
+    /// channels 3 and 4 mapped, and the left DECK button learned as deck D's
+    /// Play (it would have kept DECK off).
+    #[test]
+    fn saved_sc_live_4_mappings_gain_decks_c_and_d() {
+        let preset = builtin_preset("SC LIVE 4").unwrap();
+        let mut saved = sc_live_4_preset_13();
+        assert_eq!(saved.bindings.len(), 122);
+        // Untouched: the preset as it is now.
+        let mut plain = saved.clone();
+        assert!(plain.upgrade_from(&preset) > 0);
+        assert_eq!(lacks(&preset, &plain), [] as [String; 0]);
+        assert_eq!(lacks(&plain, &preset), [] as [String; 0]);
+        assert_eq!(plain.deck_displays, preset.deck_displays);
+        assert_eq!(plain.upgrade_from(&preset), 0, "only once");
+        // As that DJ had it, calibrated.
+        for b in &preset.bindings {
+            if b.target.part() == Part::Channel && b.target.deck().is_some_and(|d| d >= 2) {
+                saved.bindings.push(Binding {
+                    light: None,
+                    ..b.clone()
+                });
+            }
+        }
+        saved.bind(Trigger::note(4, 0x1F), Target::Play { deck: 3 });
+        saved.jog_ticks_per_rev = Some(1012.0);
+        assert_eq!(saved.bindings.len(), 137);
+        assert!(saved.upgrade_from(&preset) > 0);
+        assert_eq!(lacks(&preset, &saved), [] as [String; 0]);
+        assert_eq!(lacks(&saved, &preset), [] as [String; 0]);
+        assert_eq!(saved.jog_ticks_per_rev, Some(1012.0));
+        let mut e = MidiEngine::new(saved, 0.08);
+        assert_eq!(tap(&mut e, 0x94, 0x1F), [], "DECK plays nothing");
+        assert_eq!(tap(&mut e, 0x94, 0x0A), act(Action::Play { deck: 2 }));
+    }
+
+    #[test]
+    fn sc_live_4_upgrades_keep_what_the_dj_changed() {
+        let preset = builtin_preset("SC LIVE 4").unwrap();
+        // A control moved, one changed, one added, and the right DECK button
+        // used for something that isn't on deck C or D.
+        let mut saved = sc_live_4_preset_13();
+        let at = |t: Trigger| move |b: &Binding| b.trigger == t;
+        saved.bindings.retain(|b| !at(Trigger::note(4, 0x1D))(b));
+        saved.bind(Trigger::note(4, 0x1D), Target::LoopHalve { deck: 0 });
+        saved.bind(Trigger::note(4, 0x06), Target::Reloop { deck: 0 });
+        saved.bind(Trigger::note(5, 0x1F), Target::BrowseBack);
+        saved
+            .bindings
+            .iter_mut()
+            .find(|b| b.target == Target::Jog { deck: 0 })
+            .unwrap()
+            .invert = true;
+        assert!(saved.upgrade_from(&preset) > 0);
+        let mut e = MidiEngine::new(saved.clone(), 0.08);
+        for deck in [0, 2] {
+            assert_eq!(
+                tap(&mut e, 0x94, 0x1D),
+                act(Action::LoopHalve { deck }),
+                "deck {deck}"
+            );
+            assert_eq!(tap(&mut e, 0x94, 0x06), act(Action::Reloop { deck }));
+            tap(&mut e, 0x94, 0x1F);
+        }
+        let jogs: Vec<bool> = saved
+            .bindings
+            .iter()
+            .filter(|b| b.trigger == Trigger::cc(4, 0x36))
+            .map(|b| b.invert)
+            .collect();
+        assert_eq!(jogs, [true, true]);
+        // The right side stays on deck B, as before.
+        let right: Vec<Target> = saved
+            .bindings
+            .iter()
+            .filter(|b| b.trigger == Trigger::note(5, 0x1F))
+            .map(|b| b.target)
+            .collect();
+        assert_eq!(right, [Target::BrowseBack]);
+        tap(&mut e, 0x95, 0x1F);
+        assert_eq!(tap(&mut e, 0x95, 0x0A), act(Action::Play { deck: 1 }));
+        // A mapping the step-by-step setup had already given four decks
+        // gains nothing twice.
+        let mut made = preset.clone();
+        made.preset_version = 13;
+        made.deck_displays.clear();
+        assert_eq!(made.upgrade_from(&preset), 2, "the two screens");
+        assert_eq!(made.bindings, preset.bindings);
     }
 
     #[test]
@@ -5297,7 +5797,10 @@ mod tests {
         let b = learned(send(&mut e, [0x94, 0x16, 0x7F]));
         assert_eq!(b.trigger, Trigger::note(4, 0x16));
         assert_eq!((b.mode, b.shift), (Some(PadMode::Rolls), false));
-        assert_eq!(b.label(), "Note 0x16 · ch 5 (pad mode: rolls)");
+        assert_eq!(
+            b.label(),
+            "Note 0x16 · ch 5 (pad mode: rolls) (side on deck A)"
+        );
         assert!(send(&mut e, [0x94, 0x16, 0x00]).is_empty());
         // Learning with SHIFT held: SHIFT + the pad, in HOT CUE mode.
         tap(&mut e, 0x94, 0x0B);
@@ -5305,7 +5808,10 @@ mod tests {
         assert!(send(&mut e, [0x94, 0x1C, 0x7F]).is_empty());
         let b = learned(send(&mut e, [0x94, 0x0F, 0x7F]));
         assert_eq!((b.mode, b.shift), (Some(PadMode::HotCues), true));
-        assert_eq!(b.label(), "SHIFT + Note 0x0f · ch 5 (pad mode: hot cues)");
+        assert_eq!(
+            b.label(),
+            "SHIFT + Note 0x0f · ch 5 (pad mode: hot cues) (side on deck A)"
+        );
         send(&mut e, [0x94, 0x0F, 0x00]);
         send(&mut e, [0x94, 0x1C, 0x00]);
         // Controls that aren't pads work in every pad mode.
@@ -5313,6 +5819,17 @@ mod tests {
         e.learn = Some(Target::Reloop { deck: 0 });
         let b = learned(send(&mut e, [0x94, 0x28, 0x7F]));
         assert_eq!((b.mode, b.shift), (None, false));
+        // A control that had nothing on it takes turns, as the rest of its
+        // side does; a mixer channel's doesn't.
+        assert!(b.layered);
+        send(&mut e, [0x94, 0x28, 0x00]);
+        assert_eq!(tap(&mut e, 0x94, 0x28), act(Action::Reloop { deck: 0 }));
+        tap(&mut e, 0x94, 0x1F);
+        assert_eq!(tap(&mut e, 0x94, 0x28), []);
+        tap(&mut e, 0x94, 0x1F);
+        e.learn = Some(Target::Pfl { deck: 0 });
+        assert!(!learned(send(&mut e, [0x90, 0x2A, 0x7F])).layered);
+        send(&mut e, [0x90, 0x2A, 0x00]);
         // SHIFT and the pad mode buttons can be learned themselves.
         e.learn = Some(Target::Shift);
         let b = learned(send(&mut e, [0x94, 0x1C, 0x7F]));
@@ -5395,10 +5912,13 @@ mod tests {
             pad8_bindings,
             [
                 Target::HotCue { deck: 1, slot: 7 },
-                Target::Reloop { deck: 1 }
+                Target::Reloop { deck: 1 },
+                Target::HotCue { deck: 3, slot: 7 },
+                Target::Reloop { deck: 3 }
             ]
         );
-        assert_eq!(m.bindings.len(), preset.bindings.len() - 4 + 2);
+        assert!(at(&m, pad8).iter().all(|b| b.layered));
+        assert_eq!(m.bindings.len(), preset.bindings.len() - 8 + 4);
         // Saved and loaded again, it's the same, and deck A's pads roll.
         let json = serde_json::to_vec_pretty(&m).unwrap();
         let m: Mapping = serde_json::from_slice(&json).unwrap();
@@ -5424,7 +5944,9 @@ mod tests {
         saved
             .bind(Trigger::note(4, 0x0F), Target::Roll { deck: 0, size: 7 })
             .mode = Some(PadMode::Rolls);
-        assert_eq!(saved.upgrade_from(&preset), 16 - 2);
+        // All four decks' pads but the two, on both of the side's decks;
+        // and the two, copied to the side's other deck.
+        assert_eq!(saved.upgrade_from(&preset), 32 - 4 + 2);
         let mut e = MidiEngine::new(saved, 0.08);
         tap(&mut e, 0x94, 0x0D);
         assert_eq!(send(&mut e, [0x94, 0x0F, 0x7F]), roll(0, 8.0, true));

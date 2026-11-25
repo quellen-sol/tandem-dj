@@ -2168,7 +2168,7 @@ impl Demo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mapping::{builtin_preset, parse, MidiEngine, MidiOut};
+    use crate::mapping::{builtin_preset, parse, sc_live_4_preset_13, MidiEngine, MidiOut};
     use crate::model::{Action, RoomState};
     use crate::render::LocalParams;
 
@@ -2313,7 +2313,7 @@ mod tests {
 
     #[test]
     fn a_denon_with_tandems_shift_and_pad_modes_is_learned_as_its_preset() {
-        let preset = builtin_preset("SC LIVE 4").unwrap();
+        let preset = sc_live_4_preset_13();
         let (w, refused) = learn(&preset, false, Setup::default());
         assert_eq!(refusals(&w, &refused), [] as [String; 0]);
         let made = w.finish();
@@ -2456,29 +2456,7 @@ mod tests {
     /// sends, so decks C and D take turns with A and B on the same
     /// controls, and its mixer has four channels.
     fn sc_live_4_on_four_decks() -> Mapping {
-        let mut m = builtin_preset("SC LIVE 4").unwrap();
-        let mut more = Vec::new();
-        for b in &mut m.bindings {
-            let Some(deck) = b.target.deck() else {
-                continue;
-            };
-            let mut c = b.clone();
-            c.target = b.target.with_deck(deck + 2);
-            if b.target.part() == Part::Channel {
-                c.trigger.channel += 2;
-            } else {
-                (b.layered, c.layered) = (true, true);
-            }
-            more.push(c);
-        }
-        m.bindings.extend(more);
-        for deck in 0..4u8 {
-            m.bind(
-                Trigger::note(4 + deck % 2, 0x1F),
-                Target::DeckSelect { deck },
-            );
-        }
-        m
+        builtin_preset("SC LIVE 4").unwrap()
     }
 
     #[test]
@@ -2555,11 +2533,11 @@ mod tests {
         assert_eq!(e.handle(&[0x95, 0x0A, 0x7F], &room, &local), play(1));
     }
 
-    /// What the DECK button check tells an SC Live 4's DJ to do: from the
-    /// built-in mapping, asked only for what it lacks.
+    /// What the DECK button check tells a DJ to do: from a mapping of two
+    /// decks, asked only for what it lacks.
     #[test]
-    fn the_sc_live_4s_built_in_mapping_gains_decks_c_and_d() {
-        let preset = builtin_preset("SC LIVE 4").unwrap();
+    fn a_two_deck_mapping_gains_decks_c_and_d() {
+        let preset = sc_live_4_preset_13();
         let demo = Demo {
             controller: sc_live_4_on_four_decks(),
             fine: false,
@@ -3295,7 +3273,7 @@ mod tests {
 
     #[test]
     fn after_the_last_step_a_control_says_what_it_does() {
-        let mut w = Wizard::new(builtin_preset("SC LIVE 4").unwrap(), Setup::default());
+        let mut w = Wizard::new(sc_live_4_preset_13(), Setup::default());
         while w.at().is_some() {
             w.skip();
         }

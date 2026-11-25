@@ -11,7 +11,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tandem_core::deck_check::{
     self, jog_screen_deck, DeckCheck, Fix, Pretend, ReportInfo, Seen, Step, Want,
 };
-use tandem_core::mapping::{builtin_preset, Mapping, MidiOut};
+use tandem_core::mapping::{builtin_preset, Mapping, MidiOut, Trigger};
 
 /// A step that has heard nothing this long says so.
 const QUIET_HINT_SECS: f64 = 4.0;
@@ -48,6 +48,8 @@ pub struct DeckCheckUi {
     pretend: Option<(Pretend, Option<usize>)>,
     /// `--dev-deck-check hardware+map`: click "Map decks C and D" at the end.
     pretend_map: bool,
+    /// At the last step it presses CUE, whatever is asked for (`N!`).
+    pretend_wrong: bool,
 }
 
 /// A pretend controller has done the steps it was asked to: the check
@@ -108,9 +110,10 @@ impl TandemApp {
             self.close_deck_check(&mut old);
         }
         let port = self.midi.port.clone().unwrap_or_default();
-        let screen = {
+        let check = {
             let engine = self.midi.engine.lock();
-            self.midi.has_output && is_sc_live_4(&port, &engine.mapping)
+            let screen = self.midi.has_output && is_sc_live_4(&port, &engine.mapping);
+            DeckCheck::for_mapping(screen, &engine.mapping)
         };
         *self.midi.tap.lock() = Some(Vec::new());
         // Whatever was held on the controller (a jog wheel touched, SHIFT)
@@ -123,7 +126,7 @@ impl TandemApp {
             }
         }
         self.ui.deck_check = Some(DeckCheckUi {
-            check: DeckCheck::new(screen),
+            check,
             started: false,
             start: Instant::now(),
             step_since: 0.0,
@@ -140,6 +143,7 @@ impl TandemApp {
             copied: false,
             pretend: None,
             pretend_map: false,
+            pretend_wrong: false,
         });
         log::info!("DECK button check: started on {port}");
     }
@@ -147,9 +151,14 @@ impl TandemApp {
     /// `--dev-deck-check <start|software|hardware|quiet>[:N]`: the check
     /// with a pretend Denon SC Live 4 (no MIDI device needed) whose DECK
     /// button works that way, done up to step N (1-based; all if no N).
-    /// `hardware+map` also clicks "Map decks C and D" at the end.
+    /// `hardware+map` also clicks "Map decks C and D" at the end, and `N!`
+    /// presses CUE at step N, to see it refused.
     pub(crate) fn dev_deck_check(&mut self, how: &str) {
         let (how, map) = match how.strip_suffix("+map") {
+            Some(h) => (h, true),
+            None => (how, false),
+        };
+        let (how, wrong) = match how.strip_suffix('!') {
             Some(h) => (h, true),
             None => (how, false),
         };
@@ -165,7 +174,7 @@ impl TandemApp {
             return;
         };
         // A pretend controller has an output port.
-        ui.check = DeckCheck::new(true);
+        ui.check = DeckCheck::for_mapping(true, &self.midi.engine.lock().mapping);
         let pretend = match model {
             "software" => Pretend::Software,
             "hardware" => Pretend::Hardware,
@@ -174,6 +183,7 @@ impl TandemApp {
         };
         ui.pretend = Some((pretend, stop.map(|n| n.saturating_sub(1))));
         ui.pretend_map = map;
+        ui.pretend_wrong = wrong;
         ui.started = true;
     }
 
@@ -291,7 +301,12 @@ impl TandemApp {
             st.check.answer(seen);
             return;
         }
-        let msgs = model.messages(step);
+        let msgs = match step {
+            Step::Press { side, .. } if st.pretend_wrong && stop == Some(at) => {
+                vec![vec![0x94 + side, 0x09, 0x7F], vec![0x94 + side, 0x09, 0]]
+            }
+            _ => model.messages(step),
+        };
         for (i, m) in msgs.iter().enumerate() {
             st.check.hear(now + i as f64 * 0.04, m);
         }
@@ -332,9 +347,10 @@ impl TandemApp {
     }
 
     /// After the jog wheel screen test: the left screen, the only one it
-    /// touched, shows deck 1 again.
+    /// touched, shows the deck the left side is on again.
     fn restore_screen(&self, st: &DeckCheckUi) {
-        self.midi.send(&jog_screen_deck(st.left_channel, 1));
+        let deck = self.midi.engine.lock().side_deck(0) + 1;
+        self.midi.send(&jog_screen_deck(st.left_channel, deck));
     }
 
     /// The check is over: the controller works as usual again, and the
@@ -469,6 +485,29 @@ impl TandemApp {
                 };
                 if st.check.got().is_some() {
                     ui.label(RichText::new("Got it.").color(GREEN));
+                } else if let Some(t) = st.check.refused() {
+                    let does = {
+                        let engine = self.midi.engine.lock();
+                        control_name(&engine.mapping, t)
+                    };
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "That was {does}, not what's asked for here. Try again."
+                            ))
+                            .color(AMBER),
+                        );
+                        if ui
+                            .button("That was it")
+                            .on_hover_text(
+                                "Tandem's mapping has this control as something else, but it's \
+                                 the one asked for.",
+                            )
+                            .clicked()
+                        {
+                            st.check.take_refused();
+                        }
+                    });
                 } else if waited >= QUIET_HINT_SECS {
                     ui.label(
                         RichText::new(format!(
@@ -669,4 +708,13 @@ impl TandemApp {
         }
         again
     }
+}
+
+/// What the mapping has a control as, or the control itself.
+fn control_name(mapping: &Mapping, t: Trigger) -> String {
+    mapping
+        .bindings
+        .iter()
+        .find(|b| b.trigger == t && !b.shift)
+        .map_or_else(|| t.label(), |b| b.target.label())
 }
