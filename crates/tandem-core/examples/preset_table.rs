@@ -47,6 +47,7 @@ fn main() {
             notes.push(match b.rel {
                 RelMode::Offset64 => "64 = still".to_string(),
                 RelMode::TwosComplement => "1 = +1, 127 = -1".to_string(),
+                RelMode::Absolute | RelMode::Absolute14 { .. } => b.rel.label(),
             });
         }
         if b.invert {

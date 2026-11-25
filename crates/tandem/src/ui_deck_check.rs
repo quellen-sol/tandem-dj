@@ -61,7 +61,7 @@ fn pretend_holds(st: &DeckCheckUi) -> bool {
 /// Open Explorer on the folder with `path` selected. Explorer reads its
 /// own command line: the path goes in quotes after `/select,`, which Rust's
 /// quoting of a whole argument with spaces in it would break.
-fn show_file(path: &std::path::Path) {
+pub(crate) fn show_file(path: &std::path::Path) {
     let mut cmd = std::process::Command::new("explorer");
     #[cfg(windows)]
     {
@@ -73,7 +73,7 @@ fn show_file(path: &std::path::Path) {
     let _ = cmd.spawn();
 }
 
-fn now_secs() -> u64 {
+pub(crate) fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -105,6 +105,9 @@ impl TandemApp {
         // The step-by-step setup takes the controller's messages too.
         if self.ui.wizard.is_some() {
             return;
+        }
+        if let Some(mut other) = self.ui.jog_check.take() {
+            self.close_jog_check(&mut other);
         }
         if let Some(mut old) = self.ui.deck_check.take() {
             self.close_deck_check(&mut old);
@@ -711,7 +714,7 @@ impl TandemApp {
 }
 
 /// What the mapping has a control as, or the control itself.
-fn control_name(mapping: &Mapping, t: Trigger) -> String {
+pub(crate) fn control_name(mapping: &Mapping, t: Trigger) -> String {
     mapping
         .bindings
         .iter()

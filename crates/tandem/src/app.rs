@@ -388,6 +388,8 @@ pub struct UiState {
     pub wizard: Option<crate::ui_wizard::WizardUi>,
     /// The DECK button check, while it's open.
     pub deck_check: Option<crate::ui_deck_check::DeckCheckUi>,
+    /// The jog wheel check, while it's open.
+    pub jog_check: Option<crate::ui_jog_check::JogCheckUi>,
     pub show_terms: bool,
     pub host_open: bool,
     pub join_open: bool,
@@ -452,6 +454,11 @@ pub struct UiState {
 /// 3 s before the screenshot, a pretend DDJ-FLX6 presses SHIFT + LOAD on
 /// them while they play (refused, where they can be heard), then PLAY and
 /// SHIFT + LOAD again; `+load` then presses LOAD.
+/// `--dev-jog-check <start|model>[:N]` opens the jog wheel check the same
+/// way, with a pretend controller whose jog wheels work as the model says
+/// (`PretendDj::named`), half way through step N, or with every step done
+/// (`N!` presses PLAY at step N; `+relearned` starts with the wheels learned
+/// as counting around 64, and `+fix` clicks "Fix the mapping").
 pub struct DevOpts {
     pub screenshot: Option<PathBuf>,
     pub shot_frame: u64,
@@ -472,6 +479,7 @@ pub struct DevOpts {
     pub deck_check: Option<String>,
     pub eject: Option<String>,
     pub drag: Option<([f32; 4], bool)>,
+    pub jog_check: Option<String>,
     pub crate_demo: bool,
     pub crate_step: u8,
     /// The window has been checked against the screen (`fit_window`).
@@ -599,6 +607,7 @@ impl TandemApp {
             settings_tab: SettingsTab::Audio,
             wizard: None,
             deck_check: None,
+            jog_check: None,
             show_terms: false,
             host_open: false,
             join_open: false,
@@ -1536,6 +1545,9 @@ impl TandemApp {
             }
             if let Some(how) = self.dev.deck_check.clone() {
                 self.dev_deck_check(&how);
+            }
+            if let Some(how) = self.dev.jog_check.clone() {
+                self.dev_jog_check(&how);
             }
         }
         if self.dev.demo {

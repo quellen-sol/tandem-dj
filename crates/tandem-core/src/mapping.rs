@@ -21,6 +21,7 @@
 use crate::meter::{to_db, Levels};
 use crate::model::{deck_letter, Action, RoomState, BEAT_LOOPS, DECKS, FX_BEATS, FX_SLOTS, ROLLS};
 use crate::render::LocalParams;
+use crate::wheel::{self, Position};
 use crate::wizard::Wizard;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -194,7 +195,21 @@ pub enum Target {
     Pfl {
         deck: u8,
     },
+    /// Turning a jog wheel that sends the same message for its platter and
+    /// its edge: it scratches while the touch sensor says a hand is on top,
+    /// and nudges the rest of the time.
     Jog {
+        deck: u8,
+    },
+    /// Turning the platter with a hand on top: scratches. Without a touch
+    /// sensor ([`Target::JogTouch`]), turning it is what takes hold of the
+    /// record, and leaving it still lets go (see [`MidiEngine::let_go_still`]).
+    JogPlatter {
+        deck: u8,
+    },
+    /// Turning the wheel by its edge: bends the speed while the deck plays
+    /// and searches while it's paused, hand on top or not. Never scratches.
+    JogEdge {
         deck: u8,
     },
     JogTouch {
@@ -335,7 +350,13 @@ impl Target {
             Target::Trim { deck: d } => format!("Deck {} · Trim", deck(d)),
             Target::Filter { deck: d } => format!("Deck {} · Filter", deck(d)),
             Target::Pfl { deck: d } => format!("Deck {} · Headphone cue", deck(d)),
-            Target::Jog { deck: d } => format!("Deck {} · Jog wheel turn", deck(d)),
+            Target::Jog { deck: d } => {
+                format!("Deck {} · Jog wheel, both (touch decides)", deck(d))
+            }
+            Target::JogPlatter { deck: d } => {
+                format!("Deck {} · Jog wheel, platter (scratch)", deck(d))
+            }
+            Target::JogEdge { deck: d } => format!("Deck {} · Jog wheel, edge (nudge)", deck(d)),
             Target::JogTouch { deck: d } => format!("Deck {} · Jog wheel touch (scratch)", deck(d)),
             Target::BendDown { deck: d } => format!("Deck {} · Pitch bend −", deck(d)),
             Target::BendUp { deck: d } => format!("Deck {} · Pitch bend +", deck(d)),
@@ -421,6 +442,8 @@ impl Target {
             | Filter { deck }
             | Pfl { deck }
             | Jog { deck }
+            | JogPlatter { deck }
+            | JogEdge { deck }
             | JogTouch { deck }
             | BendDown { deck }
             | BendUp { deck }
@@ -466,7 +489,10 @@ impl Target {
             | Target::MasterLevel
             | Target::FxDepth { .. }
             | Target::FxDepthAll { .. } => TargetKind::Absolute,
-            Target::Jog { .. } | Target::Browse => TargetKind::Relative,
+            Target::Jog { .. }
+            | Target::JogPlatter { .. }
+            | Target::JogEdge { .. }
+            | Target::Browse => TargetKind::Relative,
             _ => TargetKind::Button,
         }
     }
@@ -477,6 +503,14 @@ impl Target {
 
     pub fn is_relative(&self) -> bool {
         self.kind() == TargetKind::Relative
+    }
+
+    /// Turning a jog wheel: its platter, its edge, or both alike.
+    pub fn is_jog_turn(&self) -> bool {
+        matches!(
+            self,
+            Target::Jog { .. } | Target::JogPlatter { .. } | Target::JogEdge { .. }
+        )
     }
 
     /// Something the pads do, so its binding can depend on the pad mode.
@@ -517,7 +551,7 @@ impl Target {
         use Target::*;
         match self {
             Shift => Part::Shift,
-            JogTouch { .. } | Jog { .. } => Part::Jog,
+            JogTouch { .. } | Jog { .. } | JogPlatter { .. } | JogEdge { .. } => Part::Jog,
             Play { .. }
             | Cue { .. }
             | BackToStart { .. }
@@ -585,6 +619,8 @@ impl Target {
         let mut v = vec![Target::Shift];
         for d in 0..DECKS as u8 {
             v.push(Target::JogTouch { deck: d });
+            v.push(Target::JogPlatter { deck: d });
+            v.push(Target::JogEdge { deck: d });
             v.push(Target::Jog { deck: d });
             v.push(Target::Play { deck: d });
             v.push(Target::Cue { deck: d });
@@ -734,6 +770,52 @@ pub enum RelMode {
     Offset64,
     /// 1 = +1, 127 = -1 (Pioneer browse knob, Numark, Hercules...).
     TwosComplement,
+    /// Doesn't count: says where the wheel is, 0 to 127 and round again.
+    Absolute,
+    /// The same in 14 bits: the coarse half on the binding's control
+    /// change, the fine half on this one (on the same channel), straight
+    /// after it. (Denon's Prime units.)
+    Absolute14 { fine: u8 },
+}
+
+impl RelMode {
+    /// How far a message with this value turns a control that counts. None
+    /// for one that says where it is (see [`wheel::Position`]).
+    pub fn ticks(self, v: u8) -> Option<i32> {
+        let v = v as i32;
+        match self {
+            RelMode::Offset64 => Some(v - 64),
+            RelMode::TwosComplement => Some(if v < 64 { v } else { v - 128 }),
+            RelMode::Absolute | RelMode::Absolute14 { .. } => None,
+        }
+    }
+
+    /// Whether it says where the wheel is, instead of counting.
+    pub fn is_position(self) -> bool {
+        matches!(self, RelMode::Absolute | RelMode::Absolute14 { .. })
+    }
+
+    /// The same control, counting as the mapping screen's 1/127 box says. A
+    /// control that says where it is doesn't count.
+    pub fn counting(self, one_127: bool) -> RelMode {
+        match self {
+            p if p.is_position() => p,
+            _ if one_127 => RelMode::TwosComplement,
+            _ => RelMode::Offset64,
+        }
+    }
+
+    /// "counts 1 and 127".
+    pub fn label(self) -> String {
+        match self {
+            RelMode::Offset64 => "counts around 64".into(),
+            RelMode::TwosComplement => "counts 1 and 127".into(),
+            RelMode::Absolute => "says where it is, 0 to 127".into(),
+            RelMode::Absolute14 { fine } => {
+                format!("says where it is, 14 bits with CC {fine:#04x}")
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -987,6 +1069,10 @@ const FIRST_LAYERED_PRESET: u32 = 14;
 /// The first preset version that tells the DDJ-FLX6's SHIFT + SYNC from its
 /// SHIFT + MASTER.
 const FIRST_FLX6_MASTER_PRESET: u32 = 14;
+/// The first preset version with a platter and an edge control for a jog
+/// wheel that sends a message of its own for each, and that puts back how a
+/// jog wheel counts: until then Learn took every one to count around 64.
+const FIRST_SPLIT_JOG_PRESET: u32 = 14;
 /// The first preset version with effects: older mappings start their FX
 /// units where the preset says.
 const FIRST_FX_PRESET: u32 = 13;
@@ -1121,8 +1207,15 @@ impl Mapping {
         if self.preset_version < FIRST_FLX6_MASTER_PRESET {
             added += self.move_flx6_shift_sync(preset);
         }
+        let split = self.preset_version < FIRST_SPLIT_JOG_PRESET;
+        if split {
+            added += self.split_jog(preset);
+        }
         if self.preset_version <= LAST_TWO_DECK_PRESET {
             added += self.unfold_decks(preset);
+        }
+        if split {
+            added += self.repair_jog(preset);
         }
         if self.preset_version < FIRST_LAYERED_PRESET && preset.bindings.iter().any(|b| b.layered) {
             added += self.take_turns(preset);
@@ -1185,7 +1278,8 @@ impl Mapping {
     /// Live 4 mapping), when at least half its bindings are the preset's:
     /// it becomes the preset, so it picks up the preset's controls now and
     /// later. It keeps the jog calibration and settings, and its invert and
-    /// encoder style on the preset's controls. A button or knob it binds to
+    /// encoder style on the preset's controls (but a jog wheel counts as the
+    /// preset says). A button or knob it binds to
     /// something the preset doesn't keeps all its bindings as they were,
     /// instead of the preset's. Returns whether it did.
     pub fn adopt(&mut self, preset: &Mapping) -> bool {
@@ -1215,7 +1309,9 @@ impl Mapping {
                 let mut p = p.clone();
                 if let Some(b) = self.bindings.iter().find(|b| same(b, &p)) {
                     p.invert = b.invert;
-                    p.rel = b.rel;
+                    if !p.target.is_jog_turn() {
+                        p.rel = b.rel;
+                    }
                 }
                 p
             })
@@ -1291,6 +1387,74 @@ impl Mapping {
             }
         }
         moved
+    }
+
+    /// The preset's jog wheels now have a platter and an edge control. A
+    /// binding still doing what the preset's did there (turning the wheel,
+    /// from the same message, on the same deck, or the one that deck was
+    /// folded onto) does what the preset does now, with its own invert.
+    /// Returns how many changed.
+    fn split_jog(&mut self, preset: &Mapping) -> usize {
+        let folded = self.preset_version <= LAST_TWO_DECK_PRESET;
+        let mut changed = 0;
+        for b in &mut self.bindings {
+            let Target::Jog { deck } = b.target else {
+                continue;
+            };
+            let now = preset.bindings.iter().find(|p| {
+                p.trigger == b.trigger
+                    && p.target.is_jog_turn()
+                    && p.target
+                        .deck()
+                        .is_some_and(|d| d == deck || (folded && side_of(d) == deck as usize))
+            });
+            if let Some(p) = now.map(|p| p.target.with_deck(deck)) {
+                changed += usize::from(p != b.target);
+                b.target = p;
+            }
+        }
+        changed
+    }
+
+    /// How a wheel counts is a fact about the controller, and Learn used to
+    /// get it wrong: a jog wheel bound where the preset has it counts as the
+    /// preset says (its invert and the calibration stay). A turn of the
+    /// wheel learned as its touch sensor can't work, and neither can the
+    /// fine half of its position: those are given up to the preset. A wheel
+    /// bound to any other message is the DJ's own choice. Returns how many
+    /// changed.
+    fn repair_jog(&mut self, preset: &Mapping) -> usize {
+        let before = self.bindings.len();
+        let turn = |t: Trigger| {
+            preset
+                .bindings
+                .iter()
+                .any(|p| p.trigger == t && p.target.is_jog_turn())
+        };
+        let half = |t: Trigger| {
+            preset.bindings.iter().any(|p| {
+                p.target.is_jog_turn()
+                    && p.trigger.channel == t.channel
+                    && t.kind == MidiKind::Cc
+                    && p.rel == RelMode::Absolute14 { fine: t.number }
+            })
+        };
+        self.bindings.retain(|b| match b.target {
+            Target::JogTouch { .. } => !turn(b.trigger) && !half(b.trigger),
+            t => !(t.is_jog_turn() && half(b.trigger)),
+        });
+        let mut changed = before - self.bindings.len();
+        for b in self.bindings.iter_mut().filter(|b| b.target.is_jog_turn()) {
+            let own = preset
+                .bindings
+                .iter()
+                .find(|p| p.trigger == b.trigger && p.target == b.target);
+            if let Some(p) = own.filter(|p| p.rel != b.rel) {
+                b.rel = p.rel;
+                changed += 1;
+            }
+        }
+        changed
     }
 
     /// The preset's decks now take turns on each side's controls, switched
@@ -1594,6 +1758,22 @@ impl Takeover {
     }
 }
 
+/// What Learn has heard so far: a jog wheel is only learned once its
+/// messages show how it counts, and a button that sends control changes
+/// once it's let go.
+#[derive(Default)]
+struct Gathered {
+    target: Option<Target>,
+    wheel: Vec<wheel::Msg>,
+    /// Touch sensors of the target's deck with a hand on them.
+    hand: HashSet<Trigger>,
+    /// Control changes heard for a button: the value pressed and when, and
+    /// whether it has sent others.
+    pressed: HashMap<Trigger, (u8, i64, bool)>,
+    /// What to tell the DJ meanwhile.
+    note: Option<String>,
+}
+
 pub struct MidiEngine {
     pub mapping: Mapping,
     /// Set by the mapping screen; the next matching control you touch gets
@@ -1634,6 +1814,15 @@ pub struct MidiEngine {
     /// Per deck, after the hand let go of the platter: (when, last tick
     /// since). The platter turns on by itself for a moment.
     free: [Option<(i64, i64)>; DECKS],
+    /// Per deck, while a platter without a touch sensor holds the record:
+    /// when it last turned (see [`MidiEngine::let_go_still`]).
+    hold: [Option<i64>; DECKS],
+    /// Where each wheel that says where it is was last (by what it's bound
+    /// to), and when a deck's [`Target::Jog`] last heard from one.
+    positions: HashMap<Trigger, Position>,
+    position_heard: [Option<i64>; DECKS],
+    /// What has been heard for the control being learned.
+    gathered: Gathered,
     /// Roll pads held, per deck, the latest last (sizes, see [`ROLLS`]).
     rolls: [Vec<u8>; DECKS],
     /// Each deck's pad mode, set by [`Target::PadMode`] buttons.
@@ -1669,9 +1858,24 @@ pub(crate) fn sc_live_4_preset_13() -> Mapping {
     m.bindings.retain(|b| {
         !matches!(b.target, Target::DeckSelect { .. } | Target::Eject { .. })
             && b.target.deck().is_none_or(|d| d < 2)
+            && !b.rel.is_position()
     });
     for b in &mut m.bindings {
         b.layered = false;
+    }
+    m
+}
+
+/// A built-in mapping as it was up to preset 13, when a wheel's platter and
+/// edge were one target.
+#[cfg(test)]
+pub(crate) fn preset_13(port: &str) -> Mapping {
+    let mut m = builtin_preset(port).unwrap();
+    m.preset_version = 13;
+    for b in &mut m.bindings {
+        if let Target::JogPlatter { deck } | Target::JogEdge { deck } = b.target {
+            b.target = Target::Jog { deck };
+        }
     }
     m
 }
@@ -1680,7 +1884,28 @@ fn mapping_fx_decks(m: &Mapping) -> [Option<u8>; FX_UNITS] {
     m.fx_unit_decks.map(|d| d.filter(|&d| (d as usize) < DECKS))
 }
 
+/// The jog wheel control a binding works as, if it's one: one message bound
+/// to a deck's platter and its edge is one message for both. `None` for
+/// anything else, and for all but the first of a deck's: the wheel moves the
+/// deck once.
+fn jog_part(bindings: &[Binding], b: &Binding) -> Option<Target> {
+    let deck = b.target.deck().filter(|_| b.target.is_jog_turn())?;
+    let mut same = bindings
+        .iter()
+        .filter(|x| x.target.is_jog_turn() && x.target.deck() == Some(deck));
+    let first = same.next().is_some_and(|x| std::ptr::eq(x, b));
+    first.then(|| {
+        if same.all(|x| x.target == b.target) {
+            b.target
+        } else {
+            Target::Jog { deck }
+        }
+    })
+}
+
 const BEND: f64 = 0.04;
+/// Ticks a position may always jump by (see [`MidiEngine::position`]).
+const SMALLEST_JUMP: f64 = 64.0;
 /// One platter turn at 33⅓ rpm: 1.8 s of audio.
 const SECONDS_PER_TURN: f64 = 60.0 / (100.0 / 3.0);
 /// Jog-ring pitch bend: turning the ring at one turn per second speeds the
@@ -1698,6 +1923,20 @@ const CONTROL_STILL_US: i64 = 200_000;
 /// Further than this between two readings, a fader or knob was moved
 /// meanwhile without saying so.
 const CONTROL_STEP: f32 = 0.1;
+/// A platter without a touch sensor has been let go of once it has been
+/// still this long: longer than a scratch takes to turn round.
+const HOLD_STILL_US: i64 = 100_000;
+/// How fast it was going as it stopped is taken over this long at the end.
+const HAND_END_US: i64 = 8_000;
+/// A deck that hears a wheel say where it is doesn't count its ticks too,
+/// for a controller that sends both.
+const POSITION_HEARD_US: i64 = 250_000;
+/// Learn reads a wheel from its last messages, this many, without a pause
+/// this long.
+const LEARN_MESSAGES: usize = 400;
+const LEARN_PAUSE_US: i64 = 3_000_000;
+/// How long a button that sends control changes is held down, at least.
+const PRESS_US: i64 = 15_000;
 
 impl MidiEngine {
     pub fn new(mapping: Mapping, tempo_range: f64) -> Self {
@@ -1720,6 +1959,10 @@ impl MidiEngine {
             now: 0,
             hand: std::array::from_fn(|_| VecDeque::new()),
             free: [None; DECKS],
+            hold: [None; DECKS],
+            positions: HashMap::new(),
+            position_heard: [None; DECKS],
+            gathered: Gathered::default(),
             rolls: std::array::from_fn(|_| Vec::new()),
             pad_modes: [PadMode::default(); DECKS],
             sides: [0, 1],
@@ -1739,6 +1982,7 @@ impl MidiEngine {
         self.edit(|m| *m = mapping);
         self.learn = None;
         self.wizard = None;
+        self.positions.clear();
         self.pad_modes = [PadMode::default(); DECKS];
         self.sides = [0, 1];
         self.shift.clear();
@@ -1803,6 +2047,54 @@ impl MidiEngine {
         for t in held {
             self.button(t, false, room, &mut out);
         }
+        for d in 0..DECKS {
+            out.extend(self.platter_let_go(d).into_iter().map(MidiOut::Action));
+        }
+        // Where the wheels turn to meanwhile isn't heard.
+        self.positions.clear();
+        out
+    }
+
+    /// Called every few milliseconds by the controller thread, with the
+    /// shared time (us): a platter without a touch sensor that has been
+    /// still for a moment has been let go of.
+    pub fn let_go_still(&mut self, now: i64) -> Vec<Action> {
+        let mut out = Vec::new();
+        for d in 0..DECKS {
+            if self.hold[d].is_some_and(|last| now - last >= HOLD_STILL_US) {
+                out.extend(self.platter_let_go(d));
+            }
+        }
+        out
+    }
+
+    /// Let go of a deck's platter that has no touch sensor, if it's held:
+    /// like a hand lifted off one that has, at the speed it last turned.
+    fn platter_let_go(&mut self, d: usize) -> Vec<Action> {
+        let Some(last) = self.hold[d].take() else {
+            return Vec::new();
+        };
+        let deck = d as u8;
+        let mut out = Vec::new();
+        let delta = std::mem::take(&mut self.jog_pos[d]);
+        if delta != 0.0 {
+            out.push(Action::Nudge { deck, delta });
+        }
+        // A hand that stops the record has slowed down by its last message;
+        // a wheel that goes quiet mid-turn hasn't. (That message ends the
+        // window, so one just as long before it isn't part of it.)
+        let (all, end) = (
+            self.hand_speed(d, last + 1, HAND_WINDOW_US),
+            self.hand_speed(d, last + 1, HAND_END_US),
+        );
+        let spin = if all.abs() <= end.abs() { all } else { end };
+        self.hand[d].clear();
+        self.free[d] = Some((self.now, self.now));
+        out.push(Action::JogTouch {
+            deck,
+            down: false,
+            spin: spin as f32,
+        });
         out
     }
 
@@ -1954,17 +2246,179 @@ impl MidiEngine {
             && (self.msb.contains_key(&(ch, cc - 32)) || self.hires.contains(&(ch, cc - 32)))
     }
 
+    /// What `target` becomes when it's learned from `trigger`: a jog wheel
+    /// whose platter and edge turn out to send the same message has one
+    /// control for both.
+    fn one_message(&self, target: Target, trigger: Trigger) -> Target {
+        let both = |b: &Binding| {
+            b.trigger == trigger
+                && b.target.is_jog_turn()
+                && b.target != target
+                && b.target.deck() == target.deck()
+        };
+        match target {
+            Target::JogPlatter { deck } | Target::JogEdge { deck }
+                if self.mapping.bindings.iter().any(both) =>
+            {
+                Target::Jog { deck }
+            }
+            t => t,
+        }
+    }
+
+    /// The control to learn for `target` from this message, and how it
+    /// counts, once that's clear.
+    fn learn_heard(&mut self, raw: RawMidi, t: i64, target: Target) -> Option<(Trigger, RelMode)> {
+        if self.gathered.target != Some(target) {
+            self.gathered = Gathered {
+                target: Some(target),
+                ..Gathered::default()
+            };
+        }
+        match (raw, target.kind()) {
+            (RawMidi::Cc { ch, cc, val }, TargetKind::Button) => self
+                .learn_press(Trigger::cc(ch, cc), val, t)
+                .map(|t| (t, RelMode::default())),
+            (RawMidi::Cc { ch, cc, val }, TargetKind::Relative) if target == Target::Browse => {
+                // An endless knob's clicks: one is enough to tell.
+                let rel = match val {
+                    1..=30 | 98..=127 => RelMode::TwosComplement,
+                    34..=63 | 65..=94 => RelMode::Offset64,
+                    _ => return None,
+                };
+                (!self.is_fine_half(ch, cc)).then(|| (Trigger::cc(ch, cc), rel))
+            }
+            (_, TargetKind::Relative) => self.learn_wheel(raw, t, target),
+            (_, kind) => self
+                .learn_trigger(raw, kind)
+                .map(|t| (t, RelMode::default())),
+        }
+    }
+
+    /// A message heard while a jog wheel is being learned: the wheel, once
+    /// enough of its messages have come to tell how it counts. A wheel that
+    /// says where it is sends what a fader would, so it's only learned when
+    /// it comes round past its end, or turns with a hand on its touch sensor.
+    fn learn_wheel(&mut self, raw: RawMidi, t: i64, target: Target) -> Option<(Trigger, RelMode)> {
+        let Some(m) = wheel::Msg::of(raw, t) else {
+            let (on, trig) = match raw {
+                RawMidi::NoteOn { ch, note, .. } => (true, Trigger::note(ch, note)),
+                RawMidi::NoteOff { ch, note } => (false, Trigger::note(ch, note)),
+                _ => return None,
+            };
+            let touch = |b: &Binding| {
+                matches!(b.target, Target::JogTouch { .. })
+                    && b.target.deck().map(side_of) == target.deck().map(side_of)
+            };
+            if on
+                && self
+                    .mapping
+                    .bindings
+                    .iter()
+                    .any(|b| b.trigger == trig && touch(b))
+            {
+                self.gathered.hand.insert(trig);
+            } else {
+                self.gathered.hand.remove(&trig);
+            }
+            return None;
+        };
+        let other = self
+            .mapping
+            .bindings
+            .iter()
+            .find(|b| b.trigger == m.trigger && b.target.is_absolute());
+        if let Some(b) = other {
+            self.gathered.note = Some(format!(
+                "{} is {}, not a wheel.",
+                m.trigger.label(),
+                b.target.label()
+            ));
+            return None;
+        }
+        let g = &mut self.gathered;
+        // Not what was turned for an earlier try.
+        if g.wheel.last().is_some_and(|l| m.t - l.t > LEARN_PAUSE_US) {
+            g.wheel.clear();
+        }
+        g.wheel.push(m);
+        if g.wheel.len() > LEARN_MESSAGES {
+            g.wheel.remove(0);
+        }
+        let wheels = wheel::read(&g.wheel);
+        let hand = !g.hand.is_empty();
+        let learned = wheels.iter().find(|w| w.sure() || hand);
+        g.note = match (learned, wheels.first()) {
+            (Some(_), _) => None,
+            (None, Some(w)) => Some(format!(
+                "{} {}, as a fader does. If it's the jog wheel, turn it with your hand on \
+                 top (map the touch sensor first), or use \"Check the jog wheels…\".",
+                w.trigger.label(),
+                w.rel.label()
+            )),
+            (None, None) => Some(format!(
+                "Hearing {}: keep turning, slowly, until it's learned.",
+                m.trigger.label()
+            )),
+        };
+        learned.map(|w| (w.trigger, w.rel))
+    }
+
+    /// A control change heard while a button is being learned: the button,
+    /// once it's let go after sending one value (64 or more, then 0). A
+    /// wheel's or a knob's message never is: a wheel turned back sends 127s.
+    fn learn_press(&mut self, trig: Trigger, val: u8, t: i64) -> Option<Trigger> {
+        let other = self
+            .mapping
+            .bindings
+            .iter()
+            .find(|b| b.trigger == trig && (b.target.is_relative() || b.target.is_absolute()));
+        if let Some(b) = other {
+            self.gathered.note = Some(format!(
+                "{} is {}, not a button.",
+                trig.label(),
+                b.target.label()
+            ));
+            return None;
+        }
+        if self.is_fine_half(trig.channel, trig.number) {
+            return None;
+        }
+        let g = &mut self.gathered;
+        match (val, g.pressed.get_mut(&trig)) {
+            (0, Some(&mut (first, since, false))) if first >= 64 && t - since >= PRESS_US => {
+                g.note = None;
+                return Some(trig);
+            }
+            (0, _) => {}
+            (v, Some((first, _, several))) => *several |= v != *first,
+            (v, None) => {
+                g.pressed.insert(trig, (v, t, false));
+            }
+        }
+        let many = g.pressed.get(&trig).is_some_and(|p| p.2);
+        g.note = Some(if many {
+            format!(
+                "{} is a wheel, knob or fader: press a button.",
+                trig.label()
+            )
+        } else {
+            format!("Hearing {}: now let go of it.", trig.label())
+        });
+        None
+    }
+
+    /// What Learn has heard, while it isn't enough to go by.
+    pub fn learn_note(&self) -> Option<&str> {
+        self.learn
+            .filter(|&t| self.gathered.target == Some(t))
+            .and(self.gathered.note.as_deref())
+    }
+
     fn learn_trigger(&self, raw: RawMidi, kind: TargetKind) -> Option<Trigger> {
         match (raw, kind) {
             (RawMidi::NoteOn { ch, note, .. }, TargetKind::Button) => Some(Trigger::note(ch, note)),
-            (RawMidi::Cc { ch, cc, val }, TargetKind::Button)
-                if val > 0 && !self.is_fine_half(ch, cc) =>
-            {
-                Some(Trigger::cc(ch, cc))
-            }
-            (RawMidi::Cc { ch, cc, .. }, TargetKind::Absolute | TargetKind::Relative)
-                if !self.is_fine_half(ch, cc) =>
-            {
+            (RawMidi::Cc { ch, cc, .. }, TargetKind::Absolute) if !self.is_fine_half(ch, cc) => {
                 Some(Trigger::cc(ch, cc))
             }
             (RawMidi::PitchBend { ch, .. }, TargetKind::Absolute) => Some(Trigger {
@@ -2005,6 +2459,7 @@ impl MidiEngine {
         let release = release.filter(|t| self.held.contains_key(t));
         if let Some(w) = self.wizard.as_mut() {
             w.feed(raw, t);
+            self.positions.clear();
             if let Some(trig) = release {
                 self.button(trig, false, room, &mut out);
             }
@@ -2015,21 +2470,19 @@ impl MidiEngine {
         if let Some(target) = learning.filter(|&t| !self.modifier_message(raw, t)) {
             // Only accept a message that suits the target: a fader can't be
             // learned from a button press, a jog not from its touch sensor.
-            let trigger = self.learn_trigger(raw, target.kind());
+            let heard = self.learn_heard(raw, t, target);
+            self.positions.clear();
             if let RawMidi::Cc { ch, cc, val } = raw {
                 if !(32..64).contains(&cc) {
                     self.msb.insert((ch, cc), val);
                 }
             }
-            let Some(trigger) = trigger else {
+            let Some((trigger, rel)) = heard else {
                 return Vec::new();
             };
             self.learn = None;
-            let rel = if target == Target::Browse {
-                RelMode::TwosComplement
-            } else {
-                RelMode::Offset64
-            };
+            self.gathered = Gathered::default();
+            let target = self.one_message(target, trigger);
             // Learned with SHIFT held, it's SHIFT + the control. A pad on a
             // deck with pad mode buttons works in the mode the deck is in.
             let mode = target.deck().filter(|&d| {
@@ -2060,6 +2513,14 @@ impl MidiEngine {
                 light: None,
                 layered,
             };
+            // A wheel moves its deck one way: what it did there before goes.
+            let same_wheel = |b: &Binding| {
+                b.trigger == trigger
+                    && b.target != target
+                    && target.is_jog_turn()
+                    && b.target.is_jog_turn()
+                    && b.target.deck() == target.deck()
+            };
             if std::mem::take(&mut self.learn_adds) {
                 // What it has already counts if it works wherever this
                 // would.
@@ -2072,10 +2533,13 @@ impl MidiEngine {
                 if has {
                     return vec![MidiOut::AlreadyBound(binding)];
                 }
-                self.mapping.bindings.push(binding.clone());
+                self.edit(|m| {
+                    m.bindings.retain(|b| !same_wheel(b));
+                    m.bindings.push(binding.clone());
+                });
             } else {
                 self.edit(|m| {
-                    m.bindings.retain(|b| b.target != target);
+                    m.bindings.retain(|b| b.target != target && !same_wheel(b));
                     m.bindings.push(binding.clone());
                 });
             }
@@ -2098,6 +2562,9 @@ impl MidiEngine {
                 self.value(trig, val as f32 / 16383.0, None, room, local, &mut out);
             }
             RawMidi::Cc { ch, cc, val } => {
+                if self.position(ch, cc, val, room, &mut out) {
+                    return out;
+                }
                 // 14-bit pair: coarse on CC n, fine on CC n+32.
                 if (32..64).contains(&cc) {
                     let coarse = Trigger::cc(ch, cc - 32);
@@ -2243,7 +2710,7 @@ impl MidiEngine {
                         if moved != 0.0 {
                             out.push(MidiOut::Action(Action::Nudge { deck, delta: moved }));
                         }
-                        let spin = self.hand_speed(d) as f32;
+                        let spin = self.hand_speed(d, self.now, HAND_WINDOW_US) as f32;
                         self.hand[d].clear();
                         self.free[d] = Some((self.now, self.now));
                         out.push(MidiOut::Action(Action::JogTouch { deck, down, spin }));
@@ -2410,16 +2877,16 @@ impl MidiEngine {
         }
     }
 
-    /// How fast the hand was moving the record just now (track seconds per
-    /// second, negative = backwards).
-    fn hand_speed(&self, d: usize) -> f64 {
-        let from = self.now - HAND_WINDOW_US;
+    /// How fast the hand was moving the record in the `window` (us) up to
+    /// `at` (track seconds per second, negative = backwards).
+    fn hand_speed(&self, d: usize, at: i64, window: i64) -> f64 {
+        let from = at - window;
         let moved: f64 = self.hand[d]
             .iter()
             .filter(|&&(t, _)| t >= from)
             .map(|&(_, m)| m)
             .sum();
-        moved / (HAND_WINDOW_US as f64 * 1e-6)
+        moved / (window as f64 * 1e-6)
     }
 
     /// True while a platter the hand just let go of is still turning by
@@ -2440,6 +2907,154 @@ impl MidiEngine {
         }
     }
 
+    /// A message from a wheel that says where it is: how far it has turned
+    /// since the last moves what it's bound to. Returns whether the message
+    /// was one.
+    fn position(
+        &mut self,
+        ch: u8,
+        cc: u8,
+        val: u8,
+        room: &RoomState,
+        out: &mut Vec<MidiOut>,
+    ) -> bool {
+        let heard = Trigger::cc(ch, cc);
+        let wheel = self.mapping.bindings.iter().find_map(|b| match b.rel {
+            _ if b.trigger.channel != ch || !b.target.is_relative() => None,
+            RelMode::Absolute14 { fine } if b.trigger == heard || fine == cc => {
+                Some((b.trigger, b.rel))
+            }
+            RelMode::Absolute if b.trigger == heard => Some((b.trigger, b.rel)),
+            _ => None,
+        });
+        let Some((trig, rel)) = wheel else {
+            return false;
+        };
+        let p = self.positions.entry(trig).or_default();
+        let moved = match rel {
+            RelMode::Absolute14 { fine } if fine == cc => p.fine(val),
+            RelMode::Absolute14 { .. } => {
+                p.coarse(val);
+                return true;
+            }
+            _ => p.at(val),
+        };
+        // No hand turns a wheel half a turn between two messages: some went
+        // unheard, and now it's known where it is.
+        if moved.abs() as f64 > (self.mapping.ticks_per_rev() / 2.0).max(SMALLEST_JUMP) {
+            return true;
+        }
+        let mut bindings = self.active(trig);
+        bindings.retain(|b| b.rel == rel);
+        for b in &bindings {
+            if let Target::Jog { deck } = b.target {
+                self.position_heard[deck as usize] = Some(self.now);
+            }
+            self.turn(b, jog_part(&bindings, b), moved, room, out);
+        }
+        true
+    }
+
+    /// A wheel or knob turned by `ticks`. `part`: which jog wheel control it
+    /// works as, if it's one (see [`jog_part`]).
+    fn turn(
+        &mut self,
+        b: &Binding,
+        part: Option<Target>,
+        ticks: i32,
+        room: &RoomState,
+        out: &mut Vec<MidiOut>,
+    ) {
+        let ticks = if b.invert { -ticks } else { ticks };
+        if ticks == 0 {
+            return;
+        }
+        match part {
+            Some(part) => self.jog(part, b.rel, ticks, room, out),
+            None if b.target == Target::Browse => out.push(MidiOut::Browse(ticks)),
+            None => {}
+        }
+    }
+
+    /// A jog wheel turned.
+    fn jog(
+        &mut self,
+        part: Target,
+        rel: RelMode,
+        ticks: i32,
+        room: &RoomState,
+        out: &mut Vec<MidiOut>,
+    ) {
+        let Some(deck) = part.deck() else { return };
+        let d = deck as usize;
+        // A wheel that counts and says where it is moves the deck once.
+        if matches!(part, Target::Jog { .. })
+            && !rel.is_position()
+            && self.position_heard[d].is_some_and(|t| self.now - t < POSITION_HEARD_US)
+        {
+            return;
+        }
+        if let Some(c) = self.calibration.as_mut() {
+            *c += ticks as i64;
+        }
+        let st = &room.decks[d];
+        let turns = ticks as f64 / self.mapping.ticks_per_rev();
+        let held = match part {
+            Target::JogPlatter { .. } => self.platter_holds(deck, room, out) || st.scratching,
+            Target::JogEdge { .. } => {
+                // The hand has left a platter that can't say so.
+                out.extend(self.platter_let_go(d).into_iter().map(MidiOut::Action));
+                false
+            }
+            _ => st.scratching,
+        };
+        if held {
+            // Hand on the record: it moves exactly with the platter.
+            let moved = turns * SECONDS_PER_TURN * self.mapping.scratch_sensitivity as f64;
+            self.jog_pos[d] += moved;
+            self.track_hand(d, moved);
+        } else if self.freewheeling(d) {
+            // Just let go: the platter turns on by itself
+            // (even a still hand flicks it as it lifts off).
+            // That isn't the DJ moving it; a spinning
+            // record runs on in the room model instead.
+        } else if !st.playing {
+            // Paused: turning searches through the track.
+            self.jog_pos[d] += turns * SECONDS_PER_TURN;
+        } else {
+            // Playing: the ring bends the speed while it turns.
+            self.ring_ticks[d] += ticks;
+        }
+    }
+
+    /// A platter turned: whether turning it holds the record, because its
+    /// deck has no touch sensor to say so. The first turn takes hold of it
+    /// (again, if a load or another DJ let go of it meanwhile).
+    fn platter_holds(&mut self, deck: u8, room: &RoomState, out: &mut Vec<MidiOut>) -> bool {
+        let d = deck as usize;
+        let st = &room.decks[d];
+        let touch = Target::JogTouch { deck };
+        if !self.mapping.vinyl
+            || st.track.is_none()
+            || self.mapping.bindings.iter().any(|b| b.target == touch)
+        {
+            return false;
+        }
+        if !st.scratching {
+            self.hand[d].clear();
+            self.free[d] = None;
+            self.hold[d] = Some(self.now);
+            out.push(MidiOut::Action(Action::JogTouch {
+                deck,
+                down: true,
+                spin: 0.0,
+            }));
+        } else if self.hold[d].is_some() {
+            self.hold[d] = Some(self.now);
+        }
+        true
+    }
+
     fn value(
         &mut self,
         trig: Trigger,
@@ -2454,52 +3069,10 @@ impl MidiEngine {
         for b in &bindings {
             match b.target.kind() {
                 TargetKind::Relative => {
-                    let Some(raw) = raw7 else { continue };
-                    let ticks = match b.rel {
-                        RelMode::Offset64 => raw as i32 - 64,
-                        RelMode::TwosComplement => {
-                            if raw < 64 {
-                                raw as i32
-                            } else {
-                                raw as i32 - 128
-                            }
-                        }
-                    };
-                    let ticks = if b.invert { -ticks } else { ticks };
-                    if ticks == 0 {
+                    let Some(ticks) = raw7.and_then(|raw| b.rel.ticks(raw)) else {
                         continue;
-                    }
-                    match b.target {
-                        Target::Jog { deck } => {
-                            if let Some(c) = self.calibration.as_mut() {
-                                *c += ticks as i64;
-                            }
-                            let d = deck as usize;
-                            let st = &room.decks[d];
-                            let turns = ticks as f64 / self.mapping.ticks_per_rev();
-                            if st.scratching {
-                                // Hand on the record: it moves exactly with the platter.
-                                let moved = turns
-                                    * SECONDS_PER_TURN
-                                    * self.mapping.scratch_sensitivity as f64;
-                                self.jog_pos[d] += moved;
-                                self.track_hand(d, moved);
-                            } else if self.freewheeling(d) {
-                                // Just let go: the platter turns on by itself
-                                // (even a still hand flicks it as it lifts off).
-                                // That isn't the DJ moving it; a spinning
-                                // record runs on in the room model instead.
-                            } else if !st.playing {
-                                // Paused: turning searches through the track.
-                                self.jog_pos[d] += turns * SECONDS_PER_TURN;
-                            } else {
-                                // Playing: the ring bends the speed while it turns.
-                                self.ring_ticks[d] += ticks;
-                            }
-                        }
-                        Target::Browse => out.push(MidiOut::Browse(ticks)),
-                        _ => {}
-                    }
+                    };
+                    self.turn(b, jog_part(&bindings, b), ticks, room, out);
                 }
                 TargetKind::Button => {
                     // A button sent as CC (127 press / 0 release), once
@@ -3269,9 +3842,13 @@ fn pioneer_ddj(device: &str, name: &str, hw_decks: u8, ticks_per_rev: f32) -> Ma
         m.bind(Trigger::note(ch, 0x58), Target::Sync { deck });
         m.bind(Trigger::note(ch, 0x60), Target::SyncOff { deck });
         m.bind(Trigger::note(ch, 0x36), Target::JogTouch { deck });
-        for cc in [0x21, 0x22, 0x23] {
-            m.bind(Trigger::cc(ch, cc), Target::Jog { deck });
+        // The jog wheel: its platter with a hand on top (and with the
+        // controller's own vinyl mode off), and its edge. With SHIFT they
+        // send 0x29 and 0x26, left alone.
+        for cc in [0x22, 0x23] {
+            m.bind(Trigger::cc(ch, cc), Target::JogPlatter { deck });
         }
+        m.bind(Trigger::cc(ch, 0x21), Target::JogEdge { deck });
         m.bind(Trigger::cc(ch, 0x00), Target::Tempo { deck });
         // With SHIFT held, TEMPO sends CC 0x05 (fine half 0x25) instead.
         m.bind(Trigger::cc(ch, 0x05), Target::TempoShift { deck });
@@ -3366,7 +3943,8 @@ fn denon_sc_live_4(device: &str) -> Mapping {
     let mut m = Mapping::empty(device);
     m.preset = Some("Denon SC Live 4".to_string());
     m.preset_version = PRESET_VERSION;
-    // Mixxx's Prime 4 mapping counts 1000 a turn; calibrate to be sure.
+    // Mixxx's mappings for it and the Prime 4 count 1000 a turn; calibrate
+    // to be sure.
     m.jog_ticks_per_rev = Some(1000.0);
     for side in 0..2u8 {
         let ch = 4 + side;
@@ -3398,7 +3976,14 @@ fn denon_sc_live_4(device: &str) -> Mapping {
         m.bind(Trigger::note(ch, 0x08), Target::SyncOff { deck })
             .shift = true;
         m.bind(Trigger::note(ch, 0x21), Target::JogTouch { deck });
+        // Turning the jog wheel: one message for its platter and its edge,
+        // and the touch sensor tells them apart. Which message isn't known:
+        // Traktor's mapping reads CC 0x36, counting, and Mixxx's the wheel's
+        // position on CCs 0x11 and 0x31. Whichever it sends moves the deck
+        // once (see `MidiEngine::jog`).
         m.bind(Trigger::cc(ch, 0x36), Target::Jog { deck }).rel = RelMode::TwosComplement;
+        m.bind(Trigger::cc(ch, 0x11), Target::Jog { deck }).rel =
+            RelMode::Absolute14 { fine: 0x31 };
         m.bind(Trigger::note(ch, 0x1D), Target::BendDown { deck });
         m.bind(Trigger::note(ch, 0x1E), Target::BendUp { deck });
         // The pitch fader's coarse half (its fine half, CC 0x4B, isn't on
@@ -3503,9 +4088,9 @@ fn hercules_inpulse_200_mk2(device: &str) -> Mapping {
         // The platter: turned with a hand on top (CC 0x0A, with the touch
         // sensor's note) or by its ring (CC 0x09).
         m.bind(Trigger::note(ch, 0x08), Target::JogTouch { deck });
-        for cc in [0x0A, 0x09] {
-            m.bind(Trigger::cc(ch, cc), Target::Jog { deck }).rel = RelMode::TwosComplement;
-        }
+        m.bind(Trigger::cc(ch, 0x0A), Target::JogPlatter { deck })
+            .rel = RelMode::TwosComplement;
+        m.bind(Trigger::cc(ch, 0x09), Target::JogEdge { deck }).rel = RelMode::TwosComplement;
         // The tempo fader's value falls towards +, the bottom end.
         m.bind(Trigger::cc(ch, 0x08), Target::Tempo { deck }).invert = true;
         m.bind(Trigger::cc(shift, 0x08), Target::TempoShift { deck })
@@ -3575,6 +4160,10 @@ mod tests {
         // Touching the platter sends a note first: not a jog turn.
         assert!(e.handle(&[0x90, 0x36, 127], &room, &local).is_empty());
         assert_eq!(e.learn, Some(Target::Jog { deck: 0 }));
+        // Nor is one message enough to tell how it counts.
+        for _ in 0..7 {
+            assert!(e.handle(&[0xb0, 0x22, 65], &room, &local).is_empty());
+        }
         let out = e.handle(&[0xb0, 0x22, 65], &room, &local);
         assert!(matches!(&out[0], MidiOut::Learned(b) if b.trigger == Trigger::cc(0, 0x22)));
         // A fader's fine half (CC 32+) is never learned on its own.
@@ -3909,6 +4498,10 @@ mod tests {
             if let Some(d) = b.target.deck() {
                 b.target = b.target.with_deck(d % 2);
             }
+            // The platter and the edge were one target until version 14.
+            if let Target::JogPlatter { deck } | Target::JogEdge { deck } = b.target {
+                b.target = Target::Jog { deck };
+            }
         }
         m.meters.retain(|l| l.deck < 2);
         m
@@ -3924,10 +4517,11 @@ mod tests {
         saved.bindings.retain(|b| b.trigger != custom);
         saved.bind(custom, Target::Play { deck: 0 });
         let moved_and_added = saved.upgrade_from(&preset);
-        // 41 controls on each of decks 3 and 4 (less the custom pad) move;
-        // 7 mixer controls on each of channels 3 and 4, and their meters, are
+        // The jog wheels' 3 messages on each channel become the platter's and
+        // the edge's. 41 controls on each of decks 3 and 4 (less the custom
+        // pad) move; 7 mixer controls on each of channels 3 and 4, and their meters, are
         // new, and so are SHIFT + TEMPO and 8 roll pads on all four decks.
-        assert_eq!(moved_and_added, 2 * 41 - 1 + 2 * 7 + 2 + 4 + 4 * 8);
+        assert_eq!(moved_and_added, 4 * 3 + 2 * 41 - 1 + 2 * 7 + 2 + 4 + 4 * 8);
         assert_eq!(saved.preset_version, PRESET_VERSION);
         assert_eq!(saved.jog_ticks_per_rev, Some(6387.0));
         assert_eq!(saved.meters, preset.meters);
@@ -8464,5 +9058,988 @@ mod tests {
         assert_eq!(seen[1], (Part::Jog, Some(0)));
         assert_eq!(Part::Jog.title(Some(2)), "Deck C · Jog wheel");
         assert_eq!(Part::Fx.title(Some(1)), "FX unit 2");
+    }
+
+    // ---- Jog wheels: platter, edge, positions, Learn ----
+
+    /// A backspin on a DDJ-FLX6, let go at 116 ms, and the platter turning on
+    /// by itself: "ms:number=values" (0x36 the touch sensor, 0x22 the platter
+    /// under a hand, 0x21 without one).
+    const FLX6_RELEASE: &str = "
+        0:36=7F 0:22=3E3F 2:22=3F3F 4:22=3E3F 6:22=3E3F 8:22=3F3E 10:22=3F3F 12:22=3E3F
+        14:22=3E3F 16:22=3E3F 18:22=3E3F 20:22=3E3E 22:22=3E3E 24:22=3E3E 26:22=3E3D 28:22=3E3D
+        30:22=3D3E 32:22=3C3D 34:22=3D3C 36:22=3C3D 38:22=3B3C 40:22=3C3B 42:22=3B3B 44:22=3B3B
+        46:22=3A3A 48:22=3A3A 50:22=393A 52:22=3939 54:22=3839 56:22=3838 58:22=3837 60:22=3837
+        62:22=3737 64:22=3736 66:22=3636 68:22=3636 70:22=3536 72:22=3535 74:22=3534 76:22=3534
+        78:22=3534 80:22=3434 82:22=3334 84:22=3433 86:22=3333 88:22=3333 90:22=3332 92:22=3332
+        94:22=3233 96:22=3231 98:22=3232 100:22=3132 102:22=3231 104:22=3231 106:22=3132
+        108:22=3131 110:22=3131 112:22=3131 114:22=3130 116:36=00 116:21=3131 118:21=2B2B
+        120:21=2B2B 122:21=2A2B 124:21=2B2B 126:21=2B2B 128:21=2A2B 130:21=2B2A 132:21=2B2B
+        134:21=2B2A 136:21=2B2B 138:21=2A2B 140:21=2B2A 142:21=2B2B 144:21=2B2B 146:21=2A2A
+        148:21=2B2B 150:21=2A2B 152:21=2A2B 154:21=2A2A 156:21=2B2A 158:21=2B2A 160:21=2A2B
+        162:21=2A2A 164:21=2A2A 166:21=2A2A 168:21=2A2A 170:21=2A2A 172:21=2A2A 174:21=2A2A
+        176:21=2A2B 178:21=2A2A 180:21=2B2A 182:21=2B2A 184:21=2B2B 186:21=2B2B 188:21=2B2B
+        190:21=2C2B 192:21=2C2B 194:21=2C2C 196:21=2C2C 198:21=2C2C 200:21=2D";
+
+    /// What it says, on deck A's channel.
+    fn flx6_release() -> Vec<(i64, [u8; 3])> {
+        FLX6_RELEASE
+            .split_whitespace()
+            .flat_map(|w| {
+                let (ms, rest) = w.split_once(':').unwrap();
+                let (number, values) = rest.split_once('=').unwrap();
+                let hex = |s: &str| u8::from_str_radix(s, 16).unwrap();
+                let (t, number) = (ms.parse::<i64>().unwrap() * 1_000, hex(number));
+                let status = if number == 0x36 { 0x90 } else { 0xB0 };
+                (0..values.len() / 2)
+                    .map(move |i| (t, [status, number, hex(&values[i * 2..i * 2 + 2])]))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// A room with a track on every deck.
+    fn jog_room(playing: bool) -> RoomState {
+        let mut room = RoomState::default();
+        for (d, deck) in room.decks.iter_mut().enumerate() {
+            deck.track = Some(crate::model::TrackId([d as u8 + 1; 32]));
+            deck.duration = 600.0;
+            deck.playing = playing;
+        }
+        room
+    }
+
+    /// What the messages do, with the controller thread ticking every 5 ms
+    /// (and for `after` us more): every action, when, with a hold reaching
+    /// the room at once.
+    fn jogged(
+        e: &mut MidiEngine,
+        room: &mut RoomState,
+        msgs: &[(i64, [u8; 3])],
+        after: i64,
+    ) -> Vec<(i64, Action)> {
+        let local = LocalParams::default();
+        let mut out: Vec<(i64, Action)> = Vec::new();
+        let mut next = msgs[0].0;
+        let did = |a: Action, t: i64, room: &mut RoomState, out: &mut Vec<(i64, Action)>| {
+            if let Action::JogTouch { deck, down, .. } = a {
+                room.decks[deck as usize].scratching = down;
+            }
+            out.push((t, a));
+        };
+        let end = msgs.last().unwrap().0 + after;
+        let mut i = 0;
+        while i < msgs.len() || next <= end {
+            if i < msgs.len() && msgs[i].0 < next {
+                let (t, m) = msgs[i];
+                for o in e.handle_at(&m, t, room, &local) {
+                    if let MidiOut::Action(a) = o {
+                        did(a, t, room, &mut out);
+                    }
+                }
+                i += 1;
+                continue;
+            }
+            let held = e.let_go_still(next);
+            let moved = e.flush((next % 25_000 == 0).then_some(0.025));
+            for a in held.into_iter().chain(moved) {
+                did(a, next, room, &mut out);
+            }
+            next += 5_000;
+        }
+        out
+    }
+
+    /// The last release among these, and how fast.
+    fn spin_of(acts: &[(i64, Action)]) -> Option<(i64, f32)> {
+        acts.iter().rev().find_map(|(t, a)| match a {
+            Action::JogTouch {
+                down: false, spin, ..
+            } => Some((*t, *spin)),
+            _ => None,
+        })
+    }
+
+    fn moved(acts: &[(i64, Action)]) -> f64 {
+        acts.iter()
+            .map(|(_, a)| match a {
+                Action::Nudge { delta, .. } => *delta,
+                _ => 0.0,
+            })
+            .sum()
+    }
+
+    fn bend_peak(acts: &[(i64, Action)]) -> f64 {
+        acts.iter()
+            .map(|(_, a)| match a {
+                Action::Bend { bend, .. } => *bend,
+                _ => 0.0,
+            })
+            .fold(0.0, |a, x| if x.abs() > a.abs() { x } else { a })
+    }
+
+    /// `n` messages of one control change, `every` us apart from `t`.
+    fn ccs(t: i64, every: i64, ch: u8, cc: u8, values: &[u8]) -> Vec<(i64, [u8; 3])> {
+        values
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| (t + i as i64 * every, [0xB0 | ch, cc, v]))
+            .collect()
+    }
+
+    /// The FLX6's jog wheel does what it did when its platter and edge were
+    /// one target. (The whole 25-minute recording this is from was replayed
+    /// through both as well, on playing and paused decks, vinyl mode on and
+    /// off: the actions were the same, bit for bit.)
+    #[test]
+    fn the_flx6s_jog_does_what_it_did_before_it_was_split() {
+        let preset = builtin_preset("DDJ-FLX6").unwrap();
+        assert!(preset
+            .bindings
+            .iter()
+            .all(|b| !matches!(b.target, Target::Jog { .. })));
+        for (playing, vinyl) in [(true, true), (false, true), (true, false), (false, false)] {
+            let run = |mut m: Mapping| {
+                m.vinyl = vinyl;
+                m.jog_ticks_per_rev = Some(6387.0);
+                let mut e = MidiEngine::new(m, 0.08);
+                let mut msgs = flx6_release();
+                // Then the edge, once the platter has been still.
+                msgs.extend(ccs(400_000, 2_000, 0, 0x21, &[66; 60]));
+                // And a slow turn with a hand on top, vinyl mode off on the
+                // controller.
+                msgs.push((900_000, [0x90, 0x36, 0x7F]));
+                msgs.extend(ccs(901_000, 2_000, 0, 0x23, &[65; 60]));
+                msgs.push((1_200_000, [0x90, 0x36, 0x00]));
+                jogged(&mut e, &mut jog_room(playing), &msgs, 300_000)
+            };
+            let (was, is) = (run(preset_13("DDJ-FLX6")), run(preset.clone()));
+            assert!(is.len() > 20, "{}", is.len());
+            assert_eq!(is, was, "playing {playing}, vinyl {vinyl}");
+        }
+    }
+
+    /// Deck A: touch on note 0x21, platter on CC 0x22, edge on CC 0x23, both
+    /// counting 1 and 127, 1000 ticks a turn.
+    fn split(touch: bool) -> MidiEngine {
+        let mut m = Mapping::empty("test");
+        if touch {
+            m.bind(Trigger::note(0, 0x21), Target::JogTouch { deck: 0 });
+        }
+        m.bind(Trigger::cc(0, 0x22), Target::JogPlatter { deck: 0 })
+            .rel = RelMode::TwosComplement;
+        m.bind(Trigger::cc(0, 0x23), Target::JogEdge { deck: 0 })
+            .rel = RelMode::TwosComplement;
+        m.jog_ticks_per_rev = Some(1000.0);
+        MidiEngine::new(m, 0.08)
+    }
+
+    #[test]
+    fn the_edge_never_scratches() {
+        // Playing, a hand on top (a metal edge sets the sensor off): it
+        // bends, and the record stays where it is.
+        for touched in [false, true] {
+            let mut e = split(true);
+            let mut room = jog_room(true);
+            let mut msgs = Vec::new();
+            if touched {
+                msgs.push((0, [0x90, 0x21, 0x7F]));
+            }
+            msgs.extend(ccs(10_000, 4_000, 0, 0x23, &[1; 100]));
+            let acts = jogged(&mut e, &mut room, &msgs, 0);
+            assert_eq!(moved(&acts), 0.0, "touched {touched}");
+            assert!(bend_peak(&acts) > 0.01, "touched {touched}: {acts:?}");
+            // Paused, it searches.
+            let mut e = split(true);
+            let mut room = jog_room(false);
+            let acts = jogged(&mut e, &mut room, &msgs, 10_000);
+            assert!((moved(&acts) - 0.18).abs() < 1e-9, "{}", moved(&acts));
+            assert_eq!(bend_peak(&acts), 0.0);
+            // Nor does it count as the hand's speed.
+            let acts = jogged(&mut e, &mut room, &[(420_000, [0x90, 0x21, 0])], 0);
+            assert!(spin_of(&acts).is_none_or(|(_, spin)| spin == 0.0));
+        }
+    }
+
+    #[test]
+    fn a_platter_with_a_touch_sensor_scratches_while_its_touched() {
+        for playing in [true, false] {
+            let mut e = split(true);
+            let mut room = jog_room(playing);
+            let mut msgs = vec![(0, [0x90, 0x21, 0x7F])];
+            msgs.extend(ccs(1_000, 2_000, 0, 0x22, &[2; 50]));
+            msgs.push((101_000, [0x90, 0x21, 0]));
+            let acts = jogged(&mut e, &mut room, &msgs, 0);
+            assert!((moved(&acts) - 0.18).abs() < 1e-9);
+            let (_, spin) = spin_of(&acts).unwrap();
+            assert!((spin - 1.8).abs() < 0.2, "{spin}");
+            // Untouched, it's as one message for both was: nothing holds the
+            // record.
+            let acts = jogged(
+                &mut e,
+                &mut room,
+                &ccs(400_000, 2_000, 0, 0x22, &[2; 50]),
+                400_000,
+            );
+            assert!(!acts
+                .iter()
+                .any(|(_, a)| matches!(a, Action::JogTouch { .. })));
+            assert_eq!(moved(&acts) != 0.0, !playing);
+        }
+    }
+
+    #[test]
+    fn a_platter_without_a_touch_sensor_holds_while_it_turns() {
+        for playing in [true, false] {
+            let mut e = split(false);
+            let mut room = jog_room(playing);
+            // A slow turn and back, with a hand that stops in between for
+            // less than it takes to be let go.
+            let mut msgs = ccs(0, 4_000, 0, 0x22, &[1; 40]);
+            msgs.extend(ccs(240_000, 4_000, 0, 0x22, &[127; 36]));
+            // It slows down before it stops.
+            for (i, t) in [390, 400, 415, 440].into_iter().enumerate() {
+                msgs.push((t * 1_000 + i as i64, [0xB0, 0x22, 127]));
+            }
+            let acts = jogged(&mut e, &mut room, &msgs, 90_000);
+            assert_eq!(
+                acts.first().unwrap().1,
+                Action::JogTouch {
+                    deck: 0,
+                    down: true,
+                    spin: 0.0
+                }
+            );
+            let holds = |acts: &[(i64, Action)]| {
+                acts.iter()
+                    .filter(|(_, a)| matches!(a, Action::JogTouch { .. }))
+                    .count()
+            };
+            assert_eq!(holds(&acts), 1, "{acts:?}");
+            // The record went where the hand took it, and back.
+            assert!(moved(&acts).abs() < 1e-9);
+            assert_eq!(bend_peak(&acts), 0.0);
+            assert!(room.decks[0].scratching);
+            // Still for a moment: let go, without a spin worth the name.
+            let acts = jogged(&mut e, &mut room, &[(531_000, [0xB0, 0x7F, 0])], 50_000);
+            let (_, spin) = spin_of(&acts).unwrap();
+            assert!(spin.abs() < 0.2, "{spin}");
+            assert!(!room.decks[0].scratching);
+            // And held again by the next turn.
+            let acts = jogged(
+                &mut e,
+                &mut room,
+                &ccs(600_000, 4_000, 0, 0x22, &[1; 10]),
+                0,
+            );
+            assert_eq!(holds(&acts), 1);
+            assert!(room.decks[0].scratching);
+        }
+    }
+
+    /// The recorded backspin again, on a mapping with no touch sensor: the
+    /// platter's message stops as the hand leaves it, so the record spins on
+    /// as it does with one.
+    #[test]
+    fn a_platter_without_a_touch_sensor_spins_on_when_its_let_go() {
+        let run = |touch: bool, edge: bool| {
+            let mut m = builtin_preset("DDJ-FLX6").unwrap();
+            m.jog_ticks_per_rev = Some(6387.0);
+            if !touch {
+                m.bindings
+                    .retain(|b| !matches!(b.target, Target::JogTouch { .. }));
+            }
+            if !edge {
+                m.bindings
+                    .retain(|b| !matches!(b.target, Target::JogEdge { .. }));
+            }
+            let mut e = MidiEngine::new(m, 0.08);
+            let mut room = jog_room(true);
+            let acts = jogged(&mut e, &mut room, &flx6_release(), 400_000);
+            assert!(!room.decks[0].scratching);
+            // However it was let go of, the platter turning on by itself
+            // neither bends nor scratches.
+            assert_eq!(bend_peak(&acts), 0.0, "touch {touch}, edge {edge}");
+            (spin_of(&acts).unwrap(), moved(&acts))
+        };
+        let ((t, spin), far) = run(true, true);
+        assert!((t, spin < -3.5) == (116_000, true), "{t} {spin}");
+        // The edge's message says the hand has left.
+        let ((t2, spin2), far2) = run(false, true);
+        assert_eq!(t2, 116_000);
+        assert!((spin - spin2).abs() < 0.3, "{spin} {spin2}");
+        assert!((far - far2).abs() < 1e-9);
+        // With nothing to say so, being still does.
+        let ((t3, spin3), far3) = run(false, false);
+        assert!((214_000..=220_000).contains(&t3), "{t3}");
+        assert!((spin - spin3).abs() < 0.3, "{spin} {spin3}");
+        assert!((far - far3).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_platter_without_a_touch_sensor_and_everything_else() {
+        // Vinyl mode off: it bends and searches.
+        for playing in [true, false] {
+            let mut e = split(false);
+            e.mapping.vinyl = false;
+            let acts = jogged(
+                &mut e,
+                &mut jog_room(playing),
+                &ccs(0, 4_000, 0, 0x22, &[1; 100]),
+                10_000,
+            );
+            assert!(!acts
+                .iter()
+                .any(|(_, a)| matches!(a, Action::JogTouch { .. })));
+            assert_eq!(bend_peak(&acts) > 0.0, playing);
+            assert_eq!(moved(&acts) > 0.0, !playing);
+        }
+        // No track: nothing to hold.
+        let mut e = split(false);
+        let mut room = jog_room(false);
+        room.decks[0].track = None;
+        let acts = jogged(&mut e, &mut room, &ccs(0, 4_000, 0, 0x22, &[1; 10]), 0);
+        assert!(!acts
+            .iter()
+            .any(|(_, a)| matches!(a, Action::JogTouch { .. })));
+        // A check opening lets go of it.
+        let mut e = split(false);
+        let mut room = jog_room(true);
+        jogged(&mut e, &mut room, &ccs(0, 4_000, 0, 0x22, &[1; 10]), 0);
+        assert!(room.decks[0].scratching);
+        let out = e.let_go(&room);
+        assert!(
+            out.iter().any(|o| matches!(
+                o,
+                MidiOut::Action(Action::JogTouch {
+                    deck: 0,
+                    down: false,
+                    ..
+                })
+            )),
+            "{out:?}"
+        );
+        assert!(e.let_go_still(10_000_000).is_empty());
+        // Another DJ's hand on the record: turning moves it, and doesn't
+        // take it over.
+        let mut e = split(false);
+        let mut room = jog_room(true);
+        room.decks[0].scratching = true;
+        let acts = jogged(
+            &mut e,
+            &mut room,
+            &ccs(0, 4_000, 0, 0x22, &[1; 10]),
+            400_000,
+        );
+        assert!(acts
+            .iter()
+            .all(|(_, a)| !matches!(a, Action::JogTouch { .. })));
+        assert!(moved(&acts) > 0.0);
+    }
+
+    #[test]
+    fn one_message_bound_to_the_platter_and_the_edge_moves_the_deck_once() {
+        let mut m = Mapping::empty("test");
+        m.bind(Trigger::note(0, 0x21), Target::JogTouch { deck: 0 });
+        for target in [Target::JogPlatter { deck: 0 }, Target::JogEdge { deck: 0 }] {
+            m.bind(Trigger::cc(0, 0x22), target).rel = RelMode::TwosComplement;
+        }
+        m.jog_ticks_per_rev = Some(1000.0);
+        let mut e = MidiEngine::new(m, 0.08);
+        let mut room = jog_room(true);
+        let mut msgs = vec![(0, [0x90, 0x21, 0x7F])];
+        msgs.extend(ccs(1_000, 4_000, 0, 0x22, &[1; 100]));
+        let acts = jogged(&mut e, &mut room, &msgs, 10_000);
+        assert!((moved(&acts) - 0.18).abs() < 1e-9);
+        assert_eq!(bend_peak(&acts), 0.0);
+    }
+
+    /// A 14-bit position from `from`, moving by `step` every 4 ms.
+    fn position14(
+        t: i64,
+        ch: u8,
+        (coarse, fine): (u8, u8),
+        from: i32,
+        step: i32,
+        n: i32,
+    ) -> Vec<(i64, [u8; 3])> {
+        (0..n)
+            .flat_map(|i| {
+                let at = (from + step * i).rem_euclid(1 << 14);
+                let t = t + i as i64 * 4_000;
+                [
+                    (t, [0xB0 | ch, coarse, (at >> 7) as u8]),
+                    (t + 300, [0xB0 | ch, fine, (at & 0x7F) as u8]),
+                ]
+            })
+            .collect()
+    }
+
+    /// The SC Live 4 as Mixxx's mapping has it: a touch sensor, and the
+    /// wheel's position in 14 bits on CCs 0x11 and 0x31.
+    #[test]
+    fn a_wheel_that_says_where_it_is() {
+        for (from, step) in [(3000, 2), (3000, -2), ((1 << 14) - 50, 2), (50, -2)] {
+            let mut e = MidiEngine::new(builtin_preset("SC LIVE 4").unwrap(), 0.08);
+            let mut room = jog_room(true);
+            let want = step as f64 * 100.0 / 1000.0 * SECONDS_PER_TURN;
+            // Its first message only says where it is: here, a moment before
+            // it's touched.
+            let mut msgs = position14(0, 4, (0x11, 0x31), from, step, 1);
+            msgs.push((5_000, [0x94, 0x21, 0x7F]));
+            msgs.extend(position14(10_000, 4, (0x11, 0x31), from + step, step, 100));
+            msgs.push((411_000, [0x94, 0x21, 0]));
+            let acts = jogged(&mut e, &mut room, &msgs, 10_000);
+            assert!(
+                (moved(&acts) - want).abs() < 1e-9,
+                "from {from} by {step}: {} vs {want}",
+                moved(&acts)
+            );
+            let (_, spin) = spin_of(&acts).unwrap();
+            assert!((spin - step as f32 * 0.45).abs() < 0.2, "{spin}");
+            // Untouched, it nudges; and on deck C, after DECK, it's deck C's.
+            let at = from + 101 * step;
+            let acts = jogged(
+                &mut e,
+                &mut room,
+                &position14(900_000, 4, (0x11, 0x31), at, step, 50),
+                0,
+            );
+            assert_eq!(moved(&acts), 0.0);
+            assert_eq!(bend_peak(&acts).signum(), step.signum() as f64);
+            let mut msgs = vec![(1_800_000, [0x94, 0x1F, 0x7F])];
+            let at = at + 50 * step;
+            msgs.extend(position14(1_900_000, 4, (0x11, 0x31), at, step, 50));
+            let acts = jogged(&mut e, &mut room, &msgs, 0);
+            assert!(acts
+                .iter()
+                .all(|(_, a)| matches!(a, Action::Bend { deck: 0 | 2, .. })));
+            assert!(acts
+                .iter()
+                .any(|(_, a)| matches!(a, Action::Bend { deck: 2, bend } if bend.signum() == step.signum() as f64)));
+        }
+    }
+
+    #[test]
+    fn a_jog_wheel_that_counts_and_says_where_it_is_moves_the_deck_once() {
+        let mut e = MidiEngine::new(builtin_preset("SC LIVE 4").unwrap(), 0.08);
+        let mut room = jog_room(true);
+        room.decks[0].scratching = true;
+        let mut msgs = position14(0, 4, (0x11, 0x31), 3000, 2, 101);
+        for i in 0..101 {
+            msgs.push((i * 4_000 + 600, [0xB4, 0x36, 2]));
+        }
+        msgs.sort_by_key(|m| m.0);
+        let acts = jogged(&mut e, &mut room, &msgs, 10_000);
+        let want = 200.0 / 1000.0 * SECONDS_PER_TURN;
+        assert!((moved(&acts) - want).abs() < 1e-9, "{}", moved(&acts));
+        // On its own, the one that counts does.
+        let mut e = MidiEngine::new(builtin_preset("SC LIVE 4").unwrap(), 0.08);
+        let acts = jogged(
+            &mut e,
+            &mut room,
+            &ccs(0, 4_000, 4, 0x36, &[2; 100]),
+            10_000,
+        );
+        assert!((moved(&acts) - want).abs() < 1e-9, "{}", moved(&acts));
+    }
+
+    #[test]
+    fn a_position_never_jumps_over_what_wasnt_heard() {
+        let mut m = Mapping::empty("test");
+        m.bind(Trigger::cc(0, 0x37), Target::Jog { deck: 0 }).rel =
+            RelMode::Absolute14 { fine: 0x4D };
+        m.bind(Trigger::cc(1, 0x37), Target::Jog { deck: 1 }).rel = RelMode::Absolute;
+        m.jog_ticks_per_rev = Some(1000.0);
+        let mut e = MidiEngine::new(m, 0.08);
+        let mut room = jog_room(false);
+        room.decks[0].scratching = true;
+        let pair = (0x37, 0x4D);
+        jogged(
+            &mut e,
+            &mut room,
+            &position14(0, 0, pair, 100, 1, 10),
+            10_000,
+        );
+        // Half the circle away: it was turned while nobody listened.
+        let acts = jogged(
+            &mut e,
+            &mut room,
+            &position14(100_000, 0, pair, 8000, 1, 11),
+            10_000,
+        );
+        assert!((moved(&acts) - 0.018).abs() < 1e-9, "{}", moved(&acts));
+        // Nor after a check, or Learn, has had the controller.
+        e.let_go(&room);
+        let acts = jogged(
+            &mut e,
+            &mut room,
+            &position14(200_000, 0, pair, 8100, 1, 11),
+            10_000,
+        );
+        assert!((moved(&acts) - 0.018).abs() < 1e-9, "{}", moved(&acts));
+        // Seven bits: from 120, round past the end, and back.
+        let up: Vec<u8> = (120..140).map(|v| (v % 128) as u8).collect();
+        let acts = jogged(
+            &mut e,
+            &mut room,
+            &ccs(300_000, 4_000, 1, 0x37, &up),
+            10_000,
+        );
+        assert!(
+            (moved(&acts) - 19.0 * 0.0018).abs() < 1e-9,
+            "{}",
+            moved(&acts)
+        );
+        let down: Vec<u8> = up.iter().rev().copied().collect();
+        let acts = jogged(
+            &mut e,
+            &mut room,
+            &ccs(400_000, 4_000, 1, 0x37, &down),
+            10_000,
+        );
+        assert!(
+            (moved(&acts) + 19.0 * 0.0018).abs() < 1e-9,
+            "{}",
+            moved(&acts)
+        );
+    }
+
+    /// Learn `target` from these messages: what was learned, and how many
+    /// messages it took.
+    fn learn(
+        e: &mut MidiEngine,
+        target: Target,
+        msgs: &[(i64, [u8; 3])],
+    ) -> Option<(Binding, usize)> {
+        let (room, local) = (RoomState::default(), LocalParams::default());
+        e.learn = Some(target);
+        for (i, (t, m)) in msgs.iter().enumerate() {
+            match e.handle_at(m, *t, &room, &local)[..] {
+                [] => {}
+                [MidiOut::Learned(ref b)] => return Some((b.clone(), i + 1)),
+                ref other => panic!("{other:?}"),
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn learn_finds_out_how_a_wheel_counts_however_its_messages_start() {
+        let flick: Vec<u8> = [5, 9, 14, 18, 20, 20, 19, 17, 12, 8, 5, 3, 2, 2]
+            .into_iter()
+            .chain([1; 12])
+            .collect();
+        let back: Vec<u8> = flick.iter().map(|v| 128 - v).collect();
+        let around: Vec<u8> = flick.iter().map(|v| 64 + v).collect();
+        for (values, rel) in [
+            (vec![1; 20], RelMode::TwosComplement),
+            (vec![127; 20], RelMode::TwosComplement),
+            (
+                vec![2, 1, 1, 2, 1, 127, 127, 126, 127, 1],
+                RelMode::TwosComplement,
+            ),
+            (flick, RelMode::TwosComplement),
+            (back, RelMode::TwosComplement),
+            (vec![65; 20], RelMode::Offset64),
+            (vec![63; 20], RelMode::Offset64),
+            (around, RelMode::Offset64),
+        ] {
+            for target in [
+                Target::Jog { deck: 0 },
+                Target::JogPlatter { deck: 0 },
+                Target::JogEdge { deck: 0 },
+            ] {
+                let mut e = engine();
+                let (b, n) = learn(&mut e, target, &ccs(0, 8_000, 4, 0x36, &values))
+                    .unwrap_or_else(|| panic!("{values:?}"));
+                assert_eq!(
+                    (b.trigger, b.target, b.rel, b.invert),
+                    (Trigger::cc(4, 0x36), target, rel, false),
+                    "{values:?}"
+                );
+                assert!(n >= 8, "{values:?}: after {n}");
+                assert_eq!(e.learn, None);
+                assert_eq!(e.learn_note(), None);
+            }
+            // One message is never enough, and Tandem says what it wants.
+            let mut e = engine();
+            assert_eq!(
+                learn(
+                    &mut e,
+                    Target::Jog { deck: 0 },
+                    &ccs(0, 0, 4, 0x36, &values[..1])
+                ),
+                None
+            );
+            assert!(
+                e.learn_note().unwrap().contains("keep turning"),
+                "{:?}",
+                e.learn_note()
+            );
+            assert!(e.mapping.bindings.is_empty());
+            // Asked for something else: that's off.
+            e.learn = Some(Target::Play { deck: 0 });
+            assert_eq!(e.learn_note(), None);
+        }
+        // The browse knob is learned from one click, as it counts.
+        for (v, rel) in [
+            (1, RelMode::TwosComplement),
+            (127, RelMode::TwosComplement),
+            (65, RelMode::Offset64),
+            (63, RelMode::Offset64),
+        ] {
+            let (b, _) = learn(&mut engine(), Target::Browse, &ccs(0, 0, 6, 0x40, &[v])).unwrap();
+            assert_eq!(b.rel, rel, "{v}");
+        }
+    }
+
+    #[test]
+    fn learn_never_takes_a_position_for_a_wheel_that_counts() {
+        let jog = Target::Jog { deck: 0 };
+        let touch = |e: &mut MidiEngine| {
+            e.mapping
+                .bind(Trigger::note(4, 0x21), Target::JogTouch { deck: 0 });
+        };
+        for pair in [(0x11, 0x31), (0x37, 0x4D)] {
+            for (from, step) in [(1290, 3), (12900, -3), (130, 2), (64 * 128 + 5, 3)] {
+                let msgs = position14(0, 4, pair, from, step, 150);
+                // It could be a fader: refused, and said.
+                let mut e = engine();
+                touch(&mut e);
+                assert_eq!(learn(&mut e, jog, &msgs), None, "{pair:?} from {from}");
+                assert!(
+                    e.learn_note().unwrap().contains("says where it is"),
+                    "{:?}",
+                    e.learn_note()
+                );
+                // With a hand on top, it's the wheel.
+                let mut e = engine();
+                touch(&mut e);
+                let mut hand = vec![(0, [0x94, 0x21, 0x7F])];
+                hand.extend(msgs);
+                let (b, _) = learn(&mut e, jog, &hand).expect("with a hand on top");
+                assert_eq!(
+                    (b.trigger, b.rel),
+                    (Trigger::cc(4, pair.0), RelMode::Absolute14 { fine: pair.1 })
+                );
+            }
+        }
+        // The coarse half alone, eight messages a step, from anywhere. (Where
+        // it would sit on a single tick, nothing can tell it from one.)
+        for from in (4..124u8).filter(|f| ![63, 65].contains(f)) {
+            let up: Vec<u8> = (0..200).map(|i| (from + i / 8) % 128).collect();
+            let mut e = engine();
+            match learn(&mut e, jog, &ccs(0, 4_000, 4, 0x37, &up)) {
+                None => {}
+                Some((b, _)) => assert!(b.rel.is_position(), "from {from}: {b:?}"),
+            }
+        }
+        // Seven bits that come round are a wheel's.
+        let round: Vec<u8> = (100..160).map(|v| (v % 128) as u8).collect();
+        let (b, _) = learn(&mut engine(), jog, &ccs(0, 8_000, 4, 0x37, &round)).unwrap();
+        assert_eq!(b.rel, RelMode::Absolute);
+        // A fader the mapping knows isn't one, however it's moved.
+        let mut e = engine();
+        e.mapping
+            .bind(Trigger::cc(4, 0x1F), Target::Tempo { deck: 0 });
+        assert_eq!(learn(&mut e, jog, &ccs(0, 8_000, 4, 0x1F, &round)), None);
+        assert!(e.learn_note().unwrap().contains("Tempo fader, not a wheel"));
+    }
+
+    #[test]
+    fn a_jog_wheels_turn_is_never_learned_as_a_button() {
+        // Mapped already: refused at once, whichever way it turns.
+        for v in [1, 127, 20, 108] {
+            let mut e = MidiEngine::new(builtin_preset("SC LIVE 4").unwrap(), 0.08);
+            for target in [Target::JogTouch { deck: 0 }, Target::Play { deck: 0 }] {
+                let before = e.mapping.clone();
+                let mut msgs = ccs(0, 4_000, 4, 0x36, &[v; 20]);
+                msgs.push((200_000, [0xB4, 0x36, 0]));
+                assert_eq!(learn(&mut e, target, &msgs), None);
+                assert_eq!(e.mapping, before);
+                assert!(e.learn_note().unwrap().contains("not a button"));
+            }
+        }
+        // Not mapped: slow ticks either way, a flick, a position.
+        let round: Vec<u8> = (100..160).map(|v| (v % 128) as u8).collect();
+        for values in [
+            vec![1; 20],
+            vec![127; 20],
+            vec![108, 112, 118, 121, 125, 127, 127, 127],
+            round,
+            vec![63; 20],
+        ] {
+            for every in [2_000, 300_000] {
+                let mut e = engine();
+                let msgs = ccs(0, every, 4, 0x36, &values);
+                assert_eq!(learn(&mut e, Target::JogTouch { deck: 0 }, &msgs), None);
+                assert_eq!(learn(&mut e, Target::Cue { deck: 0 }, &msgs), None);
+                assert!(e.mapping.bindings.is_empty());
+            }
+        }
+        // A button that does send control changes is learned when it's let
+        // go; a touch sensor's note straight away.
+        let mut e = engine();
+        let press = [(0, [0xB4, 0x40, 127]), (80_000, [0xB4, 0x40, 0])];
+        assert_eq!(learn(&mut e, Target::Play { deck: 0 }, &press[..1]), None);
+        assert!(e.learn_note().unwrap().contains("let go"));
+        let (b, _) = learn(&mut e, Target::Play { deck: 0 }, &press).unwrap();
+        assert_eq!(b.trigger, Trigger::cc(4, 0x40));
+        let (b, _) = learn(
+            &mut e,
+            Target::JogTouch { deck: 0 },
+            &[(0, [0x94, 0x21, 0x7F])],
+        )
+        .unwrap();
+        assert_eq!(b.trigger, Trigger::note(4, 0x21));
+    }
+
+    #[test]
+    fn a_platter_and_an_edge_learned_from_one_message_are_one_control() {
+        let mut e = engine();
+        let turn = ccs(0, 8_000, 4, 0x36, &[1; 8]);
+        learn(&mut e, Target::JogPlatter { deck: 0 }, &turn).unwrap();
+        let (b, _) = learn(&mut e, Target::JogEdge { deck: 0 }, &turn).unwrap();
+        assert_eq!(b.target, Target::Jog { deck: 0 });
+        assert_eq!(e.mapping.bindings, [b]);
+        // Another message for the edge is the edge's, and the rest stays.
+        let edge = ccs(0, 8_000, 4, 0x37, &[65; 8]);
+        let (b, _) = learn(&mut e, Target::JogEdge { deck: 0 }, &edge).unwrap();
+        assert_eq!(
+            (b.target, b.rel),
+            (Target::JogEdge { deck: 0 }, RelMode::Offset64)
+        );
+        assert_eq!(e.mapping.bindings.len(), 2);
+        // Learning the one message again leaves one binding on it.
+        learn(&mut e, Target::Jog { deck: 0 }, &turn).unwrap();
+        assert_eq!(e.mapping.bindings.len(), 2);
+        // The other deck on the same control (they take turns) has its own.
+        let mut e = MidiEngine::new(builtin_preset("SC LIVE 4").unwrap(), 0.08);
+        let (b, _) = learn(&mut e, Target::JogPlatter { deck: 2 }, &turn).unwrap();
+        assert_eq!((b.target, b.layered), (Target::Jog { deck: 2 }, true));
+        assert!(e
+            .mapping
+            .bindings
+            .iter()
+            .any(|b| b.trigger == Trigger::cc(4, 0x36) && b.target == Target::Jog { deck: 0 }));
+    }
+
+    /// The SC Live 4's owner (Tandem 0.15.1, 2026-11-24) "tried to rebind
+    /// [the] jogwheel but now it only goes one way, and nearly double speed"
+    /// the other way: Learn took the wheel to count around 64.
+    fn relearned_by_0_15_1(target: Target, trigger: Trigger) -> Mapping {
+        let mut m = sc_live_4_preset_13();
+        m.jog_ticks_per_rev = Some(1234.0);
+        m.bindings.retain(|b| b.target != target);
+        m.bind(trigger, target);
+        m
+    }
+
+    #[test]
+    fn a_jog_learned_wrongly_counts_right_again_after_the_upgrade() {
+        let preset = builtin_preset("SC LIVE 4").unwrap();
+        let jog = Target::Jog { deck: 0 };
+        let mut saved = relearned_by_0_15_1(jog, Trigger::cc(4, 0x36));
+        saved.bindings.last_mut().unwrap().invert = true;
+        let mut e = MidiEngine::new(saved.clone(), 0.08);
+        let turn = |v: u8| ccs(0, 4_000, 4, 0x36, &[v; 250]);
+        // As it was: either way speeds up or slows down, as far as it goes.
+        let peak = |e: &mut MidiEngine, v| bend_peak(&jogged(e, &mut jog_room(true), &turn(v), 0));
+        assert!(peak(&mut e, 1).abs() > 0.4 && peak(&mut e, 127).abs() > 0.4);
+        assert!(saved.upgrade_from(&preset) > 0);
+        // Encoding back, invert and calibration kept, and deck C the same.
+        assert_eq!(saved.ticks_per_rev(), 1234.0);
+        for deck in [0, 2] {
+            let b = saved
+                .bindings
+                .iter()
+                .find(|b| b.target == Target::Jog { deck } && b.trigger == Trigger::cc(4, 0x36))
+                .unwrap();
+            assert_eq!(
+                (b.rel, b.invert, b.layered),
+                (RelMode::TwosComplement, true, true),
+                "deck {deck}"
+            );
+        }
+        let mut e = MidiEngine::new(saved, 0.08);
+        let (cw, back) = (peak(&mut e, 1), peak(&mut e, 127));
+        assert!(cw < 0.0 && back > 0.0 && cw.abs() < 0.05, "{cw} {back}");
+
+        // Learned from the first half of its position instead, if that's what
+        // it sends: the position is read as one.
+        let mut saved = relearned_by_0_15_1(jog, Trigger::cc(4, 0x11));
+        saved.upgrade_from(&preset);
+        for deck in [0, 2] {
+            assert_eq!(
+                saved
+                    .bindings
+                    .iter()
+                    .find(|b| b.target == Target::Jog { deck } && b.trigger == Trigger::cc(4, 0x11))
+                    .map(|b| b.rel),
+                Some(RelMode::Absolute14 { fine: 0x31 })
+            );
+        }
+        // And from the second half: that one goes.
+        let mut saved = relearned_by_0_15_1(jog, Trigger::cc(4, 0x31));
+        saved.upgrade_from(&preset);
+        assert!(!saved
+            .bindings
+            .iter()
+            .any(|b| b.trigger == Trigger::cc(4, 0x31)));
+        assert_eq!(lacks(&preset, &saved), [] as [String; 0]);
+
+        // The touch sensor learned from the turn: it's the sensor's again.
+        let mut saved = relearned_by_0_15_1(Target::JogTouch { deck: 0 }, Trigger::cc(4, 0x36));
+        saved.upgrade_from(&preset);
+        assert_eq!(lacks(&preset, &saved), [] as [String; 0]);
+        assert!(!saved
+            .bindings
+            .iter()
+            .any(|b| b.trigger == Trigger::cc(4, 0x36) && !b.target.is_jog_turn()));
+
+        // A wheel learned somewhere else is the DJ's choice.
+        let mut saved = relearned_by_0_15_1(jog, Trigger::cc(4, 0x55));
+        saved.upgrade_from(&preset);
+        let own = |m: &Mapping| {
+            m.bindings
+                .iter()
+                .find(|b| b.trigger == Trigger::cc(4, 0x55) && b.target == jog)
+                .map(|b| b.rel)
+        };
+        assert_eq!(own(&saved), Some(RelMode::Offset64));
+        // Once the mapping is of this version, what the DJ sets stays.
+        for b in saved.bindings.iter_mut().filter(|b| b.target == jog) {
+            b.rel = RelMode::Offset64;
+        }
+        let now = saved.clone();
+        saved.upgrade_from(&preset);
+        assert_eq!(saved, now);
+    }
+
+    /// Reset to the built-in mapping: a working jog, whichever it sends.
+    #[test]
+    fn the_sc_live_4s_built_in_jog_works_either_way() {
+        let preset = builtin_preset("SC LIVE 4").unwrap();
+        for (ch, deck) in [(4u8, 0u8), (5, 1)] {
+            for v in [1, 127] {
+                let mut e = MidiEngine::new(preset.clone(), 0.08);
+                let sign = if v == 1 { 1.0 } else { -1.0 };
+                let mut room = jog_room(true);
+                let acts = jogged(&mut e, &mut room, &ccs(0, 4_000, ch, 0x36, &[v; 250]), 0);
+                let bend = bend_peak(&acts);
+                assert!(bend * sign > 0.01 && bend.abs() < 0.05, "{bend}");
+                // A hand on top: a quarter turn moves the record 0.45 s.
+                let mut e = MidiEngine::new(preset.clone(), 0.08);
+                let mut msgs = vec![(0, [0x90 | ch, 0x21, 0x7F])];
+                msgs.extend(ccs(1_000, 4_000, ch, 0x36, &[v; 250]));
+                msgs.push((1_200_000, [0x90 | ch, 0x21, 0x00]));
+                let acts = jogged(&mut e, &mut jog_room(true), &msgs, 0);
+                assert!(
+                    (moved(&acts) - sign * 0.45).abs() < 1e-9,
+                    "{}",
+                    moved(&acts)
+                );
+                assert!(acts.iter().any(
+                    |(_, a)| matches!(a, Action::JogTouch { deck: d, down: true, .. } if *d == deck)
+                ));
+            }
+        }
+    }
+
+    /// Saved FLX6, FLX4 and Inpulse mappings get the platter and the edge.
+    #[test]
+    fn saved_mappings_gain_the_platter_and_the_edge() {
+        for port in ["DDJ-FLX6", "DDJ-FLX4", "DJControl Inpulse 200 Mk2"] {
+            let preset = builtin_preset(port).unwrap();
+            let mut saved = preset_13(port);
+            saved.jog_ticks_per_rev = Some(6387.0);
+            let n = preset
+                .bindings
+                .iter()
+                .filter(|b| b.target.is_jog_turn())
+                .count();
+            assert_eq!(saved.upgrade_from(&preset), n, "{port}");
+            assert_eq!(saved.ticks_per_rev(), 6387.0);
+            saved.jog_ticks_per_rev = preset.jog_ticks_per_rev;
+            assert_eq!(saved, preset, "{port}");
+            assert_eq!(saved.upgrade_from(&preset), 0);
+        }
+        // What the DJ changed stays theirs: their invert, a wheel on another
+        // message, a message of the wheel's used for something else.
+        let preset = builtin_preset("DDJ-FLX6").unwrap();
+        let mut saved = preset_13("DDJ-FLX6");
+        for b in &mut saved.bindings {
+            match (b.target, b.trigger.number) {
+                (Target::Jog { deck: 0 }, _) => b.invert = true,
+                (Target::Jog { deck: 1 }, 0x21) => b.trigger.number = 0x55,
+                (Target::Jog { deck: 2 }, 0x22) => b.target = Target::Browse,
+                _ => {}
+            }
+        }
+        saved.upgrade_from(&preset);
+        let find = |m: &Mapping, ch: u8, cc: u8| {
+            m.bindings
+                .iter()
+                .find(|b| b.trigger == Trigger::cc(ch, cc))
+                .map(|b| (b.target, b.invert))
+        };
+        assert_eq!(
+            find(&saved, 0, 0x22),
+            Some((Target::JogPlatter { deck: 0 }, true))
+        );
+        assert_eq!(
+            find(&saved, 0, 0x21),
+            Some((Target::JogEdge { deck: 0 }, true))
+        );
+        assert_eq!(
+            find(&saved, 1, 0x55),
+            Some((Target::Jog { deck: 1 }, false))
+        );
+        assert_eq!(find(&saved, 2, 0x22), Some((Target::Browse, false)));
+        assert_eq!(
+            find(&saved, 2, 0x21),
+            Some((Target::JogEdge { deck: 2 }, false))
+        );
+    }
+
+    #[test]
+    fn jog_targets_and_positions_are_saved_and_named() {
+        let mut m = Mapping::empty("test");
+        m.bind(Trigger::cc(0, 0x22), Target::JogPlatter { deck: 1 });
+        m.bind(Trigger::cc(0, 0x21), Target::JogEdge { deck: 1 })
+            .rel = RelMode::Absolute;
+        m.bind(Trigger::cc(0, 0x11), Target::Jog { deck: 2 }).rel =
+            RelMode::Absolute14 { fine: 0x31 };
+        let json = serde_json::to_string(&m).unwrap();
+        assert_eq!(serde_json::from_str::<Mapping>(&json).unwrap(), m);
+        assert!(json.contains(r#"{"t":"JogPlatter","deck":1}"#), "{json}");
+        // A mapping saved before them still reads.
+        let old = r#"{"device":"x","bindings":[{"trigger":{"kind":"Cc","channel":0,"number":34},"target":{"t":"Jog","deck":0},"rel":"TwosComplement"}]}"#;
+        let m: Mapping = serde_json::from_str(old).unwrap();
+        assert_eq!(m.bindings[0].target, Target::Jog { deck: 0 });
+        assert_eq!(m.bindings[0].rel, RelMode::TwosComplement);
+        assert_eq!(
+            [
+                Target::JogPlatter { deck: 0 }.label(),
+                Target::JogEdge { deck: 0 }.label(),
+                Target::Jog { deck: 0 }.label()
+            ],
+            [
+                "Deck A · Jog wheel, platter (scratch)",
+                "Deck A · Jog wheel, edge (nudge)",
+                "Deck A · Jog wheel, both (touch decides)"
+            ]
+        );
+        // The mapping screen's 1/127 box leaves a position alone.
+        assert_eq!(RelMode::Offset64.counting(true), RelMode::TwosComplement);
+        assert_eq!(RelMode::TwosComplement.counting(false), RelMode::Offset64);
+        let p = RelMode::Absolute14 { fine: 0x31 };
+        assert_eq!((p.counting(true), p.counting(false)), (p, p));
+        for t in [Target::JogPlatter { deck: 3 }, Target::JogEdge { deck: 3 }] {
+            assert_eq!(t.deck(), Some(3));
+            assert_eq!(t.with_deck(1).deck(), Some(1));
+            assert_eq!((t.part(), t.kind()), (Part::Jog, TargetKind::Relative));
+        }
     }
 }

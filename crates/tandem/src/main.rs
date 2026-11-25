@@ -10,6 +10,7 @@ mod ui_broadcaster;
 mod ui_deck_check;
 mod ui_decks;
 mod ui_dialogs;
+mod ui_jog_check;
 mod ui_library;
 mod ui_meters;
 mod ui_wizard;
@@ -74,6 +75,7 @@ fn main() {
         deck_check: arg_after("--dev-deck-check").map(|p| p.to_string_lossy().to_string()),
         eject: arg_after("--dev-eject").map(|p| p.to_string_lossy().to_string()),
         drag: arg_after("--dev-drag").and_then(|p| parse_drag(&p.to_string_lossy())),
+        jog_check: arg_after("--dev-jog-check").map(|p| p.to_string_lossy().to_string()),
         crate_demo: args.iter().any(|a| a == "--dev-crate"),
         crate_step: 0,
         fitted: false,

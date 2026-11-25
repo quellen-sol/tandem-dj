@@ -59,7 +59,8 @@ jumps), `HotCueClear { slot }`, `LoopIn`, `LoopOut`, `Reloop`,
 16, 32 beats), `Roll { size }` (hold; index into 1/16, 1/8, ¼, ½, 1, 2, 4, 8
 beats), `Tempo`, `TempoShift`, `Volume`, `Eq { band }` (0 low, 1 mid,
 2 high), `Trim`, `Filter` (0.5 is off), `Pfl` (headphone cue, toggles),
-`Jog`, `JogTouch`, `BendDown`, `BendUp` (hold), `Load`, `Eject`,
+`JogPlatter`, `JogEdge`, `Jog`, `JogTouch`, `BendDown`, `BendUp` (hold), `Load`,
+`Eject`,
 `PadMode { mode }` (`HotCues`, `BeatLoops`, `Rolls`), `DeckSelect` (a
 message saying a side now plays this deck, see "Deck layers").
 
@@ -167,12 +168,15 @@ leaves) and `Reloop` (leaves and re-enters, but does nothing until a loop
 has been made another way). The existing presets use `BeatLoop { size: 4 }`
 for an auto-loop press. Say which you chose and what the DJ will notice.
 
-**Jog.** Bind *every* message the platter sends when turned (touched and
-untouched, top and side often differ) to `Target::Jog`, and the touch
-sensor's note to `Target::JogTouch`. Tandem decides what a turn means from
-the deck's state: touching scratches (vinyl mode), a paused deck searches, a
-playing deck bends. A SHIFT + jog message (fast search) has no target: leave
-it. Then settle:
+**Jog.** Bind every message the wheel sends when turned: those it sends with
+a hand on top to `Target::JogPlatter`, those it sends by its edge to
+`Target::JogEdge`, and one it sends for both to `Target::Jog`, where the
+touch sensor decides. The sensor's note goes to `Target::JogTouch`. The
+platter scratches while touched (vinyl mode); the edge, and an untouched
+wheel, bends a playing deck and searches a paused one. Don't bind a sensor
+that its edge also sets off when the edge has a message of its own, or one
+that never lets go: a platter without one holds the record by turning. A
+SHIFT + jog message (fast search) has no target: leave it. Then settle:
 
 - the encoding (`rel`), from a script's arithmetic, a Traktor encoder mode
   or a manufacturer list;
@@ -182,7 +186,9 @@ it. Then settle:
   say so, and put "calibrate" first on the owner's checklist. Settings →
   Controller → Calibrate fixes a wrong figure per user, so this is the one
   number that may be approximate.
-- A jog that reports an absolute position instead of ticks can't be bound.
+- A jog that reports an absolute position instead of ticks: `RelMode::Absolute`
+  (7 bits) or `RelMode::Absolute14 { fine }` (the binding's CC is the coarse
+  half, sent first; `fine` any CC on the same channel).
 
 **Tempo fader.** Tandem wants the value to rise as the tempo rises (the +
 end). Find which physical end sends the high value; set `invert` if the +
@@ -264,8 +270,7 @@ make it only when the profile doesn't work without it, and say you did.
   (apart from level meters and FX BEATS indicators, above).
 - Blinking, jog rings, displays.
 - A level meter that isn't Pioneer-scaled.
-- A relative encoding other than the two above; absolute-position jogs;
-  browse on a pair of notes.
+- A relative encoding other than the two above; browse on a pair of notes.
 - A 14-bit pair that isn't n / n + 32 (works, at 7-bit).
 - Scaling or curves on an absolute control.
 - More than one MIDI port per controller.

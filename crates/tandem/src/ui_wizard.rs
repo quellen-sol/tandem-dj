@@ -90,11 +90,14 @@ fn guess(mapping: &Mapping) -> Setup {
 impl TandemApp {
     /// Open the setup on its first page (Settings closes meanwhile).
     pub(crate) fn open_wizard(&mut self) {
-        // The DECK button check takes the controller's messages before the
-        // setup would hear them, and its results can put an older mapping
-        // back.
+        // The DECK button and jog wheel checks take the controller's messages
+        // before the setup would hear them, and their results can put an
+        // older mapping back.
         if let Some(mut check) = self.ui.deck_check.take() {
             self.close_deck_check(&mut check);
+        }
+        if let Some(mut check) = self.ui.jog_check.take() {
+            self.close_jog_check(&mut check);
         }
         let setup = guess(&self.midi.engine.lock().mapping);
         self.ui.wizard = Some(WizardUi {
@@ -710,7 +713,7 @@ fn wanted(w: &Wizard, i: usize) -> (Vec<El>, Option<El>, String) {
         // The setup's first two steps: the left SHIFT, then the right.
         Target::Shift => (vec![El::Shift(i.min(1))], "SHIFT".into()),
         Target::JogTouch { .. } => (vec![El::JogTop(s)], "TOUCH".into()),
-        Target::Jog { .. } => match step.ask {
+        Target::JogPlatter { .. } | Target::JogEdge { .. } => match step.ask {
             Ask::TurnEdge => (vec![El::JogRing(s)], "EDGE".into()),
             Ask::FullTurn => (vec![El::JogTop(s), El::JogRing(s)], "ONE TURN".into()),
             _ => (vec![El::JogTop(s)], "TURN".into()),

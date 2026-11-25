@@ -53,9 +53,10 @@ pub struct Midi {
     /// Things the UI handles (browse, load, learned bindings).
     pub ui_queue: Arc<Mutex<Vec<MidiOut>>>,
     pub error: Option<String>,
-    /// While the DECK button check runs: every message the controller
-    /// sends, with when it came, instead of the mapping (so the controller
-    /// plays nothing in the room). None the rest of the time.
+    /// While the DECK button check or the jog wheel check runs: every
+    /// message the controller sends, with when it came, instead of the
+    /// mapping (so the controller plays nothing in the room). None the rest
+    /// of the time.
     pub tap: Tap,
     /// Messages for the controller thread to send to the controller.
     outbox: Arc<Mutex<Vec<Vec<u8>>>>,
@@ -255,7 +256,8 @@ impl Midi {
 }
 
 /// The controller's clock: every 5 ms send gathered jog movement (scratch /
-/// search) and anything in `outbox`; every 25 ms update the jog-ring pitch
+/// search), let go of a platter without a touch sensor that has stopped, and
+/// send anything in `outbox`; every 25 ms update the jog-ring pitch
 /// bend, the lights, the level meters, the effects' BEATS lights and the
 /// screens that show which deck a side is on (left alone while `tap` is
 /// open: the DECK button check writes to them); every 200 ms keep Pioneer
@@ -289,7 +291,12 @@ fn controller_loop(
         } else {
             None
         };
-        let actions = engine.lock().flush(window);
+        let actions = {
+            let mut e = engine.lock();
+            let mut actions = e.let_go_still(clock.stamp());
+            actions.extend(e.flush(window));
+            actions
+        };
         if !actions.is_empty() {
             let t = clock.stamp();
             let mut s = session.lock();

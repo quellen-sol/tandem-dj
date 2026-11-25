@@ -108,6 +108,7 @@ impl TandemApp {
         self.settings_window(ctx);
         self.wizard_window(ctx);
         self.deck_check_window(ctx);
+        self.jog_check_window(ctx);
         self.terms_window(ctx);
     }
 
@@ -786,6 +787,21 @@ impl TandemApp {
                 );
             });
         }
+        let mut open_jog_check = false;
+        ui.horizontal(|ui| {
+            open_jog_check = ui
+                .button("Check the jog wheels…")
+                .on_hover_text("Touch and turn them as it asks: it finds out what your controller sends, can fix the mapping, and saves a report to send to us.")
+                .clicked();
+            ui.label(
+                RichText::new("If turning or touching one does the wrong thing.")
+                    .small()
+                    .weak(),
+            );
+        });
+        if let Some(note) = engine.learn_note() {
+            ui.label(RichText::new(note).color(AMBER));
+        }
         let waiting = engine.waiting_for_pickup_in(&room);
         if !waiting.is_empty() {
             let names: Vec<String> = waiting.iter().map(|t| t.label()).collect();
@@ -930,6 +946,9 @@ impl TandemApp {
         }
         if open_check {
             self.open_deck_check();
+        }
+        if open_jog_check {
+            self.open_jog_check();
         }
     }
 
@@ -1103,7 +1122,8 @@ fn mapping_rows(
         ui.horizontal(|ui| {
             let (mut invert, mut two) = (b.invert, b.rel == RelMode::TwosComplement);
             let mut edited = false;
-            if target.is_relative() {
+            // A wheel that says where it is doesn't count either way.
+            if target.is_relative() && !b.rel.is_position() {
                 edited |= ui
                     .checkbox(&mut two, "1/127 style")
                     .on_hover_text("Tick this if the wheel/encoder moves the wrong way or jumps")
@@ -1115,11 +1135,7 @@ fn mapping_rows(
             if edited {
                 let b = &mut engine.mapping.bindings[*i];
                 b.invert = invert;
-                b.rel = if two {
-                    RelMode::TwosComplement
-                } else {
-                    RelMode::Offset64
-                };
+                b.rel = b.rel.counting(two);
                 changed = true;
             }
             let also: Vec<String> = engine.mapping.also(b).iter().map(Target::label).collect();

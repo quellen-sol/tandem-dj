@@ -65,8 +65,8 @@ The design questions:
 | SHIFT + X2 (OUT) | `94 0A` | 7F / 00 | `LoopOut` | single source | [4]; [8] p.5 and [9] agree |
 | ½ held about a second | `91 0B` | 7F / 00 | left unmapped: no separate function in Tandem | single source | [4]; [8] p.3 ("LOOP_IN long press") |
 | Jog top, touched | `91 08` | 7F touch, 00 let go | `JogTouch` | confirmed | [4] [6] [7] |
-| Jog turned, hand on top | `B1 0A` | relative, 1 = +1, 127 = −1 | `Jog` | confirmed | [4] [5] [6] [7] |
-| Jog turned by the ring | `B1 09` | relative, 1 = +1, 127 = −1 | `Jog` | confirmed | [4] [5] [6] [7] |
+| Jog turned, hand on top | `B1 0A` | relative, 1 = +1, 127 = −1 | `JogPlatter` | confirmed | [4] [5] [6] [7] |
+| Jog turned by the ring | `B1 09` | relative, 1 = +1, 127 = −1 | `JogEdge` | confirmed | [4] [5] [6] [7] |
 | SHIFT + jog touch | `94 08` | 7F / 00 | no Tandem control | single source | [4]; [8] p.5 |
 | SHIFT + jog turn | `B4 0A` (top), `B4 09` (ring) | relative | no Tandem control (fast search) | single source | [4]; [8] p.15 |
 | TEMPO fader | `B1 08` + fine `B1 28` | 14-bit; high value at the "−" (top) end | `Tempo`, inverted | confirmed (message, 14-bit); direction inferred, see Layout | [4] [6] [7] |

@@ -12,9 +12,11 @@
 //!
 //! - **Which way a fader or knob runs.** A step asks for it to be left at
 //!   one end; a low value there means it's inverted.
-//! - **How a jog wheel or encoder counts.** Turned clockwise, values just
-//!   over 64 are [`RelMode::Offset64`] and small ones are
-//!   [`RelMode::TwosComplement`]; going down instead means it's inverted.
+//! - **How a jog wheel or encoder counts** (see [`crate::wheel`]). Turned
+//!   clockwise, going down instead means it's inverted.
+//! - **Whether a jog wheel's platter and edge are one control.** They're two
+//!   steps; if both send the same message, it's bound once, to
+//!   [`Target::Jog`], and the touch sensor tells them apart.
 //! - **What SHIFT does.** Held, a control that sends what it sends without
 //!   SHIFT gets a SHIFT + binding ([`Binding::shift`]); one that sends
 //!   something else gets a plain binding to that. If nothing needed a SHIFT
@@ -37,6 +39,7 @@ use crate::mapping::{
     RawMidi, RelMode, Target, Trigger,
 };
 use crate::model::{deck_letter, DECKS, FX_SLOTS};
+use crate::wheel::{self, Position, TURN_MESSAGES};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
@@ -258,8 +261,8 @@ const FINE_HALF_US: i64 = 5_000;
 const TRAVEL: f32 = 0.25;
 /// How close to an end it has to be left.
 const AT_END: f32 = 0.15;
-/// Messages a wheel has to send before its counting style is read.
-const TURN_MESSAGES: u32 = 8;
+/// A wheel is read from its last messages, this many.
+const WHEEL_MESSAGES: usize = 400;
 /// Fewest ticks a full turn can be (as the mapping screen's calibration).
 pub const MIN_TURN_TICKS: i64 = 100;
 
@@ -278,12 +281,8 @@ struct Track {
     last7: u8,
     /// A fine half arrived for it: it's a 14-bit fader or knob.
     fine: bool,
-    /// SHIFT was held when it last sent something.
+    /// SHIFT was held when it last sent something (but for a button let go).
     shifted: bool,
-    /// Messages that read as 1/127 style, and the ticks they'd be.
-    twos: (u32, i32),
-    /// Messages that read as 64-centred, and the ticks they'd be.
-    offs: (u32, i32),
 }
 
 impl Track {
@@ -299,8 +298,6 @@ impl Track {
             last7: v7,
             fine: false,
             shifted: false,
-            twos: (0, 0),
-            offs: (0, 0),
         };
         tr.add(t, v, v7);
         tr
@@ -315,12 +312,6 @@ impl Track {
         self.last = v;
         self.seen |= 1u128 << v7.min(127);
         self.last7 = v7;
-        match v7 {
-            1..=30 => self.twos = (self.twos.0 + 1, self.twos.1 + v7 as i32),
-            98..=127 => self.twos = (self.twos.0 + 1, self.twos.1 + v7 as i32 - 128),
-            34..=63 | 65..=94 => self.offs = (self.offs.0 + 1, self.offs.1 + v7 as i32 - 64),
-            _ => {}
-        }
     }
 
     fn range(&self) -> f32 {
@@ -342,27 +333,25 @@ impl Track {
             && self.path <= 4.0 * self.range() + 0.1
     }
 
-    /// It turned like a wheel or an endless knob: how it counts, and
-    /// whether clockwise came out backwards. A wheel repeats a few values;
-    /// a fader never sends the same value twice.
-    fn turned(&self) -> Option<(RelMode, bool)> {
-        if self.n < TURN_MESSAGES || self.fine || self.distinct() * 2 > self.n {
-            return None;
-        }
-        let most =
-            |(count, ticks): (u32, i32)| (count * 10 >= self.n * 9 && ticks != 0).then_some(ticks);
-        if let Some(ticks) = most(self.twos) {
-            Some((RelMode::TwosComplement, ticks < 0))
-        } else {
-            most(self.offs).map(|ticks| (RelMode::Offset64, ticks < 0))
-        }
+    /// A button that sends a control change: one value at 64 or more for
+    /// the press, and 0 for letting go.
+    fn pressed(&self) -> bool {
+        self.may_be_pressed() && self.seen & 1 != 0
     }
 
-    /// A button that sends a control change: one value at 64 or more for
-    /// the press, and perhaps 0 for letting go.
-    fn pressed(&self) -> bool {
+    /// The same, perhaps still held. (Or a wheel turned a tick back.)
+    fn may_be_pressed(&self) -> bool {
         let press = self.seen & !1;
         press.count_ones() == 1 && press >> 64 != 0
+    }
+}
+
+/// The target a jog wheel's platter and edge have together, when they send
+/// the same message.
+fn both_parts(t: Target) -> Option<Target> {
+    match t {
+        Target::JogPlatter { deck } | Target::JogEdge { deck } => Some(Target::Jog { deck }),
+        _ => None,
     }
 }
 
@@ -384,8 +373,12 @@ pub struct Wizard {
     coarse: HashMap<(u8, u8), i64>,
     /// Jog wheel touch sensors with a hand on them.
     touch: HashSet<Trigger>,
-    /// What this step's faders, knobs and wheels have sent.
+    /// What this step's faders and knobs have sent.
     tracks: HashMap<Trigger, Track>,
+    /// What this step's wheel has sent.
+    wheel: Vec<wheel::Msg>,
+    /// Where a wheel that says where it is was last, in a full turn.
+    positions: HashMap<Trigger, Position>,
     /// SHIFT buttons held.
     shift: HashSet<Trigger>,
     /// Targets whose bindings from before the run have been replaced.
@@ -393,8 +386,10 @@ pub struct Wizard {
     /// Sides (left, right) the DJ has said share their controls between
     /// two decks.
     shared: [bool; 2],
-    /// Ticks counted so far in a full turn.
+    /// Ticks counted so far in a full turn, and those of a wheel that says
+    /// where it is (a controller may send both).
     count: i64,
+    count_position: i64,
     said: Option<Said>,
     offer: Option<Offer>,
     /// The step whose control [`Wizard::said`] says was just taken.
@@ -481,7 +476,10 @@ impl Plan<'_> {
     ) {
         let mapped = match ask {
             Ask::FullTurn => self.mapping.jog_ticks_per_rev.is_some(),
-            _ => self.mapping.binding_for(target).is_some(),
+            _ => [Some(target), both_parts(target)]
+                .into_iter()
+                .flatten()
+                .any(|t| self.mapping.binding_for(t).is_some()),
         };
         let group = self.groups.len() - 1;
         self.steps.push(Step {
@@ -540,21 +538,21 @@ impl Plan<'_> {
                 "Touching the top holds the record, for scratching. Skip this if the wheel can't feel your hand.",
             );
             self.step(
-                Jog { deck },
+                JogPlatter { deck },
                 Ask::Turn,
                 "Turn the jog wheel slowly clockwise",
-                "With your hand on top, a quarter turn or so.",
+                "With your hand on top, a quarter turn or so: that's scratching.",
             );
             self.step(
-                Jog { deck },
+                JogEdge { deck },
                 Ask::TurnEdge,
                 "Now turn it clockwise by its edge",
-                "Without touching the top: many wheels send something else from the edge, for nudging.",
+                "Without touching the top: that's nudging. Many wheels send something else from the edge; \
+                 if yours doesn't, the touch sensor tells the two apart.",
             );
-            self.adds();
             if deck == 0 {
                 self.step(
-                    Jog { deck },
+                    JogPlatter { deck },
                     Ask::FullTurn,
                     "Turn the jog wheel exactly one full turn",
                     "Line up a mark on the wheel, turn it once round with your hand on top, then press Enter. \
@@ -878,10 +876,13 @@ impl Wizard {
             coarse: HashMap::new(),
             touch: HashSet::new(),
             tracks: HashMap::new(),
+            wheel: Vec::new(),
+            positions: HashMap::new(),
             shift: HashSet::new(),
             cleared: HashSet::new(),
             shared: [false; 2],
             count: 0,
+            count_position: 0,
             said: None,
             offer: None,
             taken: None,
@@ -986,7 +987,7 @@ impl Wizard {
             .draft
             .bindings
             .iter()
-            .filter(|b| b.target == step.target)
+            .filter(|b| b.target == step.target || Some(b.target) == both_parts(step.target))
             .filter(|b| b.mode.is_none() || mode.is_none() || b.mode == mode)
             .filter(|b| made(step, b) || (!own && !anothers(b)))
             .map(|b| b.label())
@@ -1000,7 +1001,10 @@ impl Wizard {
 
     /// Ticks counted so far in a full turn of the jog wheel.
     pub fn count(&self) -> i64 {
-        self.count.abs()
+        match self.count_position {
+            0 => self.count.abs(),
+            n => n.abs(),
+        }
     }
 
     /// True while a SHIFT button the run knows is held.
@@ -1045,7 +1049,10 @@ impl Wizard {
     fn go(&mut self, i: usize) {
         self.at = i.min(self.steps.len());
         self.tracks.clear();
+        self.wheel.clear();
+        self.positions.clear();
         self.count = 0;
+        self.count_position = 0;
         self.offer = None;
         self.adding = false;
         if self.said.as_ref().is_some_and(|s| s.tone != Tone::Good) {
@@ -1180,10 +1187,15 @@ impl Wizard {
         if step.ask == Ask::FullTurn {
             self.draft.jog_ticks_per_rev = None;
         } else {
-            self.draft.bindings.retain(|b| b.target != target);
+            let both =
+                both_parts(target).filter(|t| self.draft.bindings.iter().any(|b| b.target == *t));
+            self.draft
+                .bindings
+                .retain(|b| b.target != target && Some(b.target) != both);
             // Its other steps have nothing left either.
             for s in &mut self.steps {
-                if s.target == target && s.ask != Ask::FullTurn && s.state.mapped() {
+                let same = s.target == target || (both.is_some() && both_parts(s.target) == both);
+                if same && s.ask != Ask::FullTurn && s.state.mapped() {
                     s.made.clear();
                     s.state = State::Skipped;
                 }
@@ -1196,14 +1208,11 @@ impl Wizard {
     /// Use the full turn just counted, if it's long enough to be one.
     pub fn confirm(&mut self) {
         let turning = self.step().is_some_and(|s| s.ask == Ask::FullTurn);
-        if turning && self.count.abs() >= MIN_TURN_TICKS {
-            self.draft.jog_ticks_per_rev = Some(self.count.unsigned_abs() as f32);
+        if turning && self.count() >= MIN_TURN_TICKS {
+            self.draft.jog_ticks_per_rev = Some(self.count() as f32);
             self.steps[self.at].state = State::Done;
             self.said = Some(Said {
-                text: format!(
-                    "✔ The jog wheel counts {} ticks in a turn.",
-                    self.count.abs()
-                ),
+                text: format!("✔ The jog wheel counts {} ticks in a turn.", self.count()),
                 tone: Tone::Good,
                 action: None,
             });
@@ -1224,9 +1233,9 @@ impl Wizard {
                     .retain(|b| !(from.contains(&b.target) && b.overlaps(&binding)));
                 // The steps it was taken from are to do again.
                 for s in &mut self.steps {
-                    if from.contains(&s.target)
-                        && s.made.contains(&(binding.trigger, binding.shift))
-                    {
+                    let its = from.contains(&s.target)
+                        || both_parts(s.target).is_some_and(|t| from.contains(&t));
+                    if its && s.made.contains(&(binding.trigger, binding.shift)) {
                         s.made.retain(|m| *m != (binding.trigger, binding.shift));
                         if s.made.is_empty() {
                             s.state = State::Todo;
@@ -1285,9 +1294,12 @@ impl Wizard {
             RawMidi::Cc { val, .. } => (val as f32 / 127.0, val),
             RawMidi::PitchBend { val, .. } => (val as f32 / 16383.0, (val >> 7) as u8),
         };
+        let turning = self
+            .step()
+            .is_some_and(|s| matches!(s.ask, Ask::Turn | Ask::TurnEdge | Ask::FullTurn));
         // The fine half of a 14-bit fader or knob says nothing new.
         if let RawMidi::Cc { ch, cc, .. } = raw {
-            if self.is_fine_half(ch, cc, t) {
+            if !turning && self.is_fine_half(ch, cc, t) {
                 if let Some(tr) = self.tracks.get_mut(&Trigger::cc(ch, cc - 32)) {
                     tr.fine = true;
                 }
@@ -1324,7 +1336,15 @@ impl Wizard {
         };
         // The control just learned, still being let go or coming to rest.
         if let Some((h, last)) = self.hush {
-            if h == trig && t - last < QUIET_US {
+            // (Or the fine half of the position just learned.)
+            let half = || {
+                self.uses(h).any(|b| {
+                    trig.kind == MidiKind::Cc
+                        && trig.channel == h.channel
+                        && b.rel == RelMode::Absolute14 { fine: trig.number }
+                })
+            };
+            if (h == trig || half()) && t - last < QUIET_US {
                 self.hush = Some((h, t));
                 return;
             }
@@ -1409,61 +1429,108 @@ impl Wizard {
                 self.track(trig, t, value, v7);
             }
             (Ask::Turn | Ask::TurnEdge, RawMidi::Cc { .. }) => {
+                let hand = self.hand_on_top(target);
                 // The edge is wanted, and a hand is on the top.
-                let on_top = ask == Ask::TurnEdge
-                    && self.draft.bindings.iter().any(|b| {
-                        b.target.deck() == target.deck()
-                            && matches!(b.target, Target::JogTouch { .. })
-                            && self.touch.contains(&b.trigger)
-                    });
-                if on_top {
-                    self.tracks.clear();
+                if ask == Ask::TurnEdge && hand {
+                    self.wheel.clear();
                     self.say(
                         Tone::Info,
                         "Your hand is on top of the wheel. Let go, and turn it by its edge.",
                     );
                     return;
                 }
-                let (turned, n) = self.track(trig, t, value, v7);
-                if let Some((rel, invert)) = turned {
-                    self.offered(i, binding(invert, rel), held);
-                } else if n >= 3 * TURN_MESSAGES {
-                    self.tracks.remove(&trig);
+                self.wheel.extend(wheel::Msg::of(raw, t));
+                if self.wheel.len() > WHEEL_MESSAGES {
+                    self.wheel.remove(0);
+                }
+                let wheels = wheel::read(&self.wheel);
+                // A wheel that says where it is could be a fader, unless a
+                // hand is on its touch sensor.
+                let turned = wheels
+                    .iter()
+                    .find(|w| w.ticks != 0 && (w.sure() || (hand && target.is_jog_turn())));
+                if let Some(w) = turned {
+                    let b = Binding {
+                        trigger: w.trigger,
+                        ..binding(w.ticks < 0, w.rel)
+                    };
+                    self.offered(i, b, held);
+                } else if self.wheel.iter().filter(|m| m.trigger == trig).count()
+                    >= 3 * TURN_MESSAGES
+                {
+                    let place = wheels
+                        .iter()
+                        .find(|w| !w.sure() && target.is_jog_turn())
+                        .map(|w| {
+                            format!(
+                                "{} {}, as a fader does. If it's the jog wheel, turn it with your \
+                                 hand on top (map the touch sensor first).",
+                                w.trigger.label(),
+                                w.rel.label()
+                            )
+                        });
                     self.say(
                         Tone::Info,
-                        format!(
-                            "{} doesn't read as a wheel turning one way. Turn it slowly clockwise.",
-                            trig.label()
-                        ),
+                        place.unwrap_or_else(|| {
+                            format!(
+                                "{} doesn't read as a wheel turning one way. Turn it slowly clockwise.",
+                                trig.label()
+                            )
+                        }),
                     );
                 }
             }
-            (Ask::FullTurn, RawMidi::Cc { val, .. }) => {
-                let jog = self.uses(trig).find(|b| b.target == target);
-                if let Some(b) = jog {
-                    let ticks = match b.rel {
-                        RelMode::Offset64 => val as i64 - 64,
-                        RelMode::TwosComplement if val < 64 => val as i64,
-                        RelMode::TwosComplement => val as i64 - 128,
-                    };
-                    self.count += if b.invert { -ticks } else { ticks };
+            (Ask::FullTurn, RawMidi::Cc { ch, cc, val }) => {
+                let jog = self.draft.bindings.iter().find(|b| {
+                    b.target.is_jog_turn()
+                        && b.target.deck() == target.deck()
+                        && b.trigger.channel == ch
+                        && (b.trigger == trig || b.rel == RelMode::Absolute14 { fine: cc })
+                });
+                let Some((at, rel, invert)) = jog.map(|b| (b.trigger, b.rel, b.invert)) else {
+                    return;
+                };
+                let p = self.positions.entry(at).or_default();
+                let ticks = match rel {
+                    RelMode::Absolute => p.at(val),
+                    RelMode::Absolute14 { .. } if at == trig => {
+                        p.coarse(val);
+                        0
+                    }
+                    RelMode::Absolute14 { .. } => p.fine(val),
+                    _ => rel.ticks(val).unwrap_or(0),
+                };
+                let ticks = if invert { -ticks } else { ticks } as i64;
+                if rel.is_position() {
+                    self.count_position += ticks;
+                } else {
+                    self.count += ticks;
                 }
             }
             _ => {}
         }
     }
 
-    /// Note what a fader, knob or wheel sent. Returns how it reads as a
-    /// wheel so far, and how many messages it has sent.
-    fn track(&mut self, trig: Trigger, t: i64, v: f32, v7: u8) -> (Option<(RelMode, bool)>, u32) {
+    /// Whether a hand is on the touch sensor of `target`'s deck.
+    fn hand_on_top(&self, target: Target) -> bool {
+        self.draft.bindings.iter().any(|b| {
+            b.target.deck() == target.deck()
+                && matches!(b.target, Target::JogTouch { .. })
+                && self.touch.contains(&b.trigger)
+        })
+    }
+
+    /// Note what a fader or knob sent.
+    fn track(&mut self, trig: Trigger, t: i64, v: f32, v7: u8) {
         let held = !self.shift.is_empty();
         let tr = self
             .tracks
             .entry(trig)
             .and_modify(|tr| tr.add(t, v, v7))
             .or_insert_with(|| Track::new(t, v, v7));
-        tr.shifted = held;
-        (tr.turned(), tr.n)
+        if v7 > 0 {
+            tr.shifted = held;
+        }
     }
 
     /// Called every frame with the shared time (us): decides what only a
@@ -1486,13 +1553,22 @@ impl Wizard {
         };
         match ask {
             Ask::Press | Ask::ShiftPress | Ask::Touch => {
-                let quiet: Vec<(Trigger, bool, bool)> = self
+                let quiet: Vec<(Trigger, Track)> = self
                     .tracks
                     .iter()
                     .filter(|(_, tr)| t - tr.last_t >= CC_PRESS_US)
-                    .map(|(k, tr)| (*k, tr.pressed(), tr.shifted))
+                    .map(|(k, tr)| (*k, tr.clone()))
                     .collect();
-                for (trig, pressed, held) in quiet {
+                for (trig, tr) in quiet {
+                    let (pressed, held) = (tr.pressed(), tr.shifted);
+                    // Still held, or a jog wheel turned a tick back.
+                    if tr.may_be_pressed() && !pressed {
+                        self.say(
+                            Tone::Info,
+                            format!("Hearing {}: now let go of it.", trig.label()),
+                        );
+                        continue;
+                    }
                     self.tracks.remove(&trig);
                     if pressed {
                         self.offered(i, binding(trig, false), held);
@@ -1592,7 +1668,7 @@ impl Wizard {
     /// the way.
     fn offered(&mut self, i: usize, mut b: Binding, held: bool) {
         self.offer = None;
-        let (target, ask) = (b.target, self.steps[i].ask);
+        let (mut target, ask) = (b.target, self.steps[i].ask);
         let part = self.groups[self.steps[i].group].part;
         let label = b.trigger.label();
         if !modifier(target) {
@@ -1643,7 +1719,20 @@ impl Wizard {
                 return;
             }
         }
-        // A wheel's edge that sends what its top does has nothing to add.
+        // A jog wheel whose platter and edge send the same message.
+        let one = both_parts(target).filter(|_| {
+            self.uses(b.trigger).any(|x| {
+                x.target != target
+                    && x.target.is_jog_turn()
+                    && x.target.deck() == target.deck()
+                    && x.shift == b.shift
+            })
+        });
+        if let Some(both) = one {
+            self.bind_both(i, both, b);
+            return;
+        }
+        // A button that does already what the step adds.
         let again = self
             .uses(b.trigger)
             .any(|x| x.target == target && x.shift == b.shift && x.mode == b.mode);
@@ -1659,7 +1748,7 @@ impl Wizard {
                 .steps
                 .iter()
                 .any(|s| s.target == target && s.made.contains(&(b.trigger, b.shift)));
-            if mine || ask == Ask::TurnEdge || target == Target::Shift {
+            if mine || target == Target::Shift {
                 self.steps[i].state = State::Done;
                 self.say(Tone::Good, format!("✔ {label} again: nothing more to add."));
                 self.hush = Some((b.trigger, self.now));
@@ -1670,11 +1759,20 @@ impl Wizard {
         // Deck C's control sending what deck A's does: the two take turns,
         // if the DJ says the side really is on deck C.
         if let Some(other) = self.other_deck(target) {
-            let twin = self.uses(b.trigger).any(|x| {
-                x.target == other
-                    && x.shift == b.shift
-                    && (x.mode.is_none() || b.mode.is_none() || x.mode == b.mode)
+            // (The other deck's wheel may have one message for both parts.)
+            let both = both_parts(target).filter(|_| {
+                self.uses(b.trigger)
+                    .any(|x| Some(x.target) == both_parts(other) && x.shift == b.shift)
             });
+            if let Some(both) = both {
+                (b.target, target) = (both, both);
+            }
+            let twin = both.is_some()
+                || self.uses(b.trigger).any(|x| {
+                    x.target == other
+                        && x.shift == b.shift
+                        && (x.mode.is_none() || b.mode.is_none() || x.mode == b.mode)
+                });
             if twin {
                 let deck = target.deck().unwrap_or(0);
                 let (c, a) = (deck_letter(deck as usize), deck_letter(deck as usize - 2));
@@ -1771,14 +1869,10 @@ impl Wizard {
         self.put(i, b.clone(), self.adding);
         self.steps[i].state = State::Done;
         let what = match self.steps[i].ask {
-            Ask::Move(_) | Ask::ShiftMove if b.invert => " (runs backwards: inverted)",
-            Ask::Turn | Ask::TurnEdge => match (b.rel, b.invert) {
-                (RelMode::Offset64, false) => " (counts around 64)",
-                (RelMode::Offset64, true) => " (counts around 64, backwards)",
-                (RelMode::TwosComplement, false) => " (counts 1 and 127)",
-                (RelMode::TwosComplement, true) => " (counts 1 and 127, backwards)",
-            },
-            _ => "",
+            Ask::Move(_) | Ask::ShiftMove if b.invert => " (runs backwards: inverted)".into(),
+            Ask::Turn | Ask::TurnEdge if b.invert => format!(" ({}, backwards)", b.rel.label()),
+            Ask::Turn | Ask::TurnEdge => format!(" ({})", b.rel.label()),
+            _ => String::new(),
         };
         self.say(
             Tone::Good,
@@ -1801,6 +1895,49 @@ impl Wizard {
                 self.fill_deck(deck);
             }
         }
+        self.go(self.next_todo(i + 1));
+    }
+
+    /// A jog wheel's platter and edge send the same message: it's bound
+    /// once, to `both`, and step `i` is done.
+    fn bind_both(&mut self, i: usize, both: Target, b: Binding) {
+        let platter = self.steps[i].ask == Ask::Turn;
+        let mut bound = false;
+        self.draft.bindings.retain_mut(|x| {
+            let same = x.trigger == b.trigger
+                && x.shift == b.shift
+                && x.target.is_jog_turn()
+                && x.target.deck() == both.deck();
+            if !same {
+                return true;
+            }
+            x.target = both;
+            if platter {
+                (x.invert, x.rel) = (b.invert, b.rel);
+            }
+            !std::mem::replace(&mut bound, true)
+        });
+        let touch =
+            self.draft.bindings.iter().any(|x| {
+                matches!(x.target, Target::JogTouch { .. }) && x.target.deck() == both.deck()
+            });
+        let label = b.label();
+        self.say(
+            Tone::Good,
+            match (platter, touch) {
+                (true, _) => format!("✔ {} is {label} ({})", both.label(), b.rel.label()),
+                (false, true) => format!(
+                    "✔ The edge sends what the platter does ({label}): the touch sensor tells them apart."
+                ),
+                (false, false) => format!(
+                    "✔ The edge sends what the platter does ({label}). Without a touch sensor to tell \
+                     them apart, the wheel only nudges."
+                ),
+            },
+        );
+        self.steps[i].state = State::Done;
+        self.steps[i].made = vec![(b.trigger, b.shift)];
+        self.hush = Some((b.trigger, self.now));
         self.go(self.next_todo(i + 1));
     }
 
@@ -1839,6 +1976,29 @@ impl Wizard {
                     self.draft
                         .bindings
                         .retain(|x| x.target != target || kept.contains(&(x.trigger, x.shift)));
+                }
+                // What was one message for a wheel's platter and edge is its
+                // platter's, or makes way for it.
+                if let Some(both) = both_parts(target) {
+                    let platter = matches!(target, Target::JogPlatter { .. });
+                    let fresh = platter && self.cleared.insert(both);
+                    let kept: Vec<(Trigger, bool)> = self
+                        .steps
+                        .iter()
+                        .filter(|s| both_parts(s.target) == Some(both))
+                        .flat_map(|s| s.made.iter().copied())
+                        .collect();
+                    self.draft.bindings.retain_mut(|x| {
+                        if x.target != both {
+                            return true;
+                        }
+                        if !platter {
+                            if let Some(deck) = both.deck() {
+                                x.target = Target::JogPlatter { deck };
+                            }
+                        }
+                        !fresh || kept.contains(&(x.trigger, x.shift))
+                    });
                 }
                 self.draft.bindings.push(b.clone());
             }
@@ -1914,8 +2074,12 @@ impl Wizard {
             {
                 continue;
             }
-            if filled.contains(&target) {
-                // A wheel's edge, filled in with its top.
+            // The other deck's wheel may have one message for both its parts.
+            let one = both_parts(target)
+                .filter(|t| self.draft.binding_for(t.with_deck(deck - 2)).is_some());
+            let target = one.unwrap_or(target);
+            if filled.contains(&target) || one.is_some_and(|t| self.draft.binding_for(t).is_some())
+            {
                 self.steps[i].state = State::Filled;
                 continue;
             }
@@ -1977,17 +2141,14 @@ impl Wizard {
                     name.push_str(&format!(" at {:.0}%", v * 100.0));
                 }
                 (crate::mapping::TargetKind::Relative, RawMidi::Cc { val, .. }) => {
-                    let ticks = match b.rel {
-                        RelMode::Offset64 => val as i32 - 64,
-                        RelMode::TwosComplement if val < 64 => val as i32,
-                        RelMode::TwosComplement => val as i32 - 128,
-                    };
-                    let ticks = if b.invert { -ticks } else { ticks };
-                    name.push_str(if ticks >= 0 {
-                        ", clockwise"
-                    } else {
-                        ", anticlockwise"
-                    });
+                    if let Some(ticks) = b.rel.ticks(val) {
+                        let ticks = if b.invert { -ticks } else { ticks };
+                        name.push_str(if ticks >= 0 {
+                            ", clockwise"
+                        } else {
+                            ", anticlockwise"
+                        });
+                    }
                 }
                 _ => {}
             }
@@ -2103,16 +2264,21 @@ impl Demo {
         let step = &wizard.steps[i];
         let part = wizard.groups[step.group].part;
         let mode = pad_mode(part);
-        let mut mine: Vec<&Binding> = self
-            .controller
-            .bindings
-            .iter()
-            .filter(|b| {
-                b.target == step.target && (b.mode.is_none() || mode.is_none() || b.mode == mode)
-            })
-            .collect();
+        let find = |target: Target| -> Vec<&Binding> {
+            self.controller
+                .bindings
+                .iter()
+                .filter(|b| {
+                    b.target == target && (b.mode.is_none() || mode.is_none() || b.mode == mode)
+                })
+                .collect()
+        };
+        let mut mine = find(step.target);
+        if let (true, Some(both)) = (mine.is_empty(), both_parts(step.target)) {
+            mine = find(both);
+        }
         // A loop button comes before the pad with the same loop, a SHIFT on
-        // the left before one on the right, a wheel's top before its edge.
+        // the left before one on the right.
         let second = step.adds && mine.len() > 1;
         let b = match (mine.len(), second) {
             (0, _) => return Vec::new(),
@@ -2138,28 +2304,56 @@ impl Demo {
                 out.push((0, Self::message(fine, v.wrapping_mul(37) & 0x7F)));
             }
         };
-        let tick = |ticks: i32| {
+        // A wheel turned by `ticks`, with the place it's at for one that
+        // says where it is.
+        let mut place = 5_000i32;
+        let mut turn = |out: &mut Vec<(i64, [u8; 3])>, dt: i64, ticks: i32| {
             let ticks = if b.invert { -ticks } else { ticks };
+            place = (place + ticks).rem_euclid(1 << 14);
             match b.rel {
-                RelMode::Offset64 => (64 + ticks) as u8,
-                RelMode::TwosComplement => (ticks & 0x7F) as u8,
+                RelMode::Offset64 => out.push((dt, Self::message(b.trigger, (64 + ticks) as u8))),
+                RelMode::TwosComplement => {
+                    out.push((dt, Self::message(b.trigger, (ticks & 0x7F) as u8)))
+                }
+                RelMode::Absolute => out.push((dt, Self::message(b.trigger, (place & 0x7F) as u8))),
+                RelMode::Absolute14 { fine } => {
+                    let fine = Trigger::cc(b.trigger.channel, fine);
+                    out.push((dt, Self::message(b.trigger, (place >> 7) as u8)));
+                    out.push((300, Self::message(fine, (place & 0x7F) as u8)));
+                }
             }
         };
+        // A hand on top of the platter, if it can feel one.
+        let touch = match (step.ask, step.target.deck()) {
+            (Ask::Turn | Ask::FullTurn, Some(deck)) => self
+                .controller
+                .binding_for(Target::JogTouch { deck })
+                .map(|b| b.trigger),
+            _ => None,
+        };
+        if let Some(t) = touch {
+            out.push((20_000, Self::message(t, 127)));
+        }
         match step.ask {
             Ask::Press | Ask::ShiftPress | Ask::Touch => {
                 out.push((20_000, Self::message(b.trigger, 127)));
                 out.push((80_000, Self::message(b.trigger, 0)));
             }
             Ask::Turn | Ask::TurnEdge => {
-                for _ in 0..12 {
-                    out.push((8_000, Self::message(b.trigger, tick(1))));
+                let n = if b.rel.is_position() { 60 } else { 12 };
+                for _ in 0..n {
+                    turn(&mut out, 8_000, if n > 12 { 3 } else { 1 });
                 }
             }
             Ask::FullTurn => {
                 let mut left = self.controller.ticks_per_rev() as i32;
+                if b.rel.is_position() {
+                    // Its first message only says where it is.
+                    turn(&mut out, 1_000, 0);
+                }
                 while left > 0 {
                     let n = left.min(16);
-                    out.push((1_000, Self::message(b.trigger, tick(n))));
+                    turn(&mut out, 1_000, n);
                     left -= n;
                 }
             }
@@ -2182,6 +2376,9 @@ impl Demo {
         }
         if let (true, Some(s)) = (held, shift) {
             out.push((400_000, Self::message(s, 0)));
+        }
+        if let Some(t) = touch {
+            out.push((400_000, Self::message(t, 0)));
         }
         out
     }
@@ -2313,7 +2510,7 @@ mod tests {
             [0u8, 1].map(|d| {
                 let k = key(&Binding {
                     trigger: Trigger::cc(d, 0x23),
-                    target: Target::Jog { deck: d },
+                    target: Target::JogPlatter { deck: d },
                     invert: false,
                     rel: RelMode::Offset64,
                     shift: false,
@@ -2468,17 +2665,21 @@ mod tests {
             !made.binding_for(Target::MasterLevel).unwrap().invert,
             "left at the bottom"
         );
-        let jog: Vec<(u8, RelMode)> = made
+        let jog: Vec<(u8, Target, RelMode)> = made
             .bindings
             .iter()
-            .filter(|b| b.target == Target::Jog { deck: 1 })
-            .map(|b| (b.trigger.number, b.rel))
+            .filter(|b| b.target.is_jog_turn() && b.target.deck() == Some(1))
+            .map(|b| (b.trigger.number, b.target, b.rel))
             .collect();
         assert_eq!(
             jog,
             [
-                (0x0A, RelMode::TwosComplement),
-                (0x09, RelMode::TwosComplement)
+                (
+                    0x0A,
+                    Target::JogPlatter { deck: 1 },
+                    RelMode::TwosComplement
+                ),
+                (0x09, Target::JogEdge { deck: 1 }, RelMode::TwosComplement)
             ]
         );
         assert_eq!(made.jog_ticks_per_rev, Some(248.0));
@@ -2510,7 +2711,7 @@ mod tests {
         assert_eq!(left.iter().filter(|t| t.part() != Part::Fx).count(), 4);
         assert!(left
             .iter()
-            .all(|t| t.part() == Part::Fx || matches!(t, Target::Jog { .. })));
+            .all(|t| t.part() == Part::Fx || matches!(t, Target::JogPlatter { .. })));
         assert_eq!(missing(&made, &preset), [] as [String; 0]);
         assert!(made.bindings.iter().all(|b| !b.layered));
         for deck in 0..4 {
@@ -2526,9 +2727,12 @@ mod tests {
 
     /// The SC Live 4 as it really is: its DECK buttons change nothing it
     /// sends, so decks C and D take turns with A and B on the same
-    /// controls, and its mixer has four channels.
+    /// controls, and its mixer has four channels. Its jog wheels count, as
+    /// Traktor's mapping has it.
     fn sc_live_4_on_four_decks() -> Mapping {
-        builtin_preset("SC LIVE 4").unwrap()
+        let mut m = builtin_preset("SC LIVE 4").unwrap();
+        m.bindings.retain(|b| !b.rel.is_position());
+        m
     }
 
     #[test]
@@ -2897,6 +3101,16 @@ mod tests {
             t,
         );
         assert_eq!(w.draft().bindings.len(), 0);
+        // (A jog wheel turned back sends 127 as well, and never 0.)
+        wait(&mut w, &mut t, 400);
+        assert_eq!(w.draft().bindings.len(), 0);
+        assert!(w.said().unwrap().text.contains("now let go of it"));
+        let up = RawMidi::Cc {
+            ch: 0,
+            cc: 0x40,
+            val: 0,
+        };
+        w.feed(up, t);
         wait(&mut w, &mut t, 200);
         assert_eq!(
             w.draft()
@@ -2904,15 +3118,8 @@ mod tests {
                 .map(|b| b.trigger),
             Some(Trigger::cc(0, 0x40))
         );
-        // Letting go of it isn't CUE.
-        w.feed(
-            RawMidi::Cc {
-                ch: 0,
-                cc: 0x40,
-                val: 0,
-            },
-            t,
-        );
+        // Letting go of it again isn't CUE.
+        w.feed(up, t);
         wait(&mut w, &mut t, 400);
         assert_eq!(w.step().unwrap().target, Target::Cue { deck: 0 });
         assert_eq!(w.draft().bindings.len(), 1);
@@ -2920,15 +3127,17 @@ mod tests {
         // change 1 was moved a while ago: it's no 14-bit pair.
         sweep(&mut w, &mut t, 0, 0x01, 100..=127);
         wait(&mut w, &mut t, 400);
-        w.feed(
-            RawMidi::Cc {
-                ch: 0,
-                cc: 0x21,
-                val: 127,
-            },
-            t,
-        );
-        wait(&mut w, &mut t, 200);
+        for val in [127, 0] {
+            w.feed(
+                RawMidi::Cc {
+                    ch: 0,
+                    cc: 0x21,
+                    val,
+                },
+                t,
+            );
+            wait(&mut w, &mut t, 200);
+        }
         assert_eq!(
             w.draft()
                 .binding_for(Target::Cue { deck: 0 })
@@ -3477,7 +3686,10 @@ mod tests {
         assert_eq!(w.draft().bindings.len(), 0);
         // Turned clockwise, it counts down from 64: it runs backwards.
         sweep(&mut w, &mut t, 0, 0x22, [63; 12]);
-        let b = w.draft().binding_for(Target::Jog { deck: 0 }).unwrap();
+        let b = w
+            .draft()
+            .binding_for(Target::JogPlatter { deck: 0 })
+            .unwrap();
         assert_eq!((b.rel, b.invert), (RelMode::Offset64, true));
         // Its edge sends something else, counting the same way.
         assert_eq!(w.step().unwrap().ask, Ask::TurnEdge);
@@ -3604,7 +3816,7 @@ mod tests {
         w.feed(parse(&[0xB4, 0x36, 0x7F]).unwrap(), 0);
         assert_eq!(
             w.tried(),
-            Some("CC 0x36 · ch 5 → Deck A · Jog wheel turn, anticlockwise")
+            Some("CC 0x36 · ch 5 → Deck A · Jog wheel, both (touch decides), anticlockwise")
         );
         w.feed(parse(&[0x94, 0x0F, 0x7F]).unwrap(), 0);
         assert!(w
@@ -3713,5 +3925,222 @@ mod tests {
             .find(|s| s.target == Target::Play { deck: 3 })
             .unwrap();
         assert_eq!(four.place(s), "Deck D · Transport");
+    }
+
+    /// A run over the jog wheels only, at deck A's touch sensor.
+    fn jog_wheels() -> Wizard {
+        let setup = Setup {
+            sections: vec![Section::Jog],
+            ..Setup::default()
+        };
+        let mut w = Wizard::new(Mapping::empty("test"), setup);
+        past_shift(&mut w);
+        assert_eq!(w.step().unwrap().target, Target::JogTouch { deck: 0 });
+        w
+    }
+
+    /// Deck A's jog wheel bindings.
+    fn jogs(m: &Mapping) -> Vec<(u8, Target, RelMode, bool)> {
+        m.bindings
+            .iter()
+            .filter(|b| b.target.deck() == Some(0) && b.target.part() == Part::Jog)
+            .map(|b| (b.trigger.number, b.target, b.rel, b.invert))
+            .collect()
+    }
+
+    #[test]
+    fn a_platter_and_an_edge_with_one_message_are_one_control() {
+        let deck = 0;
+        let mut w = jog_wheels();
+        let mut t = 0;
+        press(&mut w, &mut t, 4, 0x21);
+        assert_eq!(w.step().unwrap().target, Target::JogPlatter { deck });
+        wait(&mut w, &mut t, 400);
+        sweep(&mut w, &mut t, 4, 0x36, [1; 8]);
+        assert_eq!(w.step().unwrap().target, Target::JogEdge { deck });
+        assert_eq!(
+            jogs(w.draft())[1..],
+            [(
+                0x36,
+                Target::JogPlatter { deck },
+                RelMode::TwosComplement,
+                false
+            )]
+        );
+        wait(&mut w, &mut t, 400);
+        sweep(&mut w, &mut t, 4, 0x36, [1; 8]);
+        assert!(
+            w.said()
+                .unwrap()
+                .text
+                .contains("the touch sensor tells them apart"),
+            "{:?}",
+            w.said()
+        );
+        let one = [
+            (0x21, Target::JogTouch { deck }, RelMode::Offset64, false),
+            (0x36, Target::Jog { deck }, RelMode::TwosComplement, false),
+        ];
+        assert_eq!(jogs(w.draft()), one);
+        // Both steps show it, and a full turn counts it.
+        let platter = w.steps.iter().position(|s| s.ask == Ask::Turn).unwrap();
+        for i in [platter, platter + 1] {
+            assert_eq!(w.steps[i].state, State::Done);
+            assert_eq!(w.bound(&w.steps[i]).as_deref(), Some("CC 0x36 · ch 5"));
+        }
+        assert_eq!(w.step().unwrap().ask, Ask::FullTurn);
+        wait(&mut w, &mut t, 400);
+        sweep(&mut w, &mut t, 4, 0x36, [5; 200]);
+        w.confirm();
+        assert_eq!(w.draft().jog_ticks_per_rev, Some(1000.0));
+        // Asked again, it stays what it is, and counts as it's found to now.
+        w.jump_to(platter);
+        wait(&mut w, &mut t, 400);
+        sweep(&mut w, &mut t, 4, 0x36, [127; 8]);
+        assert_eq!(
+            jogs(w.draft())[1],
+            (0x36, Target::Jog { deck }, RelMode::TwosComplement, true)
+        );
+        w.jump_to(platter);
+        wait(&mut w, &mut t, 400);
+        sweep(&mut w, &mut t, 4, 0x36, [1; 8]);
+        assert_eq!(jogs(w.draft()), one);
+        // An edge of its own after all: two controls.
+        w.jump_to(platter + 1);
+        wait(&mut w, &mut t, 400);
+        sweep(&mut w, &mut t, 4, 0x37, [65; 8]);
+        assert_eq!(
+            jogs(w.draft())[1..],
+            [
+                (
+                    0x36,
+                    Target::JogPlatter { deck },
+                    RelMode::TwosComplement,
+                    false
+                ),
+                (0x37, Target::JogEdge { deck }, RelMode::Offset64, false),
+            ]
+        );
+        // Unmapping the platter leaves the edge.
+        w.jump_to(platter);
+        w.clear();
+        assert_eq!(jogs(w.draft()).len(), 2);
+        assert_eq!(w.steps[platter + 1].state, State::Done);
+        // Over a mapping that has one control for both, neither is asked.
+        let w = Wizard::new(builtin_preset("SC LIVE 4").unwrap(), Setup::default());
+        for s in w.steps.iter().filter(|s| s.target.part() == Part::Jog) {
+            assert_eq!(s.state, State::Kept, "{}", s.title);
+        }
+    }
+
+    #[test]
+    fn a_hand_that_nudges_the_wheel_isnt_taken_for_its_touch_sensor() {
+        for v in [127, 1, 120] {
+            let mut w = jog_wheels();
+            let mut t = 0;
+            sweep(&mut w, &mut t, 4, 0x36, [v]);
+            wait(&mut w, &mut t, 600);
+            sweep(&mut w, &mut t, 4, 0x36, [v, v, v]);
+            wait(&mut w, &mut t, 600);
+            assert_eq!(w.draft().bindings.len(), 0, "{v}: {:?}", w.said());
+            press(&mut w, &mut t, 4, 0x21);
+            assert_eq!(
+                w.draft()
+                    .binding_for(Target::JogTouch { deck: 0 })
+                    .map(|b| b.trigger),
+                Some(Trigger::note(4, 0x21))
+            );
+            assert_eq!(w.step().unwrap().ask, Ask::Turn);
+        }
+    }
+
+    /// A wheel that says where it is, as Mixxx has the SC Live 4's and the
+    /// Prime 4's: learned with a hand on top, or with a fader's worth of
+    /// doubt not at all.
+    #[test]
+    fn a_wheel_that_says_where_it_is_is_learned() {
+        for (coarse, fine) in [(0x11, 0x31), (0x37, 0x4D)] {
+            let rel = RelMode::Absolute14 { fine };
+            let mut controller = Mapping::empty("position");
+            for deck in 0..2u8 {
+                controller.bind(Trigger::note(4 + deck, 0x21), Target::JogTouch { deck });
+                controller
+                    .bind(Trigger::cc(4 + deck, coarse), Target::Jog { deck })
+                    .rel = rel;
+            }
+            controller.jog_ticks_per_rev = Some(1000.0);
+            let setup = Setup {
+                sections: vec![Section::Jog],
+                ..Setup::default()
+            };
+            let (w, refused) = learn(&controller, false, setup);
+            // Its edge alone could be a fader's: that step is refused, and
+            // the platter's is enough.
+            for i in refused {
+                assert_eq!(w.steps[i].ask, Ask::TurnEdge);
+            }
+            let made = w.finish();
+            for deck in 0..2u8 {
+                let b = made
+                    .bindings
+                    .iter()
+                    .find(|b| b.target.is_jog_turn() && b.target.deck() == Some(deck))
+                    .unwrap();
+                assert_eq!(
+                    (b.trigger, b.rel, b.invert),
+                    (Trigger::cc(4 + deck, coarse), rel, false)
+                );
+            }
+            assert_eq!(made.jog_ticks_per_rev, Some(1000.0));
+            // With no touch sensor mapped, it says why not.
+            let mut w = jog_wheels();
+            w.skip();
+            let demo = Demo {
+                controller,
+                fine: false,
+            };
+            let mut t = 0;
+            let i = w.at().unwrap();
+            for (dt, bytes) in demo.play(&w, i) {
+                t += dt;
+                w.feed(parse(&bytes).unwrap(), t);
+            }
+            assert_eq!(w.at(), Some(i));
+            assert!(
+                w.said().unwrap().text.contains("as a fader does"),
+                "{:?}",
+                w.said()
+            );
+        }
+    }
+
+    /// A hand that keeps turning a wheel whose position was just learned
+    /// isn't turning its edge, whichever half comes.
+    #[test]
+    fn the_rest_of_a_turn_isnt_taken_for_the_edge() {
+        let mut w = jog_wheels();
+        let mut t = 0;
+        press(&mut w, &mut t, 4, 0x21);
+        wait(&mut w, &mut t, 400);
+        w.feed(parse(&[0x94, 0x21, 0x7F]).unwrap(), t);
+        let mut place = 3000u16;
+        let mut turn = |w: &mut Wizard, t: &mut i64, n: usize| {
+            for _ in 0..n {
+                *t += 4_000;
+                place += 3;
+                w.feed(parse(&[0xB4, 0x11, (place >> 7) as u8]).unwrap(), *t);
+                w.feed(
+                    parse(&[0xB4, 0x31, (place & 0x7F) as u8]).unwrap(),
+                    *t + 300,
+                );
+            }
+        };
+        turn(&mut w, &mut t, 60);
+        assert_eq!(w.step().unwrap().ask, Ask::TurnEdge);
+        // Let go, still turning.
+        w.feed(parse(&[0x94, 0x21, 0x00]).unwrap(), t);
+        turn(&mut w, &mut t, 100);
+        assert_eq!(w.step().unwrap().ask, Ask::TurnEdge);
+        assert_eq!(jogs(w.draft()).len(), 2);
     }
 }
