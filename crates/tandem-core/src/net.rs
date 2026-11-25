@@ -2067,6 +2067,79 @@ mod tests {
         }
     }
 
+    /// The files a booth can keep of a track, once it has looked.
+    fn kept(h: &SessionHandle, id: TrackId) -> Vec<std::path::PathBuf> {
+        let found = h.lock().kept_files(id);
+        wait_for("its files to be found", Duration::from_secs(10), || {
+            found.get().is_some()
+        });
+        found.get().unwrap().clone()
+    }
+
+    /// Bob loads a track only he has. It's his to keep; the others have a
+    /// session copy, which isn't, and those who were there know it's his,
+    /// though the host's link is their only one. Carol then finds the same
+    /// song in a folder of hers, and that's hers to keep, though she still
+    /// plays the session copy. Dave accepts a copy from Bob: his to keep too.
+    #[test]
+    fn a_session_copy_is_never_kept() {
+        let rig = Rig::new("kept");
+        let t = LINK_TIMEOUT;
+        let alice = rig.booth("Alice", 0, t);
+        let bob = rig.booth("Bob", 0, t);
+        let carol = rig.booth("Carol", 0, t);
+        let dave = rig.booth("Dave", 0, t);
+        let port = host(&alice, 0, "KEPT12").unwrap();
+        let addr = format!("127.0.0.1:{port}");
+        for h in [&bob, &carol] {
+            join(h, &addr, "KEPT12", false).unwrap();
+        }
+        let wav = tone(&rig.root.join("bob-music"), "Bob Tone.wav", 2.0, 550.0);
+        bob.lock().load_path(1, wav.clone());
+        let id = loaded(&bob, 1);
+        wait_for("Bob's track to arrive", Duration::from_secs(30), || {
+            [&alice, &carol].iter().all(|h| ready(h, id))
+        });
+        let owner = |h: &SessionHandle| h.lock().track_owner(id);
+        assert_eq!(kept(&bob, id), std::slice::from_ref(&wav));
+        for h in [&alice, &carol] {
+            assert!(kept(h, id).is_empty(), "a session copy was kept");
+            assert_eq!(owner(h).as_deref(), Some("Bob"));
+        }
+        // Dave came after it was loaded, so he can't tell whose it is.
+        join(&dave, &addr, "KEPT12", false).unwrap();
+        wait_for("Dave to get the track", Duration::from_secs(30), || {
+            ready(&dave, id) && dave.lock().roster().djs.len() == 4
+        });
+        assert!(kept(&dave, id).is_empty());
+        assert_eq!(owner(&dave), None);
+
+        // Carol has the song herself, in a folder Tandem lists only now.
+        let mine = tone(&rig.root.join("carol-music"), "Her Own.wav", 2.0, 550.0);
+        listed(&carol, mine.parent().unwrap());
+        let playing = carol.lock().servable_path(id).unwrap();
+        assert!(playing.starts_with(&carol.lock().paths.cache_dir));
+        assert_eq!(kept(&carol, id), [mine]);
+
+        // Bob offers it: now Dave knows, and accepting gets him a copy.
+        bob.lock().offer_share("Bob's crate".into(), vec![wav]);
+        wait_for("the offer to reach Dave", Duration::from_secs(10), || {
+            !dave.lock().view().incoming.is_empty()
+        });
+        assert_eq!(owner(&dave).as_deref(), Some("Bob"));
+        let share = dave.lock().view().incoming[0].share_id;
+        dave.lock().respond_share(share, true);
+        wait_for("Dave's copy", Duration::from_secs(30), || {
+            dave.lock().view().incoming[0].received == 1
+        });
+        let files = kept(&dave, id);
+        assert_eq!(files.len(), 1);
+        assert!(files[0].starts_with(&dave.lock().paths.shared_dir));
+        for h in [&bob, &carol, &dave, &alice] {
+            h.lock().leave();
+        }
+    }
+
     /// A folder of a booth's, scanned, as its library lists it.
     fn listed(h: &SessionHandle, dir: &std::path::Path) -> (String, Vec<crate::library::LibTrack>) {
         use crate::library::{folder_key, scan, SourceKind};

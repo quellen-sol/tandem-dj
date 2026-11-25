@@ -17,18 +17,97 @@ const KNOB_FOCUS: Color32 = Color32::from_rgb(70, 130, 210);
 /// Lists shared live: the 📡 mark on yours, and the other DJs' lists.
 const LIVE: Color32 = Color32::from_rgb(110, 200, 150);
 
+/// Round the title of a dragged track that no crate takes.
+const REFUSED: Color32 = Color32::from_rgb(210, 120, 100);
+
 /// What a crate on the left does when a dragged track hovers over it: lights
-/// up, and takes it when it's let go.
+/// up, and takes it when it's let go. It doesn't light up for a track that
+/// isn't the DJ's own (nor until that's known), and the pointer says no.
 fn crate_drop(ui: &egui::Ui, r: &egui::Response) -> Option<DragTracks> {
-    if r.dnd_hover_payload::<DragTracks>().is_some() {
-        ui.painter().rect_stroke(
-            r.rect.expand(1.0),
-            3.0,
-            egui::Stroke::new(1.5_f32, LIVE),
-            egui::StrokeKind::Outside,
-        );
+    if let Some(d) = r.dnd_hover_payload::<DragTracks>() {
+        match d.file_for(&[]) {
+            Some(Ok(_)) => {
+                ui.painter().rect_stroke(
+                    r.rect.expand(1.0),
+                    3.0,
+                    egui::Stroke::new(1.5_f32, LIVE),
+                    egui::StrokeKind::Outside,
+                );
+            }
+            Some(Err(_)) => ui.ctx().set_cursor_icon(egui::CursorIcon::NotAllowed),
+            None => {}
+        }
     }
     r.dnd_release_payload::<DragTracks>().map(|p| (*p).clone())
+}
+
+/// The title that follows the pointer while a track is dragged, and why no
+/// crate takes it, if none does.
+fn drag_label(ctx: &egui::Context, d: &DragTracks, at: egui::Pos2) {
+    let no = d.file_for(&[]).and_then(|f| f.err());
+    let p = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Tooltip,
+        egui::Id::new("dragged track"),
+    ));
+    let (fill, edge, text) = match &no {
+        Some(no) => (
+            Color32::from_rgb(58, 42, 40),
+            REFUSED,
+            format!("✖ {}\n{}", d.title, no.short()),
+        ),
+        None => (
+            Color32::from_rgb(40, 60, 52),
+            LIVE,
+            format!("📦 {}", d.title),
+        ),
+    };
+    let galley = p.layout_no_wrap(text, FontId::proportional(13.0), Color32::from_gray(235));
+    let rect =
+        egui::Rect::from_min_size(at + vec2(14.0, 10.0), galley.size()).expand2(vec2(8.0, 4.0));
+    // Kept inside the window: a deck can be at its right, a crate at its
+    // bottom.
+    let over = rect.max - ctx.screen_rect().shrink(4.0).max;
+    let rect = rect.translate(-over.max(egui::Vec2::ZERO));
+    p.rect_filled(rect, 4.0, fill);
+    p.rect_stroke(
+        rect,
+        4.0,
+        egui::Stroke::new(1.0_f32, edge),
+        egui::StrokeKind::Inside,
+    );
+    p.galley(rect.min + vec2(8.0, 4.0), galley, Color32::from_gray(235));
+}
+
+/// With a track being dragged near the top or bottom of the source list
+/// (`ui`, all of it), scroll it that way, so there's no crate out of reach.
+fn drag_scroll(ui: &egui::Ui) {
+    const EDGE: f32 = 24.0;
+    /// Points a second, at the very edge.
+    const SPEED: f32 = 700.0;
+    let (shown, all) = (ui.clip_rect(), ui.min_rect());
+    let Some(p) = (ui.ctx().pointer_latest_pos()).filter(|p| shown.contains(*p)) else {
+        return;
+    };
+    let near = |d: f32| ((EDGE - d) / EDGE).max(0.0);
+    let step = SPEED * ui.input(|i| i.stable_dt).min(0.1);
+    // Never past either end: that would draw one frame scrolled too far.
+    let up = (near(p.y - shown.top()) * step).min(shown.top() - all.top());
+    let down = (near(shown.bottom() - p.y) * step).min(all.bottom() - shown.bottom());
+    let dy = up.max(0.0) - down.max(0.0);
+    if dy != 0.0 {
+        ui.scroll_with_delta_animation(vec2(0.0, dy), egui::style::ScrollAnimation::none());
+    }
+}
+
+/// Whether to open or close MY CRATES (`None`: leave it): it's open while a
+/// track is being dragged, so there's somewhere to drop it, and if it was
+/// closed (`open` is how it was last frame) it closes again after.
+fn spring_open(dragging: bool, open: bool, sprung: &mut bool) -> Option<bool> {
+    if dragging {
+        *sprung |= !open;
+        return Some(true);
+    }
+    std::mem::take(sprung).then_some(false)
 }
 
 /// Scroll the source list to `r` if the knob just moved there.
@@ -90,6 +169,13 @@ pub(crate) fn library_max_height(room: f32, decks_w: f32, four: bool, strip: f32
 
 impl TandemApp {
     pub(crate) fn library_panel(&mut self, ctx: &egui::Context, view: &SessionView) {
+        if let Some((to, d)) = self.ui.dropped.take() {
+            self.drop_track(to, d);
+        }
+        if egui::DragAndDrop::has_payload_of_type::<DragTracks>(ctx) {
+            // A crate that won't take it says so with another one.
+            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+        }
         let id = egui::Id::new("library");
         let avail = ctx.available_rect();
         let (room, decks_w) = (
@@ -146,24 +232,7 @@ impl TandemApp {
             egui::DragAndDrop::payload::<DragTracks>(ctx),
             ctx.pointer_latest_pos(),
         ) {
-            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
-            let p = ctx.layer_painter(egui::LayerId::new(
-                egui::Order::Tooltip,
-                egui::Id::new("dragged track"),
-            ));
-            let text = format!("📦 {}", d.1);
-            let galley =
-                p.layout_no_wrap(text, FontId::proportional(13.0), Color32::from_gray(235));
-            let rect = egui::Rect::from_min_size(at + vec2(14.0, 10.0), galley.size())
-                .expand2(vec2(8.0, 4.0));
-            p.rect_filled(rect, 4.0, Color32::from_rgb(40, 60, 52));
-            p.rect_stroke(
-                rect,
-                4.0,
-                egui::Stroke::new(1.0_f32, LIVE),
-                egui::StrokeKind::Inside,
-            );
-            p.galley(rect.min + vec2(8.0, 4.0), galley, Color32::from_gray(235));
+            drag_label(ctx, &d, at);
         }
     }
 
@@ -399,6 +468,9 @@ impl TandemApp {
                     self.set_source(src);
                     self.ui.browse_focus = BrowseFocus::Tracks;
                 }
+                if egui::DragAndDrop::has_payload_of_type::<DragTracks>(ui.ctx()) {
+                    drag_scroll(ui);
+                }
             });
     }
 
@@ -417,9 +489,10 @@ impl TandemApp {
             tandem_core::session::RoleView::Hosting { .. }
                 | tandem_core::session::RoleView::Joined { .. }
         );
-        let mut dropped: Option<(u64, DragTracks)> = None;
+        let mut dropped: Option<(Option<u64>, DragTracks)> = None;
         let mut share: Option<Source> = None;
         let mut unshare: Option<String> = None;
+        let dragging = egui::DragAndDrop::has_payload_of_type::<DragTracks>(ui.ctx());
         let section = egui::CollapsingHeader::new(
             RichText::new(format!("MY CRATES ({})", mine.len()))
                 .small()
@@ -427,11 +500,16 @@ impl TandemApp {
         )
         .id_salt("my crates")
         .default_open(true)
+        .open(spring_open(
+            dragging,
+            self.ui.mine_open,
+            &mut self.ui.mine_sprung,
+        ))
         .show(ui, |ui| {
             if mine.is_empty() {
                 ui.label(
                     RichText::new(
-                        "Make a crate, then drag tracks onto it (or right-click a track).",
+                        "Make a crate, then drag tracks onto it (or a deck's waveform, or right-click a track).",
                     )
                     .small()
                     .weak(),
@@ -457,7 +535,7 @@ impl TandemApp {
                     *pick = Some(src.clone());
                 }
                 if let Some(d) = crate_drop(ui, &r) {
-                    dropped = Some((c.id, d));
+                    dropped = Some((Some(c.id), d));
                 }
                 r.context_menu(|ui| {
                     if ui.button("Rename…").clicked() {
@@ -496,22 +574,23 @@ impl TandemApp {
                 });
             }
             let r = ui.small_button("➕ New crate").on_hover_text(
-                "Make a crate of your own tracks. Drop a track here to start one with it.",
+                "Make a crate of your own tracks. Drop a track here (or a deck's waveform) to start one with it.",
             );
-            let new_with = crate_drop(ui, &r);
-            if r.clicked() || new_with.is_some() {
+            if let Some(d) = crate_drop(ui, &r) {
+                dropped = Some((None, d));
+            } else if r.clicked() {
                 self.ui.crate_dialog = Some(CrateDialog {
                     mode: CrateMode::New,
                     name: String::new(),
-                    add: new_with.map(|d| d.0).unwrap_or_default(),
+                    add: Vec::new(),
                     focus: true,
                 });
             }
         });
         // The knob only moves through crates you can see.
         self.ui.mine_open = section.body_returned.is_some();
-        if let Some((id, d)) = dropped {
-            self.add_to_crate(id, d.0);
+        if let Some((to, d)) = dropped {
+            self.drop_track(to, d);
         }
         if let Some(key) = unshare {
             self.session.lock().unshare_live(&key);
@@ -872,7 +951,7 @@ impl TandemApp {
                 let Some(row) = row else { continue };
                 let (rect, resp) = ui.allocate_exact_size(vec2(width, row_h), sense);
                 if let (Some(t), true) = (file, resp.drag_started()) {
-                    resp.dnd_set_drag_payload(DragTracks(vec![t.path.clone()], row.title.clone()));
+                    resp.dnd_set_drag_payload(DragTracks::row(t.path.clone(), row.title.clone()));
                 }
                 let p = ui.painter_at(rect);
                 let selected = i == self.ui.sel_index;
@@ -1002,6 +1081,8 @@ impl TandemApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::NotYours;
+    use std::sync::Arc;
 
     /// A track row dragged onto a crate on the left lands there when it's
     /// let go: the row hands over its file as it starts moving, and the
@@ -1039,8 +1120,8 @@ mod tests {
                                     .allocate_exact_size(vec2(200.0, 20.0), Sense::click_and_drag())
                                     .1;
                                 if i == 0 && resp.drag_started() {
-                                    resp.dnd_set_drag_payload(DragTracks(
-                                        vec![PathBuf::from("a.mp3")],
+                                    resp.dnd_set_drag_payload(DragTracks::row(
+                                        PathBuf::from("a.mp3"),
                                         "A".into(),
                                     ));
                                 }
@@ -1065,9 +1146,405 @@ mod tests {
         assert!(got.is_none(), "dropped before it was let go");
         frame(vec![button(crate_at, false)], &mut got);
         let d = got.take().expect("the crate didn't get the track");
-        assert_eq!(d.0, [PathBuf::from("a.mp3")]);
+        assert_eq!(d.file_for(&[]), Some(Ok(&PathBuf::from("a.mp3"))));
         // Nothing left to drop afterwards.
         frame(vec![moved(crate_at)], &mut got);
         assert!(egui::DragAndDrop::payload::<DragTracks>(&ctx).is_none());
+    }
+
+    const CRATE: egui::Pos2 = pos2(60.0, 350.0);
+    const OVERVIEW: egui::Rect = egui::Rect::from_min_max(pos2(100.0, 20.0), pos2(500.0, 60.0));
+    const WAVE: egui::Rect = egui::Rect::from_min_max(pos2(20.0, 150.0), pos2(580.0, 210.0));
+    /// On the waveform, like the FX chip.
+    const CHIP: egui::Rect = egui::Rect::from_min_max(pos2(530.0, 153.0), pos2(570.0, 170.0));
+
+    /// A crate, and a deck's overview and scrolling waveform (with a chip on
+    /// it), drawn in the app's order. The deck has a 100 s track.
+    struct Booth {
+        ctx: egui::Context,
+        /// The DJ's own files of the deck's track: none, and it's Bob's.
+        files: Vec<PathBuf>,
+        /// The broadcast window's overview, which does nothing.
+        seekable: bool,
+        seeks: Vec<f64>,
+        dropped: Vec<DragTracks>,
+        chip_clicks: usize,
+        /// The crate was outlined, and the pointer said no, last frame.
+        lit: bool,
+        no: bool,
+    }
+
+    impl Booth {
+        fn new(files: &[&str]) -> Self {
+            let mut b = Self {
+                ctx: egui::Context::default(),
+                files: files.iter().map(PathBuf::from).collect(),
+                seekable: true,
+                seeks: Vec::new(),
+                dropped: Vec::new(),
+                chip_clicks: 0,
+                lit: false,
+                no: false,
+            };
+            b.frame(vec![]);
+            b
+        }
+
+        fn frame(&mut self, events: Vec<egui::Event>) {
+            use crate::ui_decks::{overview, wave_dragged, OverviewUse};
+            use tandem_core::model::{DeckState, TrackId};
+            let dv = tandem_core::session::DeckView {
+                state: DeckState {
+                    track: Some(TrackId([1; 32])),
+                    duration: 100.0,
+                    ..Default::default()
+                },
+                meta: None,
+                status: None,
+                audio: None,
+                loading: None,
+            };
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    pos2(0.0, 0.0),
+                    vec2(600.0, 400.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let ctx = self.ctx.clone();
+            let out = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let gig = egui::Rect::from_center_size(CRATE, vec2(80.0, 20.0));
+                    let gig = ui.put(gig, egui::Button::new("📦 Gig"));
+                    self.dropped.extend(crate_drop(ui, &gig));
+                    let mut carry = false;
+                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(OVERVIEW), |ui| {
+                        match overview(ui, &dv, 0.0, LIVE, false, 40.0, self.seekable) {
+                            Some(OverviewUse::Seek(t)) => self.seeks.push(t),
+                            Some(OverviewUse::Carry) => carry = true,
+                            None => {}
+                        }
+                    });
+                    carry |= wave_dragged(ui, 0, WAVE);
+                    if ui
+                        .interact(CHIP, ui.id().with("chip"), Sense::click())
+                        .clicked()
+                    {
+                        self.chip_clicks += 1;
+                    }
+                    if carry {
+                        let drag = DragTracks {
+                            title: "A".into(),
+                            files: Arc::new(self.files.clone().into()),
+                            owner: Some("Bob".into()),
+                        };
+                        egui::DragAndDrop::set_payload(ctx, drag);
+                    }
+                });
+            });
+            self.no = out.platform_output.cursor_icon == egui::CursorIcon::NotAllowed;
+            self.lit = out.shapes.iter().any(|s| match &s.shape {
+                egui::Shape::Rect(r) => r.stroke.color == LIVE,
+                _ => false,
+            });
+        }
+
+        fn carrying(&self) -> bool {
+            egui::DragAndDrop::has_any_payload(&self.ctx)
+        }
+
+        /// Press at `from` and move to each of `to` in turn, a frame each.
+        fn drag(&mut self, from: egui::Pos2, to: &[egui::Pos2]) {
+            self.frame(vec![egui::Event::PointerMoved(from)]);
+            self.frame(vec![button(from, true)]);
+            for p in to {
+                self.frame(vec![egui::Event::PointerMoved(*p)]);
+            }
+        }
+
+        fn let_go(&mut self, at: egui::Pos2) {
+            self.frame(vec![button(at, false)]);
+            self.frame(vec![]);
+        }
+
+        fn escape(&mut self) {
+            self.frame(vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }]);
+            self.frame(vec![]);
+        }
+
+        /// What happened since the last call: seeks, and files dropped on
+        /// the crate.
+        fn took(&mut self) -> (Vec<f64>, Vec<PathBuf>) {
+            let files = (std::mem::take(&mut self.dropped).iter())
+                .map(|d| d.file_for(&[]).unwrap().unwrap().clone())
+                .collect();
+            (std::mem::take(&mut self.seeks), files)
+        }
+    }
+
+    fn button(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        }
+    }
+
+    const NOTHING: (Vec<f64>, Vec<PathBuf>) = (Vec::new(), Vec::new());
+
+    #[test]
+    fn a_deck_overview_still_seeks() {
+        let mut b = Booth::new(&["a.mp3"]);
+        // A click.
+        b.drag(pos2(200.0, 40.0), &[]);
+        assert!(b.seeks.is_empty(), "seeked before it was let go");
+        b.let_go(pos2(200.0, 40.0));
+        assert_eq!(b.took(), (vec![25.0], vec![]));
+        // A drag along it: once, where it's let go, with nothing carried.
+        b.drag(
+            pos2(200.0, 40.0),
+            &[pos2(230.0, 40.0), pos2(280.0, 45.0), pos2(300.0, 50.0)],
+        );
+        assert!(b.seeks.is_empty() && !b.carrying());
+        b.let_go(pos2(300.0, 50.0));
+        assert_eq!(b.took(), (vec![50.0], vec![]));
+        // A bit below it, or past its end, is still on it.
+        b.drag(pos2(200.0, 40.0), &[pos2(300.0, 80.0)]);
+        b.let_go(pos2(300.0, 80.0));
+        assert_eq!(b.took(), (vec![50.0], vec![]));
+        b.drag(pos2(200.0, 40.0), &[pos2(300.0, 40.0), pos2(540.0, 40.0)]);
+        b.let_go(pos2(540.0, 40.0));
+        assert_eq!(b.took(), (vec![100.0], vec![]));
+        // The broadcast window's does nothing.
+        b.seekable = false;
+        b.drag(pos2(200.0, 40.0), &[pos2(200.0, 250.0), CRATE]);
+        b.let_go(CRATE);
+        b.drag(pos2(200.0, 40.0), &[]);
+        b.let_go(pos2(200.0, 40.0));
+        assert_eq!(b.took(), NOTHING);
+    }
+
+    /// Dragged out of its overview, a deck's track goes to the crate it's
+    /// dropped on, or nowhere, and the deck never jumps.
+    #[test]
+    fn a_track_dragged_off_an_overview_lands_in_a_crate_and_never_seeks() {
+        let mut b = Booth::new(&["a.mp3"]);
+        let start = pos2(200.0, 40.0);
+        let out = [pos2(195.0, 70.0), pos2(150.0, 200.0), pos2(80.0, 330.0)];
+        b.drag(start, &out);
+        assert!(b.carrying() && !b.lit);
+        b.frame(vec![egui::Event::PointerMoved(CRATE)]);
+        b.frame(vec![]);
+        assert!(b.lit && !b.no, "the crate didn't light up");
+        assert_eq!(b.took(), NOTHING);
+        b.let_go(CRATE);
+        assert_eq!(b.took(), (vec![], vec![PathBuf::from("a.mp3")]));
+        assert!(!b.carrying() && !b.lit);
+
+        // Let go anywhere else, nothing happens, nor the next time round.
+        b.drag(start, &out);
+        b.let_go(pos2(80.0, 300.0));
+        assert_eq!(b.took(), NOTHING);
+        assert!(!b.carrying());
+        // Not even back where it came from.
+        b.drag(start, &[pos2(200.0, 120.0), pos2(300.0, 40.0)]);
+        assert!(b.carrying());
+        b.let_go(pos2(300.0, 40.0));
+        assert_eq!(b.took(), NOTHING);
+        // Nor flicked out of it within a frame.
+        b.drag(start, &[]);
+        b.let_go(pos2(200.0, 250.0));
+        assert_eq!(b.took(), NOTHING);
+        // And the next click seeks.
+        b.drag(start, &[]);
+        b.let_go(start);
+        assert_eq!(b.took(), (vec![25.0], vec![]));
+    }
+
+    #[test]
+    fn escape_cancels_a_drag_on_a_deck() {
+        let mut b = Booth::new(&["a.mp3"]);
+        // One that would have been a seek.
+        b.drag(pos2(200.0, 40.0), &[pos2(260.0, 40.0)]);
+        b.escape();
+        b.let_go(pos2(260.0, 40.0));
+        assert_eq!(b.took(), NOTHING);
+        // One carrying the track, from either waveform.
+        for from in [pos2(200.0, 40.0), pos2(300.0, 180.0)] {
+            b.drag(from, &[pos2(200.0, 250.0)]);
+            assert!(b.carrying());
+            b.escape();
+            assert!(!b.carrying());
+            b.frame(vec![egui::Event::PointerMoved(pos2(100.0, 300.0))]);
+            b.frame(vec![egui::Event::PointerMoved(CRATE)]);
+            assert!(!b.carrying() && !b.lit, "it was picked up again");
+            b.let_go(CRATE);
+            assert_eq!(b.took(), NOTHING);
+        }
+    }
+
+    #[test]
+    fn a_scrolling_waveform_carries_its_track_and_nothing_else() {
+        let mut b = Booth::new(&["a.mp3"]);
+        let on = pos2(300.0, 180.0);
+        // A click, however slow or shaky, does nothing.
+        b.drag(on, &[pos2(304.0, 183.0)]);
+        for _ in 0..90 {
+            b.frame(vec![]);
+        }
+        assert!(!b.carrying());
+        b.let_go(pos2(304.0, 183.0));
+        assert_eq!(b.took(), NOTHING);
+        // Dragged along itself and let go: nothing.
+        b.drag(on, &[pos2(340.0, 180.0)]);
+        assert!(b.carrying());
+        b.let_go(pos2(340.0, 180.0));
+        assert_eq!(b.took(), NOTHING);
+        // Onto a crate.
+        b.drag(on, &[pos2(290.0, 220.0), pos2(200.0, 300.0), CRATE]);
+        b.frame(vec![]);
+        assert!(b.lit);
+        b.let_go(CRATE);
+        assert_eq!(b.took(), (vec![], vec![PathBuf::from("a.mp3")]));
+        // The chip on it is still clicked, and beside it too, as before.
+        for at in [CHIP.center(), pos2(CHIP.left() - 2.0, CHIP.center().y)] {
+            b.chip_clicks = 0;
+            b.drag(at, &[]);
+            b.let_go(at);
+            assert_eq!(b.chip_clicks, 1, "at {at:?}");
+        }
+        assert_eq!(b.took(), NOTHING);
+    }
+
+    /// Only a session copy here: the crate doesn't light up, the pointer
+    /// says no, and dropping it adds nothing.
+    #[test]
+    fn a_track_that_isnt_the_djs_own_goes_in_no_crate() {
+        let mut b = Booth::new(&[]);
+        for from in [pos2(200.0, 40.0), pos2(300.0, 180.0)] {
+            b.drag(from, &[pos2(200.0, 250.0), CRATE]);
+            b.frame(vec![]);
+            assert!(b.carrying() && b.no && !b.lit);
+            b.let_go(CRATE);
+            let d = b.dropped.pop().expect("the crate heard nothing");
+            let no = d.file_for(&[]).unwrap().unwrap_err();
+            assert_eq!(no, NotYours(Some("Bob".into())));
+            assert_eq!(
+                no.notice(),
+                "That's Bob's track: ask them to send you a copy (Share…, then Send copies to keep)."
+            );
+            assert_eq!(b.took(), NOTHING);
+        }
+        assert!(NotYours(None)
+            .notice()
+            .starts_with("That's another DJ's track: ask"));
+    }
+
+    #[test]
+    fn a_dropped_track_goes_in_as_the_file_the_crate_has() {
+        let path = |p: &str| PathBuf::from(p);
+        let d = |files: &[&str]| DragTracks {
+            title: "A".into(),
+            files: Arc::new(files.iter().map(PathBuf::from).collect::<Vec<_>>().into()),
+            owner: None,
+        };
+        let two = d(&["best.mp3", "other.mp3"]);
+        assert_eq!(two.file_for(&[]), Some(Ok(&path("best.mp3"))));
+        // The crate has the same song from somewhere else: "already in it".
+        let have = [path("x.mp3"), path("other.mp3")];
+        assert_eq!(two.file_for(&have), Some(Ok(&path("other.mp3"))));
+        let none = d(&[]);
+        assert_eq!(none.file_for(&have), Some(Err(NotYours(None))));
+        // Still being looked for.
+        let files = Arc::default();
+        let (title, owner) = ("A".into(), None);
+        let waiting = DragTracks {
+            title,
+            files,
+            owner,
+        };
+        assert_eq!(waiting.file_for(&have), None);
+        waiting.files.set(vec![path("late.mp3")]).unwrap();
+        assert_eq!(waiting.file_for(&[]), Some(Ok(&path("late.mp3"))));
+    }
+
+    #[test]
+    fn my_crates_opens_while_a_track_is_dragged() {
+        for default_open in [false, true] {
+            let ctx = egui::Context::default();
+            let (mut open, mut sprung) = (default_open, false);
+            // Half a second, for the section to finish opening or closing.
+            let mut run = |dragging: bool| {
+                for _ in 0..30 {
+                    let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            let section = egui::CollapsingHeader::new("MY CRATES")
+                                .default_open(default_open)
+                                .open(spring_open(dragging, open, &mut sprung))
+                                .show(ui, |ui| ui.label("📦 Gig"));
+                            open = section.body_returned.is_some();
+                        });
+                    });
+                }
+                open
+            };
+            // Open for the drag, and after it as it was before.
+            for _ in 0..2 {
+                assert_eq!(run(false), default_open);
+                assert!(run(true));
+            }
+            assert_eq!(run(false), default_open);
+        }
+    }
+
+    /// Holding a dragged track by the bottom of the source list brings the
+    /// rest of it up, as far as it goes, and by the top brings it back.
+    #[test]
+    fn the_source_list_scrolls_under_a_dragged_track() {
+        let ctx = egui::Context::default();
+        let list = egui::Rect::from_min_size(pos2(20.0, 20.0), vec2(150.0, 200.0));
+        let scroll_to = |p: egui::Pos2| {
+            let mut offsets = vec![0.0f32];
+            for _ in 0..120 {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        pos2(0.0, 0.0),
+                        vec2(400.0, 300.0),
+                    )),
+                    events: vec![egui::Event::PointerMoved(p)],
+                    ..Default::default()
+                };
+                let _ = ctx.run(input, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(list), |ui| {
+                            let out = egui::ScrollArea::vertical()
+                                .max_height(200.0)
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    ui.allocate_exact_size(vec2(100.0, 500.0), Sense::hover());
+                                    drag_scroll(ui);
+                                });
+                            offsets.push(out.state.offset.y);
+                        });
+                    });
+                });
+            }
+            offsets
+        };
+        assert!(scroll_to(list.center()).iter().all(|o| *o == 0.0));
+        let down = scroll_to(pos2(60.0, 218.0));
+        let end = *down.last().unwrap();
+        assert!((end - 300.0).abs() < 1.0, "{end}");
+        assert!(down.iter().all(|o| *o < 301.0), "past the end: {down:?}");
+        let up = scroll_to(pos2(60.0, 22.0));
+        assert_eq!(*up.last().unwrap(), 0.0);
     }
 }

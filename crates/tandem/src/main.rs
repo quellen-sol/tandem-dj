@@ -73,6 +73,7 @@ fn main() {
         wizard: arg_after("--dev-wizard").map(|p| p.to_string_lossy().to_string()),
         deck_check: arg_after("--dev-deck-check").map(|p| p.to_string_lossy().to_string()),
         eject: arg_after("--dev-eject").map(|p| p.to_string_lossy().to_string()),
+        drag: arg_after("--dev-drag").and_then(|p| parse_drag(&p.to_string_lossy())),
         crate_demo: args.iter().any(|a| a == "--dev-crate"),
         crate_step: 0,
         fitted: false,
@@ -113,6 +114,13 @@ fn main() {
 fn parse_size(s: &str) -> Option<[f32; 2]> {
     let (w, h) = s.split_once(['x', 'X'])?;
     Some([w.trim().parse().ok()?, h.trim().parse().ok()?])
+}
+
+/// "300,200,120,700!" → [300, 200, 120, 700], and let go there.
+fn parse_drag(s: &str) -> Option<([f32; 4], bool)> {
+    let points = s.trim_end_matches('!').split(',');
+    let v: Vec<f32> = points.filter_map(|x| x.trim().parse().ok()).collect();
+    Some((v.try_into().ok()?, s.ends_with('!')))
 }
 
 /// Let `tandem.exe --self-test` print into the terminal it was run from.

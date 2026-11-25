@@ -1261,6 +1261,68 @@ pub fn find_by_hash(lib: &Arc<Mutex<Library>>, id: TrackId, size: u64) -> Option
         .find(|p| hash_path(lib, p).ok() == Some(id))
 }
 
+/// The DJ's own files of a track, best first, to keep in a crate. Unlike
+/// [`find_by_hash`], which any copy will do for, this never returns one in
+/// `temp` (the session copies, gone when Tandem closes), and gives every
+/// other file with exactly this content: those in folders and crates first,
+/// then Shared with me, then ones no longer in the library. `loaded` is the
+/// file this booth plays it from: if it's the DJ's own it counts whatever
+/// became of it since (retagged, or on a drive that's gone), as it would
+/// have dragged from the library. Reads files, so not for the UI thread.
+pub fn kept_files(
+    lib: &Arc<Mutex<Library>>,
+    id: TrackId,
+    size: Option<u64>,
+    loaded: Option<PathBuf>,
+    temp: &Path,
+) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = {
+        let l = lib.lock();
+        let known = (l.cache.iter())
+            .filter(|(_, e)| e.id == Some(id))
+            .map(|(p, _)| PathBuf::from(p));
+        let same_size = size.and_then(|s| l.size_index.get(&s));
+        known
+            .chain(same_size.into_iter().flatten().cloned())
+            .collect()
+    };
+    files.sort();
+    files.retain(|p| {
+        stat(p).is_some_and(|(s, _)| size.is_none_or(|size| s == size))
+            && hash_path(lib, p).ok() == Some(id)
+    });
+    files.extend(loaded.clone());
+    files.retain(|p| !is_in(p, temp));
+    let l = lib.lock();
+    files.sort_by_key(|p| {
+        let listed = || {
+            l.lists
+                .values()
+                .any(|li| li.tracks.iter().any(|t| t.path == *p))
+        };
+        let rank = if p.starts_with(&l.shared_dir) {
+            1
+        } else if l.folders.iter().any(|f| p.starts_with(f))
+            || l.my_crates.iter().any(|c| c.tracks.contains(p))
+            || listed()
+        {
+            0
+        } else {
+            2
+        };
+        (rank, loaded.as_ref() != Some(p))
+    });
+    let mut seen = HashSet::new();
+    files.retain(|p| seen.insert(same_file(p)));
+    files
+}
+
+/// Is this file somewhere in `dir`, whichever way its path is written?
+fn is_in(path: &Path, dir: &Path) -> bool {
+    let real = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    path.starts_with(dir) || real(path).starts_with(real(dir))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1397,6 +1459,84 @@ mod tests {
         let id = hash_file(&wav).unwrap();
         assert_eq!(find_by_hash(&lib, id, t.size), Some(wav.clone()));
         assert_eq!(find_by_hash(&lib, TrackId([7; 32]), t.size), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A track's files to keep: never the session copy, even when a music
+    /// folder holds the session cache; the DJ's folders before Shared with
+    /// me, and that before a file that's in none of their lists.
+    #[test]
+    fn kept_files_are_the_djs_own() {
+        let dir = std::env::temp_dir().join(format!("tandem-kept-test-{}", fastrand::u64(..)));
+        let file = |f: &str, hz: f64| {
+            let p = dir.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            let signal = crate::audio::test_signal(44_100, 0.2, hz);
+            crate::audio::write_wav(&p, 44_100, &signal).unwrap();
+            p
+        };
+        let temp = dir.join("data/session-cache");
+        let copy = file("data/session-cache/abc-B - Song.wav", 330.0);
+        let id = hash_file(&copy).unwrap();
+        let size = std::fs::metadata(&copy).unwrap().len();
+        let lib = Arc::new(Mutex::new(Library::new(
+            dir.join("shared"),
+            dir.join("cache.json"),
+        )));
+        let kept =
+            |loaded: Option<&PathBuf>| kept_files(&lib, id, Some(size), loaded.cloned(), &temp);
+        assert!(kept(Some(&copy)).is_empty(), "nothing but the session copy");
+
+        // The session cache inside a music folder: found there, not kept.
+        let scan_dir = |d: &Path| {
+            lib.lock().folders.push(d.to_path_buf());
+            scan(&lib, folder_key(d), SourceKind::Folder(d.to_path_buf()));
+            titles(&lib, &folder_key(d));
+        };
+        scan_dir(&dir.join("data"));
+        assert_eq!(find_by_hash(&lib, id, size), Some(copy.clone()));
+        assert!(kept(Some(&copy)).is_empty(), "the session copy was kept");
+        // However its path is written.
+        let odd = dir.join("data/../data/session-cache/abc-B - Song.wav");
+        assert!(kept(Some(&odd)).is_empty(), "the session copy was kept");
+
+        // A file Tandem has played that's in none of the DJ's lists, then
+        // the same song in Shared with me, then in a folder of theirs: the
+        // last one listed wasn't hashed until it's looked for.
+        let loose = file("loose/B - Song.wav", 330.0);
+        hash_path(&lib, &loose).unwrap();
+        assert_eq!(kept(Some(&copy)), std::slice::from_ref(&loose));
+        let gift = file("shared/Bob/Set/B - Song.wav", 330.0);
+        scan(&lib, KEY_SHARED.into(), SourceKind::Shared);
+        titles(&lib, KEY_SHARED);
+        assert_eq!(kept(Some(&copy)), [gift.clone(), loose.clone()]);
+        let mine = file("music/B - Song.wav", 330.0);
+        file("music/C - Other.wav", 440.0);
+        scan_dir(&dir.join("music"));
+        let all = [mine.clone(), gift.clone(), loose.clone()];
+        assert_eq!(kept(Some(&copy)), all);
+        assert_eq!(kept(None), all);
+        // Of two as good, the one on the deck.
+        let twin = file("music/sub/B - Song (2).wav", 330.0);
+        scan(
+            &lib,
+            folder_key(&dir.join("music")),
+            SourceKind::Folder(dir.join("music")),
+        );
+        titles(&lib, &folder_key(&dir.join("music")));
+        assert_eq!(kept(Some(&twin))[0], twin);
+        assert_eq!(kept(Some(&mine))[0], mine);
+
+        // Their file on the deck, retagged or gone since it was loaded, is
+        // still theirs.
+        for p in [&twin, &gift, &loose] {
+            std::fs::remove_file(p).unwrap();
+        }
+        std::fs::write(&mine, b"retagged").unwrap();
+        assert_eq!(kept(Some(&mine)), std::slice::from_ref(&mine));
+        std::fs::remove_file(&mine).unwrap();
+        assert_eq!(kept(Some(&mine)), std::slice::from_ref(&mine));
+        assert!(kept(Some(&copy)).is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -8,7 +8,7 @@ use eframe::egui;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tandem_core::config::{FrameRate, LibrarySort, Paths, Settings};
 use tandem_core::library::{self, LibTrack, Library, SortRow, SourceKind};
@@ -152,9 +152,64 @@ pub enum Item {
     Live(Box<TrackInfo>),
 }
 
-/// What a dragged track row carries: its file, to drop on a crate.
+/// A track being dragged, from a row of the library or off a deck's
+/// waveform, to drop on a crate.
 #[derive(Clone, Debug)]
-pub struct DragTracks(pub Vec<PathBuf>, pub String);
+pub struct DragTracks {
+    pub title: String,
+    /// The DJ's own files of it, best first. Empty: it isn't theirs to
+    /// keep. A deck's track's are looked for in the background as the drag
+    /// starts ([`Session::kept_files`]).
+    pub files: Arc<OnceLock<Vec<PathBuf>>>,
+    /// Whose track it is, if it turns out not to be the DJ's own.
+    pub owner: Option<String>,
+}
+
+impl DragTracks {
+    /// A library row's.
+    pub fn row(path: PathBuf, title: String) -> Self {
+        Self {
+            title,
+            files: Arc::new(vec![path].into()),
+            owner: None,
+        }
+    }
+
+    /// The file to put in a crate that holds `have`: if the crate has any
+    /// of them already, that one. `Err` for a track that isn't the DJ's own,
+    /// and `None` while its files are still being looked for.
+    pub fn file_for(&self, have: &[PathBuf]) -> Option<Result<&PathBuf, NotYours>> {
+        let files = self.files.get()?;
+        let file = files.iter().find(|f| have.contains(f)).or(files.first());
+        Some(file.ok_or_else(|| NotYours(self.owner.clone())))
+    }
+}
+
+/// Only a session copy of a track is here: it's this DJ's, if it's known
+/// whose it is.
+#[derive(Debug, PartialEq)]
+pub struct NotYours(pub Option<String>);
+
+impl NotYours {
+    fn whose(&self) -> String {
+        match &self.0 {
+            Some(name) => format!("{name}'s track"),
+            None => "another DJ's track".into(),
+        }
+    }
+
+    /// By the pointer, in a few words.
+    pub fn short(&self) -> String {
+        format!("Can't go in a crate: that's {}", self.whose())
+    }
+
+    pub fn notice(&self) -> String {
+        format!(
+            "That's {}: ask them to send you a copy (Share…, then Send copies to keep).",
+            self.whose()
+        )
+    }
+}
 
 /// The crate window open: making, renaming or deleting one.
 pub struct CrateDialog {
@@ -319,6 +374,11 @@ pub struct UiState {
     pub crates_open: bool,
     /// The My crates section was open last frame.
     pub mine_open: bool,
+    /// It was closed, and is open while a track is being dragged.
+    pub mine_sprung: bool,
+    /// A deck's track dropped on a crate (or on ➕ New crate) before its
+    /// file was found.
+    pub dropped: Option<(Option<u64>, DragTracks)>,
     pub crate_dialog: Option<CrateDialog>,
     /// Lists shared live: what the room last got of each, by list key.
     pub live_sent: HashMap<String, LiveSent>,
@@ -379,7 +439,10 @@ pub struct UiState {
 /// `--dev-wizard <start|N|4:N|done>` opens the controller setup: on its
 /// first page, or N steps in with a pretend Pioneer doing them (`4:N`: a
 /// four-deck one with DECK buttons; `N!` then presses a button twice, to
-/// see it refused), or on its last page.
+/// see it refused), or on its last page;
+/// `--dev-drag <x0>,<y0>,<x1>,<y1>` presses the mouse at one point of the
+/// window and drags it to the other for the screenshot, where it's held
+/// (with a `!` after them, let go).
 /// `--dev-deck-check <start|software|hardware|quiet>[:N]` opens the DECK
 /// button check: on its first page, or with a pretend Denon SC Live 4
 /// whose DECK button works that way doing every step (up to step N;
@@ -408,6 +471,7 @@ pub struct DevOpts {
     pub wizard: Option<String>,
     pub deck_check: Option<String>,
     pub eject: Option<String>,
+    pub drag: Option<([f32; 4], bool)>,
     pub crate_demo: bool,
     pub crate_step: u8,
     /// The window has been checked against the screen (`fit_window`).
@@ -527,6 +591,8 @@ impl TandemApp {
             source_browsed: false,
             crates_open: true,
             mine_open: true,
+            mine_sprung: false,
+            dropped: None,
             crate_dialog: None,
             live_sent: HashMap::new(),
             show_settings: false,
@@ -906,6 +972,27 @@ impl TandemApp {
         });
     }
 
+    /// A dragged track was let go over one of your crates, or over ➕ New
+    /// crate (`None`). One whose file is still being looked for waits for
+    /// that; one that isn't yours only says so.
+    pub(crate) fn drop_track(&mut self, to: Option<u64>, d: DragTracks) {
+        let have = (to.and_then(|id| self.library.lock().my_crate(id).cloned()))
+            .map_or(Vec::new(), |c| c.tracks);
+        match (d.file_for(&have), to) {
+            (Some(Ok(file)), Some(id)) => self.add_to_crate(id, vec![file.clone()]),
+            (Some(Ok(file)), None) => {
+                self.ui.crate_dialog = Some(CrateDialog {
+                    mode: CrateMode::New,
+                    name: String::new(),
+                    add: vec![file.clone()],
+                    focus: true,
+                })
+            }
+            (Some(Err(no)), _) => self.toast(no.notice()),
+            (None, _) => self.ui.dropped = Some((to, d)),
+        }
+    }
+
     /// Put tracks in one of your crates.
     pub(crate) fn add_to_crate(&mut self, id: u64, paths: Vec<PathBuf>) {
         let added = library::add_to_crate(&self.library, id, &paths);
@@ -1278,6 +1365,10 @@ impl TandemApp {
 }
 
 impl eframe::App for TandemApp {
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
+        self.dev_drag(raw);
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.pace_frames(ctx);
         self.fit_window(ctx);
@@ -1395,6 +1486,27 @@ impl TandemApp {
             w.feed(RawMidi::NoteOn { ch, note, vel: 127 }, t + 1_000_000);
         }
         self.midi.engine.lock().wizard = Some(w);
+    }
+
+    /// `--dev-drag`: over a second, from two seconds before the screenshot.
+    fn dev_drag(&self, raw: &mut egui::RawInput) {
+        let Some(([x0, y0, x1, y1], let_go)) = self.dev.drag else {
+            return;
+        };
+        let Some(k) = (self.dev.frame + 120).checked_sub(self.dev.shot_frame) else {
+            return;
+        };
+        let t = (k as f32 / 60.0).min(1.0);
+        let pos = egui::pos2(x0, y0).lerp(egui::pos2(x1, y1), t);
+        raw.events.push(egui::Event::PointerMoved(pos));
+        if k == 1 || (k == 100 && let_go) {
+            raw.events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: k == 1,
+                modifiers: Default::default(),
+            });
+        }
     }
 
     fn dev_hooks(&mut self, ctx: &egui::Context, view: &SessionView) {

@@ -1,6 +1,6 @@
 //! Top bar, decks, mixer and waveforms.
 
-use crate::app::TandemApp;
+use crate::app::{DragTracks, TandemApp};
 use crate::ui_meters;
 use eframe::egui::{self, pos2, vec2, Align, Color32, Layout, Rect, RichText, Sense, Stroke};
 use tandem_core::audio::PEAK_BLOCK;
@@ -640,6 +640,9 @@ impl TandemApp {
             .clamp(WAVE_MIN_H[w], WAVE_MAX_H[w]);
         for d in 0..n {
             let rect = scrolling_waveform(ui, d, &view.decks[d], view.now, h, self.ui.grid_edit[d]);
+            if wave_dragged(ui, d, rect) {
+                self.carry_track(ui.ctx(), d, view);
+            }
             if strip == FxStrip::OnWaveforms {
                 self.fx_on_waveform(ui, d, view, rect);
             }
@@ -1020,9 +1023,7 @@ impl TandemApp {
 
             ui.horizontal(|ui| deck_readout(ui, d, view, pos, 15.0));
 
-            if let Some(seek) = overview(ui, dv, pos, col, self.ui.grid_edit[d], 42.0, true) {
-                self.pending.push(Action::Seek { deck, pos: seek });
-            }
+            self.deck_overview(ui, d, view, pos, 42.0);
 
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -1131,10 +1132,7 @@ impl TandemApp {
                 });
             });
             let k = fit.k;
-            let grid_edit = self.ui.grid_edit[d];
-            if let Some(seek) = overview(ui, dv, pos, col, grid_edit, fit.overview_h, true) {
-                self.pending.push(Action::Seek { deck, pos: seek });
-            }
+            self.deck_overview(ui, d, view, pos, fit.overview_h);
             ui.horizontal(|ui| {
                 self.transport(ui, d, &st, vec2(44.0 * k, 24.0));
                 ui.add_space(4.0 * k);
@@ -1158,6 +1156,38 @@ impl TandemApp {
                 self.tempo_controls(ui, d, &st, true);
             });
         });
+    }
+
+    /// A deck panel's overview: click it or drag in it to seek, drag out of
+    /// it to put the track in a crate.
+    fn deck_overview(
+        &mut self,
+        ui: &mut egui::Ui,
+        d: usize,
+        view: &SessionView,
+        pos: f64,
+        height: f32,
+    ) {
+        let (dv, grid_edit) = (&view.decks[d], self.ui.grid_edit[d]);
+        match overview(ui, dv, pos, DECK_COLORS[d], grid_edit, height, true) {
+            Some(OverviewUse::Seek(pos)) => self.pending.push(Action::Seek { deck: d as u8, pos }),
+            Some(OverviewUse::Carry) => self.carry_track(ui.ctx(), d, view),
+            None => {}
+        }
+    }
+
+    /// Deck `d`'s track goes along with the pointer, to drop on a crate.
+    fn carry_track(&self, ctx: &egui::Context, d: usize, view: &SessionView) {
+        let dv = &view.decks[d];
+        let Some(id) = dv.state.track else { return };
+        let s = self.session.lock();
+        let drag = DragTracks {
+            title: track_names(dv).0,
+            files: s.kept_files(id),
+            owner: s.track_owner(id),
+        };
+        drop(s);
+        egui::DragAndDrop::set_payload(ctx, drag);
     }
 
     /// GRID (opens the beatgrid editor) and the bar.beat readout, laid out
@@ -2604,7 +2634,47 @@ fn deck_status(dv: &DeckView, view: &SessionView, short: bool) -> Option<(String
     }
 }
 
-/// Whole-track overview. When `seekable`, a click returns the position to seek to.
+/// How far outside a deck's overview the pointer goes, in points, before a
+/// drag from it carries the track instead of seeking. A drag along it may
+/// well end past its end.
+const CARRY_OUT: egui::Vec2 = vec2(48.0, 24.0);
+
+/// How far the pointer moves on a scrolling waveform before it does.
+const CARRY_MOVE: f32 = 8.0;
+
+/// What the DJ did with a deck's overview.
+#[derive(Debug, PartialEq)]
+pub(crate) enum OverviewUse {
+    /// Clicked on it, or let go of a drag in it: seek here.
+    Seek(f64),
+    /// Dragged out of it: the track goes with the pointer.
+    Carry,
+}
+
+/// Whether a drag on `r` has just taken the pointer out of `home`, so that
+/// from here on it carries the track: what it carries stays in egui's hands
+/// until it's let go of.
+fn carries(r: &egui::Response, home: Rect) -> bool {
+    r.dragged()
+        && (r.interact_pointer_pos()).is_some_and(|p| !home.contains(p))
+        && !egui::DragAndDrop::has_any_payload(&r.ctx)
+}
+
+/// Whether a drag on deck `d`'s scrolling waveform, drawn at `wave`, has just
+/// begun to carry its track. Only drags are sensed: a click does nothing,
+/// and what's on top of the waveform (the FX chip) gets its own.
+pub(crate) fn wave_dragged(ui: &egui::Ui, d: usize, wave: Rect) -> bool {
+    let r = ui.interact(wave, egui::Id::new(("wave", d)), Sense::drag());
+    r.dragged()
+        && (ui.input(|i| i.pointer.press_origin())).is_some_and(|from| {
+            carries(
+                &r,
+                Rect::from_center_size(from, vec2(2.0, 2.0) * CARRY_MOVE),
+            )
+        })
+}
+
+/// Whole-track overview. When `seekable`, says what the DJ did with it.
 pub(crate) fn overview(
     ui: &mut egui::Ui,
     dv: &DeckView,
@@ -2613,7 +2683,7 @@ pub(crate) fn overview(
     grid_edit: bool,
     height: f32,
     seekable: bool,
-) -> Option<f64> {
+) -> Option<OverviewUse> {
     let sense = if seekable {
         Sense::click_and_drag()
     } else {
@@ -2679,9 +2749,20 @@ pub(crate) fn overview(
             [pos2(px, rect.top()), pos2(px, rect.bottom())],
             Stroke::new(2.0_f32, Color32::WHITE),
         );
-        if resp.clicked() || resp.drag_stopped() {
-            if let Some(pp) = resp.interact_pointer_pos() {
-                return Some(((pp.x - rect.left()) / rect.width()).clamp(0.0, 1.0) as f64 * dur);
+        let home = rect.expand2(CARRY_OUT);
+        if carries(&resp, home) {
+            return Some(OverviewUse::Carry);
+        }
+        // Not a seek: a drag let go of outside, or anywhere once it carries
+        // the track (even back in here), or stopped by Escape, with the
+        // button still down.
+        let let_go = resp.drag_stopped()
+            && ui.input(|i| i.pointer.any_released())
+            && !egui::DragAndDrop::has_any_payload(ui.ctx());
+        if resp.clicked() || let_go {
+            if let Some(pp) = resp.interact_pointer_pos().filter(|p| home.contains(*p)) {
+                let x = ((pp.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+                return Some(OverviewUse::Seek(x as f64 * dur));
             }
         }
     }

@@ -28,7 +28,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 pub type SessionHandle = Arc<Mutex<Session>>;
@@ -509,7 +509,10 @@ pub struct Session {
     /// Host: DJs whose link dropped, while they're expected back.
     awaiting: Vec<Awaiting>,
     /// Host: which DJ's booth told the room about each track (it loaded it,
-    /// or offered it in a share), so the host knows whom to ask for it.
+    /// or offered it in a share), so the host knows whom to ask for it. On
+    /// a joining booth, only to name them (see [`Session::track_owner`]):
+    /// the DJ who first loaded each track that came into the room since it
+    /// joined (0 until their load arrives).
     track_from: HashMap<TrackId, u64>,
     /// Host: tracks other DJs offered in a share, so the host can pass them
     /// on to the DJs who accept without taking them itself.
@@ -1108,7 +1111,12 @@ impl Session {
 
     fn after_event(&mut self, ev: &Event) {
         match &ev.action {
-            Action::Load { track, .. } => self.ensure_track(*track),
+            Action::Load { track, .. } => {
+                if let Some(from) = self.track_from.get_mut(track).filter(|f| **f == 0) {
+                    *from = ev.origin;
+                }
+                self.ensure_track(*track)
+            }
             Action::SetGrid { track, grid, .. } => {
                 self.remember_grid(*track, grid.as_deref().copied())
             }
@@ -1367,6 +1375,43 @@ impl Session {
                 None => h.lock().on_track_missing(id),
             }
         });
+    }
+
+    /// Look in the background for the DJ's own files of a track, to keep in
+    /// a crate: best first, and none if only a session copy of it is here
+    /// (see [`library::kept_files`]). `servable` isn't the answer: once a
+    /// session copy has arrived it stays there, though the DJ's own file of
+    /// the same track may turn up in the library after.
+    pub fn kept_files(&self, id: TrackId) -> Arc<OnceLock<Vec<PathBuf>>> {
+        let size = self.meta(id).map(|m| m.size);
+        let loaded = self.servable.get(&id).cloned();
+        let (lib, temp) = (self.library.clone(), self.paths.cache_dir.clone());
+        let found = Arc::new(OnceLock::new());
+        let out = found.clone();
+        std::thread::spawn(move || out.set(library::kept_files(&lib, id, size, loaded, &temp)));
+        found
+    }
+
+    /// The name of the DJ whose track this is, as far as this booth knows:
+    /// one who shares it live, offered it in a share or brought it into the
+    /// room, or the only other DJ there.
+    pub fn track_owner(&self, id: TrackId) -> Option<String> {
+        let has = |tracks: &[TrackInfo]| tracks.iter().any(|t| t.id == id);
+        if let Some(c) = (self.room_crates.iter()).find(|c| has(&c.tracks)) {
+            return Some(c.owner_name.clone());
+        }
+        if let Some(s) = (self.incoming.iter()).find(|s| has(&s.offer.tracks)) {
+            return Some(s.offer.from_name.clone());
+        }
+        let awaited = self.awaiting.iter().map(|a| a.info.clone());
+        let others: Vec<PeerInfo> = (self.roster().djs.into_iter().chain(awaited))
+            .filter(|p| p.id != self.me.id)
+            .collect();
+        match self.track_from.get(&id).filter(|f| **f != 0) {
+            Some(from) => others.iter().find(|p| p.id == *from),
+            None => others.first().filter(|_| others.len() == 1),
+        }
+        .map(|p| p.name.clone())
     }
 
     fn set_status(&mut self, id: TrackId, status: TrackStatus) {
@@ -3186,6 +3231,8 @@ impl Session {
                     // the DJ sharing it.
                     let from = self.crate_owner(info.id).unwrap_or(dj);
                     self.track_from.insert(info.id, from);
+                } else if !host && !self.track_meta.contains_key(&info.id) {
+                    self.track_from.entry(info.id).or_insert(0);
                 }
                 self.relay(from, &Msg::Track { info: info.clone() });
                 self.track_meta.insert(info.id, info);
