@@ -1164,6 +1164,8 @@ impl TandemApp {
     /// right to left.
     fn grid_button(&mut self, ui: &mut egui::Ui, d: usize, st: &DeckState, pos: f64) {
         let editing = &mut self.ui.grid_edit[d];
+        // Ejected: nothing to edit, nor on the next track unasked.
+        *editing &= st.track.is_some();
         let fill = if *editing {
             MARKER.gamma_multiply(0.55)
         } else {

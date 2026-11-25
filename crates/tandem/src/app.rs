@@ -385,6 +385,10 @@ pub struct UiState {
 /// whose DECK button works that way doing every step (up to step N;
 /// `hardware+map` then clicks "Map decks C and D"; `N!` presses the wrong
 /// button at step N, to see it refused).
+/// `--dev-eject <decks>[+load]` (with the demo), for decks like `B` or `AC`:
+/// 3 s before the screenshot, a pretend DDJ-FLX6 presses SHIFT + LOAD on
+/// them while they play (refused, where they can be heard), then PLAY and
+/// SHIFT + LOAD again; `+load` then presses LOAD.
 pub struct DevOpts {
     pub screenshot: Option<PathBuf>,
     pub shot_frame: u64,
@@ -403,6 +407,7 @@ pub struct DevOpts {
     pub settings: Option<String>,
     pub wizard: Option<String>,
     pub deck_check: Option<String>,
+    pub eject: Option<String>,
     pub crate_demo: bool,
     pub crate_step: u8,
     /// The window has been checked against the screen (`fit_window`).
@@ -1545,9 +1550,16 @@ impl TandemApp {
                 });
             }
         }
+        if self.dev.demo_started {
+            self.dev_eject(f);
+        }
         // Try to load onto deck A while it plays, so the screenshot shows
         // the toast refusing it.
-        if self.dev.demo && self.dev.demo_started && f == self.dev.shot_frame.saturating_sub(40) {
+        if self.dev.demo
+            && self.dev.demo_started
+            && self.dev.eject.is_none()
+            && f == self.dev.shot_frame.saturating_sub(40)
+        {
             if let Some(item) = self.item_at(2, view) {
                 self.load(0, item, view);
             }
@@ -1573,6 +1585,55 @@ impl TandemApp {
 }
 
 impl TandemApp {
+    /// `--dev-eject`: SHIFT + LOAD on a pretend DDJ-FLX6.
+    fn dev_eject(&mut self, f: u64) {
+        let Some(how) = self.dev.eject.clone() else {
+            return;
+        };
+        let (decks, load) = match how.strip_suffix("+load") {
+            Some(d) => (d, true),
+            None => (how.as_str(), false),
+        };
+        let shot = self.dev.shot_frame;
+        let at = |before: u64| f == shot.saturating_sub(before);
+        for hw in decks
+            .bytes()
+            .map(|b| b.wrapping_sub(b'A'))
+            .filter(|&d| d < 4)
+        {
+            let eject = [0x96, [0x58, 0x59, 0x60, 0x61][hw as usize], 0x7F];
+            if at(180) || at(120) {
+                self.dev_press(eject);
+            } else if at(150) {
+                self.dev_press([0x90 + hw, 0x0B, 0x7F]);
+            } else if at(60) && load {
+                self.dev_press([0x96, 0x46 + hw, 0x7F]);
+            }
+        }
+    }
+
+    /// A message from a pretend DDJ-FLX6, with its built-in mapping: what
+    /// `Midi` does with one from a controller.
+    fn dev_press(&mut self, msg: [u8; 3]) {
+        let Some(preset) = tandem_core::mapping::builtin_preset("DDJ-FLX6") else {
+            return;
+        };
+        let mut engine = tandem_core::mapping::MidiEngine::new(preset, self.settings.tempo_range);
+        let mut s = self.session.lock();
+        let t = s.clock().stamp();
+        let (room, local) = (s.latest(), s.local);
+        for o in engine.handle_at(&msg, t, &room, &local) {
+            log::info!("dev: {msg:02x?}: {o:?}");
+            match o {
+                MidiOut::Action(a) => s.act_at(a, t),
+                other => self.midi.ui_queue.lock().push(other),
+            }
+        }
+        for d in &s.latest().decks {
+            log::debug!("dev: {:?} playing {} gen {}", d.track, d.playing, d.gen);
+        }
+    }
+
     /// `--dev-crate`: a crate to look at, shared live by the host.
     fn dev_crate(&mut self, f: u64, view: &SessionView) {
         const NAME: &str = "Friday warm-up";

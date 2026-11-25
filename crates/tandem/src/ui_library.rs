@@ -8,6 +8,7 @@ use eframe::egui::{self, pos2, vec2, Align2, Color32, FontId, RichText, Sense};
 use std::path::PathBuf;
 use tandem_core::config::SortColumn;
 use tandem_core::library::{self, KEY_ALL, KEY_SHARED};
+use tandem_core::model::Action;
 use tandem_core::session::{deck_letter, SessionView, ShareState, TransferState};
 
 /// The outline round the side of the library the browse knob moves through.
@@ -609,14 +610,19 @@ impl TandemApp {
                 let letter = RichText::new(deck_letter(d).to_string())
                     .strong()
                     .color(color);
-                if ui
+                let r = ui
                     .add(egui::Button::new(letter).min_size(vec2(24.0, 0.0)))
-                    .on_hover_text(format!("Load the selected track onto deck {}", deck_letter(d)))
-                    .clicked()
-                {
+                    .on_hover_text(format!(
+                        "Load the selected track onto deck {}. Right-click (or SHIFT + LOAD): eject the deck's track.",
+                        deck_letter(d)
+                    ));
+                if r.clicked() {
                     if let Some(item) = self.item_at(self.ui.sel_index, view) {
                         self.load(d, item, view);
                     }
+                }
+                if r.secondary_clicked() {
+                    self.pending.push(Action::Eject { deck: d as u8 });
                 }
             }
             ui.spacing_mut().item_spacing.x = spacing;

@@ -37,6 +37,7 @@ The check itself called the left side "switches decks itself", wrongly: it took 
 | Right DECK | `95 1F 7F` / `95 1F 00` | **seen on a unit** | [6]; [1] [2] |
 | After DECK | the side sends exactly what it sent before: left always channel 5, right channel 6 | **seen on a unit** | [6]; [1] [2]; the sibling Prime 4 [3] |
 | SHIFT + DECK | SHIFT (`94 1C`) and then the same `94 1F`: SHIFT is tracked in software | inferred from the mappings | [1] [2] |
+| SHIFT + LOAD | SHIFT and then LOAD's own `9F 01` / `9F 02` | read in a mapping made on a unit (it ejects, as here: `shift` swaps `LoadSelectedTrack` for `eject` on the same message), not seen | [1]; the sibling Prime 4 [3] |
 | DECK light | none, going by a user report passed on 2026-11-23. Engine OS's guide says that without a computer DECK flashes as the track end warning, when a track on the deck not in focus is nearly over (SC Live 4 and Prime 4) [4]. Neither mapping sends it anything | conflict | [4] |
 
 - **Mixxx** [1] (written and "tested on the hardware with Engine OS 5.0.4"): "Both layers share the same MIDI channel, so switching is handled entirely in the mapping." Only tried on macOS, says its manual page. It builds decks 1 and 3 on channel 5 and decks 2 and 4 on channel 6, and `makeDeckToggle` binds `[0x90 + 4, 0x1F]` and `[0x90 + 5, 0x1F]`. SHIFT + DECK switches Mixxx between its two- and four-deck views. No deck control is bound on channel 7 or 8.
@@ -63,7 +64,7 @@ Same CCs as channels 1 and 2, on MIDI channels 3 and 4 (`B2` / `B3`): gain `0x03
 
 ## What Tandem does
 
-- **DECK** (`94 1F` / `95 1F`): `Target::DeckSelect` for both of the side's decks, so each press goes to the other one. The side's controls, LOAD included, are `Binding::layered`. Each side starts on A or B when Tandem connects: the unit gives no state to ask for.
+- **DECK** (`94 1F` / `95 1F`): `Target::DeckSelect` for both of the side's decks, so each press goes to the other one. The side's controls, LOAD and SHIFT + LOAD (`Target::Eject`, a SHIFT + binding on LOAD's note) included, are `Binding::layered`. Each side starts on A or B when Tandem connects: the unit gives no state to ask for.
 - **Mixer channels 3 and 4** are decks C and D's.
 - **Jog wheel screens:** `Mapping::deck_displays`, sent as Mixxx sends them, without its start-up SysEx.
 - **DECK's light:** sent like the other buttons' (127 on C or D, 1 on A or B), in case there is one.

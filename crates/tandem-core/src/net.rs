@@ -1328,6 +1328,52 @@ mod tests {
         alice.lock().leave();
     }
 
+    /// Bob ejects decks A and C: A's eject reaches Alice, and C's, made
+    /// while he's cut off, once he's back. Deck B's doesn't: Alice was
+    /// playing it out loud by then, and he's told. A DJ joining then finds
+    /// the decks the same.
+    #[test]
+    fn ejects_reach_the_room_like_loads() {
+        let rig = Rig::new("eject");
+        let t = Duration::from_secs(2);
+        let (alice, bob, relay) = b2b(&rig, "EJECT1", t, t);
+        for deck in 0..3 {
+            alice.lock().act(load(deck, 1 + deck));
+        }
+        wait_for("Bob to see the tracks", Duration::from_secs(5), || {
+            bob.lock().latest().decks[2].track.is_some()
+        });
+        bob.lock().act(Action::Eject { deck: 0 });
+        wait_for("the eject to reach Alice", Duration::from_secs(5), || {
+            alice.lock().latest().decks[0].track.is_none()
+        });
+        relay.blackhole();
+        wait_for("Bob to notice", Duration::from_secs(5), || rejoining(&bob));
+        alice.lock().act(Action::Play { deck: 1 });
+        thread::sleep(Duration::from_millis(300));
+        bob.lock().act(Action::Eject { deck: 1 });
+        bob.lock().act(Action::Eject { deck: 2 });
+        assert!(bob.lock().take_notices().is_empty(), "refused too early");
+        relay.restore();
+        back_together(&alice, &bob);
+        let dave = rig.booth("Dave", -600_000_000, t);
+        join(&dave, &relay.addr(), "EJECT1", false).unwrap();
+        wait_for("Dave to agree", Duration::from_secs(5), || {
+            digests_match(&alice, &dave)
+        });
+        for h in [&alice, &bob, &dave] {
+            let tracks = h.lock().latest().decks.map(|d| d.track);
+            assert_eq!(tracks, [None, Some(TrackId([2; 32])), None, None]);
+        }
+        assert_eq!(
+            bob.lock().take_notices(),
+            ["Deck B is playing: pause it or pull its fader down to eject it."]
+        );
+        for h in [&dave, &bob, &alice] {
+            h.lock().leave();
+        }
+    }
+
     /// While Bob is cut off, Alice starts deck B (out loud) and Bob then
     /// loads onto it, and Bob starts deck A and Alice then loads onto that.
     /// Neither could see the other's deck playing, but the room can: both

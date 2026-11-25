@@ -981,21 +981,25 @@ impl DeckCheck {
                     };
                     if bound != other {
                         if let Some(d) = load_deck(bound).filter(|&d| d < 2) {
-                            add(
-                                &mut m,
-                                mapping,
-                                Binding {
-                                    trigger: other,
-                                    target: Target::Load { deck: d + 2 },
-                                    invert: false,
-                                    rel: Default::default(),
-                                    shift: false,
-                                    mode: None,
-                                    layered: false,
-                                    light: None,
-                                },
-                                &mut added,
-                            );
+                            // LOAD, and SHIFT + LOAD if it's the same button.
+                            for b in mapping.bindings.iter().filter(|b| {
+                                b.trigger == bound
+                                    && [Target::Load { deck: d }, Target::Eject { deck: d }]
+                                        .contains(&b.target)
+                            }) {
+                                add(
+                                    &mut m,
+                                    mapping,
+                                    Binding {
+                                        trigger: other,
+                                        target: b.target.with_deck(d + 2),
+                                        layered: false,
+                                        light: None,
+                                        ..b.clone()
+                                    },
+                                    &mut added,
+                                );
+                            }
                         }
                     }
                 }
@@ -2231,6 +2235,98 @@ mod tests {
         );
         assert!(
             !fix.left_out.iter().any(|l| l.contains("Play")),
+            "{:?}",
+            fix.left_out
+        );
+    }
+
+    /// LOAD with SHIFT + LOAD on it is LOAD all the same (the SC Live 4's),
+    /// and a SHIFT + LOAD of its own isn't (the FLX6's).
+    #[test]
+    fn shift_load_isnt_taken_for_load() {
+        let m = builtin_preset("SC LIVE 4").unwrap();
+        let eject = |b: &Binding| matches!(b.target, Target::Eject { .. });
+        assert!(m.bindings.iter().any(|b| b.shift && eject(b)));
+        let mut c = DeckCheck::for_mapping(false, &m);
+        c.hear(1.0, &[0x94, 0x0A, 0x7F]);
+        c.tick(3.0);
+        c.hear(4.0, &[0x9F, 0x01, 0x7F]);
+        assert_eq!((c.got(), c.refused()), (Some(4.0), None));
+        assert_eq!(c.side(0, &m).load[0], Some(Trigger::note(15, 0x01)));
+        // A pass with SHIFT + LOAD mapped finds what it found without.
+        let without = {
+            let mut m = m.clone();
+            m.bindings.retain(|b| !eject(b));
+            m
+        };
+        let (with, without) = (
+            run(Pretend::Software, Seen::No).summary(&m),
+            run(Pretend::Software, Seen::No).summary(&without),
+        );
+        assert_eq!(with, without);
+
+        let m = builtin_preset("DDJ-FLX6").unwrap();
+        let mut c = DeckCheck::for_mapping(false, &m);
+        c.hear(1.0, &[0x90, 0x0B, 0x7F]);
+        c.tick(3.0);
+        c.hear(4.0, &[0x96, 0x58, 0x7F]);
+        assert_eq!((c.got(), c.refused()), (None, Some(Trigger::note(6, 0x58))));
+        c.hear(5.0, &[0x96, 0x46, 0x7F]);
+        assert_eq!((c.got(), c.refused()), (Some(5.0), None));
+    }
+
+    /// "Map decks C and D" for a LOAD that changes with DECK takes SHIFT +
+    /// LOAD along.
+    #[test]
+    fn map_decks_c_and_d_takes_shift_load_along() {
+        let mut m = sc_live_4_preset_13();
+        for (side, deck) in [(0x01, 0), (0x02, 1)] {
+            m.bind(Trigger::note(15, side), Target::Eject { deck })
+                .shift = true;
+        }
+        let mut c = DeckCheck::new(false);
+        let mut t = 0.0;
+        while let Some(step) = c.step() {
+            t += 3.0;
+            if let Step::Press {
+                side,
+                button,
+                round,
+            } = step
+            {
+                let moved = if round == 1 { 2 } else { 0 };
+                let msg = match button {
+                    Button::Play => [0x94 + side + moved, 0x0A, 0x7F],
+                    Button::Deck => [0x94 + side, 0x1F, 0x7F],
+                    Button::Load => [0x9F, 0x01 + side + moved, 0x7F],
+                };
+                c.hear(t, &msg);
+            }
+            if step.wants() == Want::Answer {
+                c.answer(Seen::No);
+            } else if !c.tick(t + 2.0) {
+                c.next();
+            }
+        }
+        let fix = c.fix(&m).unwrap();
+        for (note, deck) in [(0x03, 2), (0x04, 3)] {
+            let on: Vec<(Target, bool)> = fix
+                .mapping
+                .bindings
+                .iter()
+                .filter(|b| b.trigger == Trigger::note(15, note))
+                .map(|b| (b.target, b.shift))
+                .collect();
+            assert_eq!(
+                on,
+                [
+                    (Target::Load { deck }, false),
+                    (Target::Eject { deck }, true)
+                ]
+            );
+        }
+        assert!(
+            !fix.left_out.iter().any(|l| l.contains("Eject")),
             "{:?}",
             fix.left_out
         );

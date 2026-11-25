@@ -580,6 +580,12 @@ impl Plan<'_> {
                 "Press LOAD",
                 "The button that loads the selected track onto this deck.",
             );
+            self.step(
+                Eject { deck },
+                Ask::ShiftPress,
+                "Hold SHIFT and press LOAD",
+                "Takes the track off this deck. If your controller has a button for that, press that one.",
+            );
         }
         if self.part(Part::Tempo, n) {
             self.step(
@@ -1560,6 +1566,7 @@ impl Wizard {
             let plain = match target {
                 Target::BackToStart { deck } => Some(Target::Cue { deck }),
                 Target::SyncOff { deck } => Some(Target::Sync { deck }),
+                Target::Eject { deck } => Some(Target::Load { deck }),
                 Target::HotCueClear { deck, slot } => Some(Target::HotCue { deck, slot }),
                 Target::TempoShift { deck } => Some(Target::Tempo { deck }),
                 _ => None,
@@ -2996,6 +3003,57 @@ mod tests {
         );
     }
 
+    /// SHIFT + LOAD is asked for right after LOAD, like the other SHIFT +
+    /// steps: LOAD alone isn't taken for it.
+    #[test]
+    fn eject_is_asked_for_after_load() {
+        let setup = Setup {
+            sections: vec![Section::Transport],
+            ..Setup::default()
+        };
+        let mut w = Wizard::new(Mapping::empty("test"), setup);
+        let mut t = 0;
+        press(&mut w, &mut t, 0, 0x1C);
+        w.skip();
+        while w.step().unwrap().target != (Target::Load { deck: 0 }) {
+            w.skip();
+        }
+        press(&mut w, &mut t, 15, 0x01);
+        let step = w.step().unwrap();
+        assert_eq!(
+            (step.target, step.ask, step.title.as_str()),
+            (
+                Target::Eject { deck: 0 },
+                Ask::ShiftPress,
+                "Hold SHIFT and press LOAD"
+            )
+        );
+        press(&mut w, &mut t, 15, 0x01);
+        assert!(w
+            .said()
+            .unwrap()
+            .text
+            .contains("Hold SHIFT while you do it"));
+        assert_eq!(w.draft().binding_for(Target::Eject { deck: 0 }), None);
+        t += 400_000;
+        let shift = RawMidi::NoteOn {
+            ch: 0,
+            note: 0x1C,
+            vel: 127,
+        };
+        w.feed(shift, t);
+        press(&mut w, &mut t, 15, 0x01);
+        assert_eq!(w.step().unwrap().target, Target::Play { deck: 1 });
+        let b = w.draft().binding_for(Target::Eject { deck: 0 }).unwrap();
+        assert_eq!((b.trigger, b.shift), (Trigger::note(15, 0x01), true));
+        assert_eq!(
+            w.draft()
+                .binding_for(Target::Load { deck: 0 })
+                .map(|b| (b.trigger, b.shift)),
+            Some((Trigger::note(15, 0x01), false))
+        );
+    }
+
     #[test]
     fn back_skip_clear_and_jump() {
         let mut w = transport();
@@ -3039,14 +3097,14 @@ mod tests {
         // The rest of the group, then deck B's.
         w.skip_group();
         assert_eq!(w.step().unwrap().target, Target::Play { deck: 1 });
-        assert_eq!(w.group_progress(1), (1, 6));
+        assert_eq!(w.group_progress(1), (1, 7));
         // Jumping to a group lands on what it still lacks.
         w.jump(1);
         assert_eq!(w.step().unwrap().target, Target::Cue { deck: 0 });
         w.jump(2);
         w.skip_group();
         assert_eq!(w.at(), None);
-        assert_eq!(w.progress(), (1, 14));
+        assert_eq!(w.progress(), (1, 16));
     }
 
     #[test]

@@ -821,6 +821,9 @@ pub enum Action {
         deck: u8,
         on: bool,
     },
+    /// Take the track off the deck, leaving it empty and its mixer channel
+    /// as it is. Dropped, like [`Action::Load`], if the deck can be heard in
+    /// the master at that moment; on an empty deck it does nothing.
     Eject {
         deck: u8,
     },
@@ -1124,7 +1127,7 @@ impl RoomState {
     /// fader at about 10% or below, the crossfader at the far end from the
     /// deck, or the filter turned all the way, each make it silent. The headphone
     /// cue doesn't count. A track can't be loaded onto a deck that's
-    /// audible.
+    /// audible, nor ejected from it.
     pub fn audible_in_master(&self, x: usize, t: i64) -> bool {
         x < DECKS
             && self.decks[x].sounding_at(t)
@@ -1137,6 +1140,16 @@ impl RoomState {
         self.audible_in_master(x, t).then(|| {
             format!(
                 "Deck {} is playing: pause it or pull its fader down to load onto it.",
+                deck_letter(x)
+            )
+        })
+    }
+
+    /// The same for ejecting deck `x`'s track.
+    pub fn eject_refusal(&self, x: usize, t: i64) -> Option<String> {
+        self.audible_in_master(x, t).then(|| {
+            format!(
+                "Deck {} is playing: pause it or pull its fader down to eject it.",
                 deck_letter(x)
             )
         })
@@ -1181,9 +1194,14 @@ impl RoomState {
         if deck >= DECKS {
             return;
         }
-        if matches!(ev.action, Action::Load { .. }) && self.audible_in_master(deck, t) {
-            // Never over music the room can hear, whichever booth loaded it
-            // and however it raced the faders: the deck carries on as it was.
+        let eject = matches!(ev.action, Action::Eject { .. });
+        if (eject || matches!(ev.action, Action::Load { .. })) && self.audible_in_master(deck, t) {
+            // Never over music the room can hear (nor is it ejected),
+            // whichever booth did it and however it raced the faders: the
+            // deck carries on as it was.
+            return;
+        }
+        if eject && self.decks[deck].track.is_none() {
             return;
         }
         if let Action::XfAssign { side, .. } = ev.action {
@@ -1416,20 +1434,21 @@ impl RoomState {
                 d.gen += 1;
             }
             Action::Eject { .. } => {
-                d.track = None;
-                d.duration = 0.0;
-                d.playing = false;
-                d.cue_preview = false;
-                d.preview_slot = None;
-                d.anchor_time = t;
-                d.spin = None;
-                d.anchor_pos = 0.0;
-                d.cue_point = 0.0;
-                d.hot_cues = [None; HOT_CUES];
-                d.clear_loop();
-                d.grid = None;
-                d.synced = false;
-                d.gen += 1;
+                // A new, empty deck, but for what a load leaves alone too:
+                // the mixer channel, where the tempo fader is and key lock.
+                *d = DeckState {
+                    anchor_time: t,
+                    tempo: d.tempo,
+                    key_lock: d.key_lock,
+                    volume: d.volume,
+                    eq: d.eq,
+                    trim: d.trim,
+                    filter: d.filter,
+                    fx: d.fx,
+                    gen: d.gen + 1,
+                    last_touch: d.last_touch,
+                    ..DeckState::default()
+                };
             }
             Action::SetGrid {
                 track, ref grid, ..
@@ -3116,6 +3135,221 @@ mod tests {
         let c = three.latest().decks[0];
         assert_eq!(c.track, Some(tid(2)));
         assert!(!c.playing);
+    }
+
+    #[test]
+    fn a_deck_the_room_can_hear_cant_be_ejected() {
+        let mut s = a_playing();
+        let before = s;
+        s.apply(&ev(3_000_000, 2, 1, Action::Eject { deck: 0 }));
+        assert_eq!(s, before, "dropped: nothing changes");
+        assert_eq!(
+            s.eject_refusal(0, 3_000_000).as_deref(),
+            Some("Deck A is playing: pause it or pull its fader down to eject it.")
+        );
+        // Nor is the sync master given up.
+        s.apply(&ev(3_000_000, 2, 2, grid_load(1, 2, 124.0, 0.0)));
+        s.apply(&ev(3_000_000, 2, 3, Action::Sync { deck: 1, on: true }));
+        assert_eq!(s.master, Some(0));
+        s.apply(&ev(3_100_000, 2, 4, Action::Eject { deck: 0 }));
+        assert_eq!((s.master, s.decks[1].synced), (Some(0), true));
+        // Paused, it can be, and it's the master no more.
+        s.apply(&ev(4_000_000, 1, 3, Action::Pause { deck: 0 }));
+        assert_eq!(s.eject_refusal(0, 5_000_000), None);
+        s.apply(&ev(5_000_000, 2, 5, Action::Eject { deck: 0 }));
+        assert_eq!(s.decks[0].track, None);
+        assert_ne!(s.master, Some(0));
+    }
+
+    /// Everything about a track goes with it, on a silent deck that's doing
+    /// everything at once; the mixer channel stays, and so does the tempo.
+    #[test]
+    fn an_ejected_deck_is_empty_and_keeps_its_channel() {
+        let mut s = RoomState::default();
+        let mut seq = 0;
+        let mut go = |s: &mut RoomState, t: i64, a: Action| {
+            seq += 1;
+            s.apply(&ev(t, 1, seq, a));
+        };
+        let mut keyed = grid_load(1, 2, 124.0, 0.0);
+        if let Action::Load { key, cue, .. } = &mut keyed {
+            (*key, *cue) = (4, 10.0);
+        }
+        go(&mut s, 0, grid_load(0, 1, 120.0, 0.0));
+        go(&mut s, 0, keyed);
+        // Its channel, all of it off where it starts, and quiet.
+        go(&mut s, 0, Action::Volume { deck: 1, v: 0.05 });
+        go(&mut s, 0, Action::Trim { deck: 1, v: 0.6 });
+        go(&mut s, 0, Action::Filter { deck: 1, v: 0.3 });
+        for band in 0..3 {
+            let v = 0.2 + band as f32 * 0.1;
+            go(&mut s, 0, Action::Eq { deck: 1, band, v });
+        }
+        let side = XfSide::Thru;
+        go(&mut s, 0, Action::XfAssign { deck: 1, side });
+        go(
+            &mut s,
+            0,
+            Action::FxOn {
+                deck: 1,
+                slot: 0,
+                on: true,
+            },
+        );
+        go(&mut s, 0, Action::KeyLock { deck: 1, on: false });
+        // Everything else a deck can be doing.
+        go(&mut s, 0, Action::Play { deck: 0 });
+        go(&mut s, 0, Action::Play { deck: 1 });
+        go(&mut s, 0, Action::HotCue { deck: 1, slot: 5 });
+        go(&mut s, 0, Action::Sync { deck: 1, on: true });
+        let four = Action::BeatLoop {
+            deck: 1,
+            beats: 4.0,
+        };
+        go(&mut s, 1_000_000, four);
+        let up = Action::KeyShift {
+            deck: 1,
+            semitones: 3,
+        };
+        go(&mut s, 1_000_000, up);
+        let bend = Action::Bend {
+            deck: 1,
+            bend: 0.04,
+        };
+        go(&mut s, 1_000_000, bend);
+        go(&mut s, 1_200_000, roll(1, 1.0, true));
+        let touch = Action::JogTouch {
+            deck: 1,
+            down: true,
+            spin: 0.0,
+        };
+        go(&mut s, 1_300_000, touch);
+        let b = s.decks[1];
+        assert!(b.synced && b.looping && b.roll.is_some() && b.scratching);
+        assert!(b.sounding_at(2_000_000) && !s.audible_in_master(1, 2_000_000));
+        let (tempo, gen) = (b.tempo, b.gen);
+        assert_ne!(tempo, 1.0, "synced to 120 BPM");
+
+        go(&mut s, 2_000_000, Action::Eject { deck: 1 });
+        let want = DeckState {
+            anchor_time: 2_000_000,
+            tempo,
+            key_lock: false,
+            volume: 0.05,
+            eq: b.eq,
+            trim: 0.6,
+            filter: 0.3,
+            fx: b.fx,
+            gen: s.decks[1].gen,
+            last_touch: 1,
+            ..DeckState::default()
+        };
+        assert_eq!(s.decks[1], want);
+        assert!(s.decks[1].gen > gen, "the renderer drops it at once");
+        assert_eq!(s.xf_assign[1], XfSide::Thru);
+        assert_eq!(s.decks[1].position_at(9_000_000), 0.0);
+        assert!(!s.decks[1].sounding_at(9_000_000));
+        assert_ne!(s.master, Some(1));
+        assert!(s.decks[0].playing);
+        // Nothing left to press does anything: what was held is let go, and
+        // the rest needs a track.
+        let empty = s.decks[1];
+        for a in [
+            roll(1, 1.0, false),
+            Action::JogTouch {
+                deck: 1,
+                down: false,
+                spin: 4.0,
+            },
+            Action::CueUp { deck: 1 },
+            Action::HotCueUp { deck: 1, slot: 5 },
+            Action::Play { deck: 1 },
+            Action::CueDown { deck: 1 },
+            Action::HotCue { deck: 1, slot: 5 },
+            Action::Seek { deck: 1, pos: 9.0 },
+            Action::LoopIn {
+                deck: 1,
+                quantize: false,
+            },
+            Action::Reloop { deck: 1 },
+            Action::Relock { deck: 1 },
+            Action::SetGrid {
+                deck: 1,
+                track: tid(2),
+                grid: BeatGrid::new(0.0, 90.0).map(Box::new),
+            },
+        ] {
+            go(&mut s, 3_000_000, a.clone());
+            assert_eq!(s.decks[1], empty, "{a:?}");
+        }
+        // Loading onto it again is as onto a new deck.
+        go(&mut s, 4_000_000, grid_load(1, 3, 100.0, 0.0));
+        assert_eq!(s.decks[1].track, Some(tid(3)));
+        assert_eq!((s.decks[1].volume, s.decks[1].tempo), (0.05, tempo));
+        go(&mut s, 4_000_000, Action::Play { deck: 1 });
+        assert!(s.decks[1].playing);
+    }
+
+    #[test]
+    fn ejecting_an_empty_deck_does_nothing() {
+        let mut s = a_playing();
+        let before = s;
+        for deck in [1, 3, 9] {
+            s.apply(&ev(3_000_000, 2, deck as u64, Action::Eject { deck }));
+        }
+        assert_eq!(s, before, "not even who touched it");
+        // Ejected twice (two DJs at once): once.
+        s.apply(&ev(4_000_000, 1, 3, Action::Pause { deck: 0 }));
+        s.apply(&ev(5_000_000, 1, 4, Action::Eject { deck: 0 }));
+        let once = s;
+        s.apply(&ev(5_000_100, 2, 10, Action::Eject { deck: 0 }));
+        assert_eq!(s, once);
+    }
+
+    /// One booth ejects a muted deck just as the other brings its fader up:
+    /// the same on both, whatever order the events arrive in.
+    #[test]
+    fn an_eject_racing_a_fader_or_a_load_comes_out_the_same_on_both_booths() {
+        let mut base = Timeline::new(0);
+        base.insert(ev(0, 1, 1, grid_load(0, 1, 120.0, 0.0)));
+        base.insert(ev(0, 1, 2, Action::Volume { deck: 0, v: 0.0 }));
+        base.insert(ev(0, 1, 3, Action::Play { deck: 0 }));
+        let fader = ev(2_000_000, 1, 4, Action::Volume { deck: 0, v: 0.8 });
+        let load = ev(2_000_050, 1, 5, grid_load(0, 2, 124.0, 0.0));
+        let eject = |t: i64| ev(t, 2, 1, Action::Eject { deck: 0 });
+        // Just after the fader: dropped. Just before it: ejected.
+        for (t, track) in [(2_000_100, Some(tid(1))), (1_999_900, None)] {
+            let mut one = base.clone();
+            one.insert(fader.clone());
+            one.insert(eject(t));
+            let mut two = base.clone();
+            two.insert(eject(t));
+            assert_eq!(two.latest().decks[0].track, None);
+            two.insert(fader.clone());
+            assert_eq!(one.latest().digest(), two.latest().digest());
+            let d = one.latest().decks[0];
+            assert_eq!((d.track, d.playing), (track, track.is_some()));
+        }
+        // Against a load: whichever was later stands.
+        for (t, track) in [(2_000_100, None), (1_999_900, Some(tid(2)))] {
+            let mut one = base.clone();
+            one.insert(load.clone());
+            one.insert(eject(t));
+            let mut two = base.clone();
+            two.insert(eject(t));
+            two.insert(load.clone());
+            assert_eq!(one.latest().digest(), two.latest().digest());
+            assert_eq!(one.latest().decks[0].track, track);
+        }
+        // Sent in a snapshot (joining, or a resync).
+        let mut tl = base.clone();
+        tl.insert(eject(1_000_000));
+        let json = serde_json::to_string(&tl).unwrap();
+        let back: Timeline = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.latest(), tl.latest());
+        tl.compact(5_000_000);
+        assert_eq!(back.latest(), tl.latest());
+        assert_eq!(tl.latest().decks[0].track, None);
     }
 
     #[test]

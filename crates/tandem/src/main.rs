@@ -72,6 +72,7 @@ fn main() {
         settings: arg_after("--dev-settings").map(|p| p.to_string_lossy().to_string()),
         wizard: arg_after("--dev-wizard").map(|p| p.to_string_lossy().to_string()),
         deck_check: arg_after("--dev-deck-check").map(|p| p.to_string_lossy().to_string()),
+        eject: arg_after("--dev-eject").map(|p| p.to_string_lossy().to_string()),
         crate_demo: args.iter().any(|a| a == "--dev-crate"),
         crate_step: 0,
         fitted: false,

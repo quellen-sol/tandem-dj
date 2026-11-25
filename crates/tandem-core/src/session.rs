@@ -475,6 +475,9 @@ pub struct Session {
     track_meta: HashMap<TrackId, TrackInfo>,
     tracks: HashMap<TrackId, TrackSlot>,
     loading: [Option<String>; DECKS],
+    /// Goes up when this booth ejects a deck: a track it was loading there
+    /// before that doesn't land on it.
+    ejects: [u64; DECKS],
     servable: HashMap<TrackId, PathBuf>,
     fetch_queue: VecDeque<(TrackId, Purpose)>,
     active_fetch: HashMap<TrackId, Fetch>,
@@ -574,9 +577,10 @@ pub struct Session {
     /// Things to tell the DJ (a load refused), for the UI to pick up with
     /// [`Session::take_notices`].
     notices: Vec<String>,
-    /// Loads this booth made that are still recent enough to be dropped by
-    /// a partner's earlier move arriving late: (time, seq, deck, track).
-    my_loads: Vec<(i64, u64, usize, TrackId)>,
+    /// Loads and ejects this booth made that are still recent enough to be
+    /// dropped by a partner's earlier move arriving late: (time, seq, deck,
+    /// the track it should have then).
+    my_loads: Vec<(i64, u64, usize, Option<TrackId>)>,
     weak: Weak<Mutex<Session>>,
 }
 
@@ -627,6 +631,7 @@ impl Session {
                 track_meta: HashMap::new(),
                 tracks: HashMap::new(),
                 loading: Default::default(),
+                ejects: [0; DECKS],
                 servable: HashMap::new(),
                 fetch_queue: VecDeque::new(),
                 active_fetch: HashMap::new(),
@@ -841,17 +846,17 @@ impl Session {
 
     /// Apply a local action at shared time `t` and send it to the partner.
     /// A broadcaster's actions are dropped: it only watches. So is a load
-    /// onto a deck the room can hear (the model would drop it anyway), with
-    /// a notice saying why.
+    /// onto a deck the room can hear, or ejecting it (the model would drop
+    /// them anyway), with a notice saying why.
     pub fn act_at(&mut self, a: Action, t: i64) {
         if self.is_broadcaster() {
             log::debug!("broadcasting only: ignoring {a:?}");
             return;
         }
-        if let Action::Load { deck, .. } = a {
-            if self.refuse_load(deck as usize, t) {
-                return;
-            }
+        match a {
+            Action::Load { deck, .. } if self.refuse_load(deck as usize, t) => return,
+            Action::Eject { deck } if !self.ready_to_eject(deck as usize, t) => return,
+            _ => {}
         }
         self.seq += 1;
         let ev = Event {
@@ -864,17 +869,16 @@ impl Session {
         if self.keeps_moves() {
             self.own_moves.push_back(ev.clone());
         }
-        if let Action::Load { deck, track, .. } = ev.action {
-            self.my_loads.push((t, self.seq, deck as usize, track));
-        }
+        self.my_loads.extend(my_load(&ev));
         self.after_event(&ev);
         self.send_all(Msg::Event { ev });
         self.publish();
     }
 
-    /// Tell the DJ if the room dropped one of this booth's recent loads: a
-    /// partner's move from just before it (bringing that deck's fader up,
-    /// say) arrived after it, so the deck could be heard when it landed.
+    /// Tell the DJ if the room dropped one of this booth's recent loads or
+    /// ejects: a partner's move from just before it (bringing that deck's
+    /// fader up, say) arrived after it, so the deck could be heard when it
+    /// landed.
     fn check_my_loads(&mut self) {
         // The host looks back as far as it keeps the room's history.
         let timeline = self.held.as_ref().unwrap_or(&self.timeline);
@@ -885,14 +889,17 @@ impl Session {
                 return false;
             }
             let st = timeline.state_at(t);
-            if st.decks[deck].track == Some(track) {
+            if st.decks[deck].track == track {
                 return true;
             }
-            dropped.extend(st.load_refusal(deck, t));
+            dropped.extend(match track {
+                Some(_) => st.load_refusal(deck, t),
+                None => st.eject_refusal(deck, t),
+            });
             false
         });
         for why in dropped {
-            log::debug!("Load dropped: {why}");
+            log::debug!("Load or eject dropped: {why}");
             self.notices.push(why);
         }
     }
@@ -921,11 +928,9 @@ impl Session {
         for ev in &since {
             timeline.insert_new(ev.clone());
         }
-        for e in &self.own_moves {
-            if let Action::Load { deck, track, .. } = e.action {
-                if !self.my_loads.iter().any(|l| l.1 == e.seq) {
-                    self.my_loads.push((e.time, e.seq, deck as usize, track));
-                }
+        for l in self.own_moves.iter().filter_map(my_load) {
+            if !self.my_loads.iter().any(|x| x.1 == l.1) {
+                self.my_loads.push(l);
             }
         }
         self.timeline = timeline;
@@ -1178,7 +1183,8 @@ impl Session {
         self.publish();
     }
 
-    /// What to tell the DJ since the last call: loads refused, oldest first.
+    /// What to tell the DJ since the last call: loads and ejects refused,
+    /// oldest first.
     pub fn take_notices(&mut self) -> Vec<String> {
         std::mem::take(&mut self.notices)
     }
@@ -1194,6 +1200,35 @@ impl Session {
         // Debug: the toast already says it, beside the status bar's log line.
         log::debug!("Not loading: {why}");
         self.notices.push(why);
+        true
+    }
+
+    /// This booth is ejecting deck `deck` at time `t`: whether there's an
+    /// eject to make. Not while the deck can be heard in the master, with a
+    /// notice for the DJ. Otherwise a track this booth is still getting
+    /// ready for the deck won't land on it, and an empty deck has nothing
+    /// more to eject.
+    fn ready_to_eject(&mut self, deck: usize, t: i64) -> bool {
+        let room = self.timeline.state_at(t);
+        let Some(d) = room.decks.get(deck) else {
+            return false;
+        };
+        if let Some(why) = room.eject_refusal(deck, t) {
+            log::debug!("Not ejecting: {why}");
+            self.notices.push(why);
+            return false;
+        }
+        let letter = deck_letter(deck);
+        self.ejects[deck] += 1;
+        self.pending_loads.retain(|p| p.deck != deck);
+        if let Some(name) = self.loading[deck].take() {
+            log::info!("Ejected deck {letter}: not loading {name} onto it");
+        }
+        let Some(id) = d.track else {
+            return false;
+        };
+        let name = self.track_file_name(id);
+        log::info!("Ejected {name} from deck {letter}");
         true
     }
 
@@ -1217,6 +1252,7 @@ impl Session {
             .unwrap_or_default();
         self.loading[deck] = Some(name.clone());
         log::info!("Loading {name} onto deck {}", deck_letter(deck));
+        let ejects = self.ejects[deck];
         let lib = self.library.clone();
         let weak = self.weak.clone();
         std::thread::spawn(move || {
@@ -1242,6 +1278,10 @@ impl Session {
             })();
             let Some(h) = weak.upgrade() else { return };
             let mut s = h.lock();
+            if s.ejects[deck] != ejects {
+                // Ejected meanwhile (and maybe loading another track now).
+                return;
+            }
             s.loading[deck] = None;
             match res {
                 Ok((info, audio)) => s.finish_local_load(deck, path, info, audio),
@@ -2434,7 +2474,9 @@ impl Session {
         let room = self.timeline.latest();
         for p in due {
             self.loading[p.deck] = None;
-            if room.decks[p.deck].track != p.was {
+            // (Another DJ may have ejected it: an empty deck takes the track.)
+            let now_on = room.decks[p.deck].track;
+            if now_on.is_some() && now_on != p.was {
                 let why = format!(
                     "Didn't load {} onto deck {}: another track went on it meanwhile.",
                     info.file_name,
@@ -3768,6 +3810,16 @@ fn decode_into(h: &SessionHandle, id: TrackId, path: &Path) {
     h.lock().on_decoded(id, res);
 }
 
+/// What [`Session::my_loads`] keeps of a load or an eject.
+fn my_load(ev: &Event) -> Option<(i64, u64, usize, Option<TrackId>)> {
+    let (deck, track) = match ev.action {
+        Action::Load { deck, track, .. } => (deck, Some(track)),
+        Action::Eject { deck } => (deck, None),
+        _ => return None,
+    };
+    Some((ev.time, ev.seq, deck as usize, track))
+}
+
 fn load_action(deck: usize, info: &TrackInfo) -> Action {
     Action::Load {
         deck: deck as u8,
@@ -3882,6 +3934,275 @@ mod tests {
             grid,
             key: None,
         }
+    }
+
+    /// Ejecting is refused like loading: not a deck the room can hear, with
+    /// a notice. A quiet one is emptied, and an empty one left alone.
+    #[test]
+    fn ejecting_is_refused_like_loading_and_empties_the_deck() {
+        let root = std::env::temp_dir().join(format!("tandem-eject-{}", fastrand::u64(..)));
+        let h = solo(&root);
+        {
+            let mut s = h.lock();
+            let x = info_of(1, BeatGrid::new(0.1, 120.0));
+            s.track_meta.insert(x.id, x.clone());
+            s.load_known(0, x.id);
+            s.act(Action::HotCue { deck: 0, slot: 2 });
+            s.act(Action::Play { deck: 0 });
+            let events = s.timeline.events().len();
+            s.act(Action::Eject { deck: 0 });
+            assert_eq!(s.timeline.events().len(), events, "nothing sent");
+            assert_eq!(
+                s.take_notices(),
+                ["Deck A is playing: pause it or pull its fader down to eject it."]
+            );
+            assert_eq!(s.latest().decks[0].track, Some(x.id));
+
+            // Its fader down, it goes, though it's still running.
+            s.act(Action::Volume { deck: 0, v: 0.0 });
+            s.act(Action::Eject { deck: 0 });
+            assert!(s.take_notices().is_empty());
+            let v = s.view();
+            let d = &v.decks[0];
+            assert_eq!(d.state.track, None);
+            assert!(!d.state.playing && d.state.hot_cues.iter().all(|c| c.is_none()));
+            assert!(d.meta.is_none() && d.status.is_none() && d.audio.is_none());
+            assert!(d.loading.is_none());
+            // The room still knows the track, and it goes on again with the
+            // beatgrid it was given while it was on the deck.
+            assert!(v.room_tracks.iter().any(|t| t.id == x.id));
+            s.load_known(0, x.id);
+            assert_eq!(s.latest().decks[0].grid, x.grid);
+            let edited = BeatGrid::new(0.3, 126.0);
+            s.act(Action::SetGrid {
+                deck: 0,
+                track: x.id,
+                grid: edited.map(Box::new),
+            });
+            s.act(Action::Eject { deck: 0 });
+            s.load_known(0, x.id);
+            assert_eq!(s.latest().decks[0].grid, edited);
+
+            // Nothing on it, nothing to say or send (nor on a deck there
+            // isn't).
+            s.act(Action::Eject { deck: 0 });
+            let events = s.timeline.events().len();
+            s.act(Action::Eject { deck: 0 });
+            s.act(Action::Eject { deck: 9 });
+            assert_eq!(s.timeline.events().len(), events);
+            assert!(s.take_notices().is_empty());
+        }
+        drop(h);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A track still on its way to a deck this booth ejects doesn't land on
+    /// it: one being decoded, and one from a list shared live waiting for
+    /// its file. The next one loaded does.
+    #[test]
+    fn ejecting_gives_up_a_track_on_its_way_to_the_deck() {
+        let root = std::env::temp_dir().join(format!("tandem-eject-way-{}", fastrand::u64(..)));
+        let h = solo(&root);
+        let wav = |name: &str, hz: f64| {
+            let path = root.join(name);
+            crate::audio::write_wav(&path, 44_100, &crate::audio::test_signal(44_100, 2.0, hz))
+                .unwrap();
+            path
+        };
+        let (one, two) = (wav("One.wav", 440.0), wav("Two.wav", 330.0));
+        {
+            // Held throughout, so the load can't finish before the eject.
+            let mut s = h.lock();
+            s.load_path(0, one);
+            assert_eq!(s.loading[0].as_deref(), Some("One.wav"));
+            s.act(Action::Eject { deck: 0 });
+            assert!(s.loading[0].is_none());
+            // Another deck's load isn't touched.
+            s.load_path(1, two.clone());
+            s.act(Action::Eject { deck: 0 });
+            assert_eq!(s.loading[1].as_deref(), Some("Two.wav"));
+            // Ejected, and another track asked for straight away.
+            s.load_path(0, two);
+            assert_eq!(s.loading[0].as_deref(), Some("Two.wav"));
+        }
+        let start = Instant::now();
+        loop {
+            let s = h.lock();
+            let decks = s.latest().decks;
+            let name = |d: usize| decks[d].track.map(|id| s.track_file_name(id));
+            // The room never hears of the one given up, even if it landed
+            // just before the other: well after both are decoded.
+            let heard = s.track_meta.values().any(|m| m.file_name == "One.wav");
+            assert!(!heard, "it landed");
+            if start.elapsed() > Duration::from_secs(2) && name(0).is_some() && name(1).is_some() {
+                assert_eq!(name(0).as_deref(), Some("Two.wav"));
+                assert!(s.loading.iter().all(|l| l.is_none()));
+                break;
+            }
+            drop(s);
+            assert!(start.elapsed() < Duration::from_secs(20), "never loaded");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        {
+            // Waiting for its file, with another track on the deck.
+            let mut s = h.lock();
+            let x = info_of(1, None);
+            s.load_room_track(0, x.clone());
+            assert_eq!(s.loading[0].as_deref(), Some("track1.mp3"));
+            s.act(Action::Eject { deck: 0 });
+            assert_eq!(s.latest().decks[0].track, None);
+            assert!(s.loading[0].is_none() && s.pending_loads.is_empty());
+            s.finish_pending_load(x.id, BeatGrid::new(0.1, 120.0), Some(3));
+            s.drop_failed_pending_loads();
+            assert_eq!(s.latest().decks[0].track, None);
+            assert!(s.take_notices().is_empty());
+            // What analysis found is kept all the same.
+            assert_eq!(s.track_meta[&x.id].key, Some(3));
+
+            // Refused (the deck can be heard): the load goes on too.
+            s.act(load_onto(2, 7));
+            s.act(Action::Play { deck: 2 });
+            s.loading[2] = Some("later.mp3".into());
+            s.act(Action::Eject { deck: 2 });
+            assert_eq!(s.loading[2].as_deref(), Some("later.mp3"));
+            assert_eq!(s.take_notices().len(), 1);
+        }
+        drop(h);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Another DJ ejecting the deck doesn't give up what this booth is
+    /// getting for it: it lands on the empty deck.
+    #[test]
+    fn a_waiting_load_lands_on_a_deck_another_dj_ejected() {
+        let root = std::env::temp_dir().join(format!("tandem-eject-them-{}", fastrand::u64(..)));
+        let h = solo(&root);
+        {
+            let mut s = h.lock();
+            s.act(load_onto(0, 2));
+            let x = info_of(1, None);
+            s.load_room_track(0, x.clone());
+            let ev = Event {
+                time: s.now(),
+                origin: 7,
+                seq: 1,
+                action: Action::Eject { deck: 0 },
+            };
+            s.on_control_msg(0, Msg::Event { ev });
+            assert_eq!(s.latest().decks[0].track, None);
+            assert_eq!(s.loading[0].as_deref(), Some("track1.mp3"));
+            s.finish_pending_load(x.id, BeatGrid::new(0.1, 120.0), None);
+            assert_eq!(s.latest().decks[0].track, Some(x.id));
+            assert!(s.take_notices().is_empty());
+        }
+        drop(h);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The partner brought the deck up just before this booth ejected it,
+    /// and their move arrives after: the room keeps the track, and the DJ
+    /// is told. So is one whose eject, made while cut off, the room refuses.
+    #[test]
+    fn an_eject_the_room_drops_is_reported() {
+        let root = std::env::temp_dir().join(format!("tandem-eject-race-{}", fastrand::u64(..)));
+        let h = solo(&root);
+        {
+            let mut s = h.lock();
+            let now = s.now();
+            s.act_at(load_onto(1, 1), now - 1_000_000);
+            s.act_at(Action::Volume { deck: 1, v: 0.0 }, now - 900_000);
+            s.act_at(Action::Play { deck: 1 }, now - 800_000);
+            s.act_at(Action::Eject { deck: 1 }, now - 100_000);
+            assert_eq!(s.latest().decks[1].track, None);
+            let ev = Event {
+                time: now - 200_000,
+                origin: 7,
+                seq: 1,
+                action: Action::Volume { deck: 1, v: 0.9 },
+            };
+            s.on_control_msg(0, Msg::Event { ev });
+            let d = s.latest().decks[1];
+            assert_eq!((d.track, d.playing), (Some(TrackId([1; 32])), true));
+            assert_eq!(
+                s.take_notices(),
+                ["Deck B is playing: pause it or pull its fader down to eject it."]
+            );
+            assert!(s.my_loads.iter().all(|l| l.3.is_some()), "told once");
+
+            // Cut off: the partner's deck was playing out loud by then. An
+            // eject of a deck that wasn't goes through.
+            let me = s.me.id;
+            let mine = |seq: u64, deck: u8| Event {
+                time: now - 8_000_000 + seq as i64,
+                origin: me,
+                seq: 100 + seq,
+                action: Action::Eject { deck },
+            };
+            s.own_moves = VecDeque::from([mine(1, 0), mine(2, 2)]);
+            let mut room = Timeline::new(now - 20_000_000);
+            for (seq, time, action) in [
+                (1, now - 12_000_000, load_onto(0, 2)),
+                (2, now - 12_000_000, load_onto(2, 3)),
+                (3, now - 10_000_000, Action::Play { deck: 0 }),
+            ] {
+                room.insert(Event {
+                    time,
+                    origin: 7,
+                    seq,
+                    action,
+                });
+            }
+            room.insert(mine(1, 0));
+            room.insert(mine(2, 2));
+            s.took_merged_room(room);
+            assert_eq!(
+                s.take_notices(),
+                ["Deck A is playing: pause it or pull its fader down to eject it."]
+            );
+            let decks = s.latest().decks;
+            assert_eq!(decks[0].track, Some(TrackId([2; 32])));
+            assert_eq!(decks[2].track, None);
+        }
+        drop(h);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An ejected track's audio goes the way a replaced track's does: kept
+    /// for a minute (the broadcast lane is still playing it) and for as long
+    /// as few are, then freed. One on a deck stays.
+    #[test]
+    fn an_ejected_tracks_audio_is_freed() {
+        let root = std::env::temp_dir().join(format!("tandem-eject-free-{}", fastrand::u64(..)));
+        let h = solo(&root);
+        {
+            let mut s = h.lock();
+            let id = |n: u8| TrackId([n; 32]);
+            for n in 0..8u8 {
+                let audio = TrackAudio::new(id(n), 44_100, vec![[0; 2]; 100]);
+                let slot = TrackSlot::new(TrackStatus::Ready, Some(Arc::new(audio)));
+                s.tracks.insert(id(n), slot);
+            }
+            let long_ago = s.now() - 9_000_000;
+            s.act_at(load_onto(0, 0), long_ago);
+            s.act_at(load_onto(1, 1), long_ago + 1);
+            s.act(Action::Eject { deck: 0 });
+            s.maintenance();
+            assert_eq!(s.tracks.len(), 8, "still being heard on the stream");
+            let Some(ages_ago) = Instant::now().checked_sub(Duration::from_secs(90)) else {
+                return; // the machine only just started
+            };
+            for (n, slot) in &mut s.tracks {
+                slot.last_used = ages_ago + Duration::from_secs(u64::from(n.0[0]));
+            }
+            s.maintenance();
+            assert!(!s.tracks.contains_key(&id(0)), "ejected: the oldest");
+            assert!(s.tracks.contains_key(&id(1)), "on deck B");
+            assert_eq!(s.tracks.len(), 6);
+            let snap = s.snapshot.load();
+            assert!(snap.track(Some(id(0))).is_none() && snap.track(Some(id(1))).is_some());
+        }
+        drop(h);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A track from a list shared live that nobody analysed waits for its

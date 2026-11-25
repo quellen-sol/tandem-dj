@@ -696,7 +696,7 @@ fn wanted(w: &Wizard, i: usize) -> (Vec<El>, Option<El>, String) {
         Target::Play { .. } => (vec![El::Play(s)], "PLAY".into()),
         Target::Cue { .. } | Target::BackToStart { .. } => (vec![El::Cue(s)], "CUE".into()),
         Target::Sync { .. } | Target::SyncOff { .. } => (vec![El::Sync(s)], "SYNC".into()),
-        Target::Load { .. } => (vec![El::Load(s)], "LOAD".into()),
+        Target::Load { .. } | Target::Eject { .. } => (vec![El::Load(s)], "LOAD".into()),
         Target::DeckSelect { .. } => (vec![El::Deck(s)], "DECK".into()),
         Target::Tempo { .. } | Target::TempoShift { .. } => (vec![El::Tempo(s)], "TEMPO".into()),
         Target::BendDown { .. } => (vec![El::Bend(s, false)], "BEND −".into()),

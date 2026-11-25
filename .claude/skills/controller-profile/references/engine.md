@@ -58,7 +58,7 @@ jumps), `HotCueClear { slot }`, `LoopIn`, `LoopOut`, `Reloop`,
 16, 32 beats), `Roll { size }` (hold; index into 1/16, 1/8, ¼, ½, 1, 2, 4, 8
 beats), `Tempo`, `TempoShift`, `Volume`, `Eq { band }` (0 low, 1 mid,
 2 high), `Trim`, `Filter` (0.5 is off), `Pfl` (headphone cue, toggles),
-`Jog`, `JogTouch`, `BendDown`, `BendUp` (hold), `Load`,
+`Jog`, `JogTouch`, `BendDown`, `BendUp` (hold), `Load`, `Eject`,
 `PadMode { mode }` (`HotCues`, `BeatLoops`, `Rolls`), `DeckSelect` (a
 message saying a side now plays this deck, see "Deck layers").
 
@@ -141,10 +141,10 @@ the notes file.
   is held.
 
 The SHIFT + functions Tandem has: SHIFT + CUE → `BackToStart`, SHIFT + SYNC
-→ `SyncOff`, SHIFT + hot cue pad → `HotCueClear`, SHIFT + tempo fader →
-`TempoShift` (moves the fader without the tempo, so a DJ out of travel can
-re-centre). Map these when the hardware labels agree or have no competing
-function; they are how the existing presets behave.
+→ `SyncOff`, SHIFT + LOAD → `Eject`, SHIFT + hot cue pad → `HotCueClear`,
+SHIFT + tempo fader → `TempoShift` (moves the fader without the tempo, so a
+DJ out of travel can re-centre). Map these when the hardware labels agree or
+have no competing function; they are how the existing presets behave.
 
 **Pad modes.** Do the pads send different notes in each pad mode?
 

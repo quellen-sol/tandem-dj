@@ -72,7 +72,7 @@ The design questions:
 | TEMPO fader | `B1 08` + fine `B1 28` | 14-bit; high value at the "−" (top) end | `Tempo`, inverted | confirmed (message, 14-bit); direction inferred, see Layout | [4] [6] [7] |
 | SHIFT + TEMPO fader | `B4 08` + fine `B4 28` | 14-bit | `TempoShift`, inverted | **inferred** | [8] p.15; [1] p.11 says Serato gives SHIFT + fader its own function |
 | LOAD | `91 0D` | 7F / 00 | `Load` | confirmed | [4] [5] [7] |
-| SHIFT + LOAD | `94 0D` | 7F / 00 | no Tandem control | single source | [7]; [8] p.10 |
+| SHIFT + LOAD | `94 0D` | 7F / 00 | `Eject` (since preset 14) | single source | [7], whose notes name it; [8] p.10 agrees, p.5 doesn't (see "Conflicts") |
 | LOAD held | `91 0E` | 7F / 00 | no Tandem control | inferred | [8] p.3 |
 
 ### Pads
@@ -176,6 +176,7 @@ Two sources drive an MK2's lights ([5] on Windows, [7] tested on an MK2 and an I
 - **Who lights the pad mode buttons?** The MK1 list [8] has no light message for them, and [10] says of the MK3 "handled by the controller"; but [5] sends note-ons to `91 0F` / `91 10` on the MK2 to light them. Tandem doesn't touch them. If they stay dark, the DJ can't see the pad mode (and only HOT CUE does anything in Tandem).
 - **Tempo fader direction** rests on arithmetic followed through three mappings, not on a statement or a capture (see Layout).
 - **SHIFT + TEMPO fader and SHIFT + BROWSER press** are bound from the MK1's list only. If the MK2 doesn't send them, those two functions do nothing; nothing else is affected.
+- **SHIFT + LOAD or SHIFT + headphone cue on `94 0D`?** The MK1 list [8] prints deck A's SHIFT rows on p.5 one row out: `94 0C` against SHIFT + LOOP IN held, `94 0D` against SHIFT + headphone cue, then `91 0F` and `91 10` (the pad mode buttons) against SHIFT + LOAD and SHIFT + LOAD held. Its own deck B rows (p.10) have `0C` as the headphone cue and `0D` as LOAD, as its plain rows do, and so do [7] ("LOAD and SHIFT+LOAD" on note 0x0D, tested with the MK2 and the Inpulse 500) and Mixxx's Inpulse 500 mapping (`94 0D` is LOAD). If p.5 were right after all, SHIFT + headphone cue would eject deck A: never while the room can hear it, and the track loads again.
 - **Jog ticks per turn** (248) is the MK1's figure. Ring and top may differ on the MK2 [7].
 - **MASTER and HEADPHONES knobs:** one MK2 source [4] says which is CC 0x03 and which 0x04 (the MK1 list and the MK3 mapping say the same). If they turn out swapped, swap the two bindings.
 - **Letting go with SHIFT changed.** Because SHIFT moves a button to another channel, a button pressed without SHIFT and let go with SHIFT held may send its release on the SHIFT channel. Tandem would then not see CUE or the jog touch let go until it's pressed again. Nothing found says what the unit does; the Pioneer presets have the same exposure.
@@ -207,7 +208,7 @@ Close DJUCED, Serato and any other DJ software first. Steps marked **(preset)** 
 9. SHIFT + SYNC turns sync off; SHIFT + CUE goes to the start of the track. **(preset)**
 10. Turn GAIN, HIGH, LOW and FILTER on each side and watch the knobs on screen: each should move its own. **(preset: GAIN and HIGH are the pair that might be swapped)**
 11. Move both volume faders and the crossfader end to end; crossfader left should be deck A.
-12. Turn BROWSER (clockwise moves down), press it (moves to the lists), press LOAD on each side. Then SHIFT + press BROWSER: it should go to the lists too. Say if it does nothing.
+12. Turn BROWSER (clockwise moves down), press it (moves to the lists), press LOAD on each side. Then SHIFT + press BROWSER: it should go to the lists too. Say if it does nothing. Then SHIFT + LOAD on each side: that deck (paused) goes empty and nothing loads. Load again and press SHIFT + headphone cue on the left: nothing should happen. **(preset: if that ejects deck A, or SHIFT + LOAD does nothing)**
 13. Hold SHIFT and move a TEMPO fader: the tempo should stay put. Say if it changes instead (then the unit doesn't send a separate message and that binding should go).
 14. Turn MASTER and HEADPHONES with Tandem playing through the controller: the level should change once, not twice as fast, and Settings → Controller should say the controller sets those levels itself. Tell us the sound card's name as Windows shows it in Tandem's audio settings.
 15. Lights: which of these come on by themselves and which stay dark: the HOT CUE / STEMS mode buttons (press each, and SHIFT + each), MASTER, BEATMATCH GUIDE, the green tempo-centre light? Do PLAY, CUE, SYNC and the hot cue pads go dark while SHIFT is held (expected)? Does anything stay lit after Tandem closes?

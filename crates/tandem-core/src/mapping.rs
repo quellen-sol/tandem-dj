@@ -204,6 +204,11 @@ pub enum Target {
     Load {
         deck: u8,
     },
+    /// SHIFT + LOAD: takes the track off the deck, unless the room can hear
+    /// it.
+    Eject {
+        deck: u8,
+    },
     Crossfader,
     CueMix,
     /// This booth's headphone level (never the room's).
@@ -329,6 +334,7 @@ impl Target {
             Target::BendDown { deck: d } => format!("Deck {} · Pitch bend −", deck(d)),
             Target::BendUp { deck: d } => format!("Deck {} · Pitch bend +", deck(d)),
             Target::Load { deck: d } => format!("Deck {} · Load selected track", deck(d)),
+            Target::Eject { deck: d } => format!("Deck {} · Eject", deck(d)),
             Target::Crossfader => "Crossfader".into(),
             Target::CueMix => "Headphone cue/master mix".into(),
             Target::HeadphoneLevel => "Headphone level".into(),
@@ -412,6 +418,7 @@ impl Target {
             | BendDown { deck }
             | BendUp { deck }
             | Load { deck }
+            | Eject { deck }
             | PadMode { deck, .. } => deck,
             // An FX unit works whichever deck it's pointed at.
             Crossfader
@@ -510,6 +517,7 @@ impl Target {
             | Sync { .. }
             | SyncOff { .. }
             | Load { .. }
+            | Eject { .. }
             | DeckSelect { .. } => Part::Transport,
             Tempo { .. } | TempoShift { .. } | BendDown { .. } | BendUp { .. } => Part::Tempo,
             LoopIn { .. }
@@ -576,6 +584,7 @@ impl Target {
             v.push(Target::BackToStart { deck: d });
             v.push(Target::SyncOff { deck: d });
             v.push(Target::Load { deck: d });
+            v.push(Target::Eject { deck: d });
             v.push(Target::DeckSelect { deck: d });
             v.push(Target::Tempo { deck: d });
             v.push(Target::TempoShift { deck: d });
@@ -765,6 +774,11 @@ impl Binding {
             && self.shift == other.shift
             && (self.mode.is_none() || other.mode.is_none() || self.mode == other.mode)
             && !turns
+    }
+
+    /// SHIFT + LOAD, on a controller whose SHIFT Tandem keeps track of.
+    fn is_shift_load(&self) -> bool {
+        self.shift && matches!(self.target, Target::Eject { .. })
     }
 
     /// The control, and what else it needs: "SHIFT + Note 0x0f · ch 5 (pad
@@ -1013,12 +1027,16 @@ impl Mapping {
         // Only what the DJ has on a control keeps the preset's off it: a
         // DECK button the preset binds to two decks gets both.
         let own = self.bindings.clone();
-        for b in &preset.bindings {
+        // SHIFT + LOAD goes where the DJ has LOAD (`shift_load_ejects`).
+        for b in preset.bindings.iter().filter(|b| !b.is_shift_load()) {
             let trigger_used = own.iter().any(|x| x.overlaps(b));
             if !trigger_used {
                 self.bindings.push(b.clone());
                 added += 1;
             }
+        }
+        if preset.bindings.iter().any(Binding::is_shift_load) {
+            added += self.shift_load_ejects();
         }
         for m in &preset.meters {
             if !self
@@ -1198,6 +1216,35 @@ impl Mapping {
             }
         }
         changed
+    }
+
+    /// The preset ejects with SHIFT + LOAD, and Tandem keeps track of SHIFT:
+    /// SHIFT + each LOAD button of this mapping, wherever the DJ put it,
+    /// ejects the deck it loads, unless the DJ has something on that
+    /// already. Returns how many were added.
+    fn shift_load_ejects(&mut self) -> usize {
+        let ejects: Vec<Binding> = self
+            .bindings
+            .iter()
+            .filter(|b| !b.shift)
+            .filter_map(|b| match b.target {
+                Target::Load { deck } => Some(Binding {
+                    target: Target::Eject { deck },
+                    shift: true,
+                    light: None,
+                    ..b.clone()
+                }),
+                _ => None,
+            })
+            .collect();
+        let own = self.bindings.clone();
+        let before = own.len();
+        self.bindings.extend(
+            ejects
+                .into_iter()
+                .filter(|e| !own.iter().any(|b| b.overlaps(e))),
+        );
+        self.bindings.len() - before
     }
 
     pub(crate) fn bind(&mut self, trigger: Trigger, target: Target) -> &mut Binding {
@@ -1442,14 +1489,15 @@ pub struct MidiEngine {
 
 /// Where a mapping's FX units start (decks past D work nothing).
 /// The Denon SC Live 4's built-in mapping as it was up to preset 13: decks
-/// A and B only, and no DECK buttons.
+/// A and B only, and no DECK buttons or SHIFT + LOAD.
 #[cfg(test)]
 pub(crate) fn sc_live_4_preset_13() -> Mapping {
     let mut m = builtin_preset("SC LIVE 4").unwrap();
     m.preset_version = 13;
     m.deck_displays.clear();
     m.bindings.retain(|b| {
-        !matches!(b.target, Target::DeckSelect { .. }) && b.target.deck().is_none_or(|d| d < 2)
+        !matches!(b.target, Target::DeckSelect { .. } | Target::Eject { .. })
+            && b.target.deck().is_none_or(|d| d < 2)
     });
     for b in &mut m.bindings {
         b.layered = false;
@@ -1964,6 +2012,7 @@ impl MidiEngine {
                     bend: if down { BEND } else { 0.0 },
                 })),
                 Target::Load { deck } if down => out.push(MidiOut::LoadSelected(deck)),
+                Target::Eject { deck } if down => out.push(MidiOut::Action(Action::Eject { deck })),
                 Target::BrowsePress if down => out.push(MidiOut::BrowsePress),
                 Target::BrowseBack if down => out.push(MidiOut::BrowseBack),
                 Target::PadMode { deck, mode } if down => {
@@ -2722,20 +2771,30 @@ pub fn builtin_preset(port_name: &str) -> Option<Mapping> {
     } else if n.contains("DDJ-FLX6") {
         Some(ddj_flx6(port_name))
     } else if n.contains("DDJ-FLX4") || n.contains("DDJ-400") {
-        Some(pioneer_ddj(
-            port_name,
-            "Pioneer DDJ-FLX4 / DDJ-400",
-            2,
-            720.0,
-        ))
+        Some(ddj_flx4(port_name))
     } else {
         None
     }
 }
 
+/// The DDJ-FLX4 and DDJ-400: the Pioneer DDJ layout on two decks. SHIFT +
+/// LOAD is note 0x68 for deck 1 and 0x7A for deck 2, on channel 7 (Pioneer's
+/// DDJ-400 MIDI list, and a transcription of its DDJ-FLX4 one in
+/// ElHanko/mixxx-ddj-flx4-mapping; on the FLX6 those are SHIFT + VIEW and
+/// VIEW).
+fn ddj_flx4(device: &str) -> Mapping {
+    let mut m = pioneer_ddj(device, "Pioneer DDJ-FLX4 / DDJ-400", 2, 720.0);
+    for (deck, note) in [(0, 0x68), (1, 0x7A)] {
+        m.bind(Trigger::note(6, note), Target::Eject { deck });
+    }
+    m
+}
+
 /// The DDJ-FLX6: the Pioneer DDJ layout on four decks, and its MASTER LEVEL
 /// and HEADPHONE LEVEL knobs, 14-bit CCs on channel 7 (from Pioneer's FLX6
-/// MIDI list; HEADPHONE LEVEL also recorded from one).
+/// MIDI list; HEADPHONE LEVEL also recorded from one). SHIFT + LOAD is also
+/// from the list: notes 0x58 and 0x59 on channel 7 for decks 1 and 2, but
+/// 0x60 and 0x61 for decks 3 and 4.
 ///
 /// Its DECK buttons switch a side between decks 1 and 3 (or 2 and 4), and
 /// it says which deck has the side now: note 0x3C on the deck's channel,
@@ -2746,6 +2805,9 @@ fn ddj_flx6(device: &str) -> Mapping {
     let mut m = pioneer_ddj(device, "Pioneer DDJ-FLX6", 4, 2048.0);
     m.bind(Trigger::cc(6, 0x08), Target::MasterLevel);
     m.bind(Trigger::cc(6, 0x0D), Target::HeadphoneLevel);
+    for (deck, note) in [(0, 0x58), (1, 0x59), (2, 0x60), (3, 0x61)] {
+        m.bind(Trigger::note(6, note), Target::Eject { deck });
+    }
     for deck in 0..4 {
         m.bind(Trigger::note(deck, 0x3C), Target::DeckSelect { deck });
     }
@@ -2982,6 +3044,8 @@ fn denon_sc_live_4(device: &str) -> Mapping {
         m.bind(Trigger::cc(ch, 0x1F), Target::TempoShift { deck })
             .shift = true;
         m.bind(Trigger::note(15, 0x01 + side), Target::Load { deck });
+        m.bind(Trigger::note(15, 0x01 + side), Target::Eject { deck })
+            .shift = true;
         // Loop section: IN, OUT, and pushing the loop knob makes a 4-beat
         // loop (Engine's auto loop).
         m.bind(Trigger::note(ch, 0x25), Target::LoopIn { deck })
@@ -3083,6 +3147,7 @@ fn hercules_inpulse_200_mk2(device: &str) -> Mapping {
         m.bind(Trigger::cc(shift, 0x08), Target::TempoShift { deck })
             .invert = true;
         m.bind(Trigger::note(ch, 0x0D), Target::Load { deck });
+        m.bind(Trigger::note(shift, 0x0D), Target::Eject { deck });
         // Loop section: LOOP is a 4-beat loop, on and off; ½ and X2 halve
         // and double it; with SHIFT they are IN and OUT.
         m.bind(Trigger::note(ch, 0x03), Target::BeatLoop { deck, size: 4 });
@@ -4796,9 +4861,12 @@ mod tests {
         );
         assert!(small.binding_for(Target::BrowsePress).is_some());
         // The FLX6 is the family's four-deck layout plus the two knobs, the
-        // four DECK messages and the Beat FX strip's 32.
+        // four DECK messages, SHIFT + LOAD and the Beat FX strip's 32.
         let family = pioneer_ddj("DDJ-FLX6", "Pioneer DDJ-FLX6", 4, 2048.0);
-        assert_eq!(preset.bindings.len(), family.bindings.len() + 2 + 4 + 32);
+        assert_eq!(
+            preset.bindings.len(),
+            family.bindings.len() + 2 + 4 + 4 + 32
+        );
         assert!(family.bindings.iter().all(|b| preset.bindings.contains(b)));
     }
 
@@ -5176,6 +5244,274 @@ mod tests {
         assert_eq!(made.bindings, preset.bindings);
     }
 
+    /// SHIFT + LOAD ejects from the deck that LOAD loads, and loads nothing.
+    /// On the Pioneers it's a message of its own, and not the same on each.
+    #[test]
+    fn pioneer_shift_load_ejects() {
+        let (room, local) = (RoomState::default(), LocalParams::default());
+        // FLX6: note, deck.
+        let mut e = MidiEngine::new(builtin_preset("DDJ-FLX6").unwrap(), 0.08);
+        for (note, deck) in [(0x58, 0), (0x59, 1), (0x60, 2), (0x61, 3)] {
+            assert_eq!(
+                e.handle(&[0x96, note, 0x7F], &room, &local),
+                act(Action::Eject { deck })
+            );
+            assert_eq!(e.handle(&[0x96, note, 0x00], &room, &local), []);
+            assert_eq!(
+                tap(&mut e, 0x96, 0x46 + deck),
+                [MidiOut::LoadSelected(deck)]
+            );
+        }
+        // Not 0x5A and 0x5B, nor the FLX4's (SHIFT + VIEW and VIEW here).
+        for note in [0x5A, 0x5B, 0x68, 0x7A] {
+            assert_eq!(tap(&mut e, 0x96, note), [], "{note:#x}");
+        }
+        // The decks' own 0x58 is still SYNC.
+        assert_eq!(
+            tap(&mut e, 0x92, 0x58),
+            act(Action::Sync { deck: 2, on: true })
+        );
+        // FLX4 and DDJ-400.
+        for port in ["DDJ-FLX4", "DDJ-400"] {
+            let mut e = MidiEngine::new(builtin_preset(port).unwrap(), 0.08);
+            for (note, deck) in [(0x68, 0), (0x7A, 1)] {
+                assert_eq!(tap(&mut e, 0x96, note), act(Action::Eject { deck }));
+                assert_eq!(
+                    tap(&mut e, 0x96, 0x46 + deck),
+                    [MidiOut::LoadSelected(deck)]
+                );
+            }
+            for note in [0x58, 0x59, 0x60, 0x61] {
+                assert_eq!(tap(&mut e, 0x96, note), [], "{port} {note:#x}");
+            }
+        }
+    }
+
+    /// The SC Live 4's SHIFT changes nothing it sends: SHIFT + LOAD is a
+    /// binding of its own, on whichever deck the side is on.
+    #[test]
+    fn sc_live_4_shift_load_ejects() {
+        let mut e = sc_live_4();
+        for (side, shift) in [(0u8, 0x95), (1, 0x94), (0, 0x94), (1, 0x95)] {
+            let load = 0x01 + side;
+            for deck in [side, side + 2] {
+                assert_eq!(tap(&mut e, 0x9F, load), [MidiOut::LoadSelected(deck)]);
+                send(&mut e, [shift, 0x1C, 0x7F]);
+                assert_eq!(
+                    send(&mut e, [0x9F, load, 0x7F]),
+                    act(Action::Eject { deck }),
+                    "and no load"
+                );
+                // SHIFT let go first: LOAD let go does nothing more.
+                send(&mut e, [shift, 0x1C, 0x00]);
+                assert_eq!(send(&mut e, [0x9F, load, 0x00]), []);
+                assert_eq!(tap(&mut e, 0x9F, load), [MidiOut::LoadSelected(deck)]);
+                tap(&mut e, 0x94 + side, 0x1F);
+            }
+        }
+        // LOAD held, then SHIFT: nothing until it's pressed again.
+        send(&mut e, [0x9F, 0x01, 0x7F]);
+        assert_eq!(send(&mut e, [0x94, 0x1C, 0x7F]), []);
+        assert_eq!(send(&mut e, [0x9F, 0x01, 0x00]), []);
+    }
+
+    fn ejects(m: &Mapping) -> Vec<(Trigger, u8, bool, bool)> {
+        let mut v: Vec<_> = m
+            .bindings
+            .iter()
+            .filter_map(|b| match b.target {
+                Target::Eject { deck } => Some((b.trigger, deck, b.shift, b.layered)),
+                _ => None,
+            })
+            .collect();
+        v.sort_by_key(|x| x.1);
+        v
+    }
+
+    #[test]
+    fn saved_flx6_mappings_gain_shift_load() {
+        let preset = builtin_preset("DDJ-FLX6").unwrap();
+        let eject = |b: &Binding| matches!(b.target, Target::Eject { .. });
+        let mut saved = preset.clone();
+        saved.preset_version = 13;
+        saved.bindings.retain(|b| !eject(b));
+        saved.jog_ticks_per_rev = Some(6387.0);
+        // A DJ who'd learned SHIFT + LOAD on deck 2 for something else, and
+        // moved deck 1's LOAD to BACK.
+        let mut custom = saved.clone();
+        custom.bind(Trigger::note(6, 0x59), Target::Reloop { deck: 1 });
+        custom
+            .bindings
+            .retain(|b| b.trigger != Trigger::note(6, 0x46) && b.trigger != Trigger::note(6, 0x65));
+        custom.bind(Trigger::note(6, 0x65), Target::Load { deck: 0 });
+
+        assert_eq!(saved.upgrade_from(&preset), 4);
+        assert_eq!(ejects(&saved), ejects(&preset));
+        assert_eq!(saved.preset_version, PRESET_VERSION);
+        assert_eq!(saved.jog_ticks_per_rev, Some(6387.0));
+        assert_eq!(saved.upgrade_from(&preset), 0, "only once");
+
+        custom.upgrade_from(&preset);
+        assert_eq!(
+            ejects(&custom)
+                .iter()
+                .map(|e| (e.0.number, e.1))
+                .collect::<Vec<_>>(),
+            [(0x58, 0), (0x60, 2), (0x61, 3)]
+        );
+        let mut e = MidiEngine::new(custom, 0.08);
+        assert_eq!(tap(&mut e, 0x96, 0x59), act(Action::Reloop { deck: 1 }));
+        assert_eq!(tap(&mut e, 0x96, 0x65), [MidiOut::LoadSelected(0)]);
+    }
+
+    /// Saved at preset 13, before DECK layers and SHIFT + LOAD.
+    #[test]
+    fn saved_sc_live_4_mappings_gain_shift_load() {
+        let preset = builtin_preset("SC LIVE 4").unwrap();
+        let left = Trigger::note(15, 0x01);
+        let right = Trigger::note(15, 0x02);
+        let mut plain = sc_live_4_preset_13();
+        assert!(ejects(&plain).is_empty());
+        plain.upgrade_from(&preset);
+        assert_eq!(ejects(&plain), ejects(&preset));
+        assert_eq!(
+            ejects(&preset),
+            [(left, 0), (right, 1), (left, 2), (right, 3)].map(|(t, d)| (t, d, true, true))
+        );
+
+        // Left SHIFT + LOAD in use already (learned): it's kept, for both of
+        // the side's decks, and the right side's ejects.
+        let mut custom = sc_live_4_preset_13();
+        custom.bind(left, Target::Reloop { deck: 0 }).shift = true;
+        custom.upgrade_from(&preset);
+        assert_eq!(
+            ejects(&custom),
+            [(right, 1, true, true), (right, 3, true, true)]
+        );
+        let mut e = MidiEngine::new(custom, 0.08);
+        assert_eq!(tap(&mut e, 0x9F, 0x01), [MidiOut::LoadSelected(0)]);
+        send(&mut e, [0x94, 0x1C, 0x7F]);
+        assert_eq!(tap(&mut e, 0x9F, 0x01), act(Action::Reloop { deck: 0 }));
+        assert_eq!(tap(&mut e, 0x9F, 0x02), act(Action::Eject { deck: 1 }));
+
+        // Left LOAD moved to another button, and its own one used for
+        // something else: SHIFT + LOAD is where LOAD is now, and SHIFT + the
+        // old one still does what that does.
+        let moved = Trigger::note(4, 0x06);
+        let mut custom = sc_live_4_preset_13();
+        for b in &mut custom.bindings {
+            if b.target == (Target::Load { deck: 0 }) {
+                b.trigger = moved;
+            }
+        }
+        custom.bind(left, Target::BrowseBack);
+        custom.upgrade_from(&preset);
+        assert_eq!(
+            ejects(&custom),
+            [(moved, 0), (right, 1), (moved, 2), (right, 3)].map(|(t, d)| (t, d, true, true))
+        );
+        let mut e = MidiEngine::new(custom, 0.08);
+        for deck in [0, 2] {
+            assert_eq!(tap(&mut e, 0x94, 0x06), [MidiOut::LoadSelected(deck)]);
+            send(&mut e, [0x95, 0x1C, 0x7F]);
+            assert_eq!(tap(&mut e, 0x94, 0x06), act(Action::Eject { deck }));
+            assert_eq!(tap(&mut e, 0x9F, 0x01), [MidiOut::BrowseBack]);
+            send(&mut e, [0x95, 0x1C, 0x00]);
+            tap(&mut e, 0x94, 0x1F);
+        }
+    }
+
+    #[test]
+    fn shift_load_can_be_learned() {
+        // With Tandem's SHIFT, on a side whose decks take turns: SHIFT + the
+        // LOAD button, for the deck the side is on.
+        let mut e = sc_live_4();
+        e.mapping
+            .bindings
+            .retain(|b| !matches!(b.target, Target::Eject { .. }));
+        e.learn = Some(Target::Eject { deck: 2 });
+        send(&mut e, [0x94, 0x1C, 0x7F]);
+        let out = send(&mut e, [0x9F, 0x01, 0x7F]);
+        let [MidiOut::Learned(b)] = &out[..] else {
+            panic!("{out:?}");
+        };
+        assert!(b.shift && b.layered);
+        assert_eq!(b.trigger, Trigger::note(15, 0x01));
+        assert_eq!(b.target.label(), "Deck C · Eject");
+        send(&mut e, [0x9F, 0x01, 0x00]);
+        send(&mut e, [0x94, 0x1C, 0x00]);
+        tap(&mut e, 0x94, 0x1F);
+        assert_eq!(tap(&mut e, 0x9F, 0x01), [MidiOut::LoadSelected(2)]);
+        send(&mut e, [0x94, 0x1C, 0x7F]);
+        assert_eq!(tap(&mut e, 0x9F, 0x01), act(Action::Eject { deck: 2 }));
+        // It's in the list, right after Load, in the same group.
+        let all = Target::all();
+        for deck in 0..4 {
+            let i = all
+                .iter()
+                .position(|&t| t == Target::Load { deck })
+                .unwrap();
+            assert_eq!(all[i + 1], Target::Eject { deck });
+            assert_eq!(all[i].group(), all[i + 1].group());
+        }
+    }
+
+    /// An ejected deck's lights go out, but the headphone cue's, which is
+    /// the channel's.
+    #[test]
+    fn an_ejected_decks_lights_go_out() {
+        let e = MidiEngine::new(builtin_preset("DDJ-FLX6").unwrap(), 0.08);
+        let mut room = RoomState::default();
+        let mut seq = 0;
+        let mut go = |room: &mut RoomState, t: i64, action: Action| {
+            seq += 1;
+            room.apply(&crate::model::Event {
+                time: t,
+                origin: 1,
+                seq,
+                action,
+            });
+        };
+        for (deck, n) in [(0, 1), (1, 2)] {
+            go(
+                &mut room,
+                0,
+                Action::Load {
+                    deck,
+                    track: crate::model::TrackId([n; 32]),
+                    duration: 200.0,
+                    cue: 0.0,
+                    grid: crate::grid::BeatGrid::new(0.0, 120.0).map(Box::new),
+                    key: -1,
+                },
+            );
+        }
+        go(&mut room, 0, Action::Volume { deck: 0, v: 0.0 });
+        go(&mut room, 0, Action::HotCue { deck: 0, slot: 3 });
+        go(&mut room, 0, Action::Sync { deck: 0, on: true });
+        go(&mut room, 0, Action::Play { deck: 0 });
+        go(
+            &mut room,
+            1_000_000,
+            Action::BeatLoop {
+                deck: 0,
+                beats: 4.0,
+            },
+        );
+        let mut local = LocalParams::default();
+        local.pfl[0] = true;
+        let lit = |room: &RoomState| -> Vec<(u8, u8)> {
+            e.leds(room, &local)
+                .into_iter()
+                .filter(|(key, on)| *on && (key.0 == 0x90 || key.0 == 0x97))
+                .map(|(key, _)| key)
+                .collect()
+        };
+        assert!(lit(&room).len() > 5, "{:?}", lit(&room));
+        go(&mut room, 2_000_000, Action::Eject { deck: 0 });
+        assert_eq!(lit(&room), [(0x90, 0x54)]);
+    }
+
     #[test]
     fn sc_live_4_shift() {
         let mut e = sc_live_4();
@@ -5419,11 +5755,12 @@ mod tests {
                 tap(&mut e, shift, 0x05)[0],
                 MidiOut::Action(Action::Sync { deck, on: false })
             );
+            // SHIFT + LOAD ejects.
+            assert_eq!(tap(&mut e, shift, 0x0D), act(Action::Eject { deck }));
             // SHIFT's own note does nothing, nor do SHIFT + PLAY (stutter),
-            // SHIFT + LOOP (vinyl mode), SHIFT + LOAD or SHIFT + the
-            // headphone cue.
+            // SHIFT + LOOP (vinyl mode) or SHIFT + the headphone cue.
             assert!(tap(&mut e, st, 0x04).is_empty());
-            for note in [0x07, 0x03, 0x0D, 0x0C] {
+            for note in [0x07, 0x03, 0x0C] {
                 assert!(tap(&mut e, shift, note).is_empty(), "{note:02X}");
             }
         }
@@ -5773,7 +6110,7 @@ mod tests {
                 .filter(|b| b.target.deck() == Some(d))
                 .count()
         };
-        assert_eq!((on(0), on(1), on(2), on(3)), (30, 30, 0, 0));
+        assert_eq!((on(0), on(1), on(2), on(3)), (31, 31, 0, 0));
         // No fine half (CC n + 32) of a fader is anything else's message.
         for b in &preset.bindings {
             if b.trigger.kind == MidiKind::Cc {

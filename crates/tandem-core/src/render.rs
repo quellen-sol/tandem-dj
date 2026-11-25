@@ -1445,6 +1445,83 @@ mod tests {
         assert!(max_diff < 1e-6, "lanes differ by {max_diff}");
     }
 
+    /// A deck ejected while it runs in the headphones (its fader down) is
+    /// quiet at once, without a click, with key lock and without; a lane
+    /// behind the room still plays it up to the moment it went.
+    #[test]
+    fn an_ejected_deck_goes_quiet_without_a_click() {
+        for key_lock in [true, false] {
+            let a = track();
+            let mut tl = Timeline::new(0);
+            for (i, (time, action)) in [
+                (
+                    0,
+                    Action::Load {
+                        deck: 0,
+                        track: a.id,
+                        duration: a.duration(),
+                        cue: 0.0,
+                        grid: None,
+                        key: -1,
+                    },
+                ),
+                (
+                    0,
+                    Action::KeyLock {
+                        deck: 0,
+                        on: key_lock,
+                    },
+                ),
+                (0, Action::Volume { deck: 0, v: 0.0 }),
+                (100_000, Action::Play { deck: 0 }),
+                (900_000, Action::Eject { deck: 0 }),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                tl.insert(fx_ev(time, 1 + i as u64, action));
+            }
+            let mut snap = snap_with(tl, a);
+            snap.local.pfl[0] = true;
+            snap.local.cue_mix = 0.0;
+            let phones = |delay_us: i64| -> Vec<f32> {
+                let mut lane = Lane::new(48_000.0, delay_us, LaneKind::Live);
+                let n = 480;
+                let (mut m, mut c) = (vec![0.0; n * 2], vec![0.0; n * 2]);
+                let mut out = Vec::new();
+                for i in 0..120i64 {
+                    lane.render(&snap, delay_us + i * 10_000, &mut m, &mut c);
+                    out.extend(c.iter().step_by(2));
+                }
+                out
+            };
+            let live = phones(0);
+            let at = |ms: usize| ms * 48;
+            let peak =
+                |r: std::ops::Range<usize>| live[r].iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let step = |r: std::ops::Range<usize>| {
+                live[r]
+                    .windows(2)
+                    .map(|w| (w[1] - w[0]).abs())
+                    .fold(0.0, f32::max)
+            };
+            assert!(peak(at(600)..at(890)) > 0.1, "key lock {key_lock}: silence");
+            let (before, after) = (step(at(600)..at(890)), step(at(890)..at(960)));
+            assert!(
+                after < before * 2.0,
+                "key lock {key_lock}: a click, {after} after {before}"
+            );
+            assert!(peak(at(960)..at(1200)) < 1e-3, "key lock {key_lock}");
+            let late = phones(500_000);
+            let diff = live
+                .iter()
+                .zip(&late)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0, f32::max);
+            assert!(diff < 1e-6, "key lock {key_lock}: lanes differ by {diff}");
+        }
+    }
+
     /// Render `secs` of the master from shared time `t0` through a fresh
     /// lane at 48 kHz, in 480-frame callbacks.
     fn master(snap: &AudioSnapshot, delay_us: i64, t0: i64, secs: f64) -> Vec<f32> {
