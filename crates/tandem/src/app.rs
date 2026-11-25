@@ -1555,14 +1555,8 @@ impl TandemApp {
                 });
                 s.act(Action::Sync { deck: 1, on: true });
                 s.act(Action::Play { deck: 1 });
-                let room = s.latest();
-                if let (k, Some(t)) = (room.decks[1].key, room.decks[0].sounding_key()) {
-                    if k >= 0 {
-                        s.act(Action::KeyShift {
-                            deck: 1,
-                            semitones: tandem_core::keys::match_shift(k, t),
-                        });
-                    }
+                if let Some(semitones) = s.latest().key_match(1) {
+                    s.act(Action::KeyShift { deck: 1, semitones });
                 }
                 s.act(Action::Crossfader { v: 0.25 });
                 s.act(Action::BeatLoop {

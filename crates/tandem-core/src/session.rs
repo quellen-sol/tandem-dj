@@ -3633,8 +3633,9 @@ impl Session {
     /// Keep synced decks locked through tempo changes in their grids. When
     /// a playing deck is about to reach a marker where its tempo changes,
     /// schedule a Relock for the exact moment; if one was missed (the deck
-    /// sped up, say), relock as soon as we notice. Relocks are harmless
-    /// when not needed, so only the host (or a booth on its own) sends them.
+    /// sped up, say), relock as soon as we notice. One also hands over a
+    /// sync master that has run out. Relocks are harmless when not needed,
+    /// so only the host (or a booth on its own) sends them.
     fn follow_grid_tempos(&mut self, now: i64) {
         let room = self.timeline.state_at(now);
         self.relocks.retain(|&(_, t)| t > now - 1_000_000);
@@ -3643,7 +3644,7 @@ impl Session {
             let d = &room.decks[c];
             let watched = (d.track, d.gen, d.bpm_at(now));
             let prev = std::mem::replace(&mut self.grid_watch[c], watched);
-            if quiet || !room.in_sync_group(c) || !d.playing {
+            if quiet || !d.synced || !d.playing {
                 continue;
             }
             let deck = c as u8;
@@ -3662,6 +3663,9 @@ impl Session {
                     self.act_at(Action::Relock { deck }, at);
                 }
             }
+        }
+        if let Some(deck) = room.master.filter(|_| !quiet && room.master_due(now)) {
+            self.act_at(Action::Relock { deck }, now);
         }
     }
 
@@ -3964,6 +3968,39 @@ mod tests {
             s.act(load(2));
             assert!(s.take_notices().is_empty());
             assert_eq!(s.view().room.decks[0].track, Some(TrackId([2; 32])));
+        }
+        drop(h);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The sync master runs off the end of its track while another deck
+    /// plays: the maintenance tick hands it over, once, without anybody
+    /// doing anything.
+    #[test]
+    fn a_master_that_runs_out_is_handed_over() {
+        let root = std::env::temp_dir().join(format!("tandem-out-{}", fastrand::u64(..)));
+        let h = solo(&root);
+        {
+            let mut s = h.lock();
+            let now = s.now();
+            for deck in [0u8, 1] {
+                let load = Action::Load {
+                    deck,
+                    track: TrackId([deck + 1; 32]),
+                    duration: if deck == 0 { 1.0 } else { 300.0 },
+                    cue: 0.0,
+                    grid: BeatGrid::new(0.0, 120.0).map(Box::new),
+                    key: -1,
+                };
+                s.act_at(load, now - 2_000_000);
+                s.act_at(Action::Play { deck }, now - 1_900_000);
+            }
+            assert_eq!(s.latest().master, Some(0));
+            let events = s.timeline.events().len();
+            s.maintenance();
+            s.maintenance();
+            assert_eq!(s.latest().master, Some(1));
+            assert_eq!(s.timeline.events().len(), events + 1);
         }
         drop(h);
         let _ = std::fs::remove_dir_all(&root);

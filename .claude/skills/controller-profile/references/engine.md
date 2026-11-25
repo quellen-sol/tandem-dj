@@ -52,7 +52,8 @@ Decks are 0–3 (A–D). A and C sit on the crossfader's left.
 ## Controls Tandem has
 
 Per deck: `Play` (toggles on press), `Cue` (hold), `BackToStart`, `Sync`
-(toggles), `SyncOff`, `HotCue { slot 0–7 }` (hold: sets when empty, else
+(toggles), `SyncOff`, `SyncMaster` (makes the deck the sync master; not
+`MasterLevel`), `HotCue { slot 0–7 }` (hold: sets when empty, else
 jumps), `HotCueClear { slot }`, `LoopIn`, `LoopOut`, `Reloop`,
 `LoopHalve`, `LoopDouble`, `BeatLoop { size }` (index into ¼, ½, 1, 2, 4, 8,
 16, 32 beats), `Roll { size }` (hold; index into 1/16, 1/8, ¼, ½, 1, 2, 4, 8
@@ -212,7 +213,7 @@ these hold:
 
 - its trigger is a **note** (a CC button gets no light);
 - it isn't a software SHIFT binding;
-- its target has a state: `Play`, `Cue`, `Sync`, `Pfl`, `HotCue`, `LoopIn`,
+- its target has a state: `Play`, `Cue`, `Sync`, `SyncMaster`, `Pfl`, `HotCue`, `LoopIn`,
   `LoopOut`, `Reloop`, `BeatLoop`, `Roll`, `PadMode`, `Shift`, `FxOn`.
 
 The message is a note-on to **the binding's own channel and note**, with the

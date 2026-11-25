@@ -563,6 +563,12 @@ impl Plan<'_> {
             self.step(Cue { deck }, Ask::Press, "Press CUE", "");
             self.step(Sync { deck }, Ask::Press, "Press SYNC", "");
             self.step(
+                SyncMaster { deck },
+                Ask::Press,
+                "Press MASTER, near SYNC",
+                "Makes this deck the one the synced decks follow. It's not the MASTER level knob: skip this if the deck has no such button.",
+            );
+            self.step(
                 BackToStart { deck },
                 Ask::ShiftPress,
                 "Hold SHIFT and press CUE",
@@ -2942,9 +2948,15 @@ mod tests {
         // No SHIFT mapped: the same note as CUE can't be SHIFT + CUE.
         let mut w = transport();
         let mut t = 0;
-        for note in [0x0B, 0x0C, 0x58] {
+        for note in [0x0B, 0x0C, 0x58, 0x5C] {
             press(&mut w, &mut t, 0, note);
         }
+        assert_eq!(
+            w.draft()
+                .binding_for(Target::SyncMaster { deck: 0 })
+                .map(|b| b.trigger),
+            Some(Trigger::note(0, 0x5C))
+        );
         assert_eq!(w.step().unwrap().target, Target::BackToStart { deck: 0 });
         press(&mut w, &mut t, 0, 0x0C);
         let said = w.said().unwrap();
@@ -2970,7 +2982,7 @@ mod tests {
         let mut w = Wizard::new(Mapping::empty("test"), setup);
         press(&mut w, &mut t, 0, 0x1C);
         w.skip();
-        for note in [0x0B, 0x0C, 0x58] {
+        for note in [0x0B, 0x0C, 0x58, 0x5C] {
             press(&mut w, &mut t, 0, note);
         }
         press(&mut w, &mut t, 0, 0x0C);
@@ -3097,14 +3109,14 @@ mod tests {
         // The rest of the group, then deck B's.
         w.skip_group();
         assert_eq!(w.step().unwrap().target, Target::Play { deck: 1 });
-        assert_eq!(w.group_progress(1), (1, 7));
+        assert_eq!(w.group_progress(1), (1, 8));
         // Jumping to a group lands on what it still lacks.
         w.jump(1);
         assert_eq!(w.step().unwrap().target, Target::Cue { deck: 0 });
         w.jump(2);
         w.skip_group();
         assert_eq!(w.at(), None);
-        assert_eq!(w.progress(), (1, 16));
+        assert_eq!(w.progress(), (1, 18));
     }
 
     #[test]
@@ -3126,8 +3138,10 @@ mod tests {
         assert_eq!(
             asked,
             [
+                Target::SyncMaster { deck: 0 },
                 Target::BendDown { deck: 0 },
                 Target::BendUp { deck: 0 },
+                Target::SyncMaster { deck: 1 },
                 Target::BendDown { deck: 1 },
                 Target::BendUp { deck: 1 },
                 Target::HeadphoneLevel,
@@ -3137,7 +3151,7 @@ mod tests {
         // Not SHIFT or the pad mode buttons: no step is left that would
         // use them.
         assert_eq!(w.steps[0].state, State::Skipped);
-        assert_eq!(w.step().unwrap().target, Target::BendDown { deck: 0 });
+        assert_eq!(w.step().unwrap().target, Target::SyncMaster { deck: 0 });
         let (_, refused) = demo.run(&mut w, 0);
         assert!(refused.is_empty());
         assert!(!w.changed());

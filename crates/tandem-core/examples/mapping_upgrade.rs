@@ -51,6 +51,14 @@ fn main() {
                 new.target.label()
             );
         }
+        if old.trigger != new.trigger {
+            println!(
+                "  ~ {}: {} -> {}",
+                new.target.label(),
+                old.trigger.label(),
+                new.trigger.label()
+            );
+        }
     }
     for b in &m.bindings[before.len()..] {
         println!("  + {} -> {}", b.label(), b.target.label());

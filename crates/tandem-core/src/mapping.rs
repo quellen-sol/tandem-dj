@@ -117,6 +117,11 @@ pub enum Target {
     SyncOff {
         deck: u8,
     },
+    /// MASTER: the deck becomes the sync master. Lit on the master. (Not
+    /// the master output's level: that's [`Target::MasterLevel`].)
+    SyncMaster {
+        deck: u8,
+    },
     HotCue {
         deck: u8,
         slot: u8,
@@ -292,6 +297,7 @@ impl Target {
             Target::SyncOff { deck: d } => {
                 format!("Deck {} · Sync off (back to tempo fader)", deck(d))
             }
+            Target::SyncMaster { deck: d } => format!("Deck {} · MASTER (sync)", deck(d)),
             Target::HotCue { deck: d, slot } => format!("Deck {} · Hot cue {}", deck(d), slot + 1),
             Target::HotCueClear { deck: d, slot } => {
                 format!("Deck {} · Clear hot cue {}", deck(d), slot + 1)
@@ -396,6 +402,7 @@ impl Target {
             | BackToStart { deck }
             | Sync { deck }
             | SyncOff { deck }
+            | SyncMaster { deck }
             | HotCue { deck, .. }
             | HotCueClear { deck, .. }
             | LoopIn { deck }
@@ -516,6 +523,7 @@ impl Target {
             | BackToStart { .. }
             | Sync { .. }
             | SyncOff { .. }
+            | SyncMaster { .. }
             | Load { .. }
             | Eject { .. }
             | DeckSelect { .. } => Part::Transport,
@@ -581,6 +589,7 @@ impl Target {
             v.push(Target::Play { deck: d });
             v.push(Target::Cue { deck: d });
             v.push(Target::Sync { deck: d });
+            v.push(Target::SyncMaster { deck: d });
             v.push(Target::BackToStart { deck: d });
             v.push(Target::SyncOff { deck: d });
             v.push(Target::Load { deck: d });
@@ -975,6 +984,9 @@ pub const PRESET_VERSION: u32 = 14;
 /// The first preset version whose decks can take turns on a side's controls
 /// (see [`Binding::layered`]): the Denon SC Live 4's.
 const FIRST_LAYERED_PRESET: u32 = 14;
+/// The first preset version that tells the DDJ-FLX6's SHIFT + SYNC from its
+/// SHIFT + MASTER.
+const FIRST_FLX6_MASTER_PRESET: u32 = 14;
 /// The first preset version with effects: older mappings start their FX
 /// units where the preset says.
 const FIRST_FX_PRESET: u32 = 13;
@@ -1018,6 +1030,9 @@ impl Mapping {
             return 0;
         }
         let mut added = 0;
+        if self.preset_version < FIRST_FLX6_MASTER_PRESET {
+            added += self.move_flx6_shift_sync(preset);
+        }
         if self.preset_version <= LAST_TWO_DECK_PRESET {
             added += self.unfold_decks(preset);
         }
@@ -1149,6 +1164,37 @@ impl Mapping {
             };
             if new >= 2 && old == new - 2 && b.target.with_deck(new) == p.target {
                 b.target = p.target;
+                moved += 1;
+            }
+        }
+        moved
+    }
+
+    /// The DDJ-FLX6's preset had SHIFT + SYNC on the note its SHIFT + MASTER
+    /// sends. Move each of those bindings to the right note, if it's still
+    /// exactly the preset's and the DJ has nothing on that note. Returns how
+    /// many moved.
+    fn move_flx6_shift_sync(&mut self, preset: &Mapping) -> usize {
+        let mut moved = 0;
+        for p in &preset.bindings {
+            if p.trigger.number != FLX6_SHIFT_SYNC || !matches!(p.target, Target::SyncOff { .. }) {
+                continue;
+            }
+            // Up to preset 6, decks 3 and 4 drove A and B.
+            let was = |b: &Binding| {
+                let mut old = p.clone();
+                old.trigger.number = FLX6_SHIFT_MASTER;
+                let two = self.preset_version <= LAST_TWO_DECK_PRESET;
+                if let Some(d) = p.target.deck().filter(|&d| two && d >= 2) {
+                    old.target = p.target.with_deck(d - 2);
+                }
+                *b == old
+            };
+            if self.bindings.iter().any(|b| b.overlaps(p)) {
+                continue;
+            }
+            if let Some(i) = self.bindings.iter().position(was) {
+                self.bindings[i].trigger = p.trigger;
                 moved += 1;
             }
         }
@@ -1423,9 +1469,10 @@ struct Takeover {
     /// tempo fader's after a DECK button gave it this deck back, an effect
     /// knob's after FX SELECT moved onto its slot.
     relearn: u8,
-    /// Effect knobs: the last relearned reading was a coarse half, so a
-    /// fine half straight after it is part of it. (Right after connecting,
-    /// a 14-bit knob isn't known to be one until its first fine half.)
+    /// Tempo faders and effect knobs: the last relearned reading was a
+    /// coarse half, so a fine half straight after it is part of it. (Right
+    /// after connecting, a 14-bit fader or knob isn't known to be one until
+    /// its first fine half.)
     relearn_fine: bool,
 }
 
@@ -1941,6 +1988,9 @@ impl MidiEngine {
                         t.last_sent = t.last_hw;
                     }
                 }
+                Target::SyncMaster { deck } if down => {
+                    out.push(MidiOut::Action(Action::Master { deck }))
+                }
                 Target::DeckSelect { deck } if down => self.deck_selected(deck),
                 Target::HotCue { deck, slot } => out.push(MidiOut::Action(if down {
                     Action::HotCue { deck, slot }
@@ -2269,8 +2319,9 @@ impl MidiEngine {
                         continue;
                     }
                     let v = if b.invert { 1.0 - v } else { v };
+                    let fine = raw7.is_none() && trig.kind == MidiKind::Cc;
                     if let Target::Tempo { deck } = b.target {
-                        if let Some(tempo) = self.tempo_fader(deck, v, room) {
+                        if let Some(tempo) = self.tempo_fader(deck, v, fine, room) {
                             out.push(MidiOut::Action(Action::Tempo { deck, tempo }));
                         }
                         continue;
@@ -2286,7 +2337,6 @@ impl MidiEngine {
                         }
                         continue;
                     }
-                    let fine = raw7.is_none() && trig.kind == MidiKind::Cc;
                     match b.target {
                         Target::FxDepth { unit, slot } => {
                             self.fx_depth(unit, slot, v, fine, room, out);
@@ -2325,16 +2375,17 @@ impl MidiEngine {
         }
     }
 
-    /// The tempo fader at `v` (0..1). It responds at once, never waits for
-    /// pickup and never makes the tempo jump:
+    /// The tempo fader at `v` (0..1; `fine`: the fine half of a 14-bit
+    /// fader). It responds at once, never waits for pickup and never makes
+    /// the tempo jump:
     ///
     /// - While the deck's tempo is where the fader says, the fader sets it
     ///   directly.
-    /// - When they disagree (SYNC changed the tempo, the other deck's fader
-    ///   carried it, your partner moved it, or you moved the fader with
-    ///   SHIFT held), moving the fader changes the tempo by exactly as much
-    ///   as the fader moved, from wherever the deck is. SHIFT + SYNC puts
-    ///   the deck back on the fader.
+    /// - When they disagree (SYNC changed the tempo, SYNC off put it back to
+    ///   0%, the other deck's fader carried it, your partner moved it, or
+    ///   you moved the fader with SHIFT held), moving the fader changes the
+    ///   tempo by exactly as much as the fader moved, from wherever the deck
+    ///   is. SHIFT + SYNC puts the deck back on the fader.
     ///
     /// So a DJ who runs out of travel can SHIFT-move the fader back and keep
     /// going the same way, as far as the room's limit (±50%), past the
@@ -2346,24 +2397,31 @@ impl MidiEngine {
     /// where the fader is, or the tempo stopped at the limit and the fader
     /// caught up.
     ///
-    /// A deck nobody has touched (tempo 0%) takes the fader's position
-    /// straight away, like the other controls.
+    /// A deck whose tempo nobody has set, by hand or with SYNC, takes the
+    /// fader's position straight away, like the other controls. On any
+    /// other deck, a fader not heard from before has to say where it is
+    /// first (both halves, on a 14-bit fader).
     ///
     /// On a four-deck controller, one fader drives decks 1 and 3 (or 2 and
     /// 4). After its DECK button switches back, the fader may be anywhere:
     /// the first reading (both halves, on a 14-bit fader) only says where it
     /// is, and from there it works as above. So switching decks never makes
     /// a tempo jump, and the deck is usually off the fader afterwards.
-    fn tempo_fader(&mut self, deck: u8, v: f32, room: &RoomState) -> Option<f64> {
+    fn tempo_fader(&mut self, deck: u8, v: f32, fine: bool, room: &RoomState) -> Option<f64> {
         /// Closer than this (0.05%) counts as "on the fader".
         const MATCH: f64 = 0.0005;
         let range = self.tempo_range;
         let at = |v: f32| 1.0 + (v as f64 - 0.5) * 2.0 * range;
-        let current = room.decks.get(deck as usize)?.tempo;
+        let d = room.decks.get(deck as usize)?;
+        let current = d.tempo;
         let t = self.tempo_takeover(deck);
         let prev = t.last_hw.replace(v);
         if t.relearn > 0 {
             t.relearn -= 1;
+            t.relearn_fine = t.relearn == 0 && !fine;
+            return None;
+        }
+        if std::mem::take(&mut t.relearn_fine) && fine {
             return None;
         }
         let past_limit = std::mem::take(&mut t.past_limit);
@@ -2374,8 +2432,11 @@ impl MidiEngine {
             // already there or nobody has touched the deck; otherwise we
             // only learn where it is.
             None if (hw - current).abs() < MATCH => hw,
-            None if t.last_sent.is_none() && (current - 1.0).abs() < 1e-9 => hw,
-            None => return None,
+            None if t.last_sent.is_none() && !d.tempo_set && (current - 1.0).abs() < 1e-9 => hw,
+            None => {
+                t.relearn_fine = !fine;
+                return None;
+            }
             Some(p) => {
                 // Held at the limit, the fader may run on past it by up to
                 // one coarse step (1/128 of its travel), taken up first on
@@ -2620,6 +2681,7 @@ impl MidiEngine {
                 room.decks[deck as usize].hot_cues[slot as usize].is_some()
             }
             Target::Sync { deck } => room.decks[deck as usize].synced,
+            Target::SyncMaster { deck } => room.master == Some(deck),
             Target::Pfl { deck } => local.pfl[deck as usize],
             // Lit while looping; LOOP IN also while it waits for LOOP OUT.
             Target::LoopIn { deck } => {
@@ -2771,7 +2833,17 @@ pub fn builtin_preset(port_name: &str) -> Option<Mapping> {
     } else if n.contains("DDJ-FLX6") {
         Some(ddj_flx6(port_name))
     } else if n.contains("DDJ-FLX4") || n.contains("DDJ-400") {
-        Some(ddj_flx4(port_name))
+        let mut m = ddj_flx4(port_name);
+        if n.contains("DDJ-400") {
+            // Holding BEAT SYNC sends a message of its own, and a short
+            // press sends its one only when it's let go, so holding it never
+            // presses SYNC first (Pioneer's DDJ-400 list). The FLX4 sends
+            // 0x5C too, but no list says when it sends 0x58: left alone.
+            for deck in 0..2 {
+                m.bind(Trigger::note(deck, 0x5C), Target::SyncMaster { deck });
+            }
+        }
+        Some(m)
     } else {
         None
     }
@@ -2800,9 +2872,21 @@ fn ddj_flx4(device: &str) -> Mapping {
 /// it says which deck has the side now: note 0x3C on the deck's channel,
 /// on (127) for the deck it switched to and off for the other one (from
 /// the MIDI list). It doesn't say where the tempo fader is.
+///
+/// It has a MASTER button of its own (note 0x5C on the deck's channel), and
+/// SHIFT + BEAT SYNC is 0x5D: 0x60, SHIFT + BEAT SYNC on the two-deck
+/// models, is SHIFT + MASTER here (from the MIDI list), and left alone.
 fn ddj_flx6(device: &str) -> Mapping {
     // Large jogs: same resolution as the DDJ-SX family until calibrated.
     let mut m = pioneer_ddj(device, "Pioneer DDJ-FLX6", 4, 2048.0);
+    for b in &mut m.bindings {
+        if matches!(b.target, Target::SyncOff { .. }) {
+            b.trigger.number = FLX6_SHIFT_SYNC;
+        }
+    }
+    for deck in 0..4 {
+        m.bind(Trigger::note(deck, 0x5C), Target::SyncMaster { deck });
+    }
     m.bind(Trigger::cc(6, 0x08), Target::MasterLevel);
     m.bind(Trigger::cc(6, 0x0D), Target::HeadphoneLevel);
     for (deck, note) in [(0, 0x58), (1, 0x59), (2, 0x60), (3, 0x61)] {
@@ -2814,6 +2898,11 @@ fn ddj_flx6(device: &str) -> Mapping {
     flx6_beat_fx(&mut m);
     m
 }
+
+/// The DDJ-FLX6's SHIFT + BEAT SYNC, and what its preset had it on before
+/// preset 14: SHIFT + MASTER.
+const FLX6_SHIFT_SYNC: u8 = 0x5D;
+const FLX6_SHIFT_MASTER: u8 = 0x60;
 
 /// The DDJ-FLX6's BEAT FX values for its BEATS lights (CC 0x64), for each
 /// of [`FX_BEATS`]: 1/16 and 1/8 blink the 1/4 light, 3/4 is 0x21 (not in
@@ -3728,11 +3817,13 @@ mod tests {
         drive(&mut e, &mut room, &[[0xb0, 0x00, 64], [0xb0, 0x20, 0]]);
         assert!((room.decks[0].tempo - (a_before - 0.01)).abs() < 0.0002);
 
-        // SYNC off (plain SYNC press): tempo stays, the fader keeps working relatively.
+        // SYNC off (plain SYNC press): back to the track's own BPM, whatever
+        // the fader says, and B keeps the tempo it was carried to.
+        let b_before = room.decks[1].tempo;
         drive(&mut e, &mut room, &[[0x90, 0x58, 127]]);
-        assert!(!room.decks[0].synced);
+        assert!(!room.decks[0].synced && !room.decks[1].synced);
         let kept = room.decks[0].tempo;
-        assert!((kept - 1.0).abs() > 0.05);
+        assert_eq!((kept, room.decks[1].tempo), (1.0, b_before));
         drive(
             &mut e,
             &mut room,
@@ -3974,8 +4065,291 @@ mod tests {
         assert!((room.decks[0].tempo - (a + at(14000) - at(first))).abs() < 1e-6);
         assert_eq!(room.decks[2].tempo, c[9], "deck C stays put");
         // The fader position is known again: SHIFT + SYNC puts A on it.
-        drive(&mut e, &mut room, &[[0x90, 0x60, 127]]);
+        drive(&mut e, &mut room, &[[0x90, 0x5D, 127]]);
         assert!((room.decks[0].tempo - at(14000)).abs() < 1e-6);
+    }
+
+    /// Something a DJ at another booth did.
+    fn partner(room: &mut RoomState, action: Action) {
+        room.apply(&crate::model::Event {
+            time: 900_000,
+            origin: 2,
+            seq: 1,
+            action,
+        });
+    }
+
+    /// SYNC on and off again on deck A, by the partner.
+    fn sync_and_off(room: &mut RoomState) {
+        partner(room, Action::Sync { deck: 0, on: true });
+        assert!(room.decks[0].synced && room.decks[1].synced);
+        partner(room, Action::Sync { deck: 0, on: false });
+        assert!(!room.decks[0].synced && !room.decks[1].synced);
+        assert_eq!(room.decks[0].tempo, 1.0);
+    }
+
+    /// How far (in tempo) a 14-bit fader moves between two positions.
+    fn travel(from: u16, to: u16) -> f64 {
+        (to as f64 - from as f64) / 16383.0 * 0.16
+    }
+
+    /// +3% and +4% on an 8% tempo fader.
+    const PLUS_3: u16 = 11264;
+    const PLUS_4: u16 = 12288;
+
+    #[test]
+    fn after_sync_off_the_fader_moves_the_tempo_by_as_much_as_it_moves() {
+        // The fader on A at +3%, A synced, SYNC off: A plays at 0%, and
+        // pushing the fader up 1% from +3% gives +1%.
+        let mut e = MidiEngine::new(builtin_preset("DDJ-FLX6").unwrap(), 0.08);
+        let mut room = two_decks(&mut e);
+        drive(&mut e, &mut room, &fader(0, 0x00, CENTRE, PLUS_3, 10));
+        assert!((room.decks[0].tempo - 1.03).abs() < 1e-4, "on the fader");
+        drive(&mut e, &mut room, &[[0x90, 0x58, 127], [0x90, 0x58, 0]]);
+        assert!(room.decks[0].synced && room.decks[1].synced);
+        assert!((room.decks[0].tempo - 115.0 / 128.0).abs() < 1e-4);
+        drive(&mut e, &mut room, &[[0x90, 0x58, 127], [0x90, 0x58, 0]]);
+        assert_eq!(room.decks[0].tempo, 1.0, "irrespective of the fader");
+        let up = tempo_after_pairs(&mut e, &mut room, 0, &fader(0, 0x00, PLUS_3, PLUS_4, 8));
+        assert!(
+            up.windows(2).all(|w| w[1] > w[0] && w[1] - w[0] < 0.002) && up[0] < 1.002,
+            "{up:?}"
+        );
+        assert!((room.decks[0].tempo - 1.0 - travel(PLUS_3, PLUS_4)).abs() < 1e-9);
+        // All the way down: no jump onto the fader on the way past 0%.
+        let down = tempo_after_pairs(&mut e, &mut room, 0, &fader(0, 0x00, PLUS_4, BOTTOM, 60));
+        assert!(down.windows(2).all(|w| w[1] < w[0] && w[0] - w[1] < 0.003));
+        assert!((room.decks[0].tempo - 1.0 - travel(PLUS_3, BOTTOM)).abs() < 1e-9);
+
+        // With the fader exactly on 0% it's on the fader, as ever.
+        let mut room = two_decks(&mut e);
+        sync_and_off(&mut room);
+        drive(&mut e, &mut room, &fader(0, 0x00, CENTRE, PLUS_3, 10));
+        assert!((room.decks[0].tempo - 1.0 - travel(CENTRE, PLUS_3)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn a_fader_not_heard_from_yet_doesnt_make_the_tempo_jump_after_sync_off() {
+        let room = || {
+            let mut e = MidiEngine::new(Mapping::empty("test"), 0.08);
+            let mut room = two_decks(&mut e);
+            room.decks[0].tempo = 1.0;
+            room
+        };
+        // A deck nobody has touched takes the fader where it is.
+        let mut e = MidiEngine::new(builtin_preset("DDJ-FLX6").unwrap(), 0.08);
+        let mut untouched = room();
+        drive(&mut e, &mut untouched, &fader(0, 0x00, PLUS_3, PLUS_3, 1));
+        assert!((untouched.decks[0].tempo - 1.03).abs() < 1e-4);
+
+        for same_bpm in [false, true] {
+            // Synced and off again (even if it never changed the tempo): the
+            // first reading, coarse half and fine half, only says where the
+            // fader is.
+            let mut e = MidiEngine::new(builtin_preset("DDJ-FLX6").unwrap(), 0.08);
+            let mut room = room();
+            if same_bpm {
+                room.decks[1].grid = room.decks[0].grid;
+            }
+            sync_and_off(&mut room);
+            // 0x2A40 has a fine half of its own: 0x40.
+            let first = fader(0, 0x00, 0x2A40, 0x2A40, 1);
+            assert!(drive(&mut e, &mut room, &first).is_empty());
+            assert_eq!(room.decks[0].tempo, 1.0);
+            assert!((e.hardware_tempo(0).unwrap() - 1.0 - travel(CENTRE, 0x2A40)).abs() < 1e-4);
+            drive(&mut e, &mut room, &fader(0, 0x00, 0x2A40, 0x3000, 4));
+            assert!((room.decks[0].tempo - 1.0 - travel(0x2A40, 0x3000)).abs() < 1e-9);
+        }
+
+        // The same from a 7-bit fader (the SC Live 4's pitch fader).
+        let mut e = MidiEngine::new(builtin_preset("SC LIVE 4").unwrap(), 0.08);
+        let mut seven = room();
+        sync_and_off(&mut seven);
+        assert!(drive(&mut e, &mut seven, &[[0xB4, 0x1F, 90]]).is_empty());
+        drive(&mut e, &mut seven, &[[0xB4, 0x1F, 91], [0xB4, 0x1F, 92]]);
+        assert!((seven.decks[0].tempo - 1.0 - 2.0 / 127.0 * 0.16).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_deck_switch_after_sync_off_doesnt_make_the_tempo_jump() {
+        let left = |deck: u8| [[0x90 | deck, 0x3C, 0x7F], [0x90 | (deck ^ 2), 0x3C, 0x00]];
+        for heard in [true, false] {
+            // `heard`: A's fader had been at -4% before. Either way the
+            // fader goes up to +4% driving deck C, with SYNC on and off on
+            // deck A meanwhile.
+            let mut e = MidiEngine::new(builtin_preset("DDJ-FLX6").unwrap(), 0.08);
+            let mut room = two_decks(&mut MidiEngine::new(Mapping::empty("test"), 0.08));
+            if heard {
+                drive(&mut e, &mut room, &fader(0, 0x00, CENTRE, 4096, 10));
+            }
+            drive(&mut e, &mut room, &left(2));
+            if heard {
+                drive(&mut e, &mut room, &fader(2, 0x00, 4096, PLUS_4, 10));
+            }
+            sync_and_off(&mut room);
+            drive(&mut e, &mut room, &left(0));
+            // The first reading only says where it is (both halves, even if
+            // no tempo fader has sent any before).
+            let first = fader(0, 0x00, 0x3040, 0x3040, 1);
+            assert!(drive(&mut e, &mut room, &first).is_empty(), "{heard}");
+            assert_eq!(room.decks[0].tempo, 1.0);
+            let on = tempo_after_pairs(&mut e, &mut room, 0, &fader(0, 0x00, 0x3040, 0x3400, 5));
+            assert!(
+                (on[4] - 1.0 - travel(0x3040, 0x3400)).abs() < 1e-9,
+                "{on:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn flx6_master_buttons() {
+        let mut e = MidiEngine::new(builtin_preset("DDJ-FLX6").unwrap(), 0.08);
+        let mut room = two_decks(&mut e);
+        let local = LocalParams::default();
+        let master = |room: &RoomState, e: &MidiEngine| -> Vec<u8> {
+            let lights = e.leds(room, &local);
+            (0..4)
+                .filter(|ch| lights.contains(&((0x90 | ch, 0x5C), true)))
+                .collect()
+        };
+        assert_eq!(master(&room, &e), [0u8; 0]);
+        // MASTER on deck 1, then on deck 2: its light moves.
+        drive(&mut e, &mut room, &[[0x90, 0x5C, 127], [0x90, 0x5C, 0]]);
+        assert_eq!((room.master, master(&room, &e)), (Some(0), vec![0]));
+        drive(&mut e, &mut room, &[[0x91, 0x5C, 127], [0x91, 0x5C, 0]]);
+        assert_eq!((room.master, master(&room, &e)), (Some(1), vec![1]));
+        // Deck 3 has no track: nothing.
+        drive(&mut e, &mut room, &[[0x92, 0x5C, 127], [0x92, 0x5C, 0]]);
+        assert_eq!(room.master, Some(1));
+        // SYNC on the master, which nobody follows: nothing. On deck 1: both
+        // SYNC lights come on.
+        let sync = |room: &RoomState, e: &MidiEngine| -> Vec<u8> {
+            let lights = e.leds(room, &local);
+            (0..4)
+                .filter(|ch| lights.contains(&((0x90 | ch, 0x58), true)))
+                .collect()
+        };
+        drive(&mut e, &mut room, &[[0x91, 0x58, 127], [0x91, 0x58, 0]]);
+        assert_eq!(sync(&room, &e), [0u8; 0]);
+        drive(&mut e, &mut room, &[[0x90, 0x58, 127], [0x90, 0x58, 0]]);
+        assert_eq!((sync(&room, &e), master(&room, &e)), (vec![0, 1], vec![1]));
+        // SHIFT + MASTER is nothing here; SHIFT + SYNC turns sync off.
+        drive(&mut e, &mut room, &[[0x90, 0x60, 127], [0x90, 0x60, 0]]);
+        assert_eq!(sync(&room, &e), [0, 1]);
+        drive(&mut e, &mut room, &[[0x90, 0x5D, 127], [0x90, 0x5D, 0]]);
+        assert_eq!(sync(&room, &e), [0u8; 0]);
+    }
+
+    #[test]
+    fn saved_flx6_mappings_gain_master_and_the_right_shift_sync() {
+        let preset = builtin_preset("DDJ-FLX6").unwrap();
+        let off = |b: &Binding| matches!(b.target, Target::SyncOff { .. });
+        let made = |m: &mut Mapping| {
+            m.bindings
+                .retain(|b| !matches!(b.target, Target::SyncMaster { .. }));
+            for b in m.bindings.iter_mut().filter(|b| off(b)) {
+                b.trigger.number = 0x60;
+            }
+        };
+        // Saved by preset 13: four MASTER buttons are new, and the four
+        // SHIFT + SYNCs move.
+        let mut saved = preset.clone();
+        saved.preset_version = 13;
+        made(&mut saved);
+        let before = saved.clone();
+        assert_eq!(saved.upgrade_from(&preset), 4 + 4);
+        assert!(lacks(&saved, &preset).is_empty() && lacks(&preset, &saved).is_empty());
+        assert_eq!(saved.upgrade_from(&preset), 0, "only once");
+
+        // What the DJ changed stays: deck 1's SHIFT + MASTER on something
+        // else, deck 2's SHIFT + SYNC (they'd found it) on something else,
+        // deck 3's sync off learned on another button, deck 4's MASTER.
+        let mut dj = before.clone();
+        dj.bindings
+            .retain(|b| !(off(b) && matches!(b.target.deck(), Some(0 | 2))));
+        dj.bind(Trigger::note(0, 0x60), Target::BackToStart { deck: 0 });
+        dj.bind(Trigger::note(1, 0x5D), Target::Play { deck: 1 });
+        dj.bind(Trigger::note(2, 0x22), Target::SyncOff { deck: 2 });
+        dj.bind(Trigger::note(3, 0x5C), Target::Reloop { deck: 3 });
+        dj.upgrade_from(&preset);
+        let does = |ch: u8, note: u8| -> Vec<Target> {
+            dj.bindings
+                .iter()
+                .filter(|b| b.trigger == Trigger::note(ch, note))
+                .map(|b| b.target)
+                .collect()
+        };
+        assert_eq!(does(0, 0x60), [Target::BackToStart { deck: 0 }]);
+        assert_eq!(does(0, 0x5D), [Target::SyncOff { deck: 0 }]);
+        assert_eq!(does(1, 0x5D), [Target::Play { deck: 1 }]);
+        assert_eq!(
+            does(1, 0x60),
+            [Target::SyncOff { deck: 1 }],
+            "nowhere to go"
+        );
+        assert_eq!(does(2, 0x22), [Target::SyncOff { deck: 2 }]);
+        assert_eq!(does(3, 0x5D), [Target::SyncOff { deck: 3 }]);
+        assert_eq!(does(3, 0x60), []);
+        assert_eq!(does(3, 0x5C), [Target::Reloop { deck: 3 }]);
+        for ch in 0..3 {
+            assert_eq!(does(ch, 0x5C), [Target::SyncMaster { deck: ch }]);
+        }
+
+        // From preset 6, where decks 3 and 4 still drove A and B.
+        let mut old = flx6_v6();
+        old.upgrade_from(&preset);
+        for deck in 0..4 {
+            let to = |t: Target| old.bindings.iter().find(|b| b.target == t).unwrap().trigger;
+            assert_eq!(to(Target::SyncOff { deck }), Trigger::note(deck, 0x5D));
+            assert_eq!(to(Target::SyncMaster { deck }), Trigger::note(deck, 0x5C));
+        }
+        assert!(!old.bindings.iter().any(|b| b.trigger.number == 0x60
+            && b.trigger.kind == MidiKind::Note
+            && b.trigger.channel < 4));
+    }
+
+    #[test]
+    fn two_deck_pioneers_keep_their_shift_sync_and_the_ddj_400_has_a_long_press() {
+        let bound = |name: &str, note: u8| -> Vec<Target> {
+            let m = builtin_preset(name).unwrap();
+            m.bindings
+                .iter()
+                .filter(|b| b.trigger == Trigger::note(1, note))
+                .map(|b| b.target)
+                .collect()
+        };
+        for name in ["DDJ-400", "DDJ-FLX4"] {
+            assert_eq!(bound(name, 0x58), [Target::Sync { deck: 1 }], "{name}");
+            assert_eq!(bound(name, 0x60), [Target::SyncOff { deck: 1 }], "{name}");
+            assert_eq!(bound(name, 0x5D), [], "{name}");
+        }
+        assert_eq!(bound("DDJ-400", 0x5C), [Target::SyncMaster { deck: 1 }]);
+        assert_eq!(bound("DDJ-FLX4", 0x5C), []);
+        // Saved DDJ-400 mappings gain it, and keep SHIFT + SYNC where it is.
+        let preset = builtin_preset("DDJ-400").unwrap();
+        let mut saved = preset.clone();
+        saved.preset_version = 13;
+        saved
+            .bindings
+            .retain(|b| !matches!(b.target, Target::SyncMaster { .. }));
+        assert_eq!(saved.upgrade_from(&preset), 2);
+        assert!(lacks(&saved, &preset).is_empty() && lacks(&preset, &saved).is_empty());
+    }
+
+    #[test]
+    fn master_can_be_learned_where_no_preset_has_it() {
+        for name in ["SC LIVE 4", "DJControl Inpulse 200 Mk2"] {
+            let mut e = MidiEngine::new(builtin_preset(name).unwrap(), 0.08);
+            let target = Target::SyncMaster { deck: 0 };
+            assert_eq!(e.mapping.binding_for(target), None, "{name}");
+            e.learn = Some(target);
+            send(&mut e, [0x94, 0x30, 127]);
+            assert_eq!(
+                send(&mut e, [0x94, 0x30, 127]),
+                act(Action::Master { deck: 0 }),
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -4861,13 +5235,18 @@ mod tests {
         );
         assert!(small.binding_for(Target::BrowsePress).is_some());
         // The FLX6 is the family's four-deck layout plus the two knobs, the
-        // four DECK messages, SHIFT + LOAD and the Beat FX strip's 32.
+        // four DECK messages, SHIFT + LOAD, the four MASTERs and the Beat FX
+        // strip's 32, with SHIFT + SYNC on a note of its own.
         let family = pioneer_ddj("DDJ-FLX6", "Pioneer DDJ-FLX6", 4, 2048.0);
         assert_eq!(
             preset.bindings.len(),
-            family.bindings.len() + 2 + 4 + 4 + 32
+            family.bindings.len() + 2 + 4 + 4 + 4 + 32
         );
-        assert!(family.bindings.iter().all(|b| preset.bindings.contains(b)));
+        assert!(family
+            .bindings
+            .iter()
+            .filter(|b| !matches!(b.target, Target::SyncOff { .. }))
+            .all(|b| preset.bindings.contains(b)));
     }
 
     #[test]

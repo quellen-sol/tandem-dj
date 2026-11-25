@@ -75,6 +75,7 @@ const FX_MENU_W: f32 = 6.0;
 /// dragged up as far as it goes.
 const CONTROLS_MIN_H: f32 = 110.0;
 pub(crate) const SYNC_BLUE: Color32 = Color32::from_rgb(40, 120, 200);
+const MASTER_ORANGE: Color32 = Color32::from_rgb(200, 110, 25);
 const HOT_CUE_COLORS: [Color32; 8] = [
     Color32::from_rgb(230, 60, 60),
     Color32::from_rgb(255, 160, 40),
@@ -1045,7 +1046,7 @@ impl TandemApp {
             ui.horizontal(|ui| self.key_controls(ui, d, view, false));
             ui.add_space(2.0);
             ui.horizontal(|ui| {
-                self.sync_button(ui, d, view, vec2(52.0, 20.0));
+                self.sync_buttons(ui, d, view, vec2(52.0, 20.0));
                 self.tempo_controls(ui, d, &st, false);
             });
         });
@@ -1137,9 +1138,9 @@ impl TandemApp {
                 self.transport(ui, d, &st, vec2(44.0 * k, 24.0));
                 ui.add_space(4.0 * k);
                 ui.spacing_mut().item_spacing.x = if k < 1.0 { 2.0 } else { 3.0 };
-                self.hot_cue_pads(ui, d, &st, 1, vec2(24.0 * k, 22.0));
+                self.hot_cue_pads(ui, d, &st, 1, vec2(21.0 * k, 22.0));
                 ui.add_space(4.0 * k);
-                self.sync_button(ui, d, view, vec2(44.0 * k, 22.0));
+                self.sync_buttons(ui, d, view, vec2(44.0 * k, 22.0));
             });
             if self.ui.grid_edit[d] && st.track.is_some() {
                 self.grid_editor(ui, d, dv, pos, true);
@@ -1318,54 +1319,85 @@ impl TandemApp {
         }
     }
 
-    /// SYNC, and MASTER on the deck the synced decks follow.
-    fn sync_button(&mut self, ui: &mut egui::Ui, d: usize, view: &SessionView, size: egui::Vec2) {
+    /// SYNC and MASTER.
+    fn sync_buttons(&mut self, ui: &mut egui::Ui, d: usize, view: &SessionView, size: egui::Vec2) {
         let deck = d as u8;
         let room = &view.room;
         let st = &room.decks[d];
-        let target = room.sync_target(d);
-        let sync_fill = if st.synced {
-            SYNC_BLUE
-        } else {
-            Color32::from_gray(50)
-        };
-        let tip = match target {
-            _ if st.synced && room.master == Some(deck) => "SYNC is on, and this deck is the master: the synced decks follow its tempo and beats. Right-click (or SHIFT + SYNC): sync off, back to the deck's own BPM.".to_string(),
-            Some(t) if st.synced && room.master == Some(t as u8) => format!(
-                "Synced to deck {}, the master: this deck follows its tempo and beats. Right-click (or SHIFT + SYNC): sync off, back to the deck's own BPM.",
+        let letter = deck_letter(d);
+        let master = room.master == Some(deck);
+        let fader =
+            "Right-click (or SHIFT + SYNC): sync off, and the deck back on its tempo fader.";
+        let tip = match room.sync_target(d) {
+            _ if st.synced && master => format!(
+                "SYNC is on, and this deck is the master: the other synced decks follow its tempo and beats. Click: sync off, back to this track's own BPM, and the synced decks carry on without it. {fader}"
+            ),
+            Some(t) if st.synced => format!(
+                "Synced to deck {}, the master: this deck follows its tempo and beats. Click: sync off, back to this track's own BPM. {fader}",
                 deck_letter(t)
+            ),
+            _ if master => format!(
+                "Deck {letter} is the master, and no deck follows it yet: press SYNC on another deck to sync it to this one, or MASTER on another deck first. Right-click (or SHIFT + SYNC): the deck back on its tempo fader."
             ),
             Some(t) => format!(
-                "Match this deck's tempo and beats to deck {}, and keep them locked while SYNC is on. Right-click (or SHIFT + SYNC): sync off, back to the deck's own BPM.",
+                "Match this deck's tempo and beats to deck {}, and keep them locked while SYNC is on. {fader}",
                 deck_letter(t)
             ),
-            None => "Right-click (or SHIFT + SYNC): sync off, back to the deck's own BPM.".into(),
+            None => fader.into(),
         };
+        // The master that nobody follows has nothing to sync to, but its
+        // right-click still works, so it's dimmed, not disabled.
+        let text = RichText::new("SYNC").strong();
+        let idle = master && !st.synced;
         let r = ui
             .add_enabled(
-                room.can_sync(d) || st.synced,
-                egui::Button::new(RichText::new("SYNC").strong())
-                    .min_size(size)
-                    .fill(sync_fill),
+                room.can_sync(d) || st.synced || master,
+                egui::Button::new(if idle {
+                    text.color(Color32::from_gray(120))
+                } else {
+                    text
+                })
+                .min_size(size)
+                .fill(if st.synced {
+                    SYNC_BLUE
+                } else {
+                    Color32::from_gray(50)
+                }),
             )
             .on_hover_text(tip)
             .on_disabled_hover_text("This deck and another one need a track with a detected beat.");
-        if r.clicked() {
+        if r.clicked() && !idle {
             self.pending.push(Action::Sync {
                 deck,
                 on: !st.synced,
             });
         }
         if r.secondary_clicked() {
-            // Like SHIFT + SYNC: sync off, back to the deck's own BPM
-            // (plus wherever the controller's tempo fader sits).
+            // Like SHIFT + SYNC: sync off, and the tempo to wherever the
+            // controller's tempo fader sits.
             self.pending.push(Action::Sync { deck, on: false });
             let tempo = self.midi.engine.lock().hardware_tempo(deck).unwrap_or(1.0);
             self.pending.push(Action::Tempo { deck, tempo });
         }
-        if room.master == Some(deck) {
-            ui.label(RichText::new("MASTER").small().strong().color(SYNC_BLUE.gamma_multiply(1.6)))
-                .on_hover_text("The synced decks follow this deck's tempo and beats. When it stops or loads a new track, a synced deck that's playing takes over.");
+        let r = ui
+            .add_enabled(
+                room.can_lead(d),
+                egui::Button::new(RichText::new("MASTER").small().strong())
+                    .min_size(size)
+                    .fill(if master {
+                        MASTER_ORANGE
+                    } else {
+                        Color32::from_gray(50)
+                    }),
+            )
+            .on_hover_text(if master {
+                "This deck is the master: SYNC and MATCH KEY on the other decks match it, and the synced decks follow its tempo. When it stops, runs out or loads a new track, a deck that's playing takes over.".to_string()
+            } else {
+                format!("Make deck {letter} the master: SYNC and MATCH KEY on the other decks match it from now on, and the synced decks follow its tempo. (The first deck to play becomes the master by itself.)")
+            })
+            .on_disabled_hover_text("The master needs a track with a detected beat.");
+        if r.clicked() && !master {
+            self.pending.push(Action::Master { deck });
         }
     }
 
@@ -1421,12 +1453,11 @@ impl TandemApp {
         }
     }
 
-    /// KEY LOCK, key shift and MATCH KEY (against the deck this one is
-    /// mixed with: see `RoomState::mix_partner`).
+    /// KEY LOCK, key shift and MATCH KEY (against the sync master: see
+    /// `RoomState::key_target`).
     fn key_controls(&mut self, ui: &mut egui::Ui, d: usize, view: &SessionView, compact: bool) {
         let deck = d as u8;
         let st = view.room.decks[d];
-        let partner = view.room.mix_partner(d);
         let lock_fill = if st.key_lock {
             Color32::from_rgb(110, 70, 170)
         } else {
@@ -1473,11 +1504,8 @@ impl TandemApp {
         if !compact && st.key_shift != 0 && ui.small_button("reset").clicked() {
             self.pending.push(Action::KeyShift { deck, semitones: 0 });
         }
-        let target = partner.and_then(|p| view.room.decks[p].sounding_key());
-        let shift = match (st.key >= 0, target) {
-            (true, Some(t)) => Some(tandem_core::keys::match_shift(st.key, t)),
-            _ => None,
-        };
+        let target = view.room.key_target(d);
+        let shift = view.room.key_match(d);
         let label = if compact {
             RichText::new("MATCH").small().strong()
         } else {
@@ -1485,15 +1513,28 @@ impl TandemApp {
         };
         let r = ui
             .add_enabled(shift.is_some(), egui::Button::new(label))
-            .on_hover_text(match (shift, target, partner) {
-                (Some(s), Some(t), Some(p)) => format!(
-                    "Shift this deck {s:+} semitones to sound in {} (or its relative key), matching deck {}",
-                    tandem_core::keys::camelot(t),
-                    deck_letter(p)
+            .on_hover_text(match target.and_then(|t| view.room.decks[t].sounding_key()) {
+                Some(k) => format!(
+                    "Shift this deck {:+} semitones to sound in {} (or its relative key), matching {}",
+                    shift.unwrap_or(0),
+                    tandem_core::keys::camelot(k),
+                    key_deck(view, target)
                 ),
-                _ => String::new(),
+                None => String::new(),
             })
-            .on_disabled_hover_text("This deck and the one it's mixed with need a track with a detected key.");
+            .on_disabled_hover_text(match target {
+                _ if view.room.master == Some(deck) => format!(
+                    "Deck {} is the master, the one the other decks' MATCH KEY matches: press it on another deck, or MASTER on another deck first.",
+                    deck_letter(d)
+                ),
+                _ if st.track.is_none() || st.key < 0 => {
+                    "This deck needs a track with a detected key.".into()
+                }
+                Some(t) if view.room.decks[t].sounding_key().is_none() => {
+                    format!("The key of {}, isn't known.", key_deck(view, target))
+                }
+                _ => "No other deck has a track to match.".into(),
+            });
         if r.clicked() {
             if let Some(s) = shift {
                 if !st.key_lock {
@@ -2529,8 +2570,19 @@ fn track_names(dv: &DeckView) -> (String, String) {
     }
 }
 
+/// The deck MATCH KEY matches, in words: "deck A, the master".
+fn key_deck(view: &SessionView, target: Option<usize>) -> String {
+    match target {
+        Some(t) if view.room.master == Some(t as u8) => {
+            format!("deck {}, the master", deck_letter(t))
+        }
+        Some(t) => format!("deck {}, the one it's mixed with", deck_letter(t)),
+        None => String::new(),
+    }
+}
+
 /// Time, time left, BPM, tempo and key (green when it fits the key of the
-/// deck it's mixed with).
+/// master, or on the master, of the deck it's mixed with).
 fn deck_readout(ui: &mut egui::Ui, d: usize, view: &SessionView, pos: f64, size: f32) {
     let st = &view.room.decks[d];
     ui.monospace(RichText::new(fmt_time(pos)).size(size));

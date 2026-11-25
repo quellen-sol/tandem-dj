@@ -106,12 +106,22 @@ pub struct DeckState {
     /// Track length in seconds (from the loader's decode, so identical everywhere).
     pub duration: f64,
     pub playing: bool,
+    /// Shared time (us) at which it last started playing: a real PLAY, not
+    /// a CUE or hot cue preview. When the sync master stops, the deck that
+    /// has been playing longest takes over.
+    #[serde(default)]
+    pub started: i64,
     /// Shared time (us) at which `anchor_pos` was true.
     pub anchor_time: i64,
     /// Track position in seconds at `anchor_time`.
     pub anchor_pos: f64,
     /// Playback speed, 1.0 = original. (No key lock yet: pitch follows.)
     pub tempo: f64,
+    /// Somebody has set the tempo, or the deck has been synced. A tempo
+    /// fader that hasn't moved yet takes the deck to where it sits only
+    /// while nobody has (see [`MidiEngine`](crate::mapping::MidiEngine)).
+    #[serde(default)]
+    pub tempo_set: bool,
     /// Temporary speed offset while a pitch-bend button is held (e.g. -0.04).
     pub bend: f64,
     pub cue_point: f64,
@@ -139,7 +149,8 @@ pub struct DeckState {
     pub spin: Option<f64>,
     /// Where the track's beats and bars are (None: no steady beat found).
     pub grid: Option<BeatGrid>,
-    /// Tempo-locked to the other deck (SYNC on).
+    /// In the sync group (SYNC on): tempo-locked to the master, or the
+    /// master itself while other decks follow it.
     pub synced: bool,
     /// Detected key: 0-11 major (C = 0), 12-23 minor; -1 unknown.
     pub key: i8,
@@ -181,9 +192,11 @@ impl Default for DeckState {
             track: None,
             duration: 0.0,
             playing: false,
+            started: 0,
             anchor_time: 0,
             anchor_pos: 0.0,
             tempo: 1.0,
+            tempo_set: false,
             bend: 0.0,
             cue_point: 0.0,
             cue_preview: false,
@@ -313,6 +326,16 @@ impl DeckState {
         }
         let (v, p) = (self.speed_at(t), self.position_at(t));
         (v > 0.0 && p < self.duration) || (v < 0.0 && p > 0.0)
+    }
+
+    /// Playing at time `t`, for the sync master: not a CUE or hot cue
+    /// preview, and not run off the end of the track.
+    fn live_at(&self, t: i64) -> bool {
+        let ran_out = self.position_at(t) >= self.duration
+            && !self.scratching
+            && self.active_loop().is_none()
+            && self.speed_at(t) > 0.0;
+        self.playing && !self.cue_preview && !ran_out
     }
 
     /// The loop that's set, `(in, out)`, whether or not it's playing.
@@ -749,10 +772,15 @@ pub struct RoomState {
     /// Which side of the crossfader each channel is on.
     #[serde(default = "default_xf_assign")]
     pub xf_assign: [XfSide; DECKS],
-    /// The sync master: the deck synced decks follow. None while no deck is
-    /// synced. See [`RoomState::sync_target`].
+    /// The sync master: the deck that SYNC on another deck matches, and that
+    /// the synced decks follow. The first deck to play becomes it (see
+    /// `settle_master`), and [`Action::Master`] moves it. None until then.
     #[serde(default)]
     pub master: Option<u8>,
+    /// A DJ made the master with [`Action::Master`] while it stood still: it
+    /// stays the master until it has played, whatever else starts.
+    #[serde(default)]
+    pub master_picked: bool,
 }
 
 impl Default for RoomState {
@@ -764,6 +792,7 @@ impl Default for RoomState {
             xf_curve: XfCurve::default(),
             xf_assign: default_xf_assign(),
             master: None,
+            master_picked: false,
         }
     }
 }
@@ -799,8 +828,9 @@ pub enum Action {
         grid: Option<Box<BeatGrid>>,
     },
     /// The deck has just reached a grid marker where the tempo changes: if
-    /// it's synced (or the master synced decks follow), re-match the tempos
-    /// so the beats stay locked. Scheduled by a booth for the exact moment.
+    /// it's synced, re-match the tempos so the beats stay locked. Scheduled
+    /// by a booth for the exact moment. Also sent when the sync master has
+    /// run out and another deck is playing: like any event, it hands over.
     Relock {
         deck: u8,
     },
@@ -814,12 +844,18 @@ pub enum Action {
         deck: u8,
         semitones: i8,
     },
-    /// SYNC on/off: match the sync master's tempo and beat phase (see
-    /// [`RoomState::sync_target`]), and keep the synced decks' tempos
-    /// locked to the master's while on.
+    /// SYNC on: match the sync master's tempo and beat phase (see
+    /// [`RoomState::sync_target`]). Both decks are synced from then on, and
+    /// the synced decks' tempos stay locked together. SYNC off: the deck
+    /// goes back to its track's own BPM (tempo 1.0), where its playhead is.
     Sync {
         deck: u8,
         on: bool,
+    },
+    /// MASTER: the deck becomes the sync master. If others are synced and
+    /// it isn't, it joins them, and they match its tempo and beats.
+    Master {
+        deck: u8,
     },
     /// Take the track off the deck, leaving it empty and its mixer channel
     /// as it is. Dropped, like [`Action::Load`], if the deck can be heard in
@@ -1023,6 +1059,7 @@ impl Action {
             | XfAssign { deck, .. }
             | JogTouch { deck, .. }
             | Sync { deck, .. }
+            | Master { deck }
             | KeyLock { deck, .. }
             | KeyShift { deck, .. }
             | FxOn { deck, .. }
@@ -1054,11 +1091,13 @@ impl Event {
 
 impl RoomState {
     pub fn apply(&mut self, ev: &Event) {
+        // The master may have run out since the last event.
+        self.settle_master(ev.time, None);
         self.apply_event(ev);
         for d in &mut self.decks {
             d.settle_loop();
         }
-        self.settle_master();
+        self.settle_master(ev.time, ev.action.deck());
     }
 
     /// The decks other than `x`, in the order `x` looks at them: its partner
@@ -1077,41 +1116,47 @@ impl RoomState {
             .filter(|&m| m < DECKS && has_beat(&self.decks[m]))
     }
 
-    /// The deck that deck `x` syncs to: the master, or when there's none
-    /// (or `x` is the master) another deck with a beatgrid, synced and
-    /// playing decks first.
+    /// The deck that deck `x` syncs to: the master. Before anything has
+    /// played there's none, and it's another deck with a beatgrid, the one
+    /// across the crossfader first. The master syncs to nobody.
     pub fn sync_target(&self, x: usize) -> Option<usize> {
-        if let Some(m) = self.master_deck().filter(|&m| m != x) {
-            return Some(m);
+        match self.master_deck() {
+            Some(m) => Some(m).filter(|&m| m != x),
+            None => Self::others(x).find(|&y| has_beat(&self.decks[y])),
         }
-        let rank = |y: usize| {
-            let d = &self.decks[y];
-            match (d.synced, d.playing) {
-                (true, true) => 0,
-                (true, false) => 1,
-                (false, true) => 2,
-                (false, false) => 3,
-            }
-        };
-        Self::others(x)
-            .filter(|&y| has_beat(&self.decks[y]))
-            .min_by_key(|&y| rank(y))
     }
 
-    /// SYNC can lock deck `x`: it and some other deck have beatgrids.
+    /// SYNC can lock deck `x`: it has a beatgrid, and a deck to sync to.
     pub fn can_sync(&self, x: usize) -> bool {
         has_beat(&self.decks[x]) && self.sync_target(x).is_some()
     }
 
-    /// In the sync group: synced, or the master that synced decks follow.
-    /// A tempo change on any deck in the group carries the others.
-    pub fn in_sync_group(&self, x: usize) -> bool {
-        self.decks[x].synced || self.master == Some(x as u8)
+    /// MASTER can make deck `x` the sync master: it has a beatgrid.
+    pub fn can_lead(&self, x: usize) -> bool {
+        has_beat(&self.decks[x])
+    }
+
+    /// The deck that MATCH KEY on deck `x` matches: the sync master, synced
+    /// to it or not. With no master, the deck `x` is mixed against (see
+    /// [`RoomState::mix_partner`]). The master matches nobody.
+    pub fn key_target(&self, x: usize) -> Option<usize> {
+        self.mix_partner(x)
+            .filter(|_| self.master_deck() != Some(x))
+    }
+
+    /// The key shift MATCH KEY gives deck `x`, to sound in its target's key
+    /// as it sounds now, or that key's relative major/minor. None if there's
+    /// no target, or either deck's key isn't known.
+    pub fn key_match(&self, x: usize) -> Option<i8> {
+        let to = self.decks[self.key_target(x)?].sounding_key()?;
+        let d = &self.decks[x];
+        (d.track.is_some() && d.key >= 0).then(|| crate::keys::match_shift(d.key, to))
     }
 
     /// The deck `x` is being mixed against, for comparing keys: the sync
-    /// master, otherwise a deck that's playing (its partner across the
-    /// crossfader first), otherwise any deck with a track.
+    /// master, otherwise (`x` is the master, or there's none) a deck that's
+    /// playing (its partner across the crossfader first), otherwise any
+    /// deck with a track.
     pub fn mix_partner(&self, x: usize) -> Option<usize> {
         let d = &self.decks;
         self.master_deck()
@@ -1155,28 +1200,86 @@ impl RoomState {
         })
     }
 
-    /// Keep the sync master sensible after every event. There's none while
-    /// no deck is synced. A master that isn't playing (or has lost its track
-    /// or grid) hands over to a synced deck that is, so the deck you're
-    /// hearing leads and a stopped deck can be prepared without dragging it.
-    /// Holding CUE or a hot cue from a pause is only a preview: it neither
-    /// keeps nor takes the master.
-    fn settle_master(&mut self) {
-        if !self.decks.iter().any(|d| d.synced) {
-            self.master = None;
-            return;
+    /// Of the decks with a beatgrid that are playing at time `t`, the one
+    /// that has been playing longest (the first of any started at the same
+    /// moment): among the synced ones only, or all; never deck `not`.
+    fn longest_playing(&self, t: i64, synced: bool, not: Option<usize>) -> Option<usize> {
+        (0..DECKS)
+            .filter(|&d| {
+                let st = &self.decks[d];
+                Some(d) != not && has_beat(st) && st.live_at(t) && (st.synced || !synced)
+            })
+            .min_by_key(|&d| self.decks[d].started)
+    }
+
+    /// Keep the sync group and its master sensible, before every event (the
+    /// master may have run out since the last one) and after it. `acted`:
+    /// the deck the event was on.
+    ///
+    /// - With no master, the deck that's playing becomes it. A CUE or hot
+    ///   cue preview isn't playing: it neither takes nor keeps the master.
+    /// - A master that stops, runs out or loses its track or beatgrid hands
+    ///   over to a synced deck that's playing, otherwise to any that is (the
+    ///   one playing longest), so the deck you're hearing leads. It leaves
+    ///   the group then, so a stopped deck can be prepared without dragging
+    ///   the others. With nothing else playing it stays, until another deck
+    ///   starts. A deck that was made the master while it stood still stays
+    ///   until it has played (see [`RoomState::master_picked`]).
+    /// - The master is always one of the synced decks, if there are any: when
+    ///   a deck that isn't takes over (none of the synced ones was playing),
+    ///   the group ends, and its decks keep their tempos.
+    /// - One deck on its own isn't synced with anybody: its SYNC goes out,
+    ///   and it keeps its tempo.
+    fn settle_master(&mut self, t: i64, acted: Option<usize>) {
+        for d in &mut self.decks {
+            d.synced &= has_beat(d);
+            d.tempo_set |= d.synced;
         }
-        let live = |d: &DeckState| d.playing && !d.cue_preview;
         let current = self.master_deck();
-        if current.is_some_and(|m| live(&self.decks[m])) {
-            return;
+        if current.is_some_and(|m| self.decks[m].live_at(t)) {
+            self.master_picked = false;
+        } else if current.is_none() || !self.master_picked {
+            self.hand_over(current, t, acted);
         }
-        let synced = |d: &DeckState| d.synced && has_beat(d);
-        let playing = (0..DECKS).find(|&d| synced(&self.decks[d]) && live(&self.decks[d]));
-        self.master = playing
-            .or(current)
-            .or_else(|| (0..DECKS).find(|&d| synced(&self.decks[d])))
-            .map(|d| d as u8);
+        if self.decks.iter().filter(|d| d.synced).count() == 1 {
+            self.end_sync_group();
+        }
+    }
+
+    /// Pass the master on from deck `from`, which isn't playing (None: it
+    /// lost its track, or there was no master). See `settle_master`.
+    fn hand_over(&mut self, from: Option<usize>, t: i64, acted: Option<usize>) {
+        let next = self
+            .longest_playing(t, true, None)
+            .or_else(|| self.longest_playing(t, false, None));
+        match (next, from) {
+            (Some(n), _) if !self.decks[n].synced => self.end_sync_group(),
+            // A synced deck that has just started: the master was waiting
+            // for somebody to play, and follows it now.
+            (Some(n), _) if acted == Some(n) => {}
+            (Some(_), Some(m)) => self.decks[m].synced = false,
+            _ => {}
+        }
+        if next.is_some() || from.is_none() {
+            let synced = || (0..DECKS).find(|&d| self.decks[d].synced);
+            self.master = next.or_else(synced).map(|d| d as u8);
+            self.master_picked = false;
+        }
+    }
+
+    /// Every SYNC out; the decks keep their tempos.
+    fn end_sync_group(&mut self) {
+        for d in &mut self.decks {
+            d.synced = false;
+        }
+    }
+
+    /// The master isn't playing at time `t` and somebody else is (it ran
+    /// out): any event hands it over (see `settle_master`).
+    pub fn master_due(&self, t: i64) -> bool {
+        let mut s = *self;
+        s.settle_master(t, None);
+        s.master != self.master
     }
 
     fn apply_event(&mut self, ev: &Event) {
@@ -1211,13 +1314,16 @@ impl RoomState {
         }
         if let Action::Sync { on, .. } = ev.action {
             self.decks[deck].last_touch = ev.origin;
-            let target = if on { self.sync_target(deck) } else { None };
-            let synced = target.is_some_and(|y| self.sync_deck(deck, y, t, true));
-            self.decks[deck].synced = synced;
-            if synced && self.master_deck().is_none() {
-                // The first deck synced to: the others follow it from now on.
-                self.master = target.map(|y| y as u8);
+            if on {
+                self.sync_on(deck, t);
+            } else if self.decks[deck].synced {
+                self.sync_off(deck, t);
             }
+            return;
+        }
+        if let Action::Master { .. } = ev.action {
+            self.decks[deck].last_touch = ev.origin;
+            self.lead(deck, t);
             return;
         }
         if let Action::Relock { .. } = ev.action {
@@ -1300,14 +1406,80 @@ impl RoomState {
         }
     }
 
-    /// Put synced deck `x` back on the beat of the deck it follows.
+    /// SYNC on deck `x`: match the master, and be synced with it.
+    fn sync_on(&mut self, x: usize, t: i64) {
+        let Some(y) = self.sync_target(x) else { return };
+        if !self.sync_deck(x, y, t, true) {
+            return;
+        }
+        self.decks[x].synced = true;
+        self.decks[y].synced = true;
+        if self.master_deck().is_none() {
+            // Nothing has played yet: the first deck synced to leads.
+            self.master = Some(y as u8);
+        }
+    }
+
+    /// SYNC off on synced deck `x`: back to its track's own BPM, where its
+    /// playhead is. If it was the master, another synced deck leads the rest
+    /// from now on, one that's playing first. But if `x` is the only one of
+    /// them playing, it's the one the room hears: it stays the master, and
+    /// the others, which were waiting for it, aren't synced any more.
+    fn sync_off(&mut self, x: usize, t: i64) {
+        let d = &mut self.decks[x];
+        d.synced = false;
+        d.reanchor(t);
+        d.tempo = 1.0;
+        if self.master != Some(x as u8) {
+            return;
+        }
+        let next = match self.longest_playing(t, true, None) {
+            None if !self.decks[x].live_at(t) => (0..DECKS).find(|&d| self.decks[d].synced),
+            playing => playing,
+        };
+        match next {
+            Some(n) => {
+                self.master = Some(n as u8);
+                self.master_picked = false;
+            }
+            None => self.end_sync_group(),
+        }
+    }
+
+    /// MASTER on deck `x`: it's the sync master from now on. If others are
+    /// synced and it isn't, it joins them and they match it. Decks already
+    /// locked to it are left as they are.
+    fn lead(&mut self, x: usize, t: i64) {
+        if !self.can_lead(x) || self.master == Some(x as u8) {
+            return;
+        }
+        self.master = Some(x as u8);
+        // Unless it's playing (see `settle_master`).
+        self.master_picked = true;
+        if self.decks[x].synced {
+            return;
+        }
+        for d in 0..DECKS {
+            if self.decks[d].synced && self.sync_deck(d, x, t, true) {
+                self.decks[x].synced = true;
+            }
+        }
+    }
+
+    /// Put synced deck `x` back on the beat of the group: the master's, or
+    /// another synced deck's that's playing. With none playing there's no
+    /// beat to be on.
     fn rephase(&mut self, x: usize, t: i64) {
-        if let Some(y) = self.sync_target(x) {
+        let master = self
+            .master_deck()
+            .filter(|&m| m != x && self.decks[m].live_at(t));
+        if let Some(y) = master.or_else(|| self.longest_playing(t, true, Some(x))) {
             self.sync_deck(x, y, t, false);
         }
     }
 
-    /// Match deck `x` to deck `y`: tempo (if `match_tempo`) and beat phase.
+    /// Match deck `x` to deck `y`: tempo (if `match_tempo`) and beat phase
+    /// (unless `x` plays and `y` stands still: that's no beat to be on).
     /// Uses half/double time when that's the smaller change (e.g. an 87 BPM
     /// track against 174). Returns false if either deck lacks a grid.
     fn sync_deck(&mut self, x: usize, y: usize, t: i64, match_tempo: bool) -> bool {
@@ -1315,6 +1487,7 @@ impl RoomState {
             return false;
         };
         let phase_y = self.decks[y].beat_phase(1.0, t);
+        let on_beat = self.decks[y].playing || !self.decks[x].playing;
         let target = by * self.decks[y].tempo;
         let k = [1.0, 0.5, 2.0]
             .into_iter()
@@ -1337,7 +1510,7 @@ impl RoomState {
             diff += 1.0;
         }
         let shift = diff * 60.0 / beat_bpm;
-        if shift.abs() > 0.0005 {
+        if on_beat && shift.abs() > 0.0005 {
             d.anchor_pos = (d.anchor_pos + shift).clamp(0.0, d.duration);
             // Under a roll, the phase is the track's underneath: both move.
             if let Some(r) = &mut d.roll {
@@ -1348,14 +1521,14 @@ impl RoomState {
         true
     }
 
-    /// A tempo change on a deck in the sync group carries the rest of the
-    /// group: the master and every synced deck.
+    /// A tempo change on a synced deck (the master too, while others follow
+    /// it) carries every other synced deck.
     fn follow_tempo(&mut self, moved: usize, t: i64) {
-        if !self.in_sync_group(moved) {
+        if !self.decks[moved].synced {
             return;
         }
         for d in 0..DECKS {
-            if d != moved && self.in_sync_group(d) {
+            if d != moved && self.decks[d].synced {
                 self.lock_tempo(d, moved, t);
             }
         }
@@ -1439,6 +1612,7 @@ impl RoomState {
                 *d = DeckState {
                     anchor_time: t,
                     tempo: d.tempo,
+                    tempo_set: d.tempo_set,
                     key_lock: d.key_lock,
                     volume: d.volume,
                     eq: d.eq,
@@ -1459,6 +1633,9 @@ impl RoomState {
             }
             Action::Play { .. } => {
                 if d.track.is_some() {
+                    if !d.playing || d.cue_preview {
+                        d.started = t;
+                    }
                     if !d.playing {
                         d.reanchor(t);
                         d.playing = true;
@@ -1725,6 +1902,7 @@ impl RoomState {
             Action::Tempo { tempo, .. } => {
                 d.reanchor(t);
                 d.tempo = tempo.clamp(0.5, 1.5);
+                d.tempo_set = true;
             }
             Action::Bend { bend, .. } => {
                 d.reanchor(t);
@@ -1794,6 +1972,7 @@ impl RoomState {
             | Action::CrossfaderCurve { .. }
             | Action::XfAssign { .. }
             | Action::Sync { .. }
+            | Action::Master { .. }
             | Action::Relock { .. } => {}
         }
     }
@@ -1808,9 +1987,11 @@ impl RoomState {
             }
             h.f64(d.duration);
             h.u64(d.playing as u64);
+            h.u64(d.started as u64);
             h.u64(d.anchor_time as u64);
             h.f64(d.anchor_pos);
             h.f64(d.tempo);
+            h.u64(d.tempo_set as u64);
             h.f64(d.bend);
             h.f64(d.cue_point);
             h.u64(d.cue_preview as u64);
@@ -1877,6 +2058,7 @@ impl RoomState {
             h.u64(*side as u64);
         }
         h.u64(self.master.map_or(u64::MAX, u64::from));
+        h.u64(self.master_picked as u64);
         h.0
     }
 }
@@ -2603,18 +2785,20 @@ mod tests {
         let s = tl.state_at(100_000_000);
         assert!((s.decks[1].effective_bpm_at(0).unwrap() - 128.0 * 1.03).abs() < 1e-9);
         assert!(beat_offset(&s, 100_000_000, 1.0).abs() < 1e-6);
-        // SYNC off: B keeps its tempo but no longer follows.
+        // SYNC off: B goes back to its own BPM and no longer follows, or
+        // carries anybody.
         go(&mut tl, 101_000_000, Action::Sync { deck: 1, on: false });
         go(
             &mut tl,
             102_000_000,
             Action::Tempo {
                 deck: 0,
-                tempo: 1.0,
+                tempo: 1.05,
             },
         );
         let s = tl.state_at(103_000_000);
-        assert!((s.decks[1].effective_bpm_at(0).unwrap() - 128.0 * 1.03).abs() < 1e-9);
+        assert_eq!(s.decks[1].tempo, 1.0);
+        assert_eq!(s.decks[0].tempo, 1.05);
     }
 
     /// Phase difference (in beats, -0.5..0.5) between decks `x` and `y`.
@@ -2625,6 +2809,11 @@ mod tests {
 
     fn bpm(s: &RoomState, d: usize, t: i64) -> f64 {
         s.decks[d].effective_bpm_at(t).unwrap()
+    }
+
+    /// The decks whose SYNC is lit.
+    fn synced(s: &RoomState) -> Vec<usize> {
+        (0..DECKS).filter(|&d| s.decks[d].synced).collect()
     }
 
     #[test]
@@ -2638,12 +2827,15 @@ mod tests {
         for (d, bpm) in [(0, 128.0), (1, 124.0), (2, 126.0), (3, 140.0)] {
             go(&mut s, 0, grid_load(d, d + 1, bpm, 0.05 * d as f64));
         }
+        assert_eq!(s.master, None);
+        // A plays first: it's the master. D playing too changes nothing.
         go(&mut s, 0, Action::Play { deck: 0 });
         go(&mut s, 0, Action::Play { deck: 3 });
-        assert_eq!(s.master, None);
-        // B syncs to A, the deck across from it: A is the master.
-        go(&mut s, 1_000_000, Action::Sync { deck: 1, on: true });
         assert_eq!(s.master, Some(0));
+        assert!(s.decks.iter().all(|d| !d.synced));
+        // B syncs to A: both SYNC lights come on.
+        go(&mut s, 1_000_000, Action::Sync { deck: 1, on: true });
+        assert_eq!(synced(&s), [0, 1]);
         // C syncs to the master too, not to B or the playing deck D.
         go(&mut s, 2_000_000, Action::Sync { deck: 2, on: true });
         assert_eq!(s.sync_target(2), Some(0));
@@ -2684,12 +2876,15 @@ mod tests {
         go(&mut s, 13_000_000, Action::Sync { deck: 3, on: true });
         assert!((bpm(&s, 3, 14_000_000) - 126.0).abs() < 1e-9);
         assert!(phase_gap(&s, 3, 0, 14_000_000).abs() < 1e-6);
-        // Everyone off: no master.
-        for deck in 1..4 {
+        // Everyone off, one at a time: the last one leaves the master with
+        // nobody to be synced with. It keeps its tempo.
+        for (deck, left) in [(1, vec![0, 2, 3]), (2, vec![0, 3]), (3, vec![])] {
             go(&mut s, 15_000_000, Action::Sync { deck, on: false });
+            assert_eq!(synced(&s), left);
         }
-        assert_eq!(s.master, None);
-        assert!(!s.in_sync_group(0));
+        assert_eq!(s.master, Some(0));
+        assert!((bpm(&s, 0, 15_000_000) - 126.0).abs() < 1e-9);
+        assert!((1..4).all(|d| s.decks[d].tempo == 1.0));
     }
 
     #[test]
@@ -2705,10 +2900,11 @@ mod tests {
         go(&mut s, 0, Action::Play { deck: 0 });
         go(&mut s, 0, Action::Play { deck: 1 });
         go(&mut s, 0, Action::Sync { deck: 1, on: true });
-        assert_eq!(s.master, Some(0));
-        // CUE stops the master: B is what's playing, so B leads.
+        assert_eq!((s.master, synced(&s)), (Some(0), vec![0, 1]));
+        // CUE stops the master: B is what's playing, so B leads. Nobody is
+        // left to be synced with.
         go(&mut s, 1_000_000, Action::CueDown { deck: 0 });
-        assert_eq!(s.master, Some(1));
+        assert_eq!((s.master, synced(&s)), (Some(1), vec![]));
         // Holding CUE on A is only a preview: it doesn't take the master back.
         go(&mut s, 1_100_000, Action::CueDown { deck: 0 });
         assert!(s.decks[0].cue_preview);
@@ -2731,14 +2927,19 @@ mod tests {
         // A new track on the master: the synced deck that's playing takes over.
         go(&mut s, 4_000_000, Action::Play { deck: 0 });
         go(&mut s, 5_000_000, Action::Sync { deck: 0, on: false });
-        go(&mut s, 5_000_000, Action::Sync { deck: 1, on: false });
+        assert_eq!((s.master, s.decks[0].tempo), (Some(1), 1.0));
+        assert!((bpm(&s, 1, 5_000_000) - 128.0).abs() < 1e-9);
         go(&mut s, 6_000_000, Action::Sync { deck: 0, on: true });
-        assert_eq!(s.master, Some(1));
+        assert_eq!((s.master, synced(&s)), (Some(1), vec![0, 1]));
         // B can't be loaded while it can be heard: pull its fader down first.
         go(&mut s, 6_500_000, Action::Volume { deck: 1, v: 0.0 });
         go(&mut s, 7_000_000, grid_load(1, 3, 90.0, 0.0));
         assert_eq!(s.decks[1].track, Some(tid(3)));
-        assert_eq!(s.master, Some(0), "A is synced and playing");
+        assert_eq!(
+            (s.master, synced(&s)),
+            (Some(0), vec![]),
+            "A was synced and playing"
+        );
         go(
             &mut s,
             8_000_000,
@@ -2751,9 +2952,592 @@ mod tests {
             (bpm(&s, 0, 8_000_000) - 128.0).abs() < 1e-9,
             "B no longer drags A"
         );
-        // The last synced deck off: no master.
-        go(&mut s, 9_000_000, Action::Sync { deck: 0, on: false });
+        // Nothing plays: the stopped master stays, until another deck starts.
+        go(&mut s, 9_000_000, Action::Pause { deck: 0 });
+        assert_eq!(s.master, Some(0));
+        go(&mut s, 10_000_000, Action::Play { deck: 1 });
+        assert_eq!(s.master, Some(1));
+        // The master ejected, with nothing playing: no master, and the next
+        // deck to start becomes it.
+        go(&mut s, 11_000_000, Action::Pause { deck: 1 });
+        go(&mut s, 11_000_000, Action::Eject { deck: 1 });
         assert_eq!(s.master, None);
+        go(&mut s, 12_000_000, Action::Play { deck: 0 });
+        assert_eq!(s.master, Some(0));
+    }
+
+    /// A room to try things in: the decks that have a BPM are loaded with a
+    /// 300 s track each, its first beat a little later on each.
+    struct Booth {
+        s: RoomState,
+        t: i64,
+        seq: u64,
+    }
+
+    impl Booth {
+        fn new(bpms: [f64; DECKS]) -> Self {
+            let mut b = Booth {
+                s: RoomState::default(),
+                t: 0,
+                seq: 0,
+            };
+            for (d, bpm) in bpms.into_iter().enumerate().filter(|x| x.1 > 0.0) {
+                b.go(0.0, grid_load(d as u8, d as u8 + 1, bpm, 0.11 * d as f64));
+            }
+            b
+        }
+
+        /// `secs` later, somebody does this.
+        fn go(&mut self, secs: f64, action: Action) {
+            self.t += (secs * 1e6) as i64;
+            self.seq += 1;
+            self.s.apply(&ev(self.t, 1, self.seq, action));
+            let on: Vec<usize> = synced(&self.s);
+            assert_ne!(on.len(), 1, "synced with nobody");
+            if let Some(m) = self.s.master {
+                assert!(has_beat(&self.s.decks[m as usize]));
+                assert!(on.is_empty() || on.contains(&(m as usize)));
+            } else {
+                assert!(on.is_empty());
+            }
+        }
+
+        fn play(&mut self, deck: u8) {
+            self.go(1.0, Action::Play { deck });
+        }
+        fn pause(&mut self, deck: u8) {
+            self.go(1.0, Action::Pause { deck });
+        }
+        fn sync(&mut self, deck: u8, on: bool) {
+            self.go(1.0, Action::Sync { deck, on });
+        }
+        fn master(&mut self, deck: u8) {
+            self.go(1.0, Action::Master { deck });
+        }
+        fn tempo(&mut self, deck: u8, tempo: f64) {
+            self.go(1.0, Action::Tempo { deck, tempo });
+        }
+
+        /// The master, and the decks whose SYNC is lit.
+        fn lit(&self) -> (Option<u8>, Vec<usize>) {
+            (self.s.master, synced(&self.s))
+        }
+
+        /// What can be heard of a deck, now and later.
+        fn heard(&self, d: usize) -> (bool, f64, f64, f64) {
+            let st = &self.s.decks[d];
+            let at = |t| st.position_at(t);
+            (st.playing, st.tempo, at(self.t), at(self.t + 7_654_321))
+        }
+
+        /// Decks `x` and `y` play the same BPM, on the same beats.
+        fn locked(&self, x: usize, y: usize) -> bool {
+            let t = self.t + 5_000_000;
+            (bpm(&self.s, x, t) - bpm(&self.s, y, t)).abs() < 1e-9
+                && phase_gap(&self.s, x, y, t).abs() < 1e-6
+        }
+    }
+
+    #[test]
+    fn the_first_deck_to_play_becomes_the_master() {
+        let mut b = Booth::new([128.0, 124.0, 0.0, 0.0]);
+        assert_eq!(b.lit(), (None, vec![]));
+        // Holding CUE, or a hot cue, on a stopped deck isn't playing.
+        b.go(1.0, Action::CueDown { deck: 1 });
+        assert!(b.s.decks[1].cue_preview);
+        assert_eq!(b.s.master, None);
+        b.go(1.0, Action::CueUp { deck: 1 });
+        b.go(1.0, Action::HotCue { deck: 1, slot: 0 });
+        b.go(1.0, Action::HotCue { deck: 1, slot: 0 });
+        assert!(b.s.decks[1].cue_preview);
+        assert_eq!(b.s.master, None);
+        // PLAY while holding it is.
+        b.play(1);
+        assert_eq!(b.lit(), (Some(1), vec![]));
+        b.go(1.0, Action::HotCueUp { deck: 1, slot: 0 });
+        assert!(b.s.decks[1].playing);
+        // The second deck to play changes nothing.
+        b.play(0);
+        assert_eq!(b.lit(), (Some(1), vec![]));
+
+        // A track with no beat can't lead; once its grid is set it does.
+        let mut b = Booth::new([0.0, 124.0, 0.0, 0.0]);
+        b.go(0.0, grid_load(0, 9, 0.0, 0.0));
+        b.play(0);
+        assert_eq!(b.s.master, None);
+        b.go(1.0, set_grid(0, 9, two_tempo_grid()));
+        assert_eq!(b.s.master, Some(0));
+        // And if it's taken away again, it doesn't.
+        b.go(
+            1.0,
+            Action::SetGrid {
+                deck: 0,
+                track: tid(9),
+                grid: None,
+            },
+        );
+        assert_eq!(b.s.master, None);
+    }
+
+    #[test]
+    fn sync_lights_both_decks_and_never_syncs_the_master_to_another() {
+        let mut b = Booth::new([128.0, 124.0, 0.0, 0.0]);
+        b.play(0);
+        // SYNC on the master, which nobody follows: nothing at all.
+        let before = b.s.digest();
+        assert_eq!((b.s.sync_target(0), b.s.can_sync(0)), (None, false));
+        b.sync(0, true);
+        assert_eq!(b.s.digest(), before);
+        // SYNC on the other deck: both light. Only that deck moved.
+        assert_eq!((b.s.sync_target(1), b.s.can_sync(1)), (Some(0), true));
+        let a = b.heard(0);
+        b.sync(1, true);
+        assert_eq!(b.lit(), (Some(0), vec![0, 1]));
+        assert_eq!(b.s.decks[0].tempo, a.1);
+        assert!((bpm(&b.s, 1, b.t) - 128.0).abs() < 1e-9);
+        b.play(1);
+        assert!(b.locked(1, 0));
+        // SYNC on it again (the partner pressed it too): the same.
+        b.sync(1, true);
+        assert_eq!(b.lit(), (Some(0), vec![0, 1]));
+        assert!(b.locked(1, 0));
+        // Either deck's tempo moves both.
+        b.tempo(0, 1.02);
+        assert!(b.locked(1, 0));
+        b.tempo(1, 1.0);
+        assert!(b.locked(1, 0) && (bpm(&b.s, 0, b.t) - 124.0).abs() < 1e-9);
+        // A master that nobody follows carries nobody.
+        b.sync(1, false);
+        b.tempo(0, 1.04);
+        assert_eq!((b.s.decks[0].tempo, b.s.decks[1].tempo), (1.04, 1.0));
+    }
+
+    #[test]
+    fn sync_off_goes_back_to_the_tracks_own_bpm_without_moving_the_playhead() {
+        let start = || {
+            let mut b = Booth::new([128.0, 124.0, 126.0, 0.0]);
+            for d in 0..3 {
+                b.play(d);
+            }
+            b.tempo(0, 1.03);
+            b.sync(1, true);
+            b.sync(2, true);
+            assert_eq!(b.lit(), (Some(0), vec![0, 1, 2]));
+            b
+        };
+        // Off on a deck that isn't synced: nothing.
+        let mut b = Booth::new([128.0, 124.0, 0.0, 0.0]);
+        b.play(0);
+        b.tempo(1, 0.97);
+        let before = b.s.digest();
+        b.sync(1, false);
+        assert_eq!(b.s.digest(), before);
+
+        // Off on a follower: only it changes, to exactly its own BPM.
+        for how in 0..3 {
+            let mut b = start();
+            match how {
+                // Bent, or rolling, at that moment.
+                1 => b.go(
+                    1.0,
+                    Action::Bend {
+                        deck: 1,
+                        bend: 0.04,
+                    },
+                ),
+                2 => b.go(1.0, roll(1, 1.0, true)),
+                _ => {}
+            }
+            let others = (b.heard(0), b.heard(2));
+            let t = b.t + 1_000_000;
+            let (was, under) = (
+                b.s.decks[1].position_at(t),
+                b.s.decks[1].slip_position_at(t),
+            );
+            let gen = b.s.decks[1].gen;
+            b.sync(1, false);
+            let d = b.s.decks[1];
+            assert_eq!(d.tempo, 1.0);
+            assert!((d.position_at(t) - was).abs() < 1e-9, "{how}");
+            assert!((d.slip_position_at(t) - under).abs() < 1e-9, "{how}");
+            assert_eq!(d.gen, gen, "no jump");
+            assert_eq!(b.lit(), (Some(0), vec![0, 2]));
+            let (a, c) = (b.heard(0), b.heard(2));
+            assert!((a.1, c.1) == (others.0 .1, others.1 .1));
+            assert!(b.locked(2, 0));
+        }
+
+        // Off on the master: a synced deck that's playing leads the rest,
+        // which keep their tempo.
+        let mut b = start();
+        let tempo = b.s.decks[1].tempo;
+        b.sync(0, false);
+        assert_eq!(b.s.decks[0].tempo, 1.0);
+        assert_eq!(b.lit(), (Some(1), vec![1, 2]));
+        assert_eq!(b.s.decks[1].tempo, tempo);
+        assert!(b.locked(2, 1));
+        // A goes its own way now, and isn't dragged.
+        b.tempo(1, 1.0);
+        assert_eq!(b.s.decks[0].tempo, 1.0);
+        assert!(b.locked(2, 1));
+        // Off on one of the last two: the other has nobody to be synced
+        // with, leads, and keeps its tempo.
+        b.tempo(1, 1.01);
+        b.sync(1, false);
+        assert_eq!(b.lit(), (Some(2), vec![]));
+        assert_eq!(b.s.decks[1].tempo, 1.0);
+        assert!((bpm(&b.s, 2, b.t) - 124.0 * 1.01).abs() < 1e-9);
+        assert!(b.s.decks.iter().all(|d| d.playing == d.track.is_some()));
+    }
+
+    #[test]
+    fn sync_off_on_the_only_deck_playing_leaves_it_the_master() {
+        // B and C are synced to A, stopped and waiting. SYNC off on A: it's
+        // what the room hears, so it still leads, and nothing is synced.
+        let mut b = Booth::new([128.0, 124.0, 126.0, 0.0]);
+        b.play(0);
+        b.sync(1, true);
+        b.sync(2, true);
+        b.sync(0, false);
+        assert_eq!(b.lit(), (Some(0), vec![]));
+        // So SYNC on B follows A again.
+        b.sync(1, true);
+        assert_eq!(b.lit(), (Some(0), vec![0, 1]));
+        // All stopped: the master passes to a deck that's still synced.
+        let mut b = Booth::new([128.0, 124.0, 126.0, 0.0]);
+        b.sync(1, true);
+        b.sync(2, true);
+        let first = b.s.master.unwrap();
+        b.sync(first, false);
+        let left: Vec<usize> = (0..3).filter(|&d| d != first as usize).collect();
+        assert_eq!(b.lit(), (Some(left[0] as u8), left));
+    }
+
+    #[test]
+    fn the_master_button_moves_the_master() {
+        let mut b = Booth::new([128.0, 124.0, 126.0, 0.0]);
+        for d in 0..3 {
+            b.play(d);
+        }
+        // With nothing synced, it only moves: nothing changes tempo.
+        let before: Vec<_> = (0..3).map(|d| b.s.decks[d]).collect();
+        b.master(2);
+        assert_eq!(b.lit(), (Some(2), vec![]));
+        assert_eq!(b.s.decks[..3], before);
+        // On the master: nothing. On a deck with no track or no beat: nothing.
+        b.go(0.0, grid_load(3, 9, 0.0, 0.0));
+        let before = b.s.digest();
+        b.master(2);
+        b.master(3);
+        assert_eq!(b.s.digest(), before);
+        assert!(!b.s.can_lead(3));
+
+        // Between decks that are locked together, nothing can be heard: not
+        // even a nudge the DJ had given one of them goes.
+        b.sync(0, true);
+        b.go(
+            1.0,
+            Action::Nudge {
+                deck: 0,
+                delta: 0.012,
+            },
+        );
+        let before: Vec<_> = (0..3).map(|d| b.s.decks[d]).collect();
+        b.master(0);
+        assert_eq!(b.lit(), (Some(0), vec![0, 2]));
+        assert_eq!(b.s.decks[..3], before);
+        // To a deck that wasn't synced: it joins, keeping its tempo and its
+        // place, and the others match it, on the beat. The old master follows.
+        let one = b.s.decks[1];
+        b.master(1);
+        assert_eq!(b.lit(), (Some(1), vec![0, 1, 2]));
+        assert_eq!(b.s.decks[1].tempo, one.tempo);
+        assert_eq!(b.s.decks[1].position_at(b.t), one.position_at(b.t));
+        assert!(b.locked(0, 1) && b.locked(2, 1));
+        assert!((bpm(&b.s, 0, b.t) - 124.0).abs() < 1e-9);
+        // The deck that gave it up can be unsynced on its own.
+        b.sync(0, false);
+        assert_eq!(b.lit(), (Some(1), vec![1, 2]));
+        assert_eq!(b.s.decks[0].tempo, 1.0);
+    }
+
+    #[test]
+    fn a_stopped_deck_can_be_made_the_master() {
+        let mut b = Booth::new([128.0, 124.0, 126.0, 140.0]);
+        b.play(0);
+        b.master(1);
+        assert_eq!(b.lit(), (Some(1), vec![]));
+        // It's what the DJ asked for, so whatever else happens or starts it
+        // stays, until it has played and stopped.
+        b.play(2);
+        b.go(1.0, Action::Crossfader { v: 0.3 });
+        b.go(1.0, Action::CueDown { deck: 1 });
+        b.go(1.0, Action::CueUp { deck: 1 });
+        assert_eq!(b.s.master, Some(1));
+        b.play(1);
+        b.play(3);
+        assert_eq!(b.s.master, Some(1));
+        b.pause(1);
+        assert_eq!(b.s.master, Some(0), "playing longest");
+        b.play(1);
+        assert_eq!(b.s.master, Some(0));
+
+        // With decks synced, the stopped deck joins them. Playing decks take
+        // its BPM, and don't jump: it has no beat to be on until it plays.
+        let mut b = Booth::new([128.0, 124.0, 126.0, 0.0]);
+        b.play(0);
+        b.sync(1, true);
+        b.play(1);
+        let at = b.s.decks[0].position_at(b.t + 1_000_000);
+        b.go(1.0, Action::Seek { deck: 2, pos: 33.3 });
+        b.go(0.0, Action::Master { deck: 2 });
+        assert_eq!(b.lit(), (Some(2), vec![0, 1, 2]));
+        assert_eq!(b.s.decks[0].position_at(b.t), at);
+        for d in 0..2 {
+            assert!((bpm(&b.s, d, b.t) - 126.0).abs() < 1e-9);
+        }
+        assert!(b.locked(1, 0));
+        // Started, it starts on their beat.
+        b.play(2);
+        assert!(b.locked(2, 0) && b.locked(1, 2));
+        // Ejected before it has played, it's gone, pick or no pick.
+        let mut b = Booth::new([128.0, 124.0, 0.0, 0.0]);
+        b.play(0);
+        b.master(1);
+        b.go(1.0, Action::Eject { deck: 1 });
+        assert_eq!(b.s.master, Some(0));
+        b.play(0);
+        assert!(!b.s.master_picked);
+    }
+
+    #[test]
+    fn the_master_passes_to_the_deck_playing_longest() {
+        // B, then D, then C play after A. A stops: B has played longest, but
+        // D is synced.
+        let mut b = Booth::new([128.0, 124.0, 126.0, 140.0]);
+        for d in [0, 1, 3, 2] {
+            b.play(d);
+        }
+        b.sync(3, true);
+        b.pause(0);
+        // The master that stopped left the group, and D is on its own.
+        assert_eq!(b.lit(), (Some(3), vec![]));
+        assert!((bpm(&b.s, 3, b.t) - 128.0).abs() < 1e-9, "keeps its tempo");
+        // Nothing synced: the one that's been playing longest. A pause and
+        // PLAY starts B's time again.
+        b.pause(1);
+        b.play(1);
+        b.pause(3);
+        assert_eq!(b.s.master, Some(2));
+        b.pause(2);
+        assert_eq!(b.s.master, Some(1));
+        // Nothing else plays: it stays, and SYNC on another deck follows it.
+        b.pause(1);
+        assert_eq!(b.s.master, Some(1));
+        assert_eq!(b.s.sync_target(0), Some(1));
+        // A CUE preview elsewhere doesn't take it; a real start does.
+        b.go(1.0, Action::Seek { deck: 0, pos: 0.0 });
+        b.go(1.0, Action::CueDown { deck: 0 });
+        assert!(b.s.decks[0].cue_preview);
+        assert_eq!(b.s.master, Some(1));
+        b.play(0);
+        assert_eq!(b.s.master, Some(0));
+        // A deck with no beat isn't a candidate.
+        b.go(1.0, grid_load(3, 9, 0.0, 0.0));
+        b.play(3);
+        b.pause(0);
+        assert_eq!(b.s.master, Some(0));
+    }
+
+    #[test]
+    fn a_stopped_master_can_be_prepared_without_dragging_the_others() {
+        let mut b = Booth::new([128.0, 124.0, 126.0, 140.0]);
+        for d in 0..3 {
+            b.play(d);
+        }
+        b.sync(1, true);
+        b.sync(2, true);
+        b.pause(0);
+        assert_eq!(b.lit(), (Some(1), vec![1, 2]));
+        b.tempo(0, 1.07);
+        assert!((bpm(&b.s, 1, b.t) - 128.0).abs() < 1e-9 && b.locked(2, 1));
+        // A new track on it, synced: it joins again.
+        b.go(1.0, grid_load(0, 9, 120.0, 0.3));
+        assert_eq!(b.lit(), (Some(1), vec![1, 2]));
+        b.go(1.0, Action::Seek { deck: 0, pos: 20.0 });
+        b.sync(0, true);
+        b.play(0);
+        assert_eq!(b.lit(), (Some(1), vec![0, 1, 2]));
+        assert!(b.locked(0, 1));
+        // A new track on the master: pull its fader down, load it.
+        b.go(1.0, Action::Volume { deck: 1, v: 0.0 });
+        b.go(1.0, grid_load(1, 10, 90.0, 0.0));
+        assert_eq!(b.lit(), (Some(2), vec![0, 2]), "C has played longest");
+        assert!(b.locked(0, 2));
+        // None of the synced decks plays, and D, which isn't synced, starts:
+        // it leads, and the others aren't synced any more.
+        b.pause(0);
+        b.pause(2);
+        assert_eq!(b.lit(), (Some(2), vec![0, 2]), "nothing plays");
+        let (a, c) = (b.s.decks[0].tempo, b.s.decks[2].tempo);
+        b.play(3);
+        assert_eq!(b.lit(), (Some(3), vec![]));
+        assert_eq!((b.s.decks[0].tempo, b.s.decks[2].tempo), (a, c));
+    }
+
+    #[test]
+    fn decks_synced_while_stopped_start_together_whichever_goes_first() {
+        // Nothing has played: SYNC on B takes A, across from it.
+        for first in [0u8, 1] {
+            let mut b = Booth::new([128.0, 124.0, 126.0, 0.0]);
+            b.sync(1, true);
+            assert_eq!(b.lit(), (Some(0), vec![0, 1]));
+            // Cued somewhere else, off the beat.
+            b.go(1.0, Action::Seek { deck: 0, pos: 8.2 });
+            b.go(
+                1.0,
+                Action::Seek {
+                    deck: 1,
+                    pos: 12.71,
+                },
+            );
+            // The first to start starts where it's cued, and leads.
+            let cued = [8.2, 12.71][first as usize];
+            b.play(first);
+            assert_eq!(b.s.decks[first as usize].position_at(b.t), cued);
+            assert_eq!(b.lit(), (Some(first), vec![0, 1]));
+            // The other starts on its beat.
+            b.go(1.234, Action::Play { deck: first ^ 1 });
+            assert_eq!(b.lit(), (Some(first), vec![0, 1]));
+            assert!(b.locked(0, 1));
+        }
+    }
+
+    #[test]
+    fn a_master_that_runs_out_hands_over() {
+        let mut b = Booth::new([128.0, 124.0, 126.0, 0.0]);
+        b.play(0);
+        b.sync(1, true);
+        b.play(1);
+        b.play(2);
+        b.go(
+            1.0,
+            Action::Seek {
+                deck: 0,
+                pos: 290.0,
+            },
+        );
+        b.go(0.0, Action::Seek { deck: 1, pos: 10.0 });
+        assert_eq!(b.lit(), (Some(0), vec![0, 1]));
+        let end = b.t + 10_000_000;
+        assert!(!b.s.master_due(end - 2_000_000));
+        assert!(b.s.master_due(end + 100_000));
+        // Nothing happens by itself; any event after that hands over, before
+        // it does what it does (SYNC on C: C goes on B's beat, not on A's,
+        // where it stands).
+        b.go(11.0, Action::Sync { deck: 2, on: true });
+        assert!(b.s.decks[0].playing);
+        assert_eq!(b.lit(), (Some(1), vec![1, 2]));
+        assert!(b.locked(2, 1));
+        assert!(!b.s.master_due(b.t + 1_000_000));
+        // So does the Relock the host sends for it, and nobody touched A.
+        let touched = |s: &RoomState| s.decks[0].last_touch;
+        let mut b = Booth::new([128.0, 124.0, 0.0, 0.0]);
+        b.play(0);
+        b.play(1);
+        b.go(
+            1.0,
+            Action::Seek {
+                deck: 0,
+                pos: 299.0,
+            },
+        );
+        b.s.decks[0].last_touch = 7;
+        b.go(3.0, Action::Relock { deck: 0 });
+        assert_eq!((b.s.master, touched(&b.s)), (Some(1), 7));
+        // Looping, rolling or held, it doesn't run out.
+        for how in 0..3 {
+            let mut b = Booth::new([128.0, 124.0, 0.0, 0.0]);
+            b.play(0);
+            b.play(1);
+            b.go(
+                1.0,
+                Action::Seek {
+                    deck: 0,
+                    pos: 299.0,
+                },
+            );
+            b.go(
+                0.0,
+                match how {
+                    0 => Action::BeatLoop {
+                        deck: 0,
+                        beats: 1.0,
+                    },
+                    1 => roll(0, 1.0, true),
+                    _ => Action::JogTouch {
+                        deck: 0,
+                        down: true,
+                        spin: 0.0,
+                    },
+                },
+            );
+            b.go(5.0, Action::Crossfader { v: 0.2 });
+            assert_eq!(b.s.master, Some(0), "{how}");
+        }
+        // With nothing else playing it stays, and played again it still is.
+        let mut b = Booth::new([128.0, 124.0, 0.0, 0.0]);
+        b.play(0);
+        b.go(
+            1.0,
+            Action::Seek {
+                deck: 0,
+                pos: 299.0,
+            },
+        );
+        b.go(5.0, Action::Crossfader { v: 0.2 });
+        assert_eq!(b.s.master, Some(0));
+        // PLAY on a deck at its end doesn't take it.
+        b.go(
+            1.0,
+            Action::Seek {
+                deck: 1,
+                pos: 300.0,
+            },
+        );
+        b.play(1);
+        assert_eq!(b.s.master, Some(0));
+        b.go(1.0, Action::Seek { deck: 1, pos: 5.0 });
+        assert_eq!(b.s.master, Some(1));
+    }
+
+    #[test]
+    fn the_master_finds_the_beat_of_the_decks_that_follow_it() {
+        // Half and double time, with the master changing hands.
+        let mut b = Booth::new([174.0, 87.5, 0.0, 0.0]);
+        b.play(0);
+        b.sync(1, true);
+        b.play(1);
+        assert!((b.s.decks[1].tempo - 87.0 / 87.5).abs() < 1e-9);
+        b.master(1);
+        assert_eq!(b.lit(), (Some(1), vec![0, 1]));
+        assert!(beat_offset(&b.s, b.t, 2.0).abs() < 1e-6);
+        b.tempo(1, 1.0);
+        assert!((bpm(&b.s, 0, b.t) - 175.0).abs() < 1e-9);
+        assert!(beat_offset(&b.s, b.t, 2.0).abs() < 1e-6);
+        // The master leaves a ¼-beat loop: back on the beat of the others.
+        b.go(
+            1.0,
+            Action::BeatLoop {
+                deck: 1,
+                beats: 0.25,
+            },
+        );
+        b.go(1.23, Action::Reloop { deck: 1 });
+        let (x, y) = (&b.s.decks[0], &b.s.decks[1]);
+        let t = b.t + 3_000_000;
+        let gap = x.beat_phase(0.5, t) - y.beat_phase(1.0, t);
+        assert!((gap * 2.0 - (gap * 2.0).round()).abs() < 1e-6, "{gap}");
     }
 
     #[test]
@@ -2789,14 +3573,101 @@ mod tests {
         // A deck that's playing.
         s.apply(&ev(0, 1, 5, Action::Play { deck: 3 }));
         assert_eq!(s.mix_partner(0), Some(3));
-        // The sync master.
+        // It's the sync master, synced to or not.
+        assert_eq!(s.master, Some(3));
         s.apply(&ev(0, 1, 6, Action::Sync { deck: 1, on: true }));
-        assert_eq!(s.master, Some(3), "B synced to the deck that's playing");
         assert_eq!(s.mix_partner(0), Some(3));
         // The master itself looks at what's playing, then across.
         assert_eq!(s.mix_partner(3), Some(2));
         s.apply(&ev(0, 1, 7, Action::Play { deck: 1 }));
         assert_eq!(s.mix_partner(3), Some(1));
+        // Not across from a deck that's playing, but against the master.
+        assert_eq!(s.mix_partner(0), Some(3));
+    }
+
+    #[test]
+    fn match_key_matches_the_master() {
+        // C minor, A minor and D major on A, B and C; D is in an unknown key.
+        let mut b = Booth::new([0.0; 4]);
+        for (deck, key) in [(0u8, 12), (1, 21), (2, 2), (3, -1)] {
+            let load = Action::Load {
+                deck,
+                track: tid(deck + 1),
+                duration: 300.0,
+                cue: 0.0,
+                grid: BeatGrid::new(0.0, 120.0 + deck as f64).map(Box::new),
+                key,
+            };
+            b.go(0.0, load);
+        }
+        let targets =
+            |b: &Booth| -> [Option<usize>; 4] { std::array::from_fn(|d| b.s.key_target(d)) };
+        // Nothing has played: the deck each is mixed with.
+        assert_eq!(targets(&b), [Some(1), Some(0), Some(3), Some(2)]);
+        assert_eq!(b.s.key_match(1), Some(3), "A minor up to C minor");
+        // The first track playing is the master: everybody matches it, synced
+        // or not, whatever else plays. It matches nobody.
+        b.play(1);
+        b.play(2);
+        assert_eq!(targets(&b), [Some(1), None, Some(1), Some(1)]);
+        assert_eq!(b.s.key_match(0), Some(-3));
+        assert_eq!(b.s.key_match(1), None);
+        assert_eq!(
+            b.s.key_match(2),
+            Some(-2),
+            "D major to C, A minor's relative"
+        );
+        assert_eq!(b.s.key_match(3), None, "its own key isn't known");
+        // As the master sounds: its key shift, and its tempo off key lock.
+        b.go(
+            1.0,
+            Action::KeyShift {
+                deck: 1,
+                semitones: 2,
+            },
+        );
+        assert_eq!(b.s.key_match(0), Some(-1), "B minor");
+        b.go(1.0, Action::KeyLock { deck: 1, on: false });
+        b.tempo(1, 2f64.powf(1.0 / 12.0));
+        assert_eq!(b.s.key_match(0), Some(0), "C minor");
+        // It's a one-off: later changes don't follow, and neither SYNC nor
+        // SYNC off touches it.
+        b.go(
+            1.0,
+            Action::KeyShift {
+                deck: 0,
+                semitones: 5,
+            },
+        );
+        b.go(
+            1.0,
+            Action::KeyShift {
+                deck: 1,
+                semitones: 0,
+            },
+        );
+        b.sync(0, true);
+        b.sync(0, false);
+        assert_eq!(b.s.decks[0].key_shift, 5);
+        // MASTER moves it.
+        b.master(0);
+        assert_eq!(targets(&b), [None, Some(0), Some(0), Some(0)]);
+        assert_eq!(b.s.key_match(2), Some(6), "C minor up 5 is F minor");
+        // The master's key isn't known: nothing to match, not another deck.
+        b.master(3);
+        assert_eq!(targets(&b), [Some(3), Some(3), Some(3), None]);
+        assert!((0..4).all(|d| b.s.key_match(d).is_none()));
+        // Ejected, it hands over to what's been playing longest.
+        b.go(1.0, Action::Eject { deck: 3 });
+        assert_eq!(targets(&b), [Some(1), None, Some(1), Some(1)]);
+        b.pause(1);
+        assert_eq!(b.s.key_target(1), Some(2));
+        // The master's own readout still compares with what it's mixed with.
+        assert_eq!(b.s.mix_partner(2), Some(0));
+        // Nothing left to match.
+        let mut b = Booth::new([0.0; 4]);
+        b.go(0.0, grid_load(0, 1, 120.0, 0.0));
+        assert_eq!((b.s.key_target(0), b.s.key_match(0)), (None, None));
     }
 
     #[test]
@@ -3098,7 +3969,8 @@ mod tests {
         assert!(!b.synced && !b.looping && b.loop_span().is_none() && b.roll.is_none());
         assert!(!b.cue_preview && !b.scratching && b.spin.is_none());
         assert_eq!(b.bend, 0.0);
-        assert_eq!(s.master, None, "nothing synced any more");
+        assert_eq!(s.master, Some(0));
+        assert!(!s.decks[0].synced, "nobody left to be synced with");
         // A plays on untouched.
         assert!(s.decks[0].playing);
         assert!(close(at(&s, 0, 9_000_000), 9.0));
@@ -3234,6 +4106,7 @@ mod tests {
         let want = DeckState {
             anchor_time: 2_000_000,
             tempo,
+            tempo_set: true,
             key_lock: false,
             volume: 0.05,
             eq: b.eq,
@@ -4087,8 +4960,14 @@ mod tests {
                 },
             ),
             ev(2_000_000, 1, 7, Action::Pause { deck: 0 }),
+            ev(1_600_000, 2, 10, Action::Master { deck: 1 }),
+            ev(1_600_000, 1, 12, Action::Master { deck: 3 }),
+            ev(1_900_000, 1, 13, Action::Master { deck: 0 }),
             ev(2_400_000, 2, 7, Action::Sync { deck: 3, on: true }),
             ev(2_500_000, 1, 8, grid_load(0, 5, 140.0, 0.0)),
+            ev(2_800_000, 1, 10, Action::Sync { deck: 0, on: true }),
+            ev(2_900_000, 2, 11, Action::Master { deck: 0 }),
+            ev(3_100_000, 1, 11, Action::Master { deck: 2 }),
             ev(
                 3_000_000,
                 2,
@@ -4127,6 +5006,212 @@ mod tests {
                 let (x, y) = (a.state_at(t), b.state_at(t));
                 assert_eq!(x.master, y.master, "master at {t}");
                 assert_eq!(x.digest(), y.digest(), "diverged at {t}");
+            }
+        }
+    }
+
+    /// A random move by one of the DJs, from what they'd do with sync.
+    fn sync_move(rng: &mut fastrand::Rng, loaded: &mut u8) -> Action {
+        let deck = rng.u8(0..DECKS as u8);
+        let slot = rng.u8(0..2);
+        match rng.u32(0..34) {
+            0..=4 => Action::Sync { deck, on: true },
+            5..=7 => Action::Sync { deck, on: false },
+            8..=11 => Action::Master { deck },
+            12..=16 => Action::Play { deck },
+            17..=18 => Action::Pause { deck },
+            19 => Action::CueDown { deck },
+            20 => Action::CueUp { deck },
+            21 => Action::HotCue { deck, slot },
+            22 => Action::HotCueUp { deck, slot },
+            23..=24 => Action::Tempo {
+                deck,
+                tempo: 0.92 + 0.16 * rng.f64(),
+            },
+            25 => Action::Seek {
+                deck,
+                // Often close enough to the end to run out.
+                pos: if rng.bool() { 298.0 } else { 280.0 * rng.f64() },
+            },
+            26 => Action::Eject { deck },
+            27..=28 => {
+                *loaded += 1;
+                let bpm = [0.0, 87.0, 120.0, 128.0, 174.0][rng.usize(0..5)];
+                grid_load(deck, *loaded, bpm, rng.f64())
+            }
+            29 => set_grid(deck, deck + 1, two_tempo_grid()),
+            30 => Action::SetGrid {
+                deck,
+                track: tid(deck + 1),
+                grid: None,
+            },
+            31 => Action::Relock { deck },
+            32 => roll(deck, 1.0, rng.bool()),
+            _ => Action::Volume {
+                deck,
+                v: rng.u8(0..2) as f32,
+            },
+        }
+    }
+
+    /// Whatever two DJs do, in whatever order it arrives, every booth has
+    /// the same master and the same decks synced, and the rules hold all the
+    /// way: the synced decks play one BPM (or half or double), the master is
+    /// one of them, nobody is synced alone, and a deck whose SYNC was turned
+    /// off is at its own BPM.
+    #[test]
+    fn sync_converges_and_keeps_its_rules_whatever_the_djs_do() {
+        for seed in 0..60 {
+            let mut rng = fastrand::Rng::with_seed(seed);
+            let mut events = Vec::new();
+            for d in 0..DECKS as u8 {
+                events.push(ev(0, 1, d as u64 + 1, grid_load(d, d + 1, 126.0, 0.1)));
+            }
+            let (mut t, mut seq, mut loaded) = (0, [DECKS as u64, 0], 9);
+            for _ in 0..120 {
+                // Often at the same moment as the last.
+                t += [0, 300_000, 1_700_000, 4_000_000][rng.usize(0..4)];
+                let dj = rng.usize(0..2);
+                seq[dj] += 1;
+                let a = sync_move(&mut rng, &mut loaded);
+                events.push(ev(t, dj as u64 + 1, seq[dj], a));
+            }
+            let mut in_order = events.clone();
+            in_order.sort_by_key(Event::key);
+
+            // One at a time, the rules hold.
+            let mut s = RoomState::default();
+            for e in &in_order {
+                let before = s;
+                s.apply(e);
+                let what = || format!("seed {seed}, {e:?}\n{:?}", (s.master, synced(&s)));
+                let on = synced(&s);
+                assert_ne!(on.len(), 1, "{}", what());
+                match s.master_deck() {
+                    Some(m) => {
+                        assert!(on.is_empty() || on.contains(&m), "{}", what());
+                        // Not while something else plays, unless a DJ picked it.
+                        let live = |d: usize| has_beat(&s.decks[d]) && s.decks[d].live_at(e.time);
+                        let other = (0..DECKS).any(|d| d != m && live(d));
+                        assert!(live(m) || !other || s.master_picked, "{}", what());
+                    }
+                    None => {
+                        let live =
+                            (0..DECKS).any(|d| has_beat(&s.decks[d]) && s.decks[d].live_at(e.time));
+                        assert!(on.is_empty() && !live, "{}", what());
+                    }
+                }
+                let bpm = |d: usize| s.decks[d].effective_bpm_at(e.time).unwrap();
+                for &d in &on {
+                    // A tempo held at the room's limit can't follow, and a
+                    // deck that crossed a tempo change waits for its Relock.
+                    let free = |d: usize| {
+                        (0.501..1.499).contains(&s.decks[d].tempo)
+                            && s.decks[d].grid.is_some_and(|g| g.markers().len() == 1)
+                    };
+                    let k = bpm(d) / bpm(on[0]);
+                    let near = [0.25, 0.5, 1.0, 2.0, 4.0]
+                        .iter()
+                        .any(|r| (k / r - 1.0).abs() < 1e-9);
+                    if on.iter().all(|&d| free(d)) {
+                        assert!(near, "{k} {}", what());
+                    }
+                }
+                if let Action::Sync { deck, on: false } = e.action {
+                    let d = deck as usize;
+                    assert!(!s.decks[d].synced);
+                    if before.decks[d].synced && before.master_due(e.time) {
+                        // It may have left the group just before.
+                    } else if before.decks[d].synced {
+                        assert_eq!(s.decks[d].tempo, 1.0, "{}", what());
+                        assert_eq!(
+                            s.decks[d].position_at(e.time),
+                            before.decks[d].position_at(e.time)
+                        );
+                    } else {
+                        assert_eq!(s.decks[d].tempo, before.decks[d].tempo);
+                    }
+                }
+                // Only the master's own deck is never moved by MASTER.
+                if let Action::Master { deck } = e.action {
+                    let d = deck as usize;
+                    assert_eq!(s.decks[d].tempo, before.decks[d].tempo, "{}", what());
+                    assert_eq!(s.decks[d].gen, before.decks[d].gen, "{}", what());
+                }
+            }
+
+            // Shuffled, with some arriving twice, and folded into the base as
+            // a booth does it as it goes.
+            let mut a = Timeline::new(0);
+            for e in &in_order {
+                a.insert(e.clone());
+            }
+            let mut late = events.clone();
+            rng.shuffle(&mut late);
+            let mut b = Timeline::new(0);
+            for e in &late {
+                b.insert(e.clone());
+                if rng.bool() {
+                    b.insert(e.clone());
+                }
+            }
+            let mut c = Timeline::new(0);
+            for (i, e) in in_order.iter().enumerate() {
+                c.insert(e.clone());
+                if i % 7 == 0 {
+                    c.compact(e.time - 2_000_000);
+                }
+            }
+            // Merged in one go (a DJ getting back in), and sent whole (a
+            // resync) with the rest of the moves after it.
+            let mut d = Timeline::new(0);
+            let (kept, cut_off): (Vec<_>, Vec<_>) =
+                in_order.iter().cloned().partition(|e| e.origin == 1);
+            for e in kept {
+                d.insert(e);
+            }
+            d.merge(cut_off);
+            // Each move on the wire as it happens, as a joiner gets them.
+            let mut g = Timeline::new(0);
+            for e in &late {
+                g.insert(serde_json::from_str(&serde_json::to_string(e).unwrap()).unwrap());
+            }
+            let (first, rest) = in_order.split_at(60);
+            let mut sent = Timeline::new(0);
+            for e in first {
+                sent.insert(e.clone());
+            }
+            sent.compact(first[40].time);
+            let mut f: Timeline =
+                serde_json::from_str(&serde_json::to_string(&sent).unwrap()).unwrap();
+            for e in rest {
+                f.insert(e.clone());
+            }
+            for at in [t / 3, t / 2, t, t + 60_000_000] {
+                let want = a.state_at(at);
+                assert_eq!(
+                    want.digest(),
+                    b.state_at(at).digest(),
+                    "seed {seed} at {at}"
+                );
+                assert_eq!(
+                    want.digest(),
+                    d.state_at(at).digest(),
+                    "seed {seed} at {at}"
+                );
+                // (Floats' last bits can change on the wire.)
+                let flags = |s: &RoomState| (s.master, s.master_picked, synced(s));
+                assert_eq!(flags(&want), flags(&g.state_at(at)), "seed {seed} at {at}");
+                if at >= t / 2 {
+                    assert_eq!(flags(&want), flags(&f.state_at(at)), "seed {seed} at {at}");
+                }
+                if at >= t {
+                    assert_eq!(
+                        want.digest(),
+                        c.state_at(at).digest(),
+                        "seed {seed} at {at}"
+                    );
+                }
             }
         }
     }

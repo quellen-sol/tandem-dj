@@ -209,7 +209,8 @@ fn deck_card(ui: &mut egui::Ui, d: usize, b: &BroadcastView) {
             };
             chip(ui, &text, LOOP.gamma_multiply(0.7), 13.0 * s);
         }
-        if b.room.master == Some(d as u8) {
+        // Who leads matters to a viewer only while others follow.
+        if st.synced && b.room.master == Some(d as u8) {
             chip(ui, "MASTER", SYNC_BLUE, 13.0 * s);
         } else if st.synced {
             chip(ui, "SYNC", SYNC_BLUE, 13.0 * s);

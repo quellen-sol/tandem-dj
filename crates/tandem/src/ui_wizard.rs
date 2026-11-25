@@ -639,6 +639,7 @@ enum El {
     Play(usize),
     Cue(usize),
     Sync(usize),
+    SyncMaster(usize),
     Load(usize),
     Deck(usize),
     Tempo(usize),
@@ -696,6 +697,7 @@ fn wanted(w: &Wizard, i: usize) -> (Vec<El>, Option<El>, String) {
         Target::Play { .. } => (vec![El::Play(s)], "PLAY".into()),
         Target::Cue { .. } | Target::BackToStart { .. } => (vec![El::Cue(s)], "CUE".into()),
         Target::Sync { .. } | Target::SyncOff { .. } => (vec![El::Sync(s)], "SYNC".into()),
+        Target::SyncMaster { .. } => (vec![El::SyncMaster(s)], "MASTER".into()),
         Target::Load { .. } | Target::Eject { .. } => (vec![El::Load(s)], "LOAD".into()),
         Target::DeckSelect { .. } => (vec![El::Deck(s)], "DECK".into()),
         Target::Tempo { .. } | Target::TempoShift { .. } => (vec![El::Tempo(s)], "TEMPO".into()),
@@ -901,7 +903,7 @@ fn diagram(ui: &mut egui::Ui, w: &Wizard, i: usize) {
             }
         }
         // The loop section and the transport, down the left.
-        let column: [(El, f32, f32, f32, f32); 10] = [
+        let column: [(El, f32, f32, f32, f32); 11] = [
             (El::LoopIn(side), 0.0, 22.0, 22.0, 14.0),
             (El::LoopOut(side), 26.0, 22.0, 22.0, 14.0),
             (El::Reloop(side), 0.0, 41.0, 48.0, 14.0),
@@ -909,7 +911,8 @@ fn diagram(ui: &mut egui::Ui, w: &Wizard, i: usize) {
             (El::Double(side), 26.0, 60.0, 22.0, 14.0),
             (El::Auto(side), 0.0, 79.0, 48.0, 14.0),
             (El::Shift(side), 0.0, 110.0, 48.0, 16.0),
-            (El::Sync(side), 0.0, 134.0, 48.0, 18.0),
+            (El::Sync(side), 0.0, 134.0, 22.0, 18.0),
+            (El::SyncMaster(side), 26.0, 134.0, 22.0, 18.0),
             (El::Cue(side), 0.0, 158.0, 48.0, 24.0),
             (El::Play(side), 0.0, 188.0, 48.0, 24.0),
         ];
